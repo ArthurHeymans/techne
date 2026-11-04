@@ -1281,27 +1281,27 @@
       "is_macro": false
     },
     "process-close-input": {
-      "description": "(process-close-input process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:953\n\nClose the input of PROCESS, which then reads end of file.",
+      "description": "(process-close-input process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:958\n\nClose the input of PROCESS, which then reads end of file.",
       "is_macro": false
     },
     "process-dropped": {
-      "description": "(process-dropped process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:963\n\nReturn how many bytes of PROCESS's output were dropped, unread.",
+      "description": "(process-dropped process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:968\n\nReturn how many bytes of PROCESS's output were dropped, unread.",
       "is_macro": false
     },
     "process-exited?": {
-      "description": "(process-exited? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:965\n\nReturn #t if PROCESS has ended.",
+      "description": "(process-exited? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:970\n\nReturn #t if PROCESS has ended.",
       "is_macro": false
     },
     "process-kill": {
-      "description": "(process-kill process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:913\n\nKill PROCESS and its process group.",
+      "description": "(process-kill process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:918\n\nKill PROCESS and its process group.",
       "is_macro": false
     },
     "process-pid": {
-      "description": "(process-pid process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:909\n\nReturn the operating system's id of PROCESS.",
+      "description": "(process-pid process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:914\n\nReturn the operating system's id of PROCESS.",
       "is_macro": false
     },
     "process-read": {
-      "description": "(process-read process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:945\n\nWait for the next output of PROCESS on STREAM, `stdout` or `stderr`.\nReturn it as a string, or the eof object once the stream is closed.",
+      "description": "(process-read process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:950\n\nWait for the next output of PROCESS on STREAM, `stdout` or `stderr`.\nReturn it as a string, or the eof object once the stream is closed.",
       "is_macro": false
     },
     "process-read-all": {
@@ -1313,15 +1313,15 @@
       "is_macro": false
     },
     "process-read-bytes": {
-      "description": "(process-read-bytes process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:948\n\nWait for the next output of PROCESS on STREAM, as a bytevector.\nSTREAM is `stdout` or `stderr`; once it is closed, return the eof object.",
+      "description": "(process-read-bytes process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:953\n\nWait for the next output of PROCESS on STREAM, as a bytevector.\nSTREAM is `stdout` or `stderr`; once it is closed, return the eof object.",
       "is_macro": false
     },
     "process-resize": {
-      "description": "(process-resize process rows columns)  built-in procedure, @source@/crates/techne-process/src/lib.rs:959\n\nTell PROCESS, on a terminal, that it has ROWS and COLUMNS.",
+      "description": "(process-resize process rows columns)  built-in procedure, @source@/crates/techne-process/src/lib.rs:964\n\nTell PROCESS, on a terminal, that it has ROWS and COLUMNS.",
       "is_macro": false
     },
     "process-signal": {
-      "description": "(process-signal process signal)  built-in procedure, @source@/crates/techne-process/src/lib.rs:957\n\nSend SIGNAL to PROCESS's group.\nSIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and\n`cont`.",
+      "description": "(process-signal process signal)  built-in procedure, @source@/crates/techne-process/src/lib.rs:962\n\nSend SIGNAL to PROCESS's group.\nSIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and\n`cont`.",
       "is_macro": false
     },
     "process-spawn": {
@@ -1329,11 +1329,11 @@
       "is_macro": false
     },
     "process-wait": {
-      "description": "(process-wait process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:961\n\nWait for PROCESS to end; return its exit code, or (signal N).",
+      "description": "(process-wait process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:966\n\nWait for PROCESS to end; return its exit code, or (signal N).",
       "is_macro": false
     },
     "process-write": {
-      "description": "(process-write process data)  built-in procedure, @source@/crates/techne-process/src/lib.rs:951\n\nWrite DATA, a string or bytevector, to the input of PROCESS.\nIt waits while the input is full.",
+      "description": "(process-write process data)  built-in procedure, @source@/crates/techne-process/src/lib.rs:956\n\nWrite DATA, a string or bytevector, to the input of PROCESS.\nIt waits while the input is full.",
       "is_macro": false
     },
     "project-root": {

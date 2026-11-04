@@ -1,0 +1,55 @@
+# cargo-deny (CI's lint job): advisories, licenses, duplicate versions
+# and sources of the whole dependency graph, not only our own crates.
+# cargo audit checks advisories alone; this is the policy around them.
+# In the dev shell, and in CI: `cargo deny check -D yanked`.
+
+[advisories]
+# Advisory lint levels are command-line flags in cargo-deny 0.20; CI
+# runs `cargo deny check -D yanked`, so a yanked version (which stays
+# in the lockfile until someone updates it) fails there.
+ignore = [
+  # Unmaintained, not unsound: both come in through the font stack
+  # (resvg/usvg and cosmic-text), and replacing them is upstream's
+  # migration, not a version bump of ours. Still noted on every run.
+  { id = "RUSTSEC-2026-0206", reason = "rustybuzz is unmaintained; via usvg/resvg, no maintained drop-in" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained; via usvg/resvg and cosmic-text, no maintained drop-in" },
+]
+
+[licenses]
+# Techne's own code is MIT OR Apache-2.0 (LICENSE); a dependency under
+# anything more restrictive than these permissive licenses is a
+# decision, not an accident. A crate offering a copyleft license as one
+# option beside a permissive one (`MIT OR GPL-2.0-only`) satisfies this
+# through the permissive option.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",              # the Boost license, despite the name
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",  # webpki's certificate data
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Two versions of one crate are sometimes forced on us; a third is
+# worth a look. Skipping a version here says we looked.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own crates are path dependencies, versioned with the
+# tree, not by a registry range.
+allow-wildcard-paths = true
+
+[sources]
+# Dependencies come from crates.io; a git or unknown source is pinned
+# here by hand when there is a reason for one.
+unknown-registry = "deny"
+unknown-git = "deny"

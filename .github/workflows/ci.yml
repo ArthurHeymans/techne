@@ -50,6 +50,8 @@ jobs:
       - run: cargo doc --no-deps --release
         env:
           RUSTDOCFLAGS: -D warnings
+      # The dependency graph: advisories, licenses, sources (deny.toml).
+      - run: cargo deny check -D yanked
       - run: typos
       # The Emacs client compiles without warnings.
       - run: emacs -Q --batch -L editors/emacs --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile editors/emacs/techne.el
