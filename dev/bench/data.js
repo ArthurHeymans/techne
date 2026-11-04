@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793795047026,
+  "lastUpdate": 1793795048760,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -44990,6 +44990,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 604526129,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 97641,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "69a2dd2d142b39d6bb4ab0767e37274feb5047c4",
+          "message": "Merge pull request #305 from ArthurHeymans/agents-dogfooding\n\nAGENTS: ask agents to dogfood techne through `techne tool`",
+          "timestamp": "2026-11-04T13:16:32+01:00",
+          "tree_id": "1961a96d2a8f14365673359e40d6eff1c3d82ee0",
+          "url": "https://github.com/ArthurHeymans/techne/commit/69a2dd2d142b39d6bb4ab0767e37274feb5047c4"
+        },
+        "date": 1793795048676,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 634286192,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 604526142,
             "unit": "instructions"
           },
           {
