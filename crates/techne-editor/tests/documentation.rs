@@ -29,7 +29,7 @@ fn documentation_problems() {
     ] {
         vm.eval_source(&format!("(require {:?})", root.join(file).display().to_string())).unwrap_or_else(|e| panic!("{file}: {e}"));
     }
-    vm.eval_source("(import (techne tools) (techne source))").unwrap();
+    vm.eval_source("(import (techne tools) (techne source) (techne path) (techne time))").unwrap();
     let problems: Vec<String> = vm
         .eval_source(
             "(map (lambda (p) (string-append (repr (problem-module p)) \" \" (symbol->string (problem-subject p))
