@@ -454,7 +454,7 @@ pub fn install(vm: &mut Vm) {
             if let Err(e) = write(vm, &mut out, vm.regs[a], 0, &meter) {
                 return Err(meter.error(vm).unwrap_or(e));
             }
-            vm.admit_items(out.len(), 1, 64)?;
+            vm.admit_string(out.len())?;
             Ok(vm.make_string_raw(&out)) };
     }
 }
