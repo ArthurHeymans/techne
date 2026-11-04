@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793781665195,
+  "lastUpdate": 1793781666864,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -44319,6 +44319,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 84963,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "80a509791e3484997e22ddf51dbef85c3de97a98",
+          "message": "Merge pull request #299 from ArthurHeymans/rendered-markdown\n\nShow markdown rendered: fonts and sizes, rich text, images",
+          "timestamp": "2026-11-04T09:32:21+01:00",
+          "tree_id": "caaae38c8250bddd32304c18136c2dc00204276b",
+          "url": "https://github.com/ArthurHeymans/techne/commit/80a509791e3484997e22ddf51dbef85c3de97a98"
+        },
+        "date": 1793781666785,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 631394417,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 601635748,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 96950,
             "unit": "data"
           }
         ]
