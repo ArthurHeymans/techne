@@ -451,12 +451,43 @@ fn output(retain: Retain) -> (mpsc::Sender<Item>, Output) {
 }
 
 /// Where a process starts: its working directory (the parent's when
-/// `None`) and variables set in its environment, besides those it
-/// inherits.
+/// `None`), variables set in its environment besides those it inherits,
+/// variables taken out of it, and where its standard streams go.
 #[derive(Clone, Debug, Default)]
 pub struct Place {
     pub directory: Option<std::path::PathBuf>,
     pub environment: Vec<(String, String)>,
+    /// Taken out of what it inherits, and of `environment` too.
+    pub removed: Vec<String>,
+    /// Its input, output and error output, in that order.
+    pub streams: [Io; 3],
+}
+
+/// Where a process's standard stream goes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Io {
+    /// A pipe this end reads or writes (`Process::read`, `write`).
+    #[default]
+    Pipe,
+    /// The stream this process has.
+    Inherit,
+    /// Nowhere: /dev/null.
+    Null,
+    /// A file: input read from it, output written to it from its start
+    /// (created, or emptied first).
+    File(std::path::PathBuf),
+}
+
+impl Io {
+    fn stdio(&self, input: bool) -> std::io::Result<Stdio> {
+        Ok(match self {
+            Io::Pipe => Stdio::piped(),
+            Io::Inherit => Stdio::inherit(),
+            Io::Null => Stdio::null(),
+            Io::File(path) if input => std::fs::File::open(path)?.into(),
+            Io::File(path) => std::fs::File::create(path)?.into(),
+        })
+    }
 }
 
 impl Process {
@@ -486,7 +517,13 @@ impl Process {
             let handle = rustix::io::dup(&terminal)?;
             // SAFETY: a duplicate of the child end of this pty.
             let pts = unsafe { pty_process::blocking::Pts::from_fd(rustix::io::dup(&pts)?) };
+            if place.streams.iter().any(|io| *io != Io::Pipe) {
+                return Err(std::io::Error::other("a pty process's streams are its terminal"));
+            }
             let mut command = pty_process::blocking::Command::new(program).args(args).envs(place.environment.iter().cloned());
+            for name in &place.removed {
+                command = command.env_remove(name);
+            }
             if let Some(dir) = &place.directory {
                 command = command.current_dir(dir);
             }
@@ -497,14 +534,23 @@ impl Process {
             if let Some(dir) = &place.directory {
                 command.current_dir(dir);
             }
-            let child = command
-                .args(args)
-                .envs(place.environment.iter().cloned())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .process_group(0)
-                .spawn()?;
+            // Taken out after those set, as on a pty: a name in both is out.
+            command.envs(place.environment.iter().cloned());
+            for name in &place.removed {
+                command.env_remove(name);
+            }
+            let [input, output, error] = &place.streams;
+            // Output and error output to one file share it, as `>f 2>&1`
+            // does: written each at its end, not each from its start over
+            // the other.
+            let (stdout, stderr) = match (output, error) {
+                (Io::File(a), Io::File(b)) if a == b => {
+                    let file = std::fs::File::create(a)?;
+                    (file.try_clone()?.into(), file.into())
+                }
+                _ => (output.stdio(false)?, error.stdio(false)?),
+            };
+            let child = command.args(args).stdin(input.stdio(true)?).stdout(stdout).stderr(stderr).process_group(0).spawn()?;
             (child, None)
         };
         let pid = child.id();
@@ -518,13 +564,18 @@ impl Process {
                 rt.spawn(feed(write, stdin_rx, Some(status.clone())));
                 (None, Some(handle))
             } else {
-                let read = tokio::process::ChildStdout::from_std(child.stdout.take().unwrap())?;
-                let err = tokio::process::ChildStderr::from_std(child.stderr.take().unwrap())?;
-                let write = tokio::process::ChildStdin::from_std(child.stdin.take().unwrap())?;
+                // A stream that is not a pipe reads as ended, and takes
+                // no input.
                 let (err_tx, stderr) = output(retain);
-                rt.spawn(pump(read, out_tx, false));
-                rt.spawn(pump(err, err_tx, false));
-                rt.spawn(feed(write, stdin_rx, None));
+                if let Some(read) = child.stdout.take() {
+                    rt.spawn(pump(tokio::process::ChildStdout::from_std(read)?, out_tx, false));
+                }
+                if let Some(err) = child.stderr.take() {
+                    rt.spawn(pump(tokio::process::ChildStderr::from_std(err)?, err_tx, false));
+                }
+                if let Some(write) = child.stdin.take() {
+                    rt.spawn(feed(tokio::process::ChildStdin::from_std(write)?, stdin_rx, None));
+                }
                 (Some(stderr), None)
             };
             Ok::<_, std::io::Error>((fd, stderr, terminal))
@@ -720,28 +771,67 @@ pub fn signal_named(name: &str) -> Result<Signal, String> {
 
 /// Scheme wrappers over the natives.
 const PRELUDE: &str = r#"
+(define (%process-stream who io)
+  (cond ((not io) '("pipe"))
+        ((memq io '(pipe inherit null)) (list (symbol->string io)))
+        ((string? io) (list "file" io))
+        (else (error (string-append "process-spawn: " who " is pipe, inherit, null or a file's path, not")
+                     io))))
+
+;; ENVIRONMENT with only the last entry for each name.
+(define (%last-of-each-name environment)
+  (let loop ((entries (reverse environment)) (seen '()) (kept '()))
+    (cond ((null? entries) kept)
+          ((member (caar entries) seen) (loop (cdr entries) seen kept))
+          (else (loop (cdr entries) (cons (caar entries) seen) (cons (car entries) kept))))))
+
 (define (process-spawn program args #:pty [pty #f] #:node [node #f] #:persist [persist #f]
-                       #:directory [directory #f] #:environment [environment '()])
+                       #:directory [directory #f] #:environment [environment '()]
+                       #:stdin [stdin #f] #:stdout [stdout #f] #:stderr [stderr #f])
   "Start PROGRAM with the list of strings ARGS; return the process.
 It runs with pipes or, with PTY, on a terminal; here, or on NODE. With
 PERSIST, on a node session, it survives disconnects, keeping its newest
 output. It starts in DIRECTORY, a path where it runs (by default the
 directory of whoever starts it), with the variables of ENVIRONMENT, a
-list of (NAME . VALUE) strings, set besides those it inherits. The
-current scope owns a local process: shutting the scope kills it."
-  (cond (node (%node-process-spawn node program args pty persist (cons directory environment)))
-        (persist (error "process-spawn: #:persist needs #:node (a node session keeps the process)"))
-        (else (scope-own! (%process-spawn program args pty directory
-                                          (map (lambda (p) (list (car p) (cdr p))) environment))
-                          process-kill %process-exited?))))
+list of (NAME . VALUE) strings, set besides those it inherits; a VALUE
+#f takes NAME out, and a later entry for a name replaces an earlier
+one. STDIN, STDOUT and STDERR say where a local process's streams go:
+`pipe` (or #f), read and written here; `inherit`, this process's own;
+`null`; or a file's path, read from, or written from its start (both
+outputs to one path share it). A stream that is not a pipe reads as
+ended here. The process is in a process group of its own, so it is not
+the foreground of a terminal it inherits. The current scope owns a
+local process: shutting the scope kills it."
+  (let* ((environment (%last-of-each-name environment))
+         (set (filter cdr environment))
+         (removed (map car (remove cdr environment)))
+         (streams (list (%process-stream "stdin" stdin) (%process-stream "stdout" stdout)
+                        (%process-stream "stderr" stderr))))
+    (cond (node
+           (unless (and (null? removed) (equal? streams '(("pipe") ("pipe") ("pipe"))))
+             (error "process-spawn: a variable taken out, or a stream not a pipe, needs a local process"))
+           (%node-process-spawn node program args pty persist (cons directory set)))
+          (persist (error "process-spawn: #:persist needs #:node (a node session keeps the process)"))
+          (else
+           ;; What this wrote comes before what the process writes to the
+           ;; same stream.
+           (when (eq? stdout 'inherit) (flush-output-port (current-output-port)))
+           (when (eq? stderr 'inherit) (flush-output-port (current-error-port)))
+           (scope-own! (%process-spawn program args pty directory
+                                       (append (map (lambda (p) (list (car p) (cdr p))) set)
+                                               (map list removed))
+                                       streams)
+                       process-kill %process-exited?)))))
 
 (define (call-with-process program args f #:pty [pty #f] #:node [node #f] #:persist [persist #f]
-                           #:directory [directory #f] #:environment [environment '()])
+                           #:directory [directory #f] #:environment [environment '()]
+                           #:stdin [stdin #f] #:stdout [stdout #f] #:stderr [stderr #f])
   "Call F with a new process, killed when F returns, fails or is cancelled.
-PROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY and ENVIRONMENT are as
-`process-spawn` takes them."
+PROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY, ENVIRONMENT, STDIN, STDOUT
+and STDERR are as `process-spawn` takes them."
   (let ((p (process-spawn program args #:pty pty #:node node #:persist persist
-                          #:directory directory #:environment environment)))
+                          #:directory directory #:environment environment
+                          #:stdin stdin #:stdout stdout #:stderr stderr)))
     (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p) (scope-disown! p)))))
 
 (define (process-read-all p stream)
@@ -782,12 +872,28 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
 fn natives(vm: &mut Vm) {
     vm.name_foreign_type::<ProcessRef>("process");
     techne_vm::procedures! { vm;
-        "(%process-spawn program args pty directory environment)" => |program: String, args: Vec<String>, pty: bool, directory: Option<String>, environment: Vec<Vec<String>>| -> Result<Foreign<ProcessRef>, String> {
-            let environment = environment.into_iter().map(|p| match <[String; 2]>::try_from(p) {
-                Ok([name, value]) => Ok((name, value)),
-                Err(_) => Err("process-spawn: an environment is a list of (NAME VALUE)".to_string()),
+        "(%process-spawn program args pty directory environment streams)" => |program: String, args: Vec<String>, pty: bool, directory: Option<String>, environment: Vec<Vec<String>>, streams: Vec<Vec<String>>| -> Result<Foreign<ProcessRef>, String> {
+            // (NAME VALUE) sets NAME, (NAME) takes it out.
+            let (mut set, mut removed) = (Vec::new(), Vec::new());
+            for p in environment {
+                match <[String; 2]>::try_from(p) {
+                    Ok([name, value]) => set.push((name, value)),
+                    Err(p) => match <[String; 1]>::try_from(p) {
+                        Ok([name]) => removed.push(name),
+                        Err(_) => return Err("process-spawn: an environment is a list of (NAME VALUE) or (NAME)".to_string()),
+                    },
+                }
+            }
+            let environment = set;
+            let streams = streams.into_iter().map(|io| match io.as_slice() {
+                [kind] if kind == "pipe" => Ok(Io::Pipe),
+                [kind] if kind == "inherit" => Ok(Io::Inherit),
+                [kind] if kind == "null" => Ok(Io::Null),
+                [kind, path] if kind == "file" => Ok(Io::File(path.into())),
+                _ => Err(format!("process-spawn: {io:?} is not where a stream goes")),
             }).collect::<Result<Vec<_>, _>>()?;
-            let place = Place { directory: directory.map(std::path::PathBuf::from), environment };
+            let streams = <[Io; 3]>::try_from(streams).map_err(|_| "process-spawn: three streams".to_string())?;
+            let place = Place { directory: directory.map(std::path::PathBuf::from), environment, removed, streams };
             let p = Process::spawn_in(&program, &args, pty, Retain::Queue, &place).map_err(|e| format!("process-spawn: {program}: {e}"))?;
             Ok(Foreign::new(ProcessRef::new(Rc::new(Arc::new(p)))))
         };

@@ -311,7 +311,8 @@ impl Node {
             }
             Request::Spawn { program, args, pty, persist, directory, environment } => {
                 let retain = if persist { Retain::Ring(techne_process::RETAIN_BYTES) } else { Retain::Queue };
-                let place = techne_process::Place { directory: directory.map(|d| crate::fs::expand(&d)), environment };
+                let place =
+                    techne_process::Place { directory: directory.map(|d| crate::fs::expand(&d)), environment, ..Default::default() };
                 let p = Process::spawn_in(&program, &args, pty, retain, &place).map_err(|e| format!("process-spawn: {program}: {e}"))?;
                 let pid = p.pid() as i64;
                 let proc = self.next.fetch_add(1, Ordering::Relaxed);

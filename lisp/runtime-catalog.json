@@ -73,7 +73,7 @@
       "is_macro": false
     },
     "call-with-process": {
-      "description": "(call-with-process program args f #:pty (pty #f) #:node (node #f) #:persist (persist #f) #:directory (directory #f) #:environment (environment (quote ())))  procedure, <techne-process>:17\n\nCall F with a new process, killed when F returns, fails or is cancelled.\nPROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY and ENVIRONMENT are as\n`process-spawn` takes them.",
+      "description": "(call-with-process program args f #:pty (pty #f) #:node (node #f) #:persist (persist #f) #:directory (directory #f) #:environment (environment (quote ())) #:stdin (stdin #f) #:stdout (stdout #f) #:stderr (stderr #f))  procedure, <techne-process>:54\n\nCall F with a new process, killed when F returns, fails or is cancelled.\nPROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY, ENVIRONMENT, STDIN, STDOUT\nand STDERR are as `process-spawn` takes them.",
       "is_macro": false
     },
     "call-with-process-at": {
@@ -1281,59 +1281,59 @@
       "is_macro": false
     },
     "process-close-input": {
-      "description": "(process-close-input process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:847\n\nClose the input of PROCESS, which then reads end of file.",
+      "description": "(process-close-input process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:953\n\nClose the input of PROCESS, which then reads end of file.",
       "is_macro": false
     },
     "process-dropped": {
-      "description": "(process-dropped process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:857\n\nReturn how many bytes of PROCESS's output were dropped, unread.",
+      "description": "(process-dropped process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:963\n\nReturn how many bytes of PROCESS's output were dropped, unread.",
       "is_macro": false
     },
     "process-exited?": {
-      "description": "(process-exited? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:859\n\nReturn #t if PROCESS has ended.",
+      "description": "(process-exited? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:965\n\nReturn #t if PROCESS has ended.",
       "is_macro": false
     },
     "process-kill": {
-      "description": "(process-kill process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:807\n\nKill PROCESS and its process group.",
+      "description": "(process-kill process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:913\n\nKill PROCESS and its process group.",
       "is_macro": false
     },
     "process-pid": {
-      "description": "(process-pid process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:803\n\nReturn the operating system's id of PROCESS.",
+      "description": "(process-pid process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:909\n\nReturn the operating system's id of PROCESS.",
       "is_macro": false
     },
     "process-read": {
-      "description": "(process-read process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:839\n\nWait for the next output of PROCESS on STREAM, `stdout` or `stderr`.\nReturn it as a string, or the eof object once the stream is closed.",
+      "description": "(process-read process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:945\n\nWait for the next output of PROCESS on STREAM, `stdout` or `stderr`.\nReturn it as a string, or the eof object once the stream is closed.",
       "is_macro": false
     },
     "process-read-all": {
-      "description": "(process-read-all p stream)  procedure, <techne-process>:26\n\nReturn everything STREAM, `stdout` or `stderr`, of P outputs, as text.\nIt reads to the end of the stream.",
+      "description": "(process-read-all p stream)  procedure, <techne-process>:65\n\nReturn everything STREAM, `stdout` or `stderr`, of P outputs, as text.\nIt reads to the end of the stream.",
       "is_macro": false
     },
     "process-read-all-bytes": {
-      "description": "(process-read-all-bytes p stream)  procedure, <techne-process>:33\n\nReturn everything STREAM, `stdout` or `stderr`, of P outputs, as bytes.\nIt reads to the end of the stream; the result is a bytevector.",
+      "description": "(process-read-all-bytes p stream)  procedure, <techne-process>:72\n\nReturn everything STREAM, `stdout` or `stderr`, of P outputs, as bytes.\nIt reads to the end of the stream; the result is a bytevector.",
       "is_macro": false
     },
     "process-read-bytes": {
-      "description": "(process-read-bytes process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:842\n\nWait for the next output of PROCESS on STREAM, as a bytevector.\nSTREAM is `stdout` or `stderr`; once it is closed, return the eof object.",
+      "description": "(process-read-bytes process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:948\n\nWait for the next output of PROCESS on STREAM, as a bytevector.\nSTREAM is `stdout` or `stderr`; once it is closed, return the eof object.",
       "is_macro": false
     },
     "process-resize": {
-      "description": "(process-resize process rows columns)  built-in procedure, @source@/crates/techne-process/src/lib.rs:853\n\nTell PROCESS, on a terminal, that it has ROWS and COLUMNS.",
+      "description": "(process-resize process rows columns)  built-in procedure, @source@/crates/techne-process/src/lib.rs:959\n\nTell PROCESS, on a terminal, that it has ROWS and COLUMNS.",
       "is_macro": false
     },
     "process-signal": {
-      "description": "(process-signal process signal)  built-in procedure, @source@/crates/techne-process/src/lib.rs:851\n\nSend SIGNAL to PROCESS's group.\nSIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and\n`cont`.",
+      "description": "(process-signal process signal)  built-in procedure, @source@/crates/techne-process/src/lib.rs:957\n\nSend SIGNAL to PROCESS's group.\nSIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and\n`cont`.",
       "is_macro": false
     },
     "process-spawn": {
-      "description": "(process-spawn program args #:pty (pty #f) #:node (node #f) #:persist (persist #f) #:directory (directory #f) #:environment (environment (quote ())))  procedure, <techne-process>:2\n\nStart PROGRAM with the list of strings ARGS; return the process.\nIt runs with pipes or, with PTY, on a terminal; here, or on NODE. With\nPERSIST, on a node session, it survives disconnects, keeping its newest\noutput. It starts in DIRECTORY, a path where it runs (by default the\ndirectory of whoever starts it), with the variables of ENVIRONMENT, a\nlist of (NAME . VALUE) strings, set besides those it inherits. The\ncurrent scope owns a local process: shutting the scope kills it.",
+      "description": "(process-spawn program args #:pty (pty #f) #:node (node #f) #:persist (persist #f) #:directory (directory #f) #:environment (environment (quote ())) #:stdin (stdin #f) #:stdout (stdout #f) #:stderr (stderr #f))  procedure, <techne-process>:16\n\nStart PROGRAM with the list of strings ARGS; return the process.\nIt runs with pipes or, with PTY, on a terminal; here, or on NODE. With\nPERSIST, on a node session, it survives disconnects, keeping its newest\noutput. It starts in DIRECTORY, a path where it runs (by default the\ndirectory of whoever starts it), with the variables of ENVIRONMENT, a\nlist of (NAME . VALUE) strings, set besides those it inherits; a VALUE\n#f takes NAME out, and a later entry for a name replaces an earlier\none. STDIN, STDOUT and STDERR say where a local process's streams go:\n`pipe` (or #f), read and written here; `inherit`, this process's own;\n`null`; or a file's path, read from, or written from its start (both\noutputs to one path share it). A stream that is not a pipe reads as\nended here. The process is in a process group of its own, so it is not\nthe foreground of a terminal it inherits. The current scope owns a\nlocal process: shutting the scope kills it.",
       "is_macro": false
     },
     "process-wait": {
-      "description": "(process-wait process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:855\n\nWait for PROCESS to end; return its exit code, or (signal N).",
+      "description": "(process-wait process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:961\n\nWait for PROCESS to end; return its exit code, or (signal N).",
       "is_macro": false
     },
     "process-write": {
-      "description": "(process-write process data)  built-in procedure, @source@/crates/techne-process/src/lib.rs:845\n\nWrite DATA, a string or bytevector, to the input of PROCESS.\nIt waits while the input is full.",
+      "description": "(process-write process data)  built-in procedure, @source@/crates/techne-process/src/lib.rs:951\n\nWrite DATA, a string or bytevector, to the input of PROCESS.\nIt waits while the input is full.",
       "is_macro": false
     },
     "project-root": {
@@ -2095,6 +2095,7 @@
     "%document-reload-remote!",
     "%document-save-remote!",
     "%hang-runtime",
+    "%last-of-each-name",
     "%lisp-directory",
     "%make-operation",
     "%make-service",
@@ -2119,6 +2120,7 @@
     "%operation-recorded-bytes",
     "%process-exited?",
     "%process-spawn",
+    "%process-stream",
     "%program-stamp",
     "%proposal-accept!",
     "%repository-canonical-root",
