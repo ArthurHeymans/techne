@@ -123,11 +123,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup
+      # The techne command reads wrk's logs and makes the tables; it needs
+      # no frontend.
+      - run: cargo build --release -p techne-cli --no-default-features
       - run: |
           nix shell --inputs-from . nixpkgs#wrk --command env EXPERIMENTS="smp work idle" IMPLS='^techne$' \
             CPUS=0-1 LOADCPUS=2-3 WRK_THREADS=2 DURATION=3 WARMUP=1 OUT=results/ci runtime/bench/http/run.sh
           { echo 'HTTP server (wall time, noisy on CI; 2 cores):'; echo
-            python3 runtime/bench/http/summarize.py runtime/bench/http/results/ci/results.tsv; } >> "$GITHUB_STEP_SUMMARY"
+            target/release/techne run runtime/bench/http/summarize.scm runtime/bench/http/results/ci/results.tsv; } >> "$GITHUB_STEP_SUMMARY"
 
   # A night that fails opens an issue, or comments on the one still open,
   # so that it does not wait for someone to look at the runs. The failing

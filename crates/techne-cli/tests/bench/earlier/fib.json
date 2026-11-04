@@ -1,0 +1,7 @@
+{"results": [
+ {"command": "chez", "mean": 0.0525, "stddev": 0.001},
+ {"command": "techne", "mean": 0.001, "stddev": null},
+ {"command": "techne", "mean": 0.002, "stddev": 0.0},
+ {"command": "python3", "mean": 0.1875, "stddev": 0.05},
+ {"command": "guile", "mean": -0.001, "stddev": 0}
+]}

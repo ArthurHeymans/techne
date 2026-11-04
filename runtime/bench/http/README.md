@@ -26,7 +26,7 @@ loaded with wrk, to see how techne's tasks (async) and worlds-on-threads
   in the language.
 
 `./run.sh` builds everything and runs every experiment (about 40 min);
-`python3 summarize.py results/DIR/results.tsv` makes the tables below.
+`techne run summarize.scm results/DIR/results.tsv` makes the tables below.
 
 For CI, `../icount.sh` counts the instructions per request of `server.scm`
 on in-memory connections (`crates/techne-vm/examples/serve.rs`), and the

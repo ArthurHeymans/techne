@@ -5,6 +5,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 TECHNE_VM=${TECHNE_VM:-$(realpath ../../../target/release/techne-vm)}
+# The techne command, which takes the medians (median.scm). Without
+# TECHNE_CLI, the release build's, made if missing: without frontends,
+# which this does not need (a build with them replaces it).
+if [[ -z ${TECHNE_CLI:-} ]]; then
+  TECHNE_CLI=$(realpath -m ../../../target/release/techne)
+  [[ -x $TECHNE_CLI ]] || cargo build --release -q -p techne-cli --no-default-features
+fi
+[[ -x $TECHNE_CLI ]] || { echo "no techne command at $TECHNE_CLI" >&2; exit 1; }
 CPU=${CPU:-4}
 B=../build/steady; mkdir -p $B; cp ../org-sample.org ../build/
 for p in ${PROGS:-fib tak nqueens bintrees hof qsort mandel hash orgparse}; do
@@ -17,7 +25,7 @@ for p in ${PROGS:-fib tak nqueens bintrees hof qsort mandel hash orgparse}; do
       techne-interp) out=$(cd ../build && TECHNE_JIT=0 taskset -c $CPU $TECHNE_VM steady/$p.scm) ;;
     esac
     result=$(head -1 <<<"$out")
-    med=$(tail -1 <<<"$out" | python3 -c 'import sys,statistics; t=list(map(int,sys.stdin.read().split())); print("%.1f %.1f" % (statistics.median(t[len(t)//2:])/1000, t[0]/1000))')
+    med=$(tail -1 <<<"$out" | "$TECHNE_CLI" run median.scm)
     printf '%-9s %-14s median %-8s first %-8s -> %s\n' "$p" "$impl" ${med% *} ${med#* } "$result"
   done
 done
