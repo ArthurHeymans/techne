@@ -313,7 +313,7 @@ Arbitrary heap persistence and automatic state migration are deferred.
 | Databases | Turso (SQLite's format, in Rust, asynchronous I/O), probed first; rusqlite as fallback (Stage 1, workstream C) |
 | Language intelligence | LSP plus structural parsing |
 | Remote connection | SSH and TRAMP-style routes; MessagePack protocol and file/process engine shared with TRAMP-RPC (doc/remote.md) |
-| Terminal | Reuse a maintained terminal engine; own PTY/process integration |
+| Terminal | Emulator in Scheme, as `../el-be-back` is in Elisp; PTYs in Rust |
 | Git/Jujutsu | Their supported commands/interfaces first; no new VCS engine |
 | Email | Existing indexing, synchronization, and sending backend(s) |
 | Agents | One existing-agent adapter first; native orchestration later |

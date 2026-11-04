@@ -38,7 +38,7 @@
          register-mode-line-segment! mode-line-segments
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
-         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-target-at buffer-completion buffer-indent
+         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
          buffer-directory)
 
 ;;; Buffers
@@ -163,7 +163,8 @@ STATE is `chord` (the default) or `normal`."
 
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
-                        #:complete [complete #f] #:indent [indent #f] #:directory [directory #f] #:options [options '()])
+                        #:complete [complete #f] #:indent [indent #f] #:directory [directory #f] #:options [options '()]
+                        #:projections [projections #f])
   "Define the major mode NAME, documented by DOC, extending PARENT.
 It has PARENT's keys, layers and options, and its own: KEYS and NORMAL
 are (key-description command) bindings for chords and for modal normal
@@ -176,10 +177,12 @@ giving the edits (from to text) that indent the lines at STARTS,
 DIRECTORY a procedure (buffer) giving the directory the buffer is in,
 with its slash, for a buffer of no file (a directory's listing); OPTIONS
 an alist of (option . value) set in the mode, FILES the file name
-suffixes it is for. It defines the command NAME, which gives the focused
-buffer this mode."
+suffixes it is for, PROJECTIONS a procedure (document from to) giving
+how the text is laid out (`buffer-projections'). It defines the command
+NAME, which gives the focused buffer this mode."
   (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete indent directory
              options files)
+  (projections! name projections)
   (register-command! name doc (lambda (s n)
                                 (set-buffer-mode! (or (current-buffer s) (error "No buffer")) name)
                                 (message! s (symbol->string name))))
@@ -191,17 +194,20 @@ buffer this mode."
 The other arguments are keywords, as `register-mode!` takes them."
     ((_ name doc arg ...) (register-mode! 'name doc arg ...))))
 
-(define (register-minor-mode! name doc #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:inlays [inlays #f])
+(define (register-minor-mode! name doc #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:inlays [inlays #f]
+                              #:projections [projections #f])
   "Define the minor mode NAME, documented by DOC.
 It is on where the boolean option NAME is. KEYS and NORMAL are
 (key-description command) bindings for chords and for modal normal
 state, LAYER a procedure (document from to) giving highlights (from to
 face), INLAYS one (document from to) giving text shown in the line and
-not in the document (position text face): a type after a name. It
-defines the command NAME, which turns the mode on and off in the
-focused buffer."
+not in the document (position text face): a type after a name,
+PROJECTIONS one (document from to) giving how the text is laid out
+(`buffer-projections'). It defines the command NAME, which turns the
+mode on and off in the focused buffer."
   (add-mode! name doc #f #t keys normal layer #f #f #f #f '() '())
   (when inlays (registry-add! %inlays name (scope-procedure inlays)))
+  (projections! name projections)
   (register-option! name #f doc #:type 'boolean)
   (register-command! name doc (lambda (s n) (toggle-mode! s name)))
   name)
@@ -464,6 +470,39 @@ They come from the minor modes on in DOC's buffer."
                       (let ((inlays (registry-ref %inlays (mode-name (car m)))))
                         (if inlays (inlays doc from to) '())))
                     (buffer-minor-modes b)))))
+
+;; Projections (EDITOR.md, section 3): layout, as layers are looks.
+(define %projections (make-registry 'projections))
+
+(define (projections! name projections)
+  (when projections (registry-add! %projections name (scope-procedure projections))))
+
+(define (buffer-projections doc from to)
+  "Return how the modes of DOC's buffer lay out its text from FROM to TO.
+Each is (hang LINE AT), the line starting at LINE wrapping under the
+character at AT, its wrapped lines starting where that character does
+(a list item's under its text, not its bullet); or (block AT IMAGE),
+IMAGE (`image-load') shown as a block of its own above the line AT is
+on, fitted to the pane's width. A frontend that cannot draw one
+ignores it: a terminal shows no images."
+  ;; Asked for every pane on every snapshot: only the few modes that lay
+  ;; text out are looked at, not every mode of the buffer.
+  (let ((names (registry-keys %projections)) (b (document-buffer doc)))
+    (if (or (null? names) (not b))
+        '()
+        (append-map (lambda (name)
+                      (let ((m (find-mode name)))
+                        (if (and m (if (mode-minor? m) (option b name) (extends? (buffer-mode b) name)))
+                            ((registry-ref %projections name) doc from to)
+                            '())))
+                    names))))
+
+;; Whether the major mode NAME is ANCESTOR or extends it, without a list.
+(define (extends? name ancestor)
+  (let loop ((n name))
+    (cond ((not n) #f)
+          ((eq? n ancestor) #t)
+          (else (let ((m (find-mode n))) (and m (loop (mode-parent m))))))))
 
 (define (buffer-target-at b pos)
   "Return the target at POS in buffer B, or #f.

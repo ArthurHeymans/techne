@@ -17,6 +17,9 @@
 (require "commands.scm")
 (require "buffers.scm")
 (require "requests.scm")
+(require "rich.scm")
+(require "markdown.scm")
+(require "views.scm")
 
 (provide define-eldoc-provider register-eldoc-provider! eldoc-provider-names eldoc-idle-delay eldoc-doc-buffer)
 
@@ -24,7 +27,7 @@
   "The milliseconds point rests before eldoc says what is there.")
 
 (define-record-type eldoc-provider
-  (%make-provider name doc applies say priority)
+  (%make-provider name doc applies say priority markdown)
   eldoc-provider?
   (name provider-name)
   (doc provider-doc)
@@ -32,19 +35,22 @@
   (applies provider-applies)
   ;; (session document position full?) -> a string or #f; it may wait.
   (say provider-say)
-  (priority provider-priority))
+  (priority provider-priority)
+  ;; Whether what it says with FULL? is markdown, not plain text.
+  (markdown provider-markdown?))
 
 (define %providers (make-registry 'eldoc-providers))
 
-(define (register-eldoc-provider! name doc #:applies [applies (lambda (b) #t)] #:say say #:priority [priority 0])
+(define (register-eldoc-provider! name doc #:applies [applies (lambda (b) #t)] #:say say #:priority [priority 0]
+                                  #:markdown [markdown #f])
   "Define the eldoc provider NAME, documented by DOC.
 APPLIES is a procedure (buffer) saying whether it knows of the buffer;
 SAY (session document position full?) returns what it knows of
 POSITION — a line for the echo area, all of it with FULL? — or #f. It
 runs in a task, and may wait. Providers are asked in order of
 PRIORITY, highest first: the echo area says the first answer, *eldoc*
-all of them."
-  (registry-add! %providers name (%make-provider name doc (scope-procedure applies) (scope-procedure say) priority))
+all of them, rendered: as markdown when MARKDOWN, else as plain text."
+  (registry-add! %providers name (%make-provider name doc (scope-procedure applies) (scope-procedure say) priority markdown))
   name)
 
 (define-syntax define-eldoc-provider
@@ -108,6 +114,13 @@ The other arguments are keywords, as `register-eldoc-provider!` takes them."
 
 ;;; All of it, in a buffer.
 
+(define-mode eldoc-doc-mode
+  "What is known of the thing at point, rendered.
+\\[quit-window] leaves it."
+  #:parent 'rich-mode
+  #:keys '(("q" quit-window))
+  #:normal '(("q" quit-window)))
+
 (define-command (eldoc-doc-buffer s n)
   "Show in *eldoc* all the providers know of the thing at point.
 As the echo area says it, at length: a name's documentation, the
@@ -117,13 +130,19 @@ diagnostics there."
     (message! s "Asking…")
     (request! (eldoc-slot s)
               (lambda ()
-                (filter-map (lambda (p) (let ((text (guard (e (#t #f)) ((provider-say p) s d pos #t)))) (and (string? text) text)))
+                ;; Each as markdown: plain text escaped to read as it is.
+                (filter-map (lambda (p) (let ((text (guard (e (#t #f)) ((provider-say p) s d pos #t))))
+                                          (and (string? text) (if (provider-markdown? p) text (markdown-escape text)))))
                             providers))
               (lambda (texts)
                 (if (null? texts)
                     (message! s "Nothing known of what is at point")
-                    (let ((b (make-generated-buffer! "*eldoc*" (make-document (string-join texts "\n\n")) 'special-mode)))
-                      (set-option! 'syntax-language 'markdown #:buffer b)
+                    ;; What they say is markdown (a language server's
+                    ;; hover), rendered; the text it is parsed from is no
+                    ;; file's, so the rendering is not for editing.
+                    (let ((b (make-rich-buffer! "*eldoc*" #:mode 'eldoc-doc-mode)))
+                      (set-option! 'read-only #t #:buffer b)
+                      (rich-present! b (markdown->rich (make-document (string-join texts "\n\n"))))
                       (message! s #f)
                       (display-buffer! s (buffer-document b)))))
               #:fail (lambda (e) (message! s (error-text e))))))

@@ -144,10 +144,40 @@ and the target at a position is found by the row's key, never its line number.
 A presentation keeps no undo history: its revisions record displayed text
 and source identities, including empty excerpts. They are kept a bounded
 number back to map positions and refuse stale edits of retargeted sources.
+A long presentation changes a run of its rows at a time
+(`presentation-splice-rows!`), the diff worked out between the rows kept
+around them: the rows changed are made and compared, the others only
+passed over in Rust (their starts counted again, their excerpts moved to
+where their text is now), some 40 µs for one row of 16000. It finds the
+rows of a range (`presentation-rows-between`) by where they start.
 Columns are padded in characters for now (no column stops for proportional
-fonts yet), and sections,
-folding and embedded blocks are not built. Frontends still receive text; keys
+fonts yet), and sections and folding are not built; embedded blocks are
+images, as projections (section 3). Frontends still receive text; keys
 go to them when a frontend needs row deltas or row-level geometry.
+
+**Rich text, as built** (`lisp/editor/rich.scm`, `markdown.scm`). A
+format-neutral tree of headings, paragraphs, lists, quotes, code blocks,
+tables and rules, with strong, emphasised, struck, code, link and image
+inlines whose text is spans of a document or generated, is rendered once
+into a presentation's rows; formats only parse into it. Its look is the
+`rich.` faces' (headings in sizes of their own, prose in a variable-pitch
+font, code and tables in the fixed one, code coloured in its language);
+links are targets, and text from a document is edited through to it, the
+markup hidden staying as it was; a row shown again keeps its key while it
+shows the same place of its document, so a caret stays on its text. A
+list item or a quote wraps under its text, a heading's rule and a
+thematic break reach across the pane, and an image of a file shows above
+its description once it has loaded, loading when its row is shown.
+A buffer of rich text is made of units, its top-level blocks and the
+items of its top-level lists, each rendered alone; `rich-splice!` shows
+new units in place of old ones, their rows only. Markdown rendered again
+(`markdown-render!`) parses from a unit before the first one edits touch
+until the parse starts a unit where an old one started, in the same
+state, and renders those units: an edit to one item of a list of 8000
+takes a millisecond in release, mostly passing over the units' starts. A single huge unit other than a list (a code block
+of thousands of lines) is still rendered whole.
+Markdown is the first format: `markdown-preview` follows a buffer, and
+*eldoc* renders a language server's hover.
 
 ## 3. Layers instead of text properties and overlays
 
@@ -194,13 +224,32 @@ chrome's styles (mode line, cursor, region, line numbers, popups are faces
 like any other); face names never reach a frontend. Each frontend only
 realizes styles: the terminal builds SGR at its colour depth, the window
 draws backgrounds and underlines as rectangles and foregrounds as coloured
-spans, and shapes weight and slant with the text — sound while the text
-font is fixed-pitch, whose bold and italic keep the plain advances.
-Family and height are honoured only on a pane's `default` face (and by no
-frontend yet): fonts do not change inside a line. An unknown face is
-reported once and drawn plainly. Buffer- and mode-local face settings, the
+spans, and shapes the text in each style's weight, slant, family and
+height: a heading can be larger and prose proportional beside fixed-pitch
+code, a line as tall as its tallest text. Its geometry (scrolling,
+keeping the caret visible, clicks) is counted from the shaping it draws
+(section 7). The terminal has one font and one cell height, and draws
+weights, slants and colours. An unknown face is reported once and drawn
+plainly. Buffer- and mode-local face settings, the
 mode line as styled runs, and "why is this underlined" at a position are
 still to come.
+
+**Projections, as built** (`buffer-projections` in `lisp/editor/modes.scm`,
+`techne_editor::images`). A mode lays text out with `#:projections`, a
+procedure of the visible range as layers are, giving `(hang LINE AT)`, a
+line whose wrapped lines start under the character at AT (a list item's
+under its text), and `(block AT IMAGE)`, an image shown as a block of its
+own above the line AT is on, fitted to the pane's width. Images are
+decoded in Rust (`image-load`: PNG, JPEG, GIF, WebP, BMP and SVG, by
+one of two decoding threads while the calling task waits, kept by path
+and modification time) and are values any mode can show: an image file's
+buffer, thumbnails in a listing, a notebook's plots. What one may cost is
+bounded before decoding (64 MiB of file, 64 megapixels), and an SVG
+reads no other file. The window draws blocks as textured quads and counts
+them in its geometry, scrolling and paging in the heights drawn; the
+terminal hangs lines in cells and shows no images yet (kitty's protocol
+would).
+Folds and replacement displays are still to come.
 
 **Syntax, as built** (`lisp/editor/syntax.scm`, `techne_editor::syntax`).
 A language is declared in Lisp (`define-language`): a grammar the runtime
@@ -443,7 +492,9 @@ from it must retain its upstream license):
 - Frames are scheduled by damage and animation, not a busy loop. No Lisp, I/O
   or whole-document walk on the frame path.
 - Proportional fonts from the start; monospace is the default style, not an
-  assumption. Hit-testing and paging use shaped geometry. Vertical motion
+  assumption. Hit-testing and paging use shaped geometry: the shaping
+  drawn, in each style's family and size, a visual line as tall as its
+  tallest text. Vertical motion
   does not yet: it moves by logical lines and grapheme columns, in Lisp, the
   same in both frontends; motion by wrapped and proportional display lines
   is to be resolved by the frontend, as section 6 says, kept apart from the

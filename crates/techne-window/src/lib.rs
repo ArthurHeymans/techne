@@ -189,6 +189,10 @@ enum Source<'a> {
 /// The key a label is shaped under: its text alone when plain, else its
 /// weight and slant too, so the mode line's bold and its plain twin
 /// elsewhere are two labels.
+/// Where a line's decoration is, down from its top: of the line's height
+/// and the window's scale.
+type Offset = fn(f32, f32) -> f32;
+
 fn label_key(text: &str, style: &Style) -> String {
     match (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal)) {
         (Weight::Normal, Slant::Normal) => text.to_string(),
@@ -275,8 +279,8 @@ impl App {
         let Some(snap) = &self.screen.snap else { return };
         // The snapshot's styles, as colours: a style's fg (or bg) over a
         // fallback, resolved here because every piece and rectangle is
-        // one colour. Weight, slant, family and height are not realized
-        // yet: shaping still takes one set of attributes per line.
+        // one colour. Weight, slant, family and height shape the text
+        // (`screen::shape_runs`).
         let rgb = |c: Color| Rgb(c.rgb[0], c.rgb[1], c.rgb[2]);
         let fg_of = |id: StyleId, fallback: Rgb| snap.style(id).fg.map(rgb).unwrap_or(fallback);
         let default = snap.panes.first().map(|p| snap.style(p.default)).unwrap_or_default();
@@ -304,7 +308,7 @@ impl App {
                     (text.line_to_byte(n) == p.seg.start)
                         .then(|| (p.top, pane.display.number(n, current, width).trim().to_string(), Some(n == current)))
                 });
-                let end = shown.placed.last().map_or(0.0, |p| p.top + p.lines as f32 * lh);
+                let end = shown.placed.last().map_or(0.0, |p| p.top + p.height());
                 let rows = ((shown.area.text - end).max(0.0) / lh).ceil() as usize;
                 let markers = pane.display.eob_marker.iter().flat_map(|m| (0..rows).map(move |k| (end + k as f32 * lh, m.clone(), None)));
                 numbers.chain(markers).collect()
@@ -346,6 +350,8 @@ impl App {
 
         let mut rects: Vec<(Rect, Rgb)> = Vec::new();
         let mut pieces: Vec<Piece> = Vec::new();
+        // Images: where each is drawn, the part of that shown, and it.
+        let mut images: Vec<(Rect, Rect, techne_editor::images::Image)> = Vec::new();
         for (i, (pane, shown)) in snap.panes.iter().zip(&self.screen.shown).enumerate() {
             let focused = i == snap.focus;
             let area = shown.area;
@@ -382,14 +388,27 @@ impl App {
             let mut deco: Vec<(Rect, Rgb, bool)> = Vec::new();
             let mut cancel: Vec<(Rect, bool)> = Vec::new();
             let decorate = |style: &Style, covered: &layout::Covered, deco: &mut Vec<(Rect, Rgb, bool)>, cancel: &mut Vec<(Rect, bool)>| {
-                // Under the text only: a line break's box is no text.
-                let lines = |y: f32| covered.text.iter().map(move |r| Rect { y: r.y + y, h: scale.max(1.0), ..*r });
-                let (under, strike) = (lh - scale.max(1.0) - 1.0, lh / 2.0);
+                // Under the text only: a line break's box is no text. Each
+                // line's own height places them: a heading's underline is
+                // under the heading.
+                let lines = |at: Offset| covered.text.iter().map(move |r| Rect { y: r.y + at(r.h, scale), h: scale.max(1.0), ..*r });
+                let (under, strike): (Offset, Offset) = (|h, scale| h - scale.max(1.0) - 1.0, |h, _| h / 2.0);
                 match style.underline {
                     Some((Underline::None, _)) => cancel.extend(lines(under).map(|r| (r, true))),
                     Some((_, color)) => {
                         let c = color.map(rgb).or(style.fg.map(rgb)).unwrap_or(pane_fg);
                         deco.extend(lines(under).map(|r| (r, c, true)));
+                        // Extending, from each line break it covers to the
+                        // pane's edge: a rule across the pane.
+                        if style.extend == Some(true) {
+                            deco.extend(covered.breaks.iter().map(|r| {
+                                (
+                                    Rect { x: r.x, y: r.y + under(r.h, scale), w: (area.text_width() - r.x).max(0.0), h: scale.max(1.0) },
+                                    c,
+                                    true,
+                                )
+                            }));
+                        }
                     }
                     None => {}
                 }
@@ -417,7 +436,7 @@ impl App {
                             .placed
                             .iter()
                             .filter(|p| h.from <= p.seg.end && h.to > p.seg.end)
-                            .map(|p| p.top + (p.lines - 1) as f32 * lh)
+                            .map(|p| p.top + p.lines.last().map_or(0.0, |l| l.top))
                             .collect()
                     } else {
                         Vec::new()
@@ -448,12 +467,12 @@ impl App {
                 // The region's own decorations, over (or taking away)
                 // what is under it.
                 if region.underline.is_some() || region.strike.is_some() {
-                    for r in sel.text.iter().flat_map(|r| [Rect { y: r.y + lh - scale.max(1.0) - 1.0, h: scale.max(1.0), ..*r }]) {
+                    for r in sel.text.iter().flat_map(|r| [Rect { y: r.y + r.h - scale.max(1.0) - 1.0, h: scale.max(1.0), ..*r }]) {
                         if region.underline.is_some() {
                             cancel.push((r, true));
                         }
                     }
-                    for r in sel.text.iter().map(|r| Rect { y: r.y + lh / 2.0, h: scale.max(1.0), ..*r }) {
+                    for r in sel.text.iter().map(|r| Rect { y: r.y + r.h / 2.0, h: scale.max(1.0), ..*r }) {
                         if region.strike.is_some() {
                             cancel.push((r, false));
                         }
@@ -485,20 +504,32 @@ impl App {
                 rects.extend(place(Rect { w, ..c }).map(|r| (r, color)));
             }
             for p in &shown.placed {
-                let lines = (0..p.lines).map(|k| p.top + k as f32 * lh);
+                // Its blocks, above its text.
+                images.extend(p.blocks.iter().filter_map(|(r, image)| {
+                    let at = Rect { x: r.x + left, y: r.y + area.top, ..*r };
+                    Some((at, at.intersect(clip)?, image.clone()))
+                }));
+                let lines = p.lines.iter().enumerate().map(|(i, l)| (p.top + l.top, l.height, p.offset(i)));
                 let on = |y: f32| fore.iter().filter(move |(r, _)| (r.y - y).abs() < 0.5);
-                let piece = |clip: Rect, color| Piece { source: Source::Segment(&p.key), left, top: area.top + p.top, clip, color };
-                if lines.clone().all(|y| on(y).next().is_none()) {
-                    pieces.push(piece(clip, pane_fg));
+                let piece = |clip: Rect, color, dx: f32| Piece {
+                    source: Source::Segment(&p.key),
+                    left: left + dx,
+                    top: area.top + p.top,
+                    clip,
+                    color,
+                };
+                if p.indent == 0.0 && lines.clone().all(|(y, _, _)| on(y).next().is_none()) {
+                    pieces.push(piece(clip, pane_fg, 0.0));
                     continue;
                 }
-                // Foreground highlights: the segment's lines in spans, each
-                // clipped to its colour's.
-                for y in lines {
+                // Line by line: foreground highlights in spans, each
+                // clipped to its colour's; wrapped lines that hang drawn
+                // further right.
+                for (y, h, dx) in lines {
                     let colored: Vec<(f32, f32, Rgb)> = on(y).map(|(r, c)| (r.x + left, r.x + left + r.w, *c)).collect();
                     for (from, to, color) in render::spans(left, left + area.text_width(), &colored, pane_fg) {
-                        let span = Rect { x: from, y: area.top + y, w: to - from, h: lh };
-                        pieces.extend(span.intersect(clip).map(|clip| piece(clip, color)));
+                        let span = Rect { x: from, y: area.top + y, w: to - from, h };
+                        pieces.extend(span.intersect(clip).map(|clip| piece(clip, color, dx)));
                     }
                 }
             }
@@ -692,7 +723,7 @@ impl App {
             })
             .collect();
         let Some(renderer) = &mut self.renderer else { return };
-        if renderer.draw(fonts, frame_bg, &rects, &texts) {
+        if renderer.draw(fonts, frame_bg, &rects, &images, &texts) {
             let now = Instant::now();
             self.latency.frame.extend(self.unanswered.drain(..).map(|at| now - at));
         } else {

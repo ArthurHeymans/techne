@@ -83,6 +83,8 @@ const COOLDOWN: Duration = Duration::from_secs(1);
 pub use techne_syntax::GRAMMARS;
 use techne_syntax::{Grammar, grammar, parse};
 
+use crate::images::OnThread;
+
 /// A language as Lisp defined it.
 struct Lang {
     /// Which definition of its name this is: a tree the worker parsed
@@ -409,6 +411,12 @@ impl Syntax {
         names.sort();
         names.dedup();
         Some(names)
+    }
+
+    /// The text of the language's highlight queries: its own, or its
+    /// grammar's (for markdown, the block grammar's).
+    pub fn highlight_query(&self, language: &str) -> Option<String> {
+        self.languages.get(language).and_then(|l| l.sources.first()).map(|(_, source)| source.clone())
     }
 
     fn next_generation(&mut self) -> u64 {
@@ -967,7 +975,7 @@ type Doc = techne_vm::api::Foreign<RefCell<Document>>;
 
 /// Define the syntax natives in `vm`, on `syntax`.
 pub fn install(vm: &mut techne_vm::vm::Vm, syntax: Shared) {
-    let (s10, s11, s12) = (syntax.clone(), syntax.clone(), syntax.clone());
+    let (s10, s11, s12, s13) = (syntax.clone(), syntax.clone(), syntax.clone(), syntax.clone());
     let (s1, s2, s3, s4, s5, s6, s7, s8, s9) = (
         syntax.clone(),
         syntax.clone(),
@@ -1001,6 +1009,11 @@ pub fn install(vm: &mut techne_vm::vm::Vm, syntax: Shared) {
         /// Return the capture names of the highlight queries of the syntax
         /// language NAME, or #f when there is no such language.
         "(syntax-capture-names name)" => move |name: String| s3.borrow_mut().capture_names(&name);
+        /// Return the text of the highlight queries of the syntax language
+        /// NAME, its own or its grammar's, or #f when there is no such
+        /// language. The grammars' own are built in: Lisp has no other
+        /// way to read them.
+        "(syntax-highlight-query name)" => move |name: String| s13.borrow().highlight_query(&name);
         /// Return the root node of DOCUMENT's tree in LANGUAGE.
         /// A node is (kind start end named?), KIND a string. The tree is
         /// parsed from the document's text as it is, if it was not.
@@ -1105,7 +1118,7 @@ pub fn install(vm: &mut techne_vm::vm::Vm, syntax: Shared) {
         })();
         async move {
             let (tree, rope, query, from, to) = asked?;
-            OnThread::spawn(move || run_query(&tree, &rope, &query, from, to, Instant::now() + LATER_BUDGET)).await
+            OnThread::spawn("syntax-query", move || run_query(&tree, &rope, &query, from, to, Instant::now() + LATER_BUDGET)).await
         }
     });
     techne_vm::document! { vm;
@@ -1122,44 +1135,6 @@ const LATER_BUDGET: Duration = Duration::from_secs(10);
 fn run_query(tree: &Tree, rope: &Rope, query: &Query, from: usize, to: usize, deadline: Instant) -> Result<Vec<Vec<Item>>, String> {
     techne_syntax::run_query(tree, rope, query, from, to, deadline, MAX_QUERY_CAPTURES)
         .map(|captures| captures.into_iter().map(|c| vec![Item::Str(c.name), Item::Int(c.start), Item::Int(c.end)]).collect())
-}
-
-/// What a thread of its own computes, as a future the calling task waits on.
-struct OnThread<T> {
-    shared: Arc<Mutex<(Option<T>, Option<std::task::Waker>)>>,
-}
-
-impl<T: Send + 'static> OnThread<T> {
-    fn spawn(work: impl FnOnce() -> T + Send + 'static) -> OnThread<T> {
-        let shared = Arc::new(Mutex::new((None, None::<std::task::Waker>)));
-        let theirs = shared.clone();
-        std::thread::Builder::new()
-            .name("syntax-query".into())
-            .spawn(move || {
-                let result = work();
-                let mut slot = theirs.lock().expect("the result");
-                slot.0 = Some(result);
-                if let Some(w) = slot.1.take() {
-                    w.wake();
-                }
-            })
-            .expect("a query thread starts");
-        OnThread { shared }
-    }
-}
-
-impl<T> std::future::Future for OnThread<T> {
-    type Output = T;
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
-        let mut slot = self.shared.lock().expect("the result");
-        match slot.0.take() {
-            Some(t) => std::task::Poll::Ready(t),
-            None => {
-                slot.1 = Some(cx.waker().clone());
-                std::task::Poll::Pending
-            }
-        }
-    }
 }
 
 #[cfg(test)]

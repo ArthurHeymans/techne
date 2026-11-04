@@ -5,8 +5,11 @@
 #
 # Inside, WAYLAND_DISPLAY is the headless sway and DISPLAY is unset, so a
 # window cannot land on the real desktop. `grim FILE.png` takes a
-# screenshot and `wtype` types; a new wtype loses its first key, so start
-# each with a throwaway one (`wtype -M shift -m shift ...`). With a GPU
+# screenshot and `wtype` types. Each wtype is a new virtual keyboard, and
+# the keys it sends before the window has its keymap are lost: one, or
+# several while a debug build is busy drawing. So start each with a key
+# and a pause, `wtype -k Shift_L -s 300 ...`, and check what arrived by
+# saving the file, not only by looking. With a GPU
 # render node, sway composites the client's GPU buffers; without one it
 # falls back to software rendering. Needs `nix develop .#window`.
 set -euo pipefail
@@ -25,7 +28,17 @@ output HEADLESS-1 resolution 1600x1000 scale 1
 default_border none
 EOF
 
-render=$(ls /dev/dri/renderD* 2>/dev/null | head -1 || true)
+# A render node Mesa drives: sway is pointed at Mesa's EGL below, and
+# on NVIDIA's node the client's EGL initialization fails (wgpu then
+# crashes in its EGL debug callback).
+render=
+for node in /dev/dri/renderD*; do
+    [[ -e $node ]] || continue
+    driver=$(basename "$(readlink -f "/sys/class/drm/${node##*/}/device/driver")")
+    [[ $driver == nvidia ]] && continue
+    render=$node
+    break
+done
 # On NixOS with NVIDIA's EGL installed next to Mesa's, sway must use Mesa's
 # for the render node.
 mesa_egl=/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json

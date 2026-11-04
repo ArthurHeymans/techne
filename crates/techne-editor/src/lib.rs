@@ -25,6 +25,7 @@ pub mod faces;
 mod fs;
 pub mod hints;
 pub mod host;
+pub mod images;
 pub mod lens;
 mod lisp_indent;
 mod lsp_text;
@@ -549,6 +550,7 @@ pub fn install(vm: &mut Vm) {
 
 pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Shared) {
     syntax::install(vm, trees);
+    images::install(vm);
     rpc::install(vm);
     vm.name_foreign_type::<RefCell<Document>>("document");
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");
@@ -756,6 +758,23 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
     }
     // Every line: (start text number), the text without its line break.
     techne_vm::procedures! { vm;
+        /// Return COUNT lines of TEXT from the line POSITION is on, each
+        /// (start line number), as `document-lines` gives them: fewer at
+        /// the end of the text. What a parser reading on from a place needs,
+        /// without every line.
+        "(document-lines-from text position count)" => |t: TextArg, pos: usize, count: usize| {
+            let t = t.0.rope();
+            let first = t.byte_to_line(pos.min(t.len_bytes()));
+            (first..t.len_lines().min(first.saturating_add(count)))
+                .map(|i| {
+                    let line = t.line(i).to_string();
+                    let text = line.strip_suffix('\n').unwrap_or(&line);
+                    (t.line_to_byte(i), text.strip_suffix('\r').unwrap_or(text).to_string(), i + 1)
+                })
+                .filter(|(start, text, _)| !(text.is_empty() && *start == t.len_bytes() && *start > 0))
+                .map(|(start, text, n)| vec![Datum::Int(start), Datum::Str(text), Datum::Int(n)])
+                .collect::<Vec<_>>()
+        };
         /// Return every line of TEXT as (start line number).
         /// LINE is without its line break; numbers count from 1.
         "(document-lines text)" => |t: TextArg| {
@@ -1443,6 +1462,13 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         /// run or a list of runs, a run a string, (text face), or an excerpt
         /// (document from to [face]). Carets on a row that stays follow it.
         "(presentation-set-rows! presentation rows)" => |p: Pres, rows: Vec<RowArg>| p.borrow_mut().set_rows(rows.into_iter().map(|r| r.0).collect());
+        /// Show ROWS in PRESENTATION in place of the REMOVE rows from row AT
+        /// (an index), the others as they are, as `presentation-set-rows!`
+        /// shows rows: what changed in a long presentation, without making
+        /// its other rows again. The rows are columned among themselves.
+        "(presentation-splice-rows! presentation at remove rows)" => |p: Pres, at: usize, remove: usize, rows: Vec<RowArg>| {
+            p.borrow_mut().splice_rows(at, remove, rows.into_iter().map(|r| r.0).collect())
+        };
     }
     techne_vm::procedures! { vm;
         /// Return the key of the row of PRESENTATION at POSITION, or #f.
@@ -1452,6 +1478,25 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         /// Return the span (start end) of the row KEY of PRESENTATION, or #f.
         /// It is without the line break.
         "(presentation-row-span presentation key)" => |p: Pres, key: String| p.borrow().row_span(&key).map(span);
+        /// Return the rows of PRESENTATION overlapping FROM to TO, each
+        /// (key start end), without its line break, in order. Its cost is
+        /// the rows returned, not the presentation's: for what is shown.
+        "(presentation-rows-between presentation from to)" => |p: Pres, from: usize, to: usize| {
+            p.borrow().rows_between(from, to).into_iter().map(|(k, r)| vec![Datum::Str(k), Datum::Int(r.start), Datum::Int(r.end)]).collect::<Vec<_>>()
+        };
+        /// Return where COUNT rows of PRESENTATION from row FROM (an index)
+        /// show their documents now: for each row with an excerpt, (key
+        /// document-id position), the position its first excerpt starts at,
+        /// followed through the document's edits since. A maker of rows
+        /// gives a row showing the same place the same key, so carets stay
+        /// on it.
+        "(presentation-row-sources presentation from count)" => |p: Pres, from: usize, count: usize| {
+            p.borrow().row_sources(from..from.saturating_add(count)).into_iter().map(|(k, d, at)| vec![Datum::Str(k), Datum::Int(d as usize), Datum::Int(at)]).collect::<Vec<_>>()
+        };
+        /// Return the index of the row KEY of PRESENTATION, or #f.
+        "(presentation-row-index presentation key)" => |p: Pres, key: String| p.borrow().index_of(&key);
+        /// Return how many rows PRESENTATION has.
+        "(presentation-row-count presentation)" => |p: Pres| p.borrow().rows.len();
     }
     techne_vm::procedures! { vm;
         /// Show the documents of PRESENTATION's excerpts as they are now.

@@ -28,9 +28,9 @@
 (require "faces.scm")
 (require "requests.scm")
 
-(provide define-language register-language! find-language language-names language-grammar language-files
+(provide define-language register-language! find-language language-names language-generation language-grammar language-files
          language-definitions path-language buffer-language
-         node-at node-kind node-start node-end node-named? node-parent node-children syntax-captures
+         node-at node-kind node-start node-end node-named? node-parent node-children syntax-captures syntax-highlights
          forward-sexp backward-sexp backward-up-list down-list kill-sexp mark-sexp
          beginning-of-defun end-of-defun mark-defun expand-region imenu describe-syntax-at-point)
 
@@ -55,13 +55,20 @@
 
 ;; The runtime learns of a language when the one in effect for its name
 ;; changes, so a package's language goes when the package does.
+(define %language-generation 0)
 (define %languages
   (make-registry 'languages
                  #:changed (lambda (name l)
+                             (set! %language-generation (+ %language-generation 1))
                              (if l
                                  (syntax-define-language! (symbol->string name) (symbol->string (language-grammar l))
                                                           (language-highlights l) (language-last-wins l))
                                  (syntax-forget-language! (symbol->string name))))))
+
+(define (language-generation)
+  "Return how often the languages in effect have changed.
+What is computed from a language's queries is good until this changes."
+  %language-generation)
 
 (define (find-language name)
   "Return the language NAME, or #f."
@@ -144,6 +151,24 @@ Only named nodes when NAMED; #f when there is none."
   "Return the captures of QUERY, a query's text, over buffer B's tree.
 Each is (capture start end), between FROM and TO, in order."
   (syntax-query (buffer-document b) (symbol->string (language-of b)) query from to))
+
+(define (syntax-highlights d name #:from [from 0] #:to [to (document-length d)])
+  "Return the faces of document D's text in the language NAME.
+They are as a buffer in NAME is coloured: (face start end), one face a
+range, between FROM and TO, a range holding another before it. D need
+not be shown: a document made for it (`make-document') is parsed too."
+  (let* ((l (or (find-language name) (error "No such language" name)))
+         (won (make-hash-table))
+         (faces '()))
+    (for-each (lambda (c)
+                (let ((range (cons (cadr c) (caddr c))))
+                  (unless (or (string-prefix? "_" (car c))
+                              (and (hash-table-ref/default won range #f) (not (language-last-wins l))))
+                    (hash-table-set! won range (car c)))))
+              (syntax-query d (symbol->string name) (syntax-highlight-query (symbol->string name)) from to))
+    (hash-table-walk won (lambda (range capture) (set! faces (cons (list (string->symbol capture) (car range) (cdr range)) faces))))
+    (sort faces
+          (lambda (a b) (or (< (cadr a) (cadr b)) (and (= (cadr a) (cadr b)) (> (caddr a) (caddr b))))))))
 
 ;;; Moving by nodes
 

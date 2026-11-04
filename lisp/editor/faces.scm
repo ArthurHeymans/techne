@@ -130,12 +130,12 @@ FG and BG are colours, as the file's head says; WEIGHT is `light',
 `normal' or `bold'; SLANT `normal' or `italic'; UNDERLINE #t, `line',
 `curl', `dotted', `dashed' or `double', or one of those with a
 colour: (curl red); STRIKE and EXTEND are booleans (an extending
-background reaches the pane's edge where the face covers a line's
+background or underline reaches the pane's edge where the face covers a line's
 end); FAMILY is a font family, or `fixed' or `variable'; HEIGHT the
-size as a factor of the frontend's, 1.3 say. FAMILY and HEIGHT are
-honoured only on the `default' face, whole panes at a time:
-frontends are not asked to change fonts or sizes inside a line, so
-set them there. An attribute set to #f clears what the face
+size as a factor of the frontend's, 1.3 say. FAMILY and HEIGHT
+change fonts wherever the face is, in a frontend that has them (a
+window; a terminal has one font): a line is as tall as its tallest
+text. An attribute set to #f clears what the face
 inherits of it. INHERIT is the face whose unset attributes this
 one takes: not given, its longest declared dotted prefix; #f, none.
 Defining it again in the same scope replaces the declaration, as a

@@ -19,7 +19,7 @@
 (require "windows.scm")
 
 (provide editor-press editor-click editor-message! session-quit?
-         editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays cursor-shape
+         editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays pane-projections cursor-shape
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations!)
 
@@ -206,6 +206,11 @@ the layers, which the runtime composes attribute by attribute."
   "Return the inlays of VIEW from FROM to TO in session S.
 Each is (position text face): text shown in the line, not in the text."
   (buffer-inlays (view-document view) from to))
+
+(define (pane-projections s view from to)
+  "Return how VIEW's text from FROM to TO is laid out in session S.
+Each is (hang LINE AT) or (block AT IMAGE), as `buffer-projections' says."
+  (buffer-projections (view-document view) from to))
 
 ;; How far past the scroll anchor matches are highlighted, in bytes.
 (define search-highlight-span 16384)

@@ -44,6 +44,15 @@ It is empty when there is none."
         (to (let loop ((p pos)) (if (and (< p (document-length d)) (identifier-at? d p)) (loop (next-grapheme d p)) p))))
     (list from to)))
 
+;; How many identifier characters are just before POS in D, at most
+;; LIMIT: the walk is LIMIT long, not the identifier's length, so a key
+;; at the end of a very long word costs what it does after a short one.
+(define (identifier-before d pos limit)
+  (let loop ((p pos) (n 0))
+    (if (and (< n limit) (> p 0) (identifier-at? d (prev-grapheme d p)))
+        (loop (prev-grapheme d p) (+ n 1))
+        n)))
+
 (define (scheme-completion d pos module)
   "Return what completes the identifier before POS in D.
 The names are those MODULE sees: (start . candidates), the shortest
@@ -203,7 +212,7 @@ With none selected, close the popup and do what RET does without it."
   (cond ((popup s) (follow! s key))
         ((typed? s key)
          (let* ((v (pane-view s)) (d (view-document v)) (p (point s))
-                (word (- p (car (identifier-span d p))))
+                (word (identifier-before d p completion-auto-prefix))
                 (token (+ 1 (or (sget s 'completion-token) 0)))
                 (revision (document-revision d)))
            (sset! s 'completion-token token)

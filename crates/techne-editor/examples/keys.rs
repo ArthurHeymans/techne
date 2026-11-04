@@ -41,6 +41,18 @@ struct Workload {
 const WORKLOADS: &[Workload] = &[
     Workload { name: "type", profile: "emacs", text: lines, eval: "", setup: "", timed: TYPING, coloured: false },
     Workload { name: "type-long-line", profile: "emacs", text: long_line, eval: "", setup: "C-n", timed: TYPING, coloured: false },
+    // Typing at the end of a word of 4000 characters: what a key looks
+    // at before the caret must not grow with the word (in-buffer
+    // completion measured the whole word on every key).
+    Workload {
+        name: "type-long-word",
+        profile: "emacs",
+        text: long_word,
+        eval: "",
+        setup: "C-e",
+        timed: "a b c d e f g h",
+        coloured: false,
+    },
     // Typing and moving in Rust the syntax layer colours: what parsing
     // and collecting cost a keystroke, against documents with no file
     // (which is why these set the language themselves).
@@ -113,6 +125,11 @@ fn lines() -> String {
 }
 
 /// One line of 1 MB between two short ones.
+/// One word of 4000 characters, on the first line.
+fn long_word() -> String {
+    format!("{}\nend\n", "w".repeat(4000))
+}
+
 fn long_line() -> String {
     let mut words = Words(2);
     let mut line = String::new();
@@ -163,6 +180,10 @@ fn run(w: &Workload) -> Vec<Duration> {
     for k in w.setup.split_whitespace() {
         press(&mut rt, k);
     }
+    // The first snapshot takes the face table and makes the chrome:
+    // once a runtime, which startup counts, not a keystroke. Timed
+    // within the keys, it made every face declared cost each key.
+    let _ = rt.snapshot();
     if w.coloured {
         let mut landed = false;
         for _ in 0..2000 {
