@@ -1201,6 +1201,8 @@ pub fn install(vm: &mut Vm) {
             /// Return #t if a file exists at PATH.
             "(file-exists? path)" => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
         }
+        #[cfg(unix)]
+        files(vm);
     });
     vm.requiring(Capability::Environment, |vm| {
         crate::natives! { vm;
@@ -1218,4 +1220,64 @@ pub fn install(vm: &mut Vm) {
             "(getenv name)" => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.convert_raw(std::env::var(k).ok()) };
         }
     });
+}
+
+/// Directories and what is in them (`files.rs`): listing, making,
+/// moving, copying and deleting entries, for worlds with files.
+#[cfg(unix)]
+fn files(vm: &mut Vm) {
+    use std::path::Path;
+
+    use crate::files;
+    techne_vm::procedures! { vm;
+        /// Return the entries of DIRECTORY, sorted.
+        /// Subdirectories have a slash after their name.
+        "(directory-list directory)" => |dir: String| files::list(Path::new(&dir)).map_err(|e| format!("{dir}: {e}"));
+        /// Return what is at PATH, or #f if nothing is there.
+        /// It is (kind size modified mode target): KIND `file`,
+        /// `directory`, `symlink` or `other`, a symbolic link not
+        /// followed; MODIFIED in seconds since the epoch; MODE the
+        /// permission bits; TARGET a link's target, else #f.
+        "(file-attributes path)" => |path: String| files::attributes(Path::new(&path)).map_err(|e| format!("{path}: {e}"));
+        /// Move the file or directory FROM to TO, which must not exist.
+        /// Where the system cannot refuse to replace TO as it renames, it
+        /// checks first, and what appears at TO in between is replaced.
+        "(rename-file from to)" => |from: String, to: String| files::rename(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
+        /// Write TEXT to the file PATH in place of what is there, at once:
+        /// whole to a new file beside it, readable by its user only, then
+        /// renamed over it. A write that fails leaves the file as it was.
+        "(replace-file path text)" => |path: String, text: String| files::replace(Path::new(&path), &text).map_err(|e| format!("{path}: {e}"));
+        /// Copy the file or directory FROM to TO, which must not exist.
+        /// A directory is copied with all it holds, a symbolic link as
+        /// a link.
+        "(copy-file from to)" => |from: String, to: String| files::copy(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
+        /// Return PATH absolute, its symbolic links and . and .. resolved.
+        /// A file that does not exist yet is named in its directory's
+        /// true name.
+        "(file-truename path)" => |path: String| files::truename(Path::new(&path)).map(|p| p.display().to_string()).map_err(|e| format!("{path}: {e}"));
+        /// Make the directory PATH, and those above it that are missing.
+        /// One already there is left as it is.
+        "(make-directory path)" => |path: String| std::fs::create_dir_all(&path).map_err(|e| format!("{path}: {e}"));
+        /// Make the directory PATH, with permission bits MODE (less the
+        /// process's umask), in a directory that is there: an error if
+        /// anything is at PATH, so that a directory made is this call's.
+        "(create-directory path mode)" => |path: String, mode: usize| -> Result<(), String> {
+            let mode = u32::try_from(mode).ok().filter(|m| *m <= 0o7777).ok_or_else(|| format!("create-directory: {mode} is not a mode"))?;
+            files::create_directory(Path::new(&path), mode).map_err(|e| format!("{path}: {e}"))
+        };
+        /// Set the permission bits of the file or directory PATH to MODE.
+        "(set-file-mode! path mode)" => |path: String, mode: usize| -> Result<(), String> {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = u32::try_from(mode).map_err(|_| format!("set-file-mode!: {mode} is not a mode"))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(|e| format!("{path}: {e}"))
+        };
+        /// Delete the file or directory at PATH.
+        /// A directory must be empty unless RECURSIVE; a symbolic link
+        /// is deleted, not what it points to.
+        "(delete-path path recursive)" => |path: String, recursive: bool| files::delete(Path::new(&path), recursive).map_err(|e| format!("{path}: {e}"));
+        /// Return the first BYTES bytes of the file at PATH, as text.
+        /// What is not UTF-8 is replaced; a character cut at the end is
+        /// left out.
+        "(file-head path bytes)" => |path: String, bytes: usize| files::head(Path::new(&path), bytes).map_err(|e| format!("{path}: {e}"));
+    }
 }

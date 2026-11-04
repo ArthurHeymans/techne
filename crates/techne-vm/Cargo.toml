@@ -50,6 +50,10 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# Directories and their entries (files.rs).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 # Pinned: a young allocator under everything; upgrade deliberately.
 [target.'cfg(any(unix, windows))'.dependencies]
 rusty_alloc-api = { version = "=2.2.6", optional = true }

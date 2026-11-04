@@ -4106,6 +4106,7 @@ dependencies = [
  "regex-cursor",
  "regex-syntax",
  "rustc-hash 2.1.3",
+ "rustix 1.1.5",
  "rusty_alloc-api",
  "rustyline",
  "sha2",
