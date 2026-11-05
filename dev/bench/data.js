@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793914914586,
+  "lastUpdate": 1793914916234,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -48385,6 +48385,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 104474,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3c6b4f40223ea674d51de18d095cb462d1aabc77",
+          "message": "Merge pull request #333 from ArthurHeymans/fix/completion-key-budget\n\neditor: keep completion filtering within the key budget",
+          "timestamp": "2026-11-05T22:35:41+01:00",
+          "tree_id": "2e2218565ac0d527af1626b79e2765ae96ec1de2",
+          "url": "https://github.com/ArthurHeymans/techne/commit/3c6b4f40223ea674d51de18d095cb462d1aabc77"
+        },
+        "date": 1793914916180,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 683802244,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 635180874,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104469,
             "unit": "data"
           }
         ]
