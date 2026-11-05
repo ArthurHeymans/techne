@@ -609,23 +609,23 @@
       "is_macro": false
     },
     "image-height": {
-      "description": "(image-height image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:380\n\nReturn the height of IMAGE in pixels, as decoded.",
+      "description": "(image-height image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:396\n\nReturn the height of IMAGE in pixels, as decoded.",
       "is_macro": false
     },
     "image-load": {
-      "description": "(image-load path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:427\n\nReturn the image of the file at PATH, decoded on a thread of\nits own while the calling task waits: PNG, JPEG, GIF, WebP,\nBMP or SVG, scaled down to 4096 pixels a side at most. A\nfile of more than 64 MiB, or of more than 64 megapixels, is\nrefused; an SVG's references to other files are not\nfollowed. A file loaded before and not changed since is not\ndecoded again. Show it with a projection, `(block AT IMAGE)`.",
+      "description": "(image-load path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:443\n\nReturn the image of the file at PATH, decoded on a thread of\nits own while the calling task waits: PNG, JPEG, GIF, WebP,\nBMP or SVG, scaled down to 4096 pixels a side at most. A\nfile of more than 64 MiB, or of more than 64 megapixels, is\nrefused; an SVG's references to other files are not\nfollowed. A file loaded before and not changed since is not\ndecoded again. Show it with a projection, `(block AT IMAGE)`.",
       "is_macro": false
     },
     "image-loaded": {
-      "description": "(image-loaded path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:387\n\nReturn the image of the file at PATH if it is loaded and\nthe file has not changed since, else #f. It never decodes:\n`image-load` does.",
+      "description": "(image-loaded path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:403\n\nReturn the image of the file at PATH if it is loaded and\nthe file has not changed since, else #f. It never decodes:\n`image-load` does.",
       "is_macro": false
     },
     "image-width": {
-      "description": "(image-width image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:378\n\nReturn the width of IMAGE in pixels, as decoded.",
+      "description": "(image-width image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:394\n\nReturn the width of IMAGE in pixels, as decoded.",
       "is_macro": false
     },
     "image?": {
-      "description": "(image? obj)  built-in procedure, @source@/crates/techne-editor/src/images.rs:376\n\nReturn #t if OBJ is an image.",
+      "description": "(image? obj)  built-in procedure, @source@/crates/techne-editor/src/images.rs:392\n\nReturn #t if OBJ is an image.",
       "is_macro": false
     },
     "indent-lines!": {
@@ -1504,6 +1504,14 @@
       "description": "(record-violation record)  procedure, @lisp@/editor/operations.scm:409\n\nReturn the `violation` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
+    "recording-start!": {
+      "description": "(recording-start! s directory #:frames (frames 100) #:interval (interval 100))  procedure, @lisp@/editor/capture.scm:134\n\nRecord S to a new private DIRECTORY: PNG frames and recording.scm.\nFRAMES is 1..300; INTERVAL is 50..10000 milliseconds between completions\nand requests. Stop at 256 MiB plus at most one frame. This is a timestamped\nframe sequence, not constant-rate video. A failed capture ends recording.",
+      "is_macro": false
+    },
+    "recording-stop!": {
+      "description": "(recording-stop! s)  procedure, @lisp@/editor/capture.scm:154\n\nStop S's recording. One already requested frame may still complete.",
+      "is_macro": false
+    },
     "recovery-choice?": {
       "description": "(recovery-choice? obj)  procedure, @lisp@/editor/operations.scm:331\n\nReturn #t if OBJ is a `recovery-choice` record.",
       "is_macro": false
@@ -1690,6 +1698,10 @@
     },
     "save-document!": {
       "description": "(save-document! d #:overwrite (overwrite #f))  procedure, @lisp@/editor/files.scm:93\n\nWrite the document D to its file, refusing an external change.\nWith OVERWRITE, an external change is replaced. A file on another\nmachine is written through its endpoint, only if it still has the text\nD was read or last saved with. Then `document-saved` runs.\nRefused, the error offers recovery choices (doc/operations.md,\n\"Recovery\"): to overwrite the file, to revert the buffer to it, to\ncompare the two; each expects D as it is now, and is refused once D has\nchanged since.",
+      "is_macro": false
+    },
+    "screenshot!": {
+      "description": "(screenshot! s path)  procedure, @lisp@/editor/capture.scm:35\n\nCapture S's next rendered frame to a new PNG at PATH.\nReturn a request id, not a claim that drawing or saving has completed.\nThe frontend may draw a newer snapshot; completion identifies that frame.",
       "is_macro": false
     },
     "search!": {

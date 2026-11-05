@@ -70,9 +70,19 @@ struct Args {
     open: bool,
     /// Return once the file opened is done with.
     wait: bool,
+    screenshot: Option<PathBuf>,
+    record: Option<PathBuf>,
+    stop_recording: bool,
+    record_frames: usize,
+    record_interval: usize,
 }
 
-const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [--open] [--wait] [FILE]";
+const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [--open] [--wait] [FILE]\n\
+  techne window --screenshot NEW.png\n\
+  techne window --record NEW-DIR [--record-frames 1..300] [--record-interval 50..10000]\n\
+  techne window --stop-recording\n\
+Capture commands address an already running editor and print a JSON reply.\n\
+Recording saves timestamped PNG frames plus recording.scm (default: 100 frames, 100 ms).";
 
 fn args(args: Vec<String>) -> Result<Args, String> {
     let mut a = Args {
@@ -84,10 +94,20 @@ fn args(args: Vec<String>) -> Result<Args, String> {
         size: 15.0,
         open: false,
         wait: false,
+        screenshot: None,
+        record: None,
+        stop_recording: false,
+        record_frames: 100,
+        record_interval: 100,
     };
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--screenshot" => a.screenshot = Some(PathBuf::from(it.next().ok_or(USAGE)?)),
+            "--record" => a.record = Some(PathBuf::from(it.next().ok_or(USAGE)?)),
+            "--stop-recording" => a.stop_recording = true,
+            "--record-frames" => a.record_frames = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
+            "--record-interval" => a.record_interval = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
             "--modal" => a.profile = "modal".into(),
             "--load" => a.load = true,
             "--open" => a.open = true,
@@ -99,6 +119,15 @@ fn args(args: Vec<String>) -> Result<Args, String> {
             _ if a.path.is_none() && !arg.starts_with("--") => a.path = Some(PathBuf::from(arg)),
             _ => return Err(USAGE.into()),
         }
+    }
+    let controls = a.screenshot.is_some() as u8 + a.record.is_some() as u8 + a.stop_recording as u8;
+    if controls > 1
+        || (controls > 0 && (a.path.is_some() || a.open || a.bench.is_some() || a.load))
+        || !(1..=300).contains(&a.record_frames)
+        || !(50..=10000).contains(&a.record_interval)
+        || (a.record.is_none() && (a.record_frames != 100 || a.record_interval != 100))
+    {
+        return Err(USAGE.into());
     }
     if a.open && a.path.is_none() {
         return Err(USAGE.into());
@@ -167,6 +196,7 @@ struct App {
     /// The Wayland clipboard: kills go to it; what another program put
     /// there is sent to the runtime when the window gets the focus.
     clipboard: Option<smithay_clipboard::Clipboard>,
+    captures: Vec<(usize, u64)>,
 }
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
@@ -248,6 +278,7 @@ impl App {
                         self.send(input);
                     }
                 }
+                Event::Output(Output::Capture { id, after }) => self.captures.push((id, after)),
                 // Every key a window gets can be sent.
                 Event::Output(Output::Bindings(_) | Output::Session(_)) => {}
                 Event::Output(Output::Clipboard(text)) => {
@@ -261,7 +292,10 @@ impl App {
                     self.quit(event_loop);
                 }
                 Event::Ended if self.quitting => {}
-                Event::Ended if self.host.restart() => eprintln!("techne: the runtime stopped; a new one has the unsaved edits"),
+                Event::Ended if self.host.restart() => {
+                    self.captures.clear();
+                    eprintln!("techne: the runtime stopped; a new one has the unsaved edits");
+                }
                 Event::Ended => {
                     eprintln!("techne: the runtime stopped before it had input");
                     self.quit(event_loop);
@@ -723,7 +757,24 @@ impl App {
             })
             .collect();
         let Some(renderer) = &mut self.renderer else { return };
-        if renderer.draw(fonts, frame_bg, &rects, &images, &texts) {
+        let capture = self.captures.iter().any(|(_, after)| snap.id >= *after);
+        if renderer.draw(fonts, frame_bg, &rects, &images, &texts, capture) {
+            if capture {
+                let result =
+                    renderer.captured.take().unwrap_or_else(|| Err("the renderer did not produce a capture".into())).map(|mut f| {
+                        f.snapshot = snap.id;
+                        f
+                    });
+                let mut pending = Vec::new();
+                for (id, after) in self.captures.drain(..) {
+                    if snap.id >= after {
+                        self.host.captured(id, result.clone());
+                    } else {
+                        pending.push((id, after));
+                    }
+                }
+                self.captures = pending;
+            }
             let now = Instant::now();
             self.latency.frame.extend(self.unanswered.drain(..).map(|at| now - at));
         } else {
@@ -876,6 +927,35 @@ pub fn main(args: Vec<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let capture = args.screenshot.is_some() || args.record.is_some() || args.stop_recording;
+    if capture {
+        let result = (|| {
+            let socket = server::socket().ok_or("no XDG_RUNTIME_DIR for the editor socket")?;
+            if let Some(path) = &args.screenshot {
+                return server::capture(&socket, path);
+            }
+            let request = if let Some(path) = &args.record {
+                server::Request::Record {
+                    path: std::path::absolute(path).map_err(|e| e.to_string())?,
+                    frames: args.record_frames,
+                    interval_ms: args.record_interval,
+                }
+            } else {
+                server::Request::StopRecording
+            };
+            server::request(&socket, &request)
+        })();
+        return match result {
+            Ok(reply) => {
+                println!("{}", serde_json::to_string(&reply).expect("a capture reply"));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("techne: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(opened) = args.path.as_deref().filter(|_| args.open).and_then(|p| server::open_running(p, args.wait)) {
         if let Err(e) = opened {
             eprintln!("techne: {e}");
@@ -935,6 +1015,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         latency: Latency::default(),
         bench,
         clipboard: None,
+        captures: Vec::new(),
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, .. } = app;

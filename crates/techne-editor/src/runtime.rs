@@ -24,7 +24,7 @@ use std::{
 use techne_text::{Assoc, Document, Range, Recovery};
 pub use techne_vm::tasks::Progress;
 use techne_vm::{
-    api::{Arg as Val, Foreign, FromValue, IntoValue, Value},
+    api::{Arg as Val, Bytes, Foreign, FromValue, IntoValue, Value},
     vm::{Error, ExecId, Grants, InterruptHandle, Stop, Vm},
 };
 
@@ -128,7 +128,13 @@ pub enum Msg {
     /// A frontend attaches (`Runtime::attach`), its inputs interrupted
     /// with `interrupts`. `state` is its session as it last sent it
     /// (`Output::Session`), brought back after a crash.
-    Attach { client: Client, file: Option<File>, profile: String, state: Option<String>, interrupts: Arc<Interrupts> },
+    Attach {
+        client: Client,
+        file: Option<File>,
+        profile: String,
+        state: Option<String>,
+        interrupts: Arc<Interrupts>,
+    },
     /// An input from an attached frontend, counted in its backlog until
     /// taken.
     Input(Client, Input, Admitted),
@@ -136,7 +142,29 @@ pub enum Msg {
     /// program (`server`): `reply` gets `Opened`, or `Failed`, and with
     /// `wait`, `Done` once the file is done with. It is dropped after
     /// the last. `id` is the request's, unique to the process.
-    Open { id: usize, path: PathBuf, wait: bool, reply: mpsc::Sender<Reply> },
+    Open {
+        id: usize,
+        path: PathBuf,
+        wait: bool,
+        reply: mpsc::Sender<Reply>,
+    },
+    /// Request a screenshot in the selected Scheme session.
+    Capture {
+        path: PathBuf,
+        reply: mpsc::Sender<Reply>,
+    },
+    Recording {
+        path: Option<PathBuf>,
+        frames: usize,
+        interval_ms: usize,
+        reply: mpsc::Sender<Reply>,
+    },
+    /// A frontend completed a capture (not interruptible keyboard input).
+    Captured {
+        client: Client,
+        id: usize,
+        result: Result<crate::present::CapturedFrame, String>,
+    },
     /// The program of request `id` stopped waiting (`Open`).
     Gone(usize),
     /// A background task woke. One is queued at a time, however many
@@ -159,6 +187,7 @@ pub struct Runtime {
     /// The programs waiting until a file they opened is done with, by the
     /// id of their request, which Lisp knows them by (`Msg::Open`).
     waiting: HashMap<usize, mpsc::Sender<Reply>>,
+    captures: HashMap<usize, mpsc::Sender<Reply>>,
     /// How long a call into Lisp for a part of a snapshot may run
     /// (`call`).
     deadline: Duration,
@@ -390,7 +419,13 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 34] = [
+const PROCS: [&str; 40] = [
+    "editor-cancel-captures!",
+    "editor-record!",
+    "editor-stop-record!",
+    "editor-capture-request!",
+    "editor-take-captures!",
+    "editor-captured!",
     "editor-open!",
     "keep-histories!",
     "editor-take-done!",
@@ -487,6 +522,7 @@ impl Runtime {
             serving: Client::FIRST,
             next_id: 0,
             waiting: HashMap::new(),
+            captures: HashMap::new(),
             deadline: PART_DEADLINE,
             watch,
             stalled: HashMap::new(),
@@ -546,6 +582,13 @@ impl Runtime {
     pub fn detach(&mut self, client: Client) {
         if self.clients.contains_key(&client) {
             self.serving = client;
+            let cancelled =
+                self.call("editor-cancel-captures!", &[Arg::Session]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
+            for id in cancelled {
+                if let Some(reply) = self.captures.remove(&id) {
+                    let _ = reply.send(Reply::Failed("the frontend detached before capture completed".into()));
+                }
+            }
             if let Err(e) = self.call("editor-detach!", &[Arg::Session]) {
                 eprintln!("techne: editor-detach!: {e}");
             }
@@ -754,6 +797,60 @@ impl Runtime {
                         Err(e) => send(client, Output::Refused(e)),
                     },
                     Msg::Open { id, path, wait, reply } => self.open_for(id, &path, wait, reply),
+                    Msg::Capture { path, reply } => {
+                        let requested = self
+                            .call("editor-capture-request!", &[Arg::Str(path.display().to_string())])
+                            .and_then(|v| self.vm.get::<usize>(&v));
+                        match requested {
+                            Ok(id) => {
+                                self.captures.insert(id, reply);
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Reply::Failed(e.to_string()));
+                            }
+                        }
+                    }
+                    Msg::Recording { path, frames, interval_ms, reply } => {
+                        let result = if let Some(path) = path {
+                            self.call("editor-record!", &[Arg::Str(path.display().to_string()), Arg::Int(frames), Arg::Int(interval_ms)])
+                        } else {
+                            self.call("editor-stop-record!", &[])
+                        };
+                        let answer = match result.and_then(|v| self.vm.get::<String>(&v)) {
+                            Ok(path) => Reply::Recording { path },
+                            Err(e) => Reply::Failed(e.to_string()),
+                        };
+                        let _ = reply.send(answer);
+                    }
+                    Msg::Captured { client, id, result } => {
+                        if !self.clients.contains_key(&client) {
+                            continue;
+                        }
+                        self.serving = client;
+                        let (snapshot, width, height, png, error) = match result {
+                            Ok(f) => (f.snapshot, f.width, f.height, f.png, String::new()),
+                            Err(e) => (0, 0, 0, Vec::new(), e),
+                        };
+                        let args = [
+                            Arg::Session,
+                            Arg::Int(id),
+                            Arg::Int(snapshot as usize),
+                            Arg::Int(width as usize),
+                            Arg::Int(height as usize),
+                            Arg::Bytes(png),
+                            Arg::Str(error),
+                        ];
+                        let saved = self.call_within("editor-captured!", &args, OPEN_DEADLINE).and_then(|v| self.vm.get::<String>(&v));
+                        if let Some(reply) = self.captures.remove(&id) {
+                            let answer = match saved {
+                                Ok(path) => Reply::Captured { path, snapshot, width, height },
+                                Err(e) => Reply::Failed(e.to_string()),
+                            };
+                            let _ = reply.send(answer);
+                        } else if let Err(e) = saved {
+                            let _ = self.message(&format!("Capture: {e}"));
+                        }
+                    }
                     Msg::Gone(id) => {
                         if self.waiting.remove(&id).is_some() {
                             let _ = self.call("editor-forget!", &[Arg::Int(id)]);
@@ -837,7 +934,14 @@ impl Runtime {
             if discarded > 0 {
                 let _ = self.message(&format!("Discarded {discarded} inputs sent while the editor was busy"));
             }
-            send(client, Output::Snapshot(Box::new(self.snapshot())));
+            let snapshot = self.snapshot();
+            let after = snapshot.id;
+            send(client, Output::Snapshot(Box::new(snapshot)));
+            let captures =
+                self.call("editor-take-captures!", &[Arg::Session]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
+            for id in captures {
+                send(client, Output::Capture { id, after });
+            }
             if greet.contains(&client) {
                 send(client, Output::Bindings(self.bindings()));
             }
@@ -1396,6 +1500,7 @@ impl Runtime {
                 Arg::Int(n) => (*n).into_value(&mut self.vm)?,
                 Arg::Bool(b) => (*b).into_value(&mut self.vm)?,
                 Arg::Strs(v) => v.clone().into_value(&mut self.vm)?,
+                Arg::Bytes(v) => Bytes(v.clone()).into_value(&mut self.vm)?,
                 Arg::View(v) => Foreign(v.clone()).into_value(&mut self.vm)?,
             };
             values.push(v);
@@ -1614,6 +1719,7 @@ enum Arg {
     Int(usize),
     Bool(bool),
     Strs(Vec<String>),
+    Bytes(Vec<u8>),
 }
 
 #[cfg(all(test, unix))]

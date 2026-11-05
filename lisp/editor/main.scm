@@ -39,11 +39,13 @@
 (require "checkdoc.scm")
 (require "help.scm")
 (require "server.scm")
+(require "capture.scm")
 
 (provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers pane-inlays pane-projections face-table face-generation cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
-         bound-keys editor-unsendable! editor-take-violations! keep-histories!)
+         bound-keys editor-unsendable! editor-take-violations! keep-histories!
+         editor-capture-request! editor-take-captures! editor-captured! editor-cancel-captures! editor-record! editor-stop-record!)
 
 (define (start-session view profile-name)
   "Start a session for a frontend attaching, keys read by PROFILE-NAME.

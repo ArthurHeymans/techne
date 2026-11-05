@@ -176,6 +176,17 @@ impl Host {
         crate::server::listen(self.shared.clone(), socket)
     }
 
+    /// Complete a capture, outside the interruptible keystroke backlog.
+    /// Old frontend results cannot enter a restarted runtime.
+    pub fn captured(&self, id: usize, result: Result<crate::present::CapturedFrame, String>) {
+        let s = self.shared.lock().expect("the host");
+        if s.generation == self.generation
+            && let Some(tx) = &s.inputs
+        {
+            let _ = tx.send(Msg::Captured { client: self.client, id, result });
+        }
+    }
+
     /// Send an input. C-g also interrupts the frontend's input the runtime
     /// is handling, and discards those queued before it.
     pub fn send(&mut self, input: Input) {

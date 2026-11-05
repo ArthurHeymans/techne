@@ -5,7 +5,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use techne_editor::images::Image;
+use techne_editor::{
+    images::{Image, encode_png},
+    present::CapturedFrame,
+};
 
 use glyphon::{Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use wgpu::util::DeviceExt;
@@ -96,6 +99,7 @@ pub struct Renderer {
     textures: HashMap<u64, (wgpu::BindGroup, u64, usize)>,
     texture_bytes: usize,
     frames: u64,
+    pub captured: Option<Result<CapturedFrame, String>>,
     // Dropped last: the surface refers to it.
     pub window: Arc<Window>,
 }
@@ -314,6 +318,7 @@ impl Renderer {
             textures: HashMap::new(),
             texture_bytes: 0,
             frames: 0,
+            captured: None,
             window,
         }
     }
@@ -402,7 +407,9 @@ impl Renderer {
         rects: &[(Rect, Rgb)],
         images: &[(Rect, Rect, Image)],
         texts: &[TextPiece],
+        capture: bool,
     ) -> bool {
+        self.captured = None;
         self.frames += 1;
         for (_, _, image) in images {
             self.texture(image);
@@ -454,13 +461,43 @@ impl Renderer {
             _ => return false,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Reuse exactly the same render pass for the capture. Surface textures
+        // need not support COPY_SRC on every backend; an offscreen attachment
+        // does. No second layout, compositor or approximation of the scene.
+        if capture {
+            if !matches!(
+                self.config.format,
+                wgpu::TextureFormat::Bgra8Unorm
+                    | wgpu::TextureFormat::Bgra8UnormSrgb
+                    | wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Rgba8UnormSrgb
+            ) {
+                self.captured = Some(Err("capture needs an RGBA8 or BGRA8 surface".into()));
+            } else if self.config.width as u64 * self.config.height as u64 > 16_777_216 {
+                self.captured = Some(Err("capture exceeds the 16 megapixel limit".into()));
+            }
+        }
+        let capture = capture && self.captured.is_none();
+        let offscreen = capture.then(|| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("capture"),
+                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        });
+        let capture_view = offscreen.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
+        for target in std::iter::once(&view).chain(capture_view.as_ref()) {
             let bg = background.linear();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -500,10 +537,61 @@ impl Renderer {
                 eprintln!("techne: drawing text: {e}");
             }
         }
+        let padded = (self.config.width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = offscreen.as_ref().map(|texture| {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("capture readback"),
+                size: padded as u64 * self.config.height as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(self.config.height),
+                    },
+                },
+                texture.size(),
+            );
+            buffer
+        });
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
+        if let Some(buffer) = readback {
+            self.captured = Some(self.read_capture(&buffer, padded));
+        }
         self.atlas.trim();
         true
+    }
+
+    fn read_capture(&self, buffer: &wgpu::Buffer, padded: u32) -> Result<CapturedFrame, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(5)) })
+            .map_err(|e| e.to_string())?;
+        rx.recv_timeout(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        let bytes = buffer.slice(..).get_mapped_range().map_err(|e| e.to_string())?;
+        let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+        let mut rgba = Vec::with_capacity((self.config.width as usize * self.config.height as usize) * 4);
+        for row in bytes.chunks_exact(padded as usize) {
+            rgba.extend_from_slice(&row[..self.config.width as usize * 4]);
+        }
+        drop(bytes);
+        buffer.unmap();
+        if bgra {
+            for pixel in rgba.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+        }
+        let png = encode_png(self.config.width, self.config.height, &rgba)?;
+        Ok(CapturedFrame { snapshot: 0, width: self.config.width, height: self.config.height, png })
     }
 }
 

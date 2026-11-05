@@ -410,8 +410,9 @@ another machine's files and processes through a node there, as TRAMP does
 attachment from afar waits a network round trip for every key; one over the
 node keeps typing local, and is what to use for editing remote files. Attaching
 is for coming back to a session: its buffers, unsaved edits and processes.
-Built so far: frontends in the runtime's process, and the socket's one request,
-opening a file; attaching from another process or machine is not.
+Built so far: frontends in the runtime's process, and socket requests for
+opening files and capturing the selected session; attaching from another
+process or machine is not.
 
 **The protocol.** Everything in it is serializable data: no native pointers or
 callbacks, even when frontend and runtime share a process.
@@ -427,6 +428,16 @@ callbacks, even when frontend and runtime share a process.
   presentation-owned faces are always recomputed. Panes are individually
   consistent; callbacks for later panes can observe newer revisions of a
   shared document.
+- **Pixel capture:** Scheme queues a bounded capture request, sent after
+  its fresh snapshot with that snapshot's id as a lower bound. A window
+  captures the same scene it draws, using an offscreen GPU attachment,
+  and answers with the actual snapshot id, dimensions and PNG bytes.
+  A terminal refuses pixel capture explicitly. Scheme saves files and owns
+  recording cadence, metadata and limits; native code only reads GPU
+  pixels and performs bulk PNG encoding (a Scheme prototype's CRC/Adler
+  passes alone took 27.6 seconds per 1600x1000 RGBA frame). Captures
+  observe the editor, not the compositor or other windows; independent
+  desktop capture remains useful for end-to-end comparison.
 - **Lazy rows:** the frontend requests rows around an anchor, lays them out,
   and requests more until the viewport is full. Providers support seeking,
   ranges and cancellation, and never run Lisp on the frame path.
