@@ -15,7 +15,7 @@ wgpu = "30"
 glyphon = "0.12"
 # Shaped words are cached across lines and frames.
 cosmic-text = { version = "0.19", features = ["shape-run-cache"] }
-pollster = "0.4"
+pollster = "1.0"
 bytemuck = { version = "1", features = ["derive"] }
 smithay-clipboard = "0.7.3"
 
