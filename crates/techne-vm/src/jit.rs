@@ -82,6 +82,8 @@ use crate::{
     vm::{Error, Moves, PlainFn, Vm},
 };
 
+mod fast;
+
 /// `(vm, ctx, registers at bp, bp, entry pc, native depth) -> pc | status << 32`.
 pub type JitFn = unsafe extern "C" fn(*mut Vm, *mut JitCtx, *mut Value, u64, u32, u32) -> u64;
 
@@ -118,6 +120,10 @@ pub struct JitCtx {
     /// a value names from its offset there, as `alloc::caged` does, so
     /// that no value, however it came about, names memory outside it.
     pub cage: *mut u8,
+    /// Owner and outer frame of an active numeric kernel. The owner is
+    /// stable for this native run; only cold materialization uses it.
+    pub vm: *mut Vm,
+    pub fast_root: u64,
 }
 
 /// Native calls nest at most this deep before handing over to the interpreter.
@@ -252,6 +258,8 @@ struct Arena {
     id: u32,
     generation: u32,
     module: JITModule,
+    /// A kernel and its entry/fallback live and fail as one unit.
+    isolated: bool,
     functions: usize,
     /// Functions not released yet.
     live: usize,
@@ -1313,6 +1321,34 @@ unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u
     }
 }
 
+/// Initialize a kernel's active virtual span before any original slow
+/// instruction can collect. Bounds/depth were checked by the pc-0 entry.
+/// This helper neither collects nor grows the register buffer.
+unsafe extern "C" fn jit_fast_prepare(ctx: *mut JitCtx, bp: u64, frame: u64) -> *mut Value {
+    let (vm, root) = unsafe { ((*ctx).vm, (*ctx).fast_root as usize) };
+    catch_jit(vm, |vm| {
+        let bp = bp as usize;
+        let end = bp.checked_add(frame as usize).expect("kernel frame extent");
+        assert!(root <= bp && end <= vm.regs.len(), "kernel capacity proof");
+        vm.regs[root..end].fill(Value::float(0.0));
+        vm.stack_top = vm.stack_top.max(end);
+        vm.regs.as_mut_ptr().wrapping_add(bp)
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// The child has materialized already. Record this suspended caller and
+/// return a fresh pointer for stores *below* its child's callee slot.
+unsafe extern "C" fn jit_fast_unwind(ctx: *mut JitCtx, bp: u64, code: *const Code, pc: u64) -> *mut Value {
+    let vm = unsafe { (*ctx).vm };
+    catch_jit(vm, |vm| {
+        assert!((bp as usize) < vm.regs.len(), "kernel caller frame");
+        vm.jit_push_frame(code, pc as u32, bp as u32);
+        vm.regs.as_mut_ptr().wrapping_add(bp as usize)
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
 /// The register stack has no room for the `needed` registers of a frame
 /// of `code` with the functions inlined in it (`Gen::room`): grow it, and
 /// return `RESUME << 32` (enter again); if it cannot grow, let the
@@ -1985,15 +2021,25 @@ impl Jit {
 
     /// The index of the arena to compile `generation`'s code into: its
     /// last, or a new one if that is full.
-    fn arena(&mut self, generation: u32) -> usize {
-        match self.arenas.iter().rposition(|a| a.generation == generation) {
+    fn arena(&mut self, generation: u32, isolated: bool) -> usize {
+        match self.arenas.iter().rposition(|a| !isolated && !a.isolated && a.generation == generation) {
             Some(i) if self.arenas[i].functions < ARENA_FUNCTIONS => i,
             _ => {
                 self.arena_ids += 1;
                 let module = JITModule::new(JITBuilder::with_isa(self.isa.clone(), cranelift_module::default_libcall_names()));
                 // Charged as functions go in (`compile`).
                 let charged = self.budget.reserve(0).expect("nothing reserved");
-                self.arenas.push(Arena { id: self.arena_ids, generation, module, functions: 0, live: 0, bytes: 0, charged, ops: 0 });
+                self.arenas.push(Arena {
+                    id: self.arena_ids,
+                    generation,
+                    module,
+                    isolated,
+                    functions: 0,
+                    live: 0,
+                    bytes: 0,
+                    charged,
+                    ops: 0,
+                });
                 self.usage.arenas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.arenas.len() - 1
             }
@@ -2016,14 +2062,33 @@ impl Jit {
     /// The function and the arena it is in.
     fn compile(&mut self, job: &Job) -> (Option<JitFn>, u32) {
         self.oversized_buffers = false;
-        let i = self.arena(job.generation);
-        // What compiling takes while it runs and what it makes, reserved
-        // before: past the world's ceiling the function is not compiled.
-        let ops = job.ops.len() + job.inlined.values().map(Inlinee::size).sum::<usize>();
-        let reserved = self.budget.charge(working(ops)).and_then(|w| self.budget.reserve(reserve(ops) + kept(ops)).map(|r| (w, r)));
+        let mut kernel = fast::plan(job);
+        // Admit both functions. Under pressure, drop the optional kernel
+        // before giving up compilation of the ordinary implementation.
+        let plain = job.ops.len() + job.inlined.values().map(Inlinee::size).sum::<usize>();
+        // Also recheck the extra working set against the owner's current
+        // accounting, not just the mutator's earlier admission snapshot.
+        // Separate definitions round to separate executable mappings.
+        if kernel.is_some() {
+            let room = self.budget.limit().saturating_sub(self.budget.accounted());
+            if !Compiler::fits(plain + job.ops.len(), room.saturating_sub(2 * PAGE)) {
+                kernel = None;
+            }
+        }
+        let mut ops = plain + kernel.as_ref().map_or(0, |_| job.ops.len());
+        let reserve_work = |ops, extra| {
+            self.budget.charge(working(ops)).and_then(|w| self.budget.reserve(reserve(ops) + kept(ops) + extra).map(|r| (w, r)))
+        };
+        let mut reserved = reserve_work(ops, if kernel.is_some() { 2 * PAGE } else { 0 });
+        if reserved.is_err() && kernel.is_some() {
+            kernel = None;
+            ops = plain;
+            reserved = reserve_work(ops, 0);
+        }
+        let i = self.arena(job.generation, kernel.is_some());
         let (f, made) = match reserved {
             Ok((working, made)) => {
-                let f = self.compile_in(i, job);
+                let f = self.compile_in(i, job, kernel.as_ref());
                 drop(working);
                 (f, Some(made))
             }
@@ -2049,7 +2114,7 @@ impl Jit {
     }
 
     /// The function and the bytes of its pages.
-    fn compile_in(&mut self, arena: usize, job: &Job) -> Option<(JitFn, usize)> {
+    fn compile_in(&mut self, arena: usize, job: &Job, kernel: Option<&fast::Plan>) -> Option<(JitFn, usize)> {
         let module = &mut self.arenas[arena].module;
         let heads = &job.heads[..];
         let frame = job.frame_size as usize;
@@ -2057,6 +2122,10 @@ impl Jit {
         if effects.iter().flat_map(|(u, d)| u.iter().chain(d)).any(|&r| r as usize >= frame) {
             return None;
         }
+        let kernel = match kernel {
+            Some(plan) => Some(fast::compile(module, &mut self.ctx, &mut self.fctx, job, plan)?),
+            None => None,
+        };
         // The function's instructions, then those of the functions inlined,
         // whose registers are above.
         let (ops, origin, sites, returns) = combine(job);
@@ -2357,6 +2426,11 @@ impl Jit {
             if n > frame {
                 g.room(&mut b, h, n);
             }
+            if h == 0 {
+                if let Some(kernel) = &kernel {
+                    fast::enter(module, &mut b, &g, kernel, job);
+                }
+            }
             g.reload(&mut b, &g.flow.live_in[h].clone());
             g.reload_globals(&mut b, h);
             for r in g.vecs[h].and(&g.flow.live_in[h]).iter() {
@@ -2465,7 +2539,8 @@ impl Jit {
         b.finalize(frontend);
         let f = &self.ctx.func;
         let insts: usize = f.layout.blocks().map(|bl| f.layout.block_insts(bl).count()).sum();
-        self.oversized_buffers = insts > MAX_CACHED_INSTS || n > MAX_CACHED_REGS;
+        self.oversized_buffers =
+            insts > MAX_CACHED_INSTS || n > MAX_CACHED_REGS || kernel.as_ref().is_some_and(|k| k.insts > MAX_CACHED_INSTS);
         if std::env::var_os("TECHNE_JIT_IR").is_some() {
             eprintln!(
                 "ir: {} {} ops ({} inlined at {} calls, {} tail) -> {} blocks, {insts} insts",
@@ -2491,7 +2566,7 @@ impl Jit {
         module.clear_context(&mut self.ctx);
         module.finalize_definitions().ok()?;
         let f = module.get_finalized_function(id);
-        Some((unsafe { std::mem::transmute::<*const u8, JitFn>(f) }, bytes))
+        Some((unsafe { std::mem::transmute::<*const u8, JitFn>(f) }, bytes + kernel.as_ref().map_or(0, |k| k.bytes)))
     }
 }
 
@@ -4789,6 +4864,8 @@ mod tests {
             res: 0,
             moves: vm.moves,
             cage: vm.heap.cage_base(),
+            vm: &mut vm,
+            fast_root: 0,
         };
         let result = unsafe { jit_after_call(&mut vm, &mut ctx, (TAILCALL as u64) << 32, 1, 0) };
         assert_eq!(result, (RETURNED as u64) << 32);

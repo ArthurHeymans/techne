@@ -3,6 +3,36 @@
 #![cfg(feature = "counting-allocator")]
 use std::{fs, process::Command};
 
+const DENSE: &str = "(define (dense n) (if (= n 0) 0 (let ((a (+ n 1)) (b (+ n 2)) (c (+ n 3)) (d (+ n 4)) (e (+ n 5)) (g (+ n 6)) (h (+ n 7)) (i (+ n 8))) (+ a (+ b (+ c (+ d (+ e (+ g (+ h (+ i (dense (- n 1)))))))))))))";
+
+#[test]
+fn numeric_kernel_is_compiled_and_can_be_ablated() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kernel.scm");
+    fs::write(
+        &file,
+        format!("{DENSE} (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (list (fib 20) (dense 4000)))"),
+    )
+    .unwrap();
+    for fast in ["0", "1"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
+            .arg(&file)
+            .env("TECHNE_JIT", "1")
+            .env("TECHNE_JIT_SYNC", "1")
+            .env("TECHNE_JIT_FAST", fast)
+            .env("TECHNE_JIT_LOG", "1")
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{log}");
+        assert_eq!(out.stdout, b"(6765 64160000)");
+        for name in ["fib", "dense"] {
+            assert!(log.contains(&format!("jit: {name} compiled")), "{log}");
+            assert_eq!(log.contains(&format!("fast-jit: {name}")), fast == "1", "{log}");
+        }
+    }
+}
+
 #[test]
 fn recursive_fast_calls_preserve_values_exits_and_source_frames() {
     let cases = [
@@ -16,11 +46,16 @@ fn recursive_fast_calls_preserve_values_exits_and_source_frames() {
         "(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1))))) (f 16) (define old f) (set! f car) (old 3)",
         "(define (prod n x) (if (= n 0) x (* 2 (prod (- n 1) x)))) (define (hold) (let ((p (list 42))) (+ (prod 8 35184372088832) (car p)))) (display (hold))",
         "(define (mixed n x) (if (= n 0) x (+ 1 (mixed (- n 1) x)))) (guard (e (else (display 'caught))) (mixed 10 'bad))",
+        "(define (f n) (if (= n 0) 0 (if (< n 3) (+ 1 (alias (- n 1))) (+ 1 (f (- n 1)))))) (define alias f) (f 16) (set! alias car) (f 8)",
+        "(define hits 0) (define (f n) (if (= n 0) 0 (if (< n 3) (+ 1 (alias (- n 1))) (+ 1 (f (- n 1)))))) (define alias f) (f 16) (set! alias (lambda (n) (set! hits (+ hits 1)) (collect-garbage) 100)) (display (list (f 8) hits))",
+        "(define (arith n x y) (if (= n 0) (* x y) (+ (- x y) (arith (- n 1) x y)))) (display (list (arith 4 -140737488355328 -1) (arith 4 140737488355327 140737488355327) (arith 4 -140737488355328 0) (arith 4 70368744177664 -2)))",
     ];
+    let mut cases: Vec<String> = cases.into_iter().map(str::to_owned).collect();
+    cases.push(format!("{DENSE} (display (dense 4000))"));
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("fast-calls.scm");
     for source in cases {
-        fs::write(&file, source).unwrap();
+        fs::write(&file, &source).unwrap();
         let run = |jit: &str, fast: &str, stress: Option<&str>| {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_techne-vm"));
             cmd.arg(&file)

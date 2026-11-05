@@ -19,8 +19,10 @@ overflow or a changed procedure leaves the kernel, not a fabricated return.
 A companion native function takes `(ctx, bp, numeric arguments..., remaining)`
 and returns `(shifted fixnum result, status)`. There are no more than six
 arguments, even for tak. Only the ordinary pc-0 loader can enter it, after
-checking all arguments. OSR, non-numeric inputs and unsupported functions
-retain the original JIT and interpreter. The kernel uses one numeric SSA
+checking all arguments. Normal kernel status is zero; a high-bit marker
+keeps every cold status distinct, including EXIT at pc 0. The entry strips
+it before returning the original dispatch status. OSR, non-numeric inputs
+and unsupported functions retain the original JIT and interpreter. The kernel uses one numeric SSA
 form and does not carry both tags and unboxed values across recursive calls.
 
 ## Rooting and exact exits
@@ -28,8 +30,14 @@ form and does not carry both tags and unboxed values across recursive calls.
 The kernel cannot collect, grow registers or invoke arbitrary code. Calls
 check the expected closure, available virtual-register capacity, native depth
 and the same preemption fuel as the original JIT. Tail self-calls are jumps.
+The outer entry also requires its actual closure and every expected self
+callee to be the same object. This preserves the closure slot across tail
+jumps, including weak-key observations of otherwise unused environments;
+code identity alone is insufficient here. Distinct instances use the old path.
 Capacity is bounded using the largest call-frame advance; it is not reserved
-for an unconditional thousand frames in small worlds.
+for an unconditional thousand frames in small worlds. A kernel chain has at
+most 128 native activations (numeric live ranges can enlarge its frames),
+and consumes the original native-depth budget including its initial call.
 
 The outer entry retains normal frame initialization/publication. It records
 its frame base in the native-run context. On an innermost exceptional exit:
@@ -54,7 +62,10 @@ kernel. The ctx and register buffer stay valid throughout its native run.
 ## Compilation and lifetime budget
 
 This is a bounded companion, not a general second optimizing tier. Admit
-both functions' working/code memory. Keep the pair in one isolated arena so
+both functions' working/code memory, including separately rounded mappings.
+Recheck the optional working set against current owner accounting; on
+admission refusal try the ordinary compilation without the kernel.
+Keep the pair in one isolated arena so
 partial compilation failure can discard it whole. Charge both code mappings,
 retain the same code dependencies, and reclaim both together. Reuse the same
 Cranelift working contexts sequentially; do not create a new backend per call.
