@@ -60,7 +60,7 @@ ctrlc = "3.5"
 
 # Pinned: a young allocator under everything; upgrade deliberately.
 [target.'cfg(any(unix, windows))'.dependencies]
-rusty_alloc-api = { version = "=2.2.6", optional = true }
+rusty_alloc-api = { version = "=2.4.0", optional = true }
 
 [dev-dependencies]
 libtest-mimic = "0.8"
