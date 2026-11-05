@@ -40,6 +40,7 @@ use std::{
 
 pub(crate) mod held;
 mod host;
+mod jit_stats;
 pub(crate) mod meter;
 mod no_gc;
 pub use no_gc::{HeapAccess, HeapValue};
@@ -1085,6 +1086,8 @@ pub struct Vm {
     pub(crate) locals: FxHashMap<i64, Root>,
     /// Where standard output and error go (`Vm::capture_output`).
     pub(crate) out: crate::ports::Standard,
+    /// Optional, bounded diagnostics; absent in ordinary worlds. No roots.
+    jit_stats: Option<Box<jit_stats::Stats>>,
     /// The world's symbols, entered with it (`alloc::cage::enter`): a
     /// copy of its template's, or its own from the start. Declared last
     /// so every field that might print a symbol while dropping (roots,
@@ -1595,11 +1598,15 @@ impl Vm {
             jit_fuel: std::ptr::null_mut(),
             locals: FxHashMap::default(),
             out: crate::ports::Standard::process(),
+            jit_stats: None,
             symbols: Default::default(),
         };
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
         vm.regs.budget().set_limit(vm.memory_limit.saturating_mul(3));
+        if std::env::var_os("TECHNE_JIT_STATS").is_some() {
+            vm.jit_stats = jit_stats::Stats::new(vm.regs.budget());
+        }
         vm
     }
 
@@ -3327,7 +3334,7 @@ impl Vm {
     pub(crate) fn make_list_raw(&mut self, items: &[Value]) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(items);
-        let mut bulk = crate::builtins::Bulk::reserve(self, 3 * items.len());
+        let mut bulk = crate::builtins::Bulk::reserve_list(self, 3 * items.len());
         let mut acc = Value::NIL;
         for i in (mark..self.scratch.len()).rev() {
             acc = bulk.pair(self, self.scratch[i], acc);
@@ -4843,6 +4850,7 @@ impl Vm {
                             let status = (res >> 32) as u32;
                             pc = res as u32 as usize;
                             if status == crate::jit::RETURNED {
+                                self.note_jit_exit(code, pc, bp, status);
                                 r = self.regs.as_mut_ptr().add(bp);
                                 ret!(*r.sub(1));
                                 continue;
@@ -4853,6 +4861,7 @@ impl Vm {
                             code = ctx.code;
                             ops = (*code).ops.as_ptr();
                             bp = ctx.bp as usize;
+                            self.note_jit_exit(code, pc, bp, status);
                             // A native called from JIT code may have grown the register stack.
                             r = self.regs.as_mut_ptr().add(bp);
                             match status {
@@ -5083,6 +5092,7 @@ impl Vm {
                         }
                         Op::Call { base, n } | Op::TailCall { base, n } => {
                             let f = reg!(base);
+                            self.observe_call(code, pc - 1, f);
                             let tail = matches!(op, Op::TailCall { .. });
                             if is_kind(f, Kind::Closure) {
                                 call_closure!(f, base, n, tail);
@@ -5204,6 +5214,24 @@ impl Vm {
         }));
     }
 
+    /// Bounded indirect-call feedback, without allocation or roots. Code
+    /// ids are hints only: resolve live ids again before taking addresses.
+    #[inline]
+    fn observe_call(&self, code: *const Code, pc: usize, f: Value) {
+        let jit = unsafe { &(*code).jit };
+        if jit.failed.get() || self.jit_threshold == u32::MAX || !crate::jit::feedback_enabled() {
+            return;
+        }
+        let target = if f.is_native() {
+            crate::jit::CallTarget::Native(f.as_native() as u32)
+        } else if is_kind(f, Kind::Closure) {
+            crate::jit::CallTarget::Code(code_slot(unsafe { field(f.as_ptr(), 0) }) as u32)
+        } else {
+            crate::jit::CallTarget::Other
+        };
+        jit.calls.borrow_mut().observe(pc as u32, target);
+    }
+
     /// Queue a hot function for compilation (or compile it now in sync mode).
     #[cold]
     unsafe fn jit_compile(&mut self, code: *const Code, seen: Option<(usize, usize)>) {
@@ -5251,14 +5279,40 @@ impl Vm {
             .collect();
         // Globals called that hold plain Rust natives now: calls of the same
         // native call it directly.
-        let known_native = |g: u32| {
-            let v = self.globals[g as usize];
+        let known_native_value = |v: Value| {
             let native = self.natives.get(v.as_native()).filter(|_| v.is_native() && v != self.apply_native)?;
             let NativeImpl::Plain(_, f) = native.f else { return None };
             let inline = self.jit_inline.iter().find(|(x, _)| *x == v).map(|&(_, i)| i);
             let fixnum = self.jit_fixnum.contains(&v);
             Some(crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline, fixnum })
         };
+        let known_native = |g: u32| known_native_value(self.globals[g as usize]);
+        let mut closure_calls = std::collections::HashMap::new();
+        let mut native_calls = std::collections::HashMap::new();
+        for (pc, target) in c.jit.calls.borrow().iter() {
+            match target {
+                crate::jit::CallTarget::Code(id) if self.code_live(id) => {
+                    let callee = self.code(id);
+                    closure_calls.insert(
+                        pc,
+                        crate::jit::Known {
+                            closure: None,
+                            id,
+                            code: callee as *const Code as usize,
+                            nparams: callee.nparams,
+                            rest: callee.rest,
+                            frame_size: callee.frame_size,
+                        },
+                    );
+                }
+                crate::jit::CallTarget::Native(id) => {
+                    if let Some(k) = known_native_value(Value::native(id)) {
+                        native_calls.insert(pc, k);
+                    }
+                }
+                _ => {}
+            }
+        }
         // Calls of small functions globals hold run inline (and the calls
         // of small functions in those, nested). Native code leaving inside
         // one makes its frame, which the interpreter then runs from its
@@ -5268,11 +5322,22 @@ impl Vm {
         let handlers = orig.iter().any(|op| matches!(op, Op::PushHandler { .. } | Op::PushEscape { .. }));
         let mut inlined = std::collections::HashMap::new();
         for (pc, op) in orig.iter().enumerate().filter(|_| jit_inlines()) {
-            let (Op::CallG { n, g, .. } | Op::TailCallG { n, g, .. }) = *op else { continue };
-            if matches!(op, Op::TailCallG { .. }) && handlers {
-                continue;
-            }
-            if let Some(inlinee) = unsafe { self.jit_inlinee(g, n, 1, &mut vec![code], &known_native) } {
+            let inlinee = match *op {
+                Op::CallG { n, g, .. } | Op::TailCallG { n, g, .. } => {
+                    if matches!(op, Op::TailCallG { .. }) && handlers {
+                        continue;
+                    }
+                    unsafe { self.jit_inlinee(g, n, 1, &mut vec![code], &known_native) }
+                }
+                // Non-tail indirect calls keep their actual closure in
+                // the base register below the callee's registers. Tail
+                // indirect calls use the guarded compiled-call path.
+                Op::Call { n, .. } => closure_calls
+                    .get(&(pc as u32))
+                    .and_then(|k| unsafe { self.jit_inline_code(k.code as *const Code, n, 1, &mut vec![code], &known_native) }),
+                _ => None,
+            };
+            if let Some(inlinee) = inlinee {
                 inlined.insert(pc as u32, inlinee);
             }
         }
@@ -5297,7 +5362,7 @@ impl Vm {
         inlined.values().for_each(|i| nested_globals(i, &mut known));
         known.sort_unstable();
         known.dedup();
-        if c.jit.callees.get().is_none() && !known.is_empty() {
+        if c.jit.callees.get().is_none() && (!known.is_empty() || !closure_calls.is_empty()) {
             self.jit_callers.push(c);
         }
         let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
@@ -5308,6 +5373,7 @@ impl Vm {
             let code_id = |v: Value| code_slot(unsafe { field(v.as_ptr(), 0) }) as u32;
             let mut deps = c.jit.deps.borrow_mut();
             deps.extend(callees.iter().map(|&v| code_id(v)));
+            deps.extend(closure_calls.values().map(|k| k.id));
             deps.extend(known.iter().map(|&g| self.globals[g as usize]).filter(|&v| is_kind(v, Kind::Closure)).map(code_id));
             deps.sort_unstable();
             deps.dedup();
@@ -5357,6 +5423,8 @@ impl Vm {
             heads,
             captures,
             native_globals,
+            closure_calls,
+            native_calls,
             inlined,
             closure_globals: known
                 .iter()
@@ -5364,7 +5432,8 @@ impl Vm {
                 .map(|(&g, closure)| {
                     let callee = unsafe { &*self.closure_code(*closure) };
                     let known = crate::jit::Known {
-                        closure: closure as *const Value as usize,
+                        closure: Some(closure as *const Value as usize),
+                        id: code_slot(unsafe { field(closure.as_ptr(), 0) }) as u32,
                         code: callee as *const Code as usize,
                         nparams: callee.nparams,
                         rest: callee.rest,
@@ -5401,7 +5470,17 @@ impl Vm {
         if !is_kind(v, Kind::Closure) {
             return None;
         }
-        let callee = self.closure_code(v);
+        unsafe { self.jit_inline_code(self.closure_code(v), n, depth, outer, known_native) }
+    }
+
+    unsafe fn jit_inline_code(
+        &self,
+        callee: *const Code,
+        n: u16,
+        depth: usize,
+        outer: &mut Vec<*const Code>,
+        known_native: &dyn Fn(u32) -> Option<crate::jit::KnownNative>,
+    ) -> Option<crate::jit::Inlinee> {
         if outer.contains(&callee) {
             return None;
         }

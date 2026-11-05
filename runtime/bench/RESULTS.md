@@ -4,6 +4,24 @@ The tables are the record. A run's raw output lands in `results/`
 (gitignored, like `http/results/`): rerun `run.sh` to reproduce a
 table, and see gh-pages for CI's instruction-count history.
 
+## Bounded runtime improvements, 2026-11-05
+
+Against `eda95c01`, on an EPYC 3151: indirect-call control **28.9 → 8.6 ms**,
+HOF **575 → 342 ms**, and HOF peak RSS over ten calls **738 → 97 MiB**.
+The default nursery stays 8 MiB. Most other existing workloads remain
+essentially flat. Native compilation remains close to baseline; no general
+optimizing tier or recompilation was added.
+
+See [HILLCLIMB.md](HILLCLIMB.md) for the full table, instruction-count
+ablations, compilation costs, rejected allocation policy and reproduction
+with the Scheme [compare.scm](compare.scm) harness. These are before/after
+Techne measurements, not a new V8-parity claim.
+
+The [follow-up investigation](INVESTIGATION.md) finds normal compiled-call
+pressure rather than frequent deoptimization in fib/tak, rejects a numeric
+register-retention experiment, and fixes the retained compiler-workspace test
+without loosening it. The final runtime timings stay essentially unchanged.
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror

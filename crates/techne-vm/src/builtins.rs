@@ -58,6 +58,26 @@ impl Bulk {
             Bulk { p: std::ptr::null_mut(), old: true }
         }
     }
+
+    /// A list of small pairs is not one large object. Let it use the
+    /// existing nursery rather than individually allocating every pair in
+    /// old space above the general bulk allocator's half-nursery cutoff.
+    pub fn list(vm: &mut Vm, count: usize) -> Result<Bulk, Error> {
+        let words = 3 * count;
+        if words > vm.heap.nursery_capacity() {
+            vm.admit_items(words, 8, 0)?;
+        }
+        Ok(Bulk::reserve_list(vm, words))
+    }
+
+    /// `list` without admitting: its pair words have already been admitted.
+    pub fn reserve_list(vm: &mut Vm, words: usize) -> Bulk {
+        if words <= vm.heap.nursery_capacity() {
+            Bulk { p: vm.reserve_nursery(words), old: false }
+        } else {
+            Bulk { p: std::ptr::null_mut(), old: true }
+        }
+    }
     pub fn take(&mut self, vm: &mut Vm, words: usize) -> *mut u64 {
         if self.old {
             return vm.heap.alloc_old(words);
@@ -1424,7 +1444,7 @@ fn set_pair(vm: &mut Vm, args: usize, i: usize, who: &str) -> R {
 }
 
 fn list(vm: &mut Vm, args: usize, n: usize) -> R {
-    let mut b = Bulk::new(vm, 3 * n)?;
+    let mut b = Bulk::list(vm, n)?;
     let mut acc = Value::NIL;
     for i in (0..n).rev() {
         let car = arg(vm, args, i);
@@ -1439,7 +1459,7 @@ fn length(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn reverse(vm: &mut Vm, args: usize, _: usize) -> R {
     let len = list_len(arg(vm, args, 0), "reverse")?;
-    let mut b = Bulk::new(vm, 3 * len)?;
+    let mut b = Bulk::list(vm, len)?;
     let mut acc = Value::NIL;
     let mut l = arg(vm, args, 0);
     while is_kind(l, Kind::Pair) {
@@ -1457,7 +1477,7 @@ fn append(vm: &mut Vm, args: usize, n: usize) -> R {
     let total = (0..n - 1).map(|i| list_len(arg(vm, args, i), "append")).sum::<Result<usize, _>>()?;
     // Pairs, and the items gathered first.
     vm.admit_items(total, 32, 0)?;
-    let mut b = Bulk::new(vm, 3 * total)?;
+    let mut b = Bulk::list(vm, total)?;
     let mut result = arg(vm, args, n - 1);
     let items: Vec<Value> = (0..n - 1).flat_map(|i| list_items(arg(vm, args, i))).collect();
     for car in items.into_iter().rev() {
@@ -2502,6 +2522,28 @@ pub(crate) fn install(vm: &mut Vm) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_lists_use_all_of_the_existing_nursery_and_survive_collection() {
+        for fits in [true, false] {
+            let mut vm = Vm::bare();
+            let _world = vm.enter_account();
+            let capacity = vm.heap.nursery_capacity();
+            let count = if fits { capacity / 4 } else { capacity / 3 + 1 };
+            let mut bulk = Bulk::list(&mut vm, count).unwrap();
+            assert_eq!(bulk.old, !fits);
+            let mut list = Value::NIL;
+            for i in 0..count {
+                list = bulk.pair(&mut vm, Value::int_unchecked(i as i64), list);
+            }
+            let list = vm.root(list);
+            vm.full_collect_raw();
+            let items = list_values(list.get()).unwrap();
+            assert_eq!(items.len(), count);
+            assert_eq!(items.first().unwrap().as_int(), count as i64 - 1);
+            assert_eq!(items.last().unwrap().as_int(), 0);
+        }
+    }
 
     /// Printing stops at its limit for every kind of value, escapes, symbols
     /// and ratios included.

@@ -170,6 +170,10 @@ const GUARD_TICK: u32 = 12;
 pub struct JitSlot {
     /// Loop back-edges taken so far (until compiled).
     pub hot: Cell<u32>,
+    /// A few indirect sites, observed only while interpreting before the
+    /// one compilation. No heap values or addresses: feedback cannot keep
+    /// a closure alive, and a code id is resolved afresh when queued.
+    pub calls: RefCell<CallFeedback>,
     pub entry: Cell<Option<JitFn>>,
     /// `entry` if the function can be entered at pc 0 (by native calls).
     pub call_entry: Cell<Option<JitFn>>,
@@ -196,6 +200,46 @@ pub struct JitSlot {
 impl fmt::Debug for JitSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "JitSlot {{ compiled: {} }}", self.entry.get().is_some())
+    }
+}
+
+/// One target per indirect call site; a second target makes it generic.
+/// The fixed budget bounds both profiling memory and specialization work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallTarget {
+    Code(u32),
+    Native(u32),
+    Other,
+}
+
+#[derive(Default)]
+pub struct CallFeedback([(u32, Option<CallTarget>); 4]);
+
+/// Developer ablation: no observation and no indirect specialization.
+#[inline]
+pub fn feedback_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TECHNE_JIT_FEEDBACK").as_deref() != Ok("0"))
+}
+
+impl CallFeedback {
+    pub fn observe(&mut self, pc: u32, target: CallTarget) {
+        for (site, seen) in &mut self.0 {
+            if seen.is_none() {
+                (*site, *seen) = (pc, Some(target));
+                break;
+            }
+            if *site == pc {
+                if *seen != Some(target) {
+                    *seen = Some(CallTarget::Other);
+                }
+                break;
+            }
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u32, CallTarget)> + '_ {
+        self.0.iter().filter_map(|&(pc, target)| target.filter(|t| *t != CallTarget::Other).map(|t| (pc, t)))
     }
 }
 
@@ -265,6 +309,11 @@ fn kept(ops: usize) -> usize {
 /// pages of its own).
 const PAGE: usize = 4096;
 
+// Reusing the ordinary ~500-instruction buffers saves compilation work.
+// A rare 3,467-instruction loader retained about 3 MiB indefinitely.
+const MAX_CACHED_INSTS: usize = 2048;
+const MAX_CACHED_REGS: usize = 256;
+
 struct Jit {
     isa: cranelift_codegen::isa::OwnedTargetIsa,
     /// The last of a generation's arenas is where its functions go.
@@ -272,6 +321,8 @@ struct Jit {
     arena_ids: u32,
     ctx: Context,
     fctx: FunctionBuilderContext,
+    /// The last job exceeded the working-buffer reuse budget.
+    oversized_buffers: bool,
     usage: std::sync::Arc<Usage>,
     /// The world's, which its machine code and its compiling are charged to.
     budget: crate::alloc::Budget,
@@ -318,6 +369,10 @@ pub struct Job {
     /// Globals called by this code that held plain Rust natives when it was
     /// queued; calls of those natives call them directly.
     pub native_globals: HashMap<u32, KnownNative>,
+    /// Monomorphic indirect sites, by original pc. Code ids were resolved
+    /// and their dependencies retained before this self-contained job.
+    pub closure_calls: HashMap<u32, Known>,
+    pub native_calls: HashMap<u32, KnownNative>,
     /// Calls and tail calls through globals (by pc) of small functions
     /// (`inlinable`) that native code runs inline, the global holding
     /// their closure (`closure_globals`).
@@ -510,12 +565,20 @@ struct Site {
     start: usize,
     code: i64,
     frame: u16,
-    /// Where the closure called is (`Known::closure`): a GC root, so
-    /// current after anything that collects, and the closure running
-    /// (the call's guard compared it), even if the global changed since.
-    closure: i64,
+    /// The actual closure: a global's GC-updated root, or an indirect
+    /// non-tail call's live base register (not a sampled instance).
+    closure: SiteClosure,
     consts: i64,
     const_bits: Vec<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum SiteClosure {
+    /// A global call's expected closure, in a GC-updated root.
+    Root(i64),
+    /// An indirect non-tail call's actual closure. Its base is below all
+    /// callee registers, stays live until return, and moves with the GC.
+    Register(Reg),
 }
 
 /// What a return of a function inlined does: the caller's own return, or a
@@ -596,9 +659,10 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>, Vec<Option<u
         calls.iter().map(|&call| (call as usize, &job.inlined[&call], None)).collect();
     let mut sites: Vec<Site> = Vec::new();
     while let Some((call, inl, parent)) = todo.pop_front() {
-        let (tail, base, args, g) = match ops[call] {
-            Op::CallG { base, n, g } => (false, base, n, g),
-            Op::TailCallG { base, n, g } => (true, base, n, g),
+        let (tail, base, args, closure) = match ops[call] {
+            Op::CallG { base, n, g } => (false, base, n, SiteClosure::Root(job.closure_globals[&g].closure.unwrap() as i64)),
+            Op::TailCallG { base, n, g } => (true, base, n, SiteClosure::Root(job.closure_globals[&g].closure.unwrap() as i64)),
+            Op::Call { base, n } => (false, base, n, SiteClosure::Register(base)),
             op => unreachable!("inlined call: {op:?}"),
         };
         let site = sites.len();
@@ -677,7 +741,7 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>, Vec<Option<u
             start,
             code: inl.code as i64,
             frame: inl.frame_size,
-            closure: job.closure_globals[&g].closure as i64,
+            closure,
             consts: inl.consts_addr as i64,
             const_bits: inl.consts.clone(),
         });
@@ -799,8 +863,11 @@ impl Inline {
 #[derive(Clone, Copy)]
 pub struct Known {
     /// Where the closure the global held is (in `JitSlot::callees`): a call
-    /// of that same closure needs no other check.
-    pub closure: usize,
+    /// of that same closure needs no other check. None for an indirect site.
+    pub closure: Option<usize>,
+    /// For an indirect call, guard the code id, not closure identity:
+    /// different instances of a capturing lambda use the actual instance.
+    pub id: u32,
     pub code: usize,
     pub nparams: u16,
     pub rest: bool,
@@ -871,9 +938,31 @@ impl Compiler {
                             continue;
                         }
                     };
+                    let memory_log = std::env::var_os("TECHNE_JIT_MEMORY").is_some();
+                    let held_before = if memory_log { jit.budget.accounted() } else { 0 };
                     let started = std::time::Instant::now();
                     let cancelled = job.cancelled.load(std::sync::atomic::Ordering::Relaxed);
                     let (entry, arena) = if cancelled { (None, 0) } else { jit.compile(&job) };
+                    let held_after = if memory_log { jit.budget.accounted() } else { 0 };
+                    // Keep small-function buffers warm, not a rare loader's
+                    // multi-megabyte high-water mark. The arenas/executable
+                    // code are independent. 0/1 force drop/keep for ablation.
+                    let cache = std::env::var("TECHNE_JIT_CACHE").ok();
+                    if cache.as_deref() == Some("0") || (cache.as_deref() != Some("1") && jit.oversized_buffers) {
+                        jit.ctx = Context::new();
+                        jit.fctx = FunctionBuilderContext::new();
+                        jit.oversized_buffers = false;
+                    }
+                    if memory_log {
+                        eprintln!(
+                            "jit-memory: {} before={} compiled={} cached={} machine={}",
+                            job.name,
+                            held_before,
+                            held_after,
+                            jit.budget.accounted(),
+                            jit.usage.bytes.load(std::sync::atomic::Ordering::Relaxed)
+                        );
+                    }
                     let done =
                         Done { id: job.id, entry, arena, heads: job.heads, name: job.name, ops: job.ops.len(), time: started.elapsed() };
                     if done_tx.send(done).is_err() {
@@ -1002,7 +1091,10 @@ fn jit_poisoned(vm: *mut Vm) -> Error {
 
 unsafe extern "C" fn jit_step(vm: *mut Vm, bp: usize, op: *const Op) -> u32 {
     unsafe {
-        match catch_jit(vm, |vm| vm.jit_slow_op(bp, *op)) {
+        match catch_jit(vm, |vm| {
+            vm.note_jit_helper(0);
+            vm.jit_slow_op(bp, *op)
+        }) {
             Some(Ok(false)) => 0,
             Some(Ok(true)) => 1,
             Some(Err(e)) => {
@@ -1147,7 +1239,10 @@ unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64,
 /// callee handed over to the interpreter; its result is in `ctx.res`).
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base: u64, n: u64, depth: u64, f: u64) -> u64 {
-    match catch_jit(vm, |_| unsafe { jit_call_slow_inner(vm, ctx, bp, base, n, depth, f) }) {
+    match catch_jit(vm, |vm| {
+        vm.note_jit_helper(1);
+        unsafe { jit_call_slow_inner(vm, ctx, bp, base, n, depth, f) }
+    }) {
         Some(status) => status,
         None => {
             let vm_ref = unsafe { &mut *vm };
@@ -1202,6 +1297,7 @@ unsafe fn jit_call_slow_inner(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base: u64,
 /// register stack or globals moved).
 unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u64) -> u64 {
     let status = catch_jit(vm, |vm| {
+        vm.note_jit_helper(2);
         let (f, bp) = (Value::from_bits(f), bp as usize);
         if f.is_native() && f != vm.apply_native {
             return call_native(vm, f, bp + base as usize, n as usize, bp - 1);
@@ -1281,7 +1377,17 @@ impl Regs {
         Regs(self.0.iter().zip(&o.0).map(|(a, b)| a & !b).collect())
     }
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(w, bits)| (0..64).filter(move |i| bits & (1 << i) != 0).map(move |i| w * 64 + i))
+        self.0.iter().enumerate().flat_map(|(w, &bits)| {
+            let mut bits = bits;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let i = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(w * 64 + i)
+            })
+        })
     }
 }
 
@@ -1380,6 +1486,8 @@ struct Flow {
 
 /// The control flow of the instructions compiled (`combine`).
 struct Shape {
+    /// Computed once, shared by the kind, liveness and dirtiness analyses.
+    effects: Vec<(Vec<Reg>, Vec<Reg>)>,
     /// Each instruction's successors: an inlined call's include the start
     /// of its callee's instructions.
     succs: Vec<Vec<usize>>,
@@ -1408,14 +1516,14 @@ impl Shape {
 fn analyze(
     ops: &[Op],
     n: usize,
-    captures: &HashMap<u32, Vec<Reg>>,
+    _captures: &HashMap<u32, Vec<Reg>>,
     self_jump: bool,
     fix: &[Regs],
     native: impl Fn(usize) -> Option<bool>,
     shape: &Shape,
 ) -> Flow {
     let len = ops.len();
-    let effects: Vec<_> = ops.iter().map(|op| uses_defs(op, captures)).collect();
+    let effects = &shape.effects;
     let succs = &shape.succs;
     let mut live_in = vec![Regs::empty(n); len];
     let mut live_out = vec![Regs::empty(n); len];
@@ -1462,7 +1570,7 @@ fn analyze(
                 // A known native's value stays in a machine register. Its
                 // call writes registers back (unless inline) but for known
                 // fixnums, and keeps them or re-reads them.
-                (Op::CallG { base, .. }, Some(inline)) => {
+                (Op::CallG { base, .. } | Op::Call { base, .. }, Some(inline)) => {
                     let mut d = if inline {
                         dirty_in[pc].clone()
                     } else if shape.inlined[pc] {
@@ -1557,7 +1665,7 @@ fn fixnums(
             Op::Quo { dst, .. } | Op::Rem { dst, .. } | Op::Mod { dst, .. } => Some((dst, true)),
             // An inlined call returns a fixnum if each of its callee's
             // returns does (`Gen::call_op` checks the call's result).
-            Op::CallG { base, .. } => {
+            Op::CallG { base, .. } | Op::Call { base, .. } => {
                 let results = shape.results.get(&pc);
                 Some((base, fixnum_call(pc) || results.is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
             }
@@ -1588,6 +1696,9 @@ fn flonums(
             Op::Mov { dst, src } => Some((dst, has(src))),
             Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) || has(b))),
             Op::AddI { dst, a, .. } => Some((dst, has(a))),
+            Op::Call { base, .. } | Op::CallG { base, .. } => {
+                Some((base, shape.results.get(&pc).is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
+            }
             _ => None,
         }
     };
@@ -1693,6 +1804,21 @@ fn vectors(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usi
     known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
 }
 
+/// Pair kinds cannot change, even across calls or collections. A
+/// successful access proves its operand a pair (unless overwritten).
+fn pairs(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usize], shape: &Shape) -> Vec<Regs> {
+    let step = |pc: usize, known: &[Regs]| match ops[pc] {
+        Op::Cons { dst, .. } => Some((dst, true)),
+        Op::Mov { dst, src } => Some((dst, known[pc].contains(src))),
+        _ => None,
+    };
+    let also = |pc: usize| match ops[pc] {
+        Op::Car { dst, a } | Op::Cdr { dst, a } if dst != a => Some(a),
+        _ => None,
+    };
+    known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
+}
+
 /// The registers whose kind some instruction uses: operands of arithmetic
 /// and comparisons, and vector indices, and what is moved into them.
 fn kind_used(ops: &[Op], n: usize) -> Regs {
@@ -1744,7 +1870,7 @@ fn kind_used(ops: &[Op], n: usize) -> Regs {
 fn known_regs(
     ops: &[Op],
     n: usize,
-    captures: &HashMap<u32, Vec<Reg>>,
+    _captures: &HashMap<u32, Vec<Reg>>,
     heads: &[usize],
     shape: &Shape,
     assumed: &HashMap<usize, Regs>,
@@ -1782,10 +1908,14 @@ fn known_regs(
     // What is known after the instruction at `pc`, on its edge to `s`.
     let out = |known: &[Regs], pc: usize, s: usize| {
         let mut k = known[pc].clone();
-        match step(pc, known) {
-            Some((dst, true)) => k.insert(dst),
-            Some((dst, false)) => k.remove(dst),
-            None => uses_defs(&ops[pc], captures).1.iter().for_each(|&d| k.remove(d)),
+        // Entering an inlinee is before the call's result exists. In
+        // particular an indirect call's base still holds its closure.
+        if shape.fresh(pc, s).is_none() {
+            match step(pc, known) {
+                Some((dst, true)) => k.insert(dst),
+                Some((dst, false)) => k.remove(dst),
+                None => shape.effects[pc].1.iter().for_each(|&d| k.remove(d)),
+            }
         }
         if let Some(r) = also(pc) {
             k.insert(r);
@@ -1841,7 +1971,16 @@ impl Jit {
         flags.set("is_pic", "false").ok()?;
         flags.set("enable_verifier", "false").ok()?;
         let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
-        Some(Jit { isa, arenas: Vec::new(), arena_ids: 0, ctx: Context::new(), fctx: FunctionBuilderContext::new(), usage, budget })
+        Some(Jit {
+            isa,
+            arenas: Vec::new(),
+            arena_ids: 0,
+            ctx: Context::new(),
+            fctx: FunctionBuilderContext::new(),
+            oversized_buffers: false,
+            usage,
+            budget,
+        })
     }
 
     /// The index of the arena to compile `generation`'s code into: its
@@ -1876,6 +2015,7 @@ impl Jit {
 
     /// The function and the arena it is in.
     fn compile(&mut self, job: &Job) -> (Option<JitFn>, u32) {
+        self.oversized_buffers = false;
         let i = self.arena(job.generation);
         // What compiling takes while it runs and what it makes, reserved
         // before: past the world's ceiling the function is not compiled.
@@ -1924,7 +2064,23 @@ impl Jit {
         let n = sites.iter().map(|s| (s.off + s.frame) as usize).fold(frame, usize::max);
         let own_len = job.ops.len();
         let site_at: HashMap<usize, usize> = sites.iter().enumerate().map(|(i, s)| (s.call, i)).collect();
+        let effects = ops
+            .iter()
+            .enumerate()
+            .map(|(pc, op)| {
+                let (mut uses, defs) = uses_defs(op, &job.captures);
+                if let Some(o) = origin[pc] {
+                    if let SiteClosure::Register(r) = sites[root(&sites, o.site)].closure {
+                        // Exits can materialize the actual captured environment
+                        // at any instruction, including inside a nested inlinee.
+                        uses.push(r);
+                    }
+                }
+                (uses, defs)
+            })
+            .collect();
         let shape = Shape {
+            effects,
             succs: ops
                 .iter()
                 .enumerate()
@@ -2063,6 +2219,7 @@ impl Jit {
             heads,
             |pc| match orig[pc] {
                 Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
+                Op::Call { .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.fixnum),
                 _ => false,
             },
             &shape,
@@ -2080,8 +2237,14 @@ impl Jit {
         let cached = cached_globals(orig, &shape.succs, &sites.iter().map(|s| s.call).collect::<Vec<_>>());
         let vec_globals: Vec<u32> = cached.iter().filter(|c| c.1).map(|c| c.0).collect();
         let vecs = vectors(orig, n, &job.captures, heads, &shape, &vec_globals);
+        let pairs = if std::env::var("TECHNE_JIT_PAIRS").as_deref() == Ok("0") {
+            vec![Regs::empty(n); orig.len()]
+        } else {
+            pairs(orig, n, &job.captures, heads, &shape)
+        };
         let inline = |pc: usize| match orig[pc] {
             Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
+            Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n).is_some()),
             _ => false,
         };
         let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline);
@@ -2108,6 +2271,7 @@ impl Jit {
                 &fix,
                 |pc| match orig[pc] {
                     Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
+                    Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).map(|k| k.inline(n).is_some()),
                     _ => None,
                 },
                 &shape,
@@ -2115,6 +2279,7 @@ impl Jit {
             fix,
             flo,
             vecs,
+            pairs,
             ant,
             lens: (0..n).map(|_| (b.declare_var(I64), b.declare_var(I64))).collect(),
             cached: cached
@@ -2139,6 +2304,8 @@ impl Jit {
             sigs,
             closure_globals: job.closure_globals.clone(),
             native_globals: job.native_globals.clone(),
+            closure_calls: job.closure_calls.clone(),
+            native_calls: job.native_calls.clone(),
             own,
             consts: job.consts_addr as i64,
             const_bits: job.consts.clone(),
@@ -2196,6 +2363,13 @@ impl Jit {
                 let x = g.get(&mut b, r as Reg);
                 let lens = g.lens_of(&mut b, x);
                 g.set_lens(&mut b, r as Reg, lens);
+            }
+            // Pair facts hold on compiled paths, not necessarily on an
+            // interpreter/OSR entry (an earlier access may have raised).
+            for r in g.pairs[h].and(&g.flow.live_in[h]).iter() {
+                let x = g.get(&mut b, r as Reg);
+                let interpret = g.exit(&mut b, h, INTERPRET);
+                g.check_kind(&mut b, x, Kind::Pair, interpret);
             }
             // The interpreter may have stored something else where native
             // code knows fixnums or floats.
@@ -2289,9 +2463,10 @@ impl Jit {
         g.finish_inline_exits(&mut b);
         b.seal_all_blocks();
         b.finalize(frontend);
+        let f = &self.ctx.func;
+        let insts: usize = f.layout.blocks().map(|bl| f.layout.block_insts(bl).count()).sum();
+        self.oversized_buffers = insts > MAX_CACHED_INSTS || n > MAX_CACHED_REGS;
         if std::env::var_os("TECHNE_JIT_IR").is_some() {
-            let f = &self.ctx.func;
-            let insts: usize = f.layout.blocks().map(|bl| f.layout.block_insts(bl).count()).sum();
             eprintln!(
                 "ir: {} {} ops ({} inlined at {} calls, {} tail) -> {} blocks, {insts} insts",
                 job.name,
@@ -2367,6 +2542,8 @@ struct Gen {
     flo: Vec<Regs>,
     /// Registers whose `lens` are kept, by pc (`vectors`).
     vecs: Vec<Regs>,
+    /// Registers known pairs on compiled paths (`pairs`).
+    pairs: Vec<Regs>,
     /// The globals kept native code may read, by pc (`anticipated`).
     ant: Vec<u16>,
     /// By register: the length of the vector it holds if it is one, and
@@ -2404,6 +2581,8 @@ struct Gen {
     sigs: Sigs,
     closure_globals: HashMap<u32, Known>,
     native_globals: HashMap<u32, KnownNative>,
+    closure_calls: HashMap<u32, Known>,
+    native_calls: HashMap<u32, KnownNative>,
     /// This function, for direct recursive calls.
     own: ir::FuncRef,
     consts: i64,
@@ -2638,8 +2817,13 @@ impl Gen {
     /// The closure the call inlined at `site` called, read anew: what
     /// native code held of it is stale after a collection.
     fn site_closure(&self, b: &mut FunctionBuilder, site: usize) -> ir::Value {
-        let addr = b.ins().iconst(I64, self.sites[site].closure);
-        b.ins().load(I64, flags(), addr, 0)
+        match self.sites[site].closure {
+            SiteClosure::Root(addr) => {
+                let addr = b.ins().iconst(I64, addr);
+                b.ins().load(I64, flags(), addr, 0)
+            }
+            SiteClosure::Register(r) => self.get(b, r),
+        }
     }
 
     /// The closure running instruction `pc`: the frame's, or that of the
@@ -2931,10 +3115,7 @@ impl Gen {
             b.ins().jump(slow, &[]);
             return None;
         }
-        let addr = b.ins().iconst(I64, k.closure as i64);
-        let expected = b.ins().load(I64, flags(), addr, 0);
-        let same = b.ins().icmp(IntCC::Equal, f, expected);
-        Self::guard(b, same, slow);
+        self.check_callee(b, f, k, slow);
         let end = b.ins().iadd_imm_s(frame, k.frame_size as i64 * 8);
         let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, self.regs_end);
         Self::guard(b, fits, slow);
@@ -2947,6 +3128,24 @@ impl Gen {
         let compiled = b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
         Self::guard(b, compiled, slow);
         Some(Target::Entry(entry))
+    }
+
+    /// A global's rooted closure, or an indirect site's observed code.
+    fn check_callee(&self, b: &mut FunctionBuilder, f: ir::Value, k: Known, slow: Block) {
+        let same = match k.closure {
+            Some(addr) => {
+                let addr = b.ins().iconst(I64, addr as i64);
+                let expected = b.ins().load(I64, flags(), addr, 0);
+                b.ins().icmp(IntCC::Equal, f, expected)
+            }
+            None => {
+                let p = self.check_kind(b, f, Kind::Closure, slow);
+                let w = b.ins().load(I64, flags(), p, 8);
+                let id = b.ins().band_imm_s(w, crate::heap::CODE_MASK as i64);
+                b.ins().icmp_imm_s(IntCC::Equal, id, k.id as i64)
+            }
+        };
+        Self::guard(b, same, slow);
     }
 
     /// For a call of `f` with `n` arguments whose frame starts at `frame`:
@@ -3398,13 +3597,14 @@ impl Gen {
         b.append_block_param(bail, I64);
         let returned = b.create_block();
         b.append_block_param(returned, I64);
-        // Calls through globals that hold no closure skip the inline path.
-        let known = global.and_then(|g| self.closure_globals.get(&g).copied());
-        let native = global.and_then(|g| self.native_globals.get(&g).copied());
+        // Globals and observed monomorphic indirect calls share the paths.
+        let known = global.map_or_else(|| self.closure_calls.get(&(pc as u32)), |g| self.closure_globals.get(&g)).copied();
+        let native = global.map_or_else(|| self.native_calls.get(&(pc as u32)), |g| self.native_globals.get(&g)).copied();
         let fixnum = native.is_some_and(|k| k.fixnum);
         // What native code knows a fixnum after the call, whatever path
         // the call took.
         let checked = self.fix.get(next).is_some_and(|f| f.contains(base));
+        let checked_float = self.flo.get(next).is_some_and(|f| f.contains(base));
         if let Some(k) = native {
             self.known_native(b, pc, base, n, f, k, slow, returned, false, |g, b, v| {
                 if fixnum {
@@ -3469,6 +3669,13 @@ impl Gen {
             Self::guard(b, int, other);
             let s = Self::shifted(b, x);
             b.def_var(self.shifts[base as usize], s);
+        } else if checked_float {
+            let x = self.get(b, base);
+            let float = Self::is_float(b, x);
+            let other = self.exit(b, next, RESUME);
+            Self::guard(b, float, other);
+            let f = b.ins().bitcast(F64, MemFlagsData::new(), x);
+            b.def_var(self.fvals[base as usize], f);
         }
         self.jump(b, next);
     }
@@ -3476,14 +3683,18 @@ impl Gen {
     /// Run the callee of call `pc` inline (`sites[site]`) if `f` is the
     /// closure it expects, else go to `slow`.
     fn enter_inlined(&mut self, b: &mut FunctionBuilder, pc: usize, f: ir::Value, site: usize, slow: Block) {
-        let same = match self.same.iter().find(|s| s.0 == site) {
-            Some(&(_, same)) => b.use_var(same),
-            None => {
-                let expected = self.site_closure(b, site);
-                b.ins().icmp(IntCC::Equal, f, expected)
-            }
-        };
-        Self::guard(b, same, slow);
+        if let Some(&k) = self.closure_calls.get(&(pc as u32)) {
+            self.check_callee(b, f, k, slow);
+        } else {
+            let same = match self.same.iter().find(|s| s.0 == site) {
+                Some(&(_, same)) => b.use_var(same),
+                None => {
+                    let expected = self.site_closure(b, site);
+                    b.ins().icmp(IntCC::Equal, f, expected)
+                }
+            };
+            Self::guard(b, same, slow);
+        }
         // Counted as a call.
         self.tick(b, pc);
         let zero = b.ins().iconst(I64, 0);
@@ -3612,8 +3823,8 @@ impl Gen {
         let slow = b.create_block();
         let returned = b.create_block();
         b.append_block_param(returned, I64);
-        let known = global.and_then(|g| self.closure_globals.get(&g).copied());
-        let native = global.and_then(|g| self.native_globals.get(&g).copied());
+        let known = global.map_or_else(|| self.closure_calls.get(&(pc as u32)), |g| self.closure_globals.get(&g)).copied();
+        let native = global.map_or_else(|| self.native_calls.get(&(pc as u32)), |g| self.native_globals.get(&g)).copied();
         if let Some(k) = native {
             // Its value is returned from the callee slot.
             self.known_native(b, pc, base, n, f, k, slow, returned, true, |g, b, v| {
@@ -4090,6 +4301,10 @@ impl Gen {
                 self.branch(b, eq, next, t as usize);
             }
             Op::JNPair { a, t } => {
+                if self.pairs[pc].contains(a) {
+                    self.jump(b, next);
+                    return;
+                }
                 let x = self.get(b, a);
                 let no = self.target(b, t as usize);
                 self.check_kind(b, x, Kind::Pair, no);
@@ -4158,7 +4373,7 @@ impl Gen {
             Op::Car { dst, a } | Op::Cdr { dst, a } => {
                 let slow = self.step(b, pc);
                 let x = self.get(b, a);
-                let p = self.check_kind(b, x, Kind::Pair, slow);
+                let p = if self.pairs[pc].contains(a) { self.ptr(b, x) } else { self.check_kind(b, x, Kind::Pair, slow) };
                 let offset = if matches!(op, Op::Car { .. }) { 8 } else { 16 };
                 let v = b.ins().load(I64, flags(), p, offset);
                 self.set(b, dst, v);
@@ -4180,6 +4395,12 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::PairP { dst, a } => {
+                if self.pairs[pc].contains(a) {
+                    let t = Self::imm(b, Value::TRUE);
+                    self.set(b, dst, t);
+                    self.jump(b, next);
+                    return;
+                }
                 let x = self.get(b, a);
                 let no = b.create_block();
                 self.check_kind(b, x, Kind::Pair, no);
@@ -4248,6 +4469,16 @@ impl Gen {
         }
     }
 }
+
+#[cfg(test)]
+fn code_for_test<'a>(vm: &'a mut Vm, name: &str) -> &'a Code {
+    let f = vm.eval_source_raw(name).unwrap();
+    unsafe { &*vm.closure_code(f) }
+}
+
+#[cfg(test)]
+#[path = "jit/tests.rs"]
+mod feedback_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4425,7 +4656,7 @@ mod tests {
                         start: 1,
                         code: 0,
                         frame: 8,
-                        closure: 0,
+                        closure: SiteClosure::Root(0),
                         consts: 0,
                         const_bits: vec![],
                     };
