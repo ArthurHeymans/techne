@@ -8,6 +8,10 @@
       "description": "(absolute-path path)  procedure, @lisp@/editor/files.scm:44\n\nReturn PATH as an absolute path, with ~ for the home directory.\nPATH may be a location on another machine (doc/remote.md): its path\nthere is made absolute, ~ standing for the home directory there.",
       "is_macro": false
     },
+    "accept-operation-proposals!": {
+      "description": "(accept-operation-proposals! s r ids seen)  procedure, @lisp@/editor/staging.scm:39\n\nAccept the staged proposals IDS of operation record R in S.\nSEEN gives each proposal's preview revision. Every revision and conflict\nis checked before anything changes; a later journal failure can leave a\npartial result, recorded as such. Acceptance is a child operation of R.\nRefuse while R is pending or its pending proposal set changed.",
+      "is_macro": false
+    },
     "act-on!": {
       "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:745\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
       "is_macro": false
@@ -26,6 +30,10 @@
     },
     "append-bounded-output!": {
       "description": "(append-bounded-output! out text max)  procedure, @lisp@/editor/shell.scm:56\n\nAppend TEXT to OUT, (document . writer), keeping about MAX bytes.\nOnce it holds an eighth more, its start is dropped down to the start\nof the line MAX bytes before its end if that is within an eighth of\nMAX, else down to the character there (a grapheme may be split, of\noutput dropped anyway), and a line at its start says so. With MAX 256\nbytes at least, each trim drops output and the note stays one line.",
+      "is_macro": false
+    },
+    "argument-form?": {
+      "description": "(argument-form? obj)  procedure, @lisp@/editor/forms.scm:25\n\nReturn #t if OBJ is a `argument-form` record.",
       "is_macro": false
     },
     "async-source": {
@@ -69,7 +77,7 @@
       "is_macro": false
     },
     "call-in-operation": {
-      "description": "(call-in-operation op thunk #:fail (fail #t))  procedure, @lisp@/editor/operations.scm:276\n\nCall THUNK with OP current, holding OP while it runs.\nA condition THUNK raises fails OP (a task's cancellation cancels it),\nunless FAIL is #f, and is raised again: a preview failing, say, is\nshown, and the reading goes on.",
+      "description": "(call-in-operation op thunk #:fail (fail #t))  procedure, @lisp@/editor/operations.scm:289\n\nCall THUNK with OP current, holding OP while it runs.\nA condition THUNK raises fails OP (a task's cancellation cancels it),\nunless FAIL is #f, and is raised again: a preview failing, say, is\nshown, and the reading goes on.",
       "is_macro": false
     },
     "call-with-process": {
@@ -129,23 +137,23 @@
       "is_macro": false
     },
     "choice-arguments": {
-      "description": "(choice-arguments record)  procedure, @lisp@/editor/operations.scm:327\n\nReturn the `arguments` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-arguments record)  procedure, @lisp@/editor/operations.scm:340\n\nReturn the `arguments` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choice-command": {
-      "description": "(choice-command record)  procedure, @lisp@/editor/operations.scm:325\n\nReturn the `command` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-command record)  procedure, @lisp@/editor/operations.scm:338\n\nReturn the `command` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choice-doc": {
-      "description": "(choice-doc record)  procedure, @lisp@/editor/operations.scm:324\n\nReturn the `doc` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-doc record)  procedure, @lisp@/editor/operations.scm:337\n\nReturn the `doc` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choice-label": {
-      "description": "(choice-label record)  procedure, @lisp@/editor/operations.scm:323\n\nReturn the `label` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-label record)  procedure, @lisp@/editor/operations.scm:336\n\nReturn the `label` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choice-settles?": {
-      "description": "(choice-settles? record)  procedure, @lisp@/editor/operations.scm:328\n\nReturn the `settles` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-settles? record)  procedure, @lisp@/editor/operations.scm:341\n\nReturn the `settles` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choose-recovery!": {
@@ -153,7 +161,7 @@
       "is_macro": false
     },
     "code-id": {
-      "description": "(code-id code)  procedure, @lisp@/editor/operations.scm:174\n\nReturn the number naming the procedure CODE in records, or #f.\nA command redefined runs another procedure, under another number.",
+      "description": "(code-id code)  procedure, @lisp@/editor/operations.scm:187\n\nReturn the number naming the procedure CODE in records, or #f.\nA command redefined runs another procedure, under another number.",
       "is_macro": false
     },
     "column": {
@@ -165,7 +173,7 @@
       "is_macro": false
     },
     "command-available": {
-      "description": "(command-available s name)  procedure, @lisp@/editor/contracts.scm:334\n\nReturn #t if the command NAME can run in session S, else why not.",
+      "description": "(command-available s name)  procedure, @lisp@/editor/contracts.scm:395\n\nReturn #t if the command NAME can run in session S, else why not.",
       "is_macro": false
     },
     "command-contract": {
@@ -173,7 +181,7 @@
       "is_macro": false
     },
     "command-joins!": {
-      "description": "(command-joins! name join)  procedure, @lisp@/editor/dispatch.scm:552\n\nLet runs of the command NAME join one operation when JOIN says so.\nJOIN is #t, or a procedure (session record) saying whether this run\njoins the last, whose record is RECORD.",
+      "description": "(command-joins! name join)  procedure, @lisp@/editor/dispatch.scm:579\n\nLet runs of the command NAME join one operation when JOIN says so.\nJOIN is #t, or a procedure (session record) saying whether this run\njoins the last, whose record is RECORD.",
       "is_macro": false
     },
     "command-names": {
@@ -181,7 +189,7 @@
       "is_macro": false
     },
     "command-schema": {
-      "description": "(command-schema name)  procedure, @lisp@/editor/contracts.scm:339\n\nReturn the command NAME's contract as data for JSON, for an agent.\nA dict: its name, description, input (the JSON Schema of its\narguments), effects and, when it has one, its result's schema.",
+      "description": "(command-schema name)  procedure, @lisp@/editor/contracts.scm:400\n\nReturn the command NAME's contract as data for JSON, for an agent.\nA dict: its name, description, input (the JSON Schema of its\narguments), effects and, when it has one, its result's schema.",
       "is_macro": false
     },
     "completing-read": {
@@ -189,7 +197,7 @@
       "is_macro": false
     },
     "condition-choices": {
-      "description": "(condition-choices e)  procedure, @lisp@/editor/operations.scm:349\n\nReturn the recovery choices the condition E offers, a list.",
+      "description": "(condition-choices e)  procedure, @lisp@/editor/operations.scm:362\n\nReturn the recovery choices the condition E offers, a list.",
       "is_macro": false
     },
     "contract-effects": {
@@ -225,7 +233,7 @@
       "is_macro": false
     },
     "current-principal": {
-      "description": "(current-principal)  procedure, @lisp@/editor/operations.scm:162\n\nReturn who the current operation runs for: \"user\", an agent's name.\nEnded, it runs for whom it ran for: work it left (a task, a callback)\nkeeps that principal. \"user\" without an operation.",
+      "description": "(current-principal)  procedure, @lisp@/editor/operations.scm:175\n\nReturn who the current operation runs for: \"user\", an agent's name.\nEnded, it runs for whom it ran for: work it left (a task, a callback)\nkeeps that principal. \"user\" without an operation.",
       "is_macro": false
     },
     "current-session": {
@@ -281,7 +289,7 @@
       "is_macro": true
     },
     "define-reader!": {
-      "description": "(define-reader! name proc #:context (context #f))  procedure, @lisp@/editor/contracts.scm:165\n\nMake NAME a way to read an argument, for a command's #:read.\nPROC is (session entry options args k): ENTRY the argument's (name\nschema option ...), OPTIONS the #:read entry's options, ARGS a dict of\nthe arguments read before; it calls (K value) once read. With CONTEXT,\nPROC is (session entry options args prefix) and gives the value at\nonce, from the context, before any prompt.",
+      "description": "(define-reader! name proc #:context (context #f))  procedure, @lisp@/editor/contracts.scm:166\n\nMake NAME a way to read an argument, for a command's #:read.\nPROC is (session entry options args k): ENTRY the argument's (name\nschema option ...), OPTIONS the #:read entry's options, ARGS a dict of\nthe arguments read before; it calls (K value) once read. With CONTEXT,\nPROC is (session entry options args prefix) and gives the value at\nonce, from the context, before any prompt.",
       "is_macro": false
     },
     "define-view": {
@@ -429,11 +437,11 @@
       "is_macro": false
     },
     "document?": {
-      "description": "(document? obj)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1487\n\nReturn #t if OBJ is a document.",
+      "description": "(document? obj)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1500\n\nReturn #t if OBJ is a document.",
       "is_macro": false
     },
     "documents-undo-operation!": {
-      "description": "(documents-undo-operation! documents earliest operation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1417\n\nUndo OPERATION's changes in DOCUMENTS, in the current operation.\nEARLIEST is, for each, the revision its first change there made.\nEvery document is checked before any changes, in this one call,\nso that no task changes one in between: that revision must still\nbe in its history (so all are, the oldest forgotten first), and\nthey must be the latest undo units of the one actor they were made\nas, holding no other operation's changes, untouched by any\nlater change. Then each is undone in turn, each unit a revision,\nuntil one fails (its journal). Return a string for each\ndocument: \\\"undone\\\", \\\"refused: WHY\\\", \\\"failed: WHY\\\" or\n\\\"untouched\\\".",
+      "description": "(documents-undo-operation! documents earliest operation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1430\n\nUndo OPERATION's changes in DOCUMENTS, in the current operation.\nEARLIEST is, for each, the revision its first change there made.\nEvery document is checked before any changes, in this one call,\nso that no task changes one in between: that revision must still\nbe in its history (so all are, the oldest forgotten first), and\nthey must be the latest undo units of the one actor they were made\nas, holding no other operation's changes, untouched by any\nlater change. Then each is undone in turn, each unit a revision,\nuntil one fails (its journal). Return a string for each\ndocument: \\\"undone\\\", \\\"refused: WHY\\\", \\\"failed: WHY\\\" or\n\\\"untouched\\\".",
       "is_macro": false
     },
     "drop-buffer!": {
@@ -449,11 +457,11 @@
       "is_macro": false
     },
     "error-text": {
-      "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:496\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
+      "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:523\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
       "is_macro": false
     },
     "error-with-choices": {
-      "description": "(error-with-choices choices message . irritants)  procedure, @lisp@/editor/operations.scm:358\n\nRaise an error of MESSAGE and IRRITANTS offering CHOICES.\nCHOICES are recovery choices (`make-choice`): the operation it fails\nkeeps them, for the user, or who it ran for, to choose from.",
+      "description": "(error-with-choices choices message . irritants)  procedure, @lisp@/editor/operations.scm:371\n\nRaise an error of MESSAGE and IRRITANTS offering CHOICES.\nCHOICES are recovery choices (`make-choice`): the operation it fails\nkeeps them, for the user, or who it ran for, to choose from.",
       "is_macro": false
     },
     "eval-region!": {
@@ -489,7 +497,7 @@
       "is_macro": false
     },
     "exposed-command-schemas": {
-      "description": "(exposed-command-schemas)  procedure, @lisp@/editor/contracts.scm:353\n\nReturn the contracts of the commands exposed to agents, by name.\nEach as `command-schema` gives it.",
+      "description": "(exposed-command-schemas)  procedure, @lisp@/editor/contracts.scm:414\n\nReturn the contracts of the commands exposed to agents, by name.\nEach as `command-schema` gives it.",
       "is_macro": false
     },
     "face-attributes": {
@@ -537,11 +545,35 @@
       "is_macro": false
     },
     "find-operation-record": {
-      "description": "(find-operation-record serial)  procedure, @lisp@/editor/operations.scm:622\n\nReturn the record of the operation SERIAL of this runtime, or #f.\n#f when it is forgotten: past the bounds of the logs, ended.",
+      "description": "(find-operation-record serial)  procedure, @lisp@/editor/operations.scm:650\n\nReturn the record of the operation SERIAL of this runtime, or #f.\n#f when it is forgotten: past the bounds of the logs, ended.",
       "is_macro": false
     },
     "forget-operation!": {
-      "description": "(forget-operation! r)  procedure, @lisp@/editor/operations.scm:614\n\nForget the operation of record R: its record leaves the logs.\nIts changes still name it, by number; asked for, it is forgotten. A\npending operation is not forgotten: it is an error.",
+      "description": "(forget-operation! r)  procedure, @lisp@/editor/operations.scm:641\n\nForget the operation of record R: its record leaves the logs.\nIts changes still name it, by number; asked for, it is forgotten.\nAny pending proposals it owns are rejected, without editing their\nsources. A pending operation is not forgotten: it is an error.",
+      "is_macro": false
+    },
+    "form-arguments": {
+      "description": "(form-arguments record)  procedure, @lisp@/editor/forms.scm:29\n\nReturn the `arguments` field of RECORD, a `argument-form` record.",
+      "is_macro": false
+    },
+    "form-clear-argument!": {
+      "description": "(form-clear-argument! f key)  procedure, @lisp@/editor/forms.scm:73\n\nClear argument KEY in form F, returning its validation problems.\nAn optional argument is then omitted; a required one needs input.",
+      "is_macro": false
+    },
+    "form-command": {
+      "description": "(form-command record)  procedure, @lisp@/editor/forms.scm:28\n\nReturn the `command` field of RECORD, a `argument-form` record.",
+      "is_macro": false
+    },
+    "form-invoke!": {
+      "description": "(form-invoke! s f #:mode (mode (quote apply)))  procedure, @lisp@/editor/forms.scm:90\n\nInvoke form F's command in S, in MODE apply or stage.\nRevalidate all arguments in its original pane, then use `invoke`.\nA changed body or contract is shown for review before it can run.\nReturn the command's result; its operation is linked to the old one\nwhen the form was opened by `again-operation`.",
+      "is_macro": false
+    },
+    "form-problems": {
+      "description": "(form-problems f)  procedure, @lisp@/editor/forms.scm:59\n\nReturn (argument . explanation) for every invalid argument of form F.\nDependent schemas see only valid preceding arguments. Nothing runs.",
+      "is_macro": false
+    },
+    "form-set-argument!": {
+      "description": "(form-set-argument! f key value)  procedure, @lisp@/editor/forms.scm:64\n\nSet argument KEY of form F to VALUE; return its validation problems.\nThe value stays editable even when invalid; all later, dependent\narguments are checked again. No command or effect is executed.",
       "is_macro": false
     },
     "goto-next!": {
@@ -549,7 +581,7 @@
       "is_macro": false
     },
     "grant-revoke!": {
-      "description": "(grant-revoke! grant)  built-in procedure, @source@/crates/techne-editor/src/access.rs:245\n\nRevoke GRANT: its service has no more snapshots through it, nor\nproposes through it, and what it proposed is accepted only to\nadopt it.",
+      "description": "(grant-revoke! grant)  built-in procedure, @source@/crates/techne-editor/src/access.rs:310\n\nRevoke GRANT: its service has no more snapshots through it, nor\nproposes through it, and what it proposed is accepted only to\nadopt it.",
       "is_macro": false
     },
     "hop-host": {
@@ -609,7 +641,7 @@
       "is_macro": false
     },
     "invoke": {
-      "description": "(invoke s name args #:principal (principal \"user\") #:mode (mode (quote apply)) #:parent (parent #f) #:started (started #f))  procedure, @lisp@/editor/dispatch.scm:396\n\nRun the command NAME in session S with ARGS, a dict of its arguments.\nKeys are the arguments' names, symbols or strings (JSON's). The command\nmust have a contract; it checks that PRINCIPAL (\"user\", or an agent's\nname) may invoke it, that it is available, and conforms and validates\nARGS, refusing with what is wrong, values of sensitive arguments left\nout. It runs as an operation, a child of the current one, recording the\narguments as data. MODE `check` stops there and returns #t; `apply`\nruns it and returns what it returns. Errors are raised to the caller,\nirritants that are sensitive values redacted. The operation is a child\nof PARENT when given (the failed one a recovery choice is of), and\nSTARTED, if given, is called with its record before the command runs.",
+      "description": "(invoke s name args #:principal (principal \"user\") #:mode (mode (quote apply)) #:parent (parent #f) #:started (started #f))  procedure, @lisp@/editor/dispatch.scm:412\n\nRun the command NAME in session S with ARGS, a dict of its arguments.\nKeys are the arguments' names, symbols or strings (JSON's). The command\nmust have a contract; it checks that PRINCIPAL (\"user\", or an agent's\nname) may invoke it, that it is available, and conforms and validates\nARGS, refusing with what is wrong, values of sensitive arguments left\nout. It runs as an operation, a child of the current one, recording the\narguments as data. MODE `check` stops there and returns #t; `apply`\nruns it and returns what it returns. `stage` runs reads and queries,\nbut edits become revision-checked proposals; settings and external\neffects are refused, as are edits through presentations and undo.\nErrors are raised to the caller, sensitive irritants redacted.\nThe operation is a child of PARENT when given (the failed one a recovery\nchoice is of), and\nSTARTED, if given, is called with its record before the command runs.",
       "is_macro": false
     },
     "kbd": {
@@ -617,7 +649,7 @@
       "is_macro": false
     },
     "kept-operation-records": {
-      "description": "(kept-operation-records)  procedure, @lisp@/editor/operations.scm:579\n\nReturn the records of the operations kept, newest first.\nThey are those that made a change or failed, as far back as their\nbounds (`operations-kept-max`) let them be kept.",
+      "description": "(kept-operation-records)  procedure, @lisp@/editor/operations.scm:606\n\nReturn the records of the operations kept, newest first.\nThey are those that made a change or failed, as far back as their\nbounds (`operations-kept-max`) let them be kept.",
       "is_macro": false
     },
     "keymap-sequences": {
@@ -801,7 +833,7 @@
       "is_macro": false
     },
     "make-choice": {
-      "description": "(make-choice label command arguments #:doc (doc \"\") #:settles (settles #t))  procedure, @lisp@/editor/operations.scm:330\n\nReturn a recovery choice, LABEL: invoking COMMAND with ARGUMENTS.\nARGUMENTS is a dict of data, as `invoke` takes them, which say what the\nchoice expects (a document as of a revision): invoked, they are checked\nagainst the state then, and refused if stale. DOC says what it does. A\nchoice that only shows something (comparing) does not settle the\nfailure: SETTLES #f.",
+      "description": "(make-choice label command arguments #:doc (doc \"\") #:settles (settles #t))  procedure, @lisp@/editor/operations.scm:343\n\nReturn a recovery choice, LABEL: invoking COMMAND with ARGUMENTS.\nARGUMENTS is a dict of data, as `invoke` takes them, which say what the\nchoice expects (a document as of a revision): invoked, they are checked\nagainst the state then, and refused if stale. DOC says what it does. A\nchoice that only shows something (comparing) does not settle the\nfailure: SETTLES #f.",
       "is_macro": false
     },
     "make-contract": {
@@ -837,7 +869,7 @@
       "is_macro": false
     },
     "make-presentation": {
-      "description": "(make-presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1479\n\nReturn a new presentation, without rows.",
+      "description": "(make-presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1492\n\nReturn a new presentation, without rows.",
       "is_macro": false
     },
     "make-request-slot": {
@@ -901,7 +933,7 @@
       "is_macro": false
     },
     "message!": {
-      "description": "(message! s text)  procedure, @lisp@/editor/dispatch.scm:452\n\nShow TEXT in the echo area of session S; #f clears it.\nThe message is kept in *Messages*.",
+      "description": "(message! s text)  procedure, @lisp@/editor/dispatch.scm:479\n\nShow TEXT in the echo area of session S; #f clears it.\nThe message is kept in *Messages*.",
       "is_macro": false
     },
     "method-names": {
@@ -1077,7 +1109,11 @@
       "is_macro": false
     },
     "note-effect!": {
-      "description": "(note-effect! effect)  procedure, @lisp@/editor/operations.scm:133\n\nNote that the current operation has EFFECT: `settings`, `external`.\nWhat changes text and saves files is noted where it commits; this is\nfor the rest: a setting changed, a process started. An invocation that\ndid not declare it has it as a violation.",
+      "description": "(note-effect! effect)  procedure, @lisp@/editor/operations.scm:138\n\nNote that the current operation has EFFECT: `settings`, `external`.\nWhat changes text and saves files is noted where it commits; this is\nfor the rest: a setting changed, a process started. An invocation that\ndid not declare it has it as a violation.",
+      "is_macro": false
+    },
+    "open-command-form!": {
+      "description": "(open-command-form! s name #:record (r #f))  procedure, @lisp@/editor/forms.scm:156\n\nShow command NAME's argument form in S; return the form.\nWithout record R capture the source's context and declared defaults.\nWith a completed operation's R, fill only its complete,\nnon-sensitive arguments, noting changed code or contract. Nothing runs.",
       "is_macro": false
     },
     "open-document": {
@@ -1089,19 +1125,19 @@
       "is_macro": false
     },
     "operation-cancelled!": {
-      "description": "(operation-cancelled! op)  procedure, @lisp@/editor/operations.scm:265\n\nCancel OP, unless it failed already: what it holds is cancelled.",
+      "description": "(operation-cancelled! op)  procedure, @lisp@/editor/operations.scm:278\n\nCancel OP, unless it failed already: what it holds is cancelled.",
       "is_macro": false
     },
     "operation-change-counts": {
-      "description": "(operation-change-counts operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:359\n\nReturn how many more changes OPERATION made past the hundred\n`operation-changes` gives, by document: each (document count\nfirst), FIRST the revision the first of them made.",
+      "description": "(operation-change-counts operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:401\n\nReturn how many more changes OPERATION made past the hundred\n`operation-changes` gives, by document: each (document count\nfirst), FIRST the revision the first of them made.",
       "is_macro": false
     },
     "operation-change-total": {
-      "description": "(operation-change-total operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:372\n\nReturn how many changes OPERATION made, in all.",
+      "description": "(operation-change-total operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:414\n\nReturn how many changes OPERATION made, in all.",
       "is_macro": false
     },
     "operation-changes": {
-      "description": "(operation-changes operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:343\n\nReturn the changes OPERATION made, oldest first, each (document\nrevision), revision the one it made: at most the first hundred,\nof documents still open.",
+      "description": "(operation-changes operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:385\n\nReturn the changes OPERATION made, oldest first, each (document\nrevision), revision the one it made: at most the first hundred,\nof documents still open.",
       "is_macro": false
     },
     "operation-command": {
@@ -1109,27 +1145,27 @@
       "is_macro": false
     },
     "operation-committed?": {
-      "description": "(operation-committed? operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:266\n\nReturn #t if a change was made in OPERATION.",
+      "description": "(operation-committed? operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:308\n\nReturn #t if a change was made in OPERATION.",
       "is_macro": false
     },
     "operation-failed!": {
-      "description": "(operation-failed! op condition)  procedure, @lisp@/editor/operations.scm:257\n\nSay that OP failed with CONDITION; the first failure is the one kept.\nOP is ending from then: what it holds is cancelled.",
+      "description": "(operation-failed! op condition)  procedure, @lisp@/editor/operations.scm:270\n\nSay that OP failed with CONDITION; the first failure is the one kept.\nOP is ending from then: what it holds is cancelled.",
       "is_macro": false
     },
     "operation-hold!": {
-      "description": "(operation-hold! op #:cancel (cancel #f))  procedure, @lisp@/editor/operations.scm:202\n\nKeep OP from ending until the token returned is released.\nCANCEL, if given, is a thunk stopping the work holding it, called when\nOP fails or is cancelled. Return #f, holding nothing, if OP has ended.",
+      "description": "(operation-hold! op #:cancel (cancel #f))  procedure, @lisp@/editor/operations.scm:215\n\nKeep OP from ending until the token returned is released.\nCANCEL, if given, is a thunk stopping the work holding it, called when\nOP fails or is cancelled. Return #f, holding nothing, if OP has ended.",
       "is_macro": false
     },
     "operation-logs-bytes": {
-      "description": "(operation-logs-bytes)  procedure, @lisp@/editor/operations.scm:631\n\nReturn about how many bytes the logs' records hold: (trace kept).",
+      "description": "(operation-logs-bytes)  procedure, @lisp@/editor/operations.scm:659\n\nReturn about how many bytes the logs' records hold: (trace kept).",
       "is_macro": false
     },
     "operation-made-last-change?": {
-      "description": "(operation-made-last-change? operation text)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:314\n\nReturn #t if the last change of TEXT was made in OPERATION: no\nother change came since its own. #f for a presentation.",
+      "description": "(operation-made-last-change? operation text)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:356\n\nReturn #t if the last change of TEXT was made in OPERATION: no\nother change came since its own. #f for a presentation.",
       "is_macro": false
     },
     "operation-omitted": {
-      "description": "(operation-omitted operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:306\n\nReturn how many changes and how many files written OPERATION's\nrecords leave out, past their bounds: (changes files).",
+      "description": "(operation-omitted operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:348\n\nReturn how many changes and how many files written OPERATION's\nrecords leave out, past their bounds: (changes files).",
       "is_macro": false
     },
     "operation-outcome": {
@@ -1137,7 +1173,7 @@
       "is_macro": false
     },
     "operation-parent-serial": {
-      "description": "(operation-parent-serial operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:253\n\nReturn the serial of OPERATION's parent, or #f if it has none.",
+      "description": "(operation-parent-serial operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:295\n\nReturn the serial of OPERATION's parent, or #f if it has none.",
       "is_macro": false
     },
     "operation-phase": {
@@ -1145,31 +1181,39 @@
       "is_macro": false
     },
     "operation-procedure": {
-      "description": "(operation-procedure proc #:fail (fail #t))  procedure, @lisp@/editor/operations.scm:298\n\nReturn PROC made to run in the operation current now.\nReturn PROC itself when there is none, or PROC is #f. FAIL is as\n`call-in-operation` takes it.",
+      "description": "(operation-procedure proc #:fail (fail #t))  procedure, @lisp@/editor/operations.scm:311\n\nReturn PROC made to run in the operation current now.\nReturn PROC itself when there is none, or PROC is #f. FAIL is as\n`call-in-operation` takes it.",
+      "is_macro": false
+    },
+    "operation-proposals": {
+      "description": "(operation-proposals operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:282\n\nReturn OPERATION's current proposal identities, in document order.\nMerging more edits replaces an identity, invalidating old previews.\nApplied/rejected proposals stay named; `proposal-state` says which.",
       "is_macro": false
     },
     "operation-record-of": {
-      "description": "(operation-record-of op)  procedure, @lisp@/editor/operations.scm:183\n\nReturn the record of OP while it is pending, else #f.",
+      "description": "(operation-record-of op)  procedure, @lisp@/editor/operations.scm:196\n\nReturn the record of OP while it is pending, else #f.",
       "is_macro": false
     },
     "operation-record?": {
-      "description": "(operation-record? obj)  procedure, @lisp@/editor/operations.scm:367\n\nReturn #t if OBJ is a `operation-record` record.",
+      "description": "(operation-record? obj)  procedure, @lisp@/editor/operations.scm:380\n\nReturn #t if OBJ is a `operation-record` record.",
       "is_macro": false
     },
     "operation-release!": {
-      "description": "(operation-release! op token #:cancelled (cancelled #f))  procedure, @lisp@/editor/operations.scm:213\n\nRelease the hold TOKEN on OP; it ends when nothing holds it.\nCANCELLED says the work holding it was cancelled rather than done.",
+      "description": "(operation-release! op token #:cancelled (cancelled #f))  procedure, @lisp@/editor/operations.scm:226\n\nRelease the hold TOKEN on OP; it ends when nothing holds it.\nCANCELLED says the work holding it was cancelled rather than done.",
       "is_macro": false
     },
     "operation-runtime": {
-      "description": "(operation-runtime)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:249\n\nReturn the number of this runtime, which with an operation's\nserial names it in a document's history after a restart.",
+      "description": "(operation-runtime)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:291\n\nReturn the number of this runtime, which with an operation's\nserial names it in a document's history after a restart.",
       "is_macro": false
     },
     "operation-saves": {
-      "description": "(operation-saves operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:376\n\nReturn the files OPERATION wrote, by name.",
+      "description": "(operation-saves operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:418\n\nReturn the files OPERATION wrote, by name.",
       "is_macro": false
     },
     "operation-serial": {
-      "description": "(operation-serial operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:244\n\nReturn the number of OPERATION, never reused in this runtime.",
+      "description": "(operation-serial operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:286\n\nReturn the number of OPERATION, never reused in this runtime.",
+      "is_macro": false
+    },
+    "operation-staged?": {
+      "description": "(operation-staged? operation)  built-in procedure, @source@/crates/techne-editor/src/operation.rs:278\n\nReturn #t if OPERATION stages edits instead of committing them.",
       "is_macro": false
     },
     "operation-trace-bytes": {
@@ -1185,11 +1229,11 @@
       "is_macro": false
     },
     "operations-kept-bytes": {
-      "description": "operations-kept-bytes = 4194304\n\nAbout the most bytes the kept operations' records hold.",
+      "description": "operations-kept-bytes = 4194304\n\nAbout the most bytes the kept operations' records hold.\nEvicting a record rejects any staged proposals it still owns.",
       "is_macro": false
     },
     "operations-kept-max": {
-      "description": "operations-kept-max = 1000\n\nThe most operations kept once they changed something or failed.",
+      "description": "operations-kept-max = 1000\n\nThe most operations kept once they changed something or failed.\nEvicting a record rejects any staged proposals it still owns.",
       "is_macro": false
     },
     "option": {
@@ -1213,7 +1257,7 @@
       "is_macro": false
     },
     "pending-operation-records": {
-      "description": "(pending-operation-records)  procedure, @lisp@/editor/operations.scm:589\n\nReturn the records of the operations not ended, newest first.\nThey are listed from the work holding them, kept in the logs or not.",
+      "description": "(pending-operation-records)  procedure, @lisp@/editor/operations.scm:616\n\nReturn the records of the operations not ended, newest first.\nThey are listed from the work holding them, kept in the logs or not.",
       "is_macro": false
     },
     "point": {
@@ -1229,51 +1273,51 @@
       "is_macro": false
     },
     "presentation-key-at": {
-      "description": "(presentation-key-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1505\n\nReturn the key of the row of PRESENTATION at POSITION, or #f.",
+      "description": "(presentation-key-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1518\n\nReturn the key of the row of PRESENTATION at POSITION, or #f.",
       "is_macro": false
     },
     "presentation-refresh!": {
-      "description": "(presentation-refresh! presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1534\n\nShow the documents of PRESENTATION's excerpts as they are now.\nThis includes where they changed under it.",
+      "description": "(presentation-refresh! presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1547\n\nShow the documents of PRESENTATION's excerpts as they are now.\nThis includes where they changed under it.",
       "is_macro": false
     },
     "presentation-row-count": {
-      "description": "(presentation-row-count presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1529\n\nReturn how many rows PRESENTATION has.",
+      "description": "(presentation-row-count presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1542\n\nReturn how many rows PRESENTATION has.",
       "is_macro": false
     },
     "presentation-row-index": {
-      "description": "(presentation-row-index presentation key)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1527\n\nReturn the index of the row KEY of PRESENTATION, or #f.",
+      "description": "(presentation-row-index presentation key)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1540\n\nReturn the index of the row KEY of PRESENTATION, or #f.",
       "is_macro": false
     },
     "presentation-row-sources": {
-      "description": "(presentation-row-sources presentation from count)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1523\n\nReturn where COUNT rows of PRESENTATION from row FROM (an index)\nshow their documents now: for each row with an excerpt, (key\ndocument-id position), the position its first excerpt starts at,\nfollowed through the document's edits since. A maker of rows\ngives a row showing the same place the same key, so carets stay\non it.",
+      "description": "(presentation-row-sources presentation from count)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1536\n\nReturn where COUNT rows of PRESENTATION from row FROM (an index)\nshow their documents now: for each row with an excerpt, (key\ndocument-id position), the position its first excerpt starts at,\nfollowed through the document's edits since. A maker of rows\ngives a row showing the same place the same key, so carets stay\non it.",
       "is_macro": false
     },
     "presentation-row-span": {
-      "description": "(presentation-row-span presentation key)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1510\n\nReturn the span (start end) of the row KEY of PRESENTATION, or #f.\nIt is without the line break.",
+      "description": "(presentation-row-span presentation key)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1523\n\nReturn the span (start end) of the row KEY of PRESENTATION, or #f.\nIt is without the line break.",
       "is_macro": false
     },
     "presentation-rows-between": {
-      "description": "(presentation-rows-between presentation from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1514\n\nReturn the rows of PRESENTATION overlapping FROM to TO, each\n(key start end), without its line break, in order. Its cost is\nthe rows returned, not the presentation's: for what is shown.",
+      "description": "(presentation-rows-between presentation from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1527\n\nReturn the rows of PRESENTATION overlapping FROM to TO, each\n(key start end), without its line break, in order. Its cost is\nthe rows returned, not the presentation's: for what is shown.",
       "is_macro": false
     },
     "presentation-set-rows!": {
-      "description": "(presentation-set-rows! presentation rows)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1494\n\nMake ROWS what PRESENTATION shows, changing its text where they differ.\nA row is (key column ...), its key a string, unique; a column is a\nrun or a list of runs, a run a string, (text face), or an excerpt\n(document from to [face]). Carets on a row that stays follow it.",
+      "description": "(presentation-set-rows! presentation rows)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1507\n\nMake ROWS what PRESENTATION shows, changing its text where they differ.\nA row is (key column ...), its key a string, unique; a column is a\nrun or a list of runs, a run a string, (text face), or an excerpt\n(document from to [face]). Carets on a row that stays follow it.",
       "is_macro": false
     },
     "presentation-source-at": {
-      "description": "(presentation-source-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1546\n\nReturn where POSITION of PRESENTATION is in an excerpt's document.\nThe result is (document position): in the excerpt at POSITION, else\nthe first of its row (for a position in its label); #f if none.",
+      "description": "(presentation-source-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1559\n\nReturn where POSITION of PRESENTATION is in an excerpt's document.\nThe result is (document position): in the excerpt at POSITION, else\nthe first of its row (for a position in its label); #f if none.",
       "is_macro": false
     },
     "presentation-sources": {
-      "description": "(presentation-sources presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1538\n\nReturn the documents PRESENTATION's excerpts show, each once.",
+      "description": "(presentation-sources presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1551\n\nReturn the documents PRESENTATION's excerpts show, each once.",
       "is_macro": false
     },
     "presentation-splice-rows!": {
-      "description": "(presentation-splice-rows! presentation at remove rows)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1499\n\nShow ROWS in PRESENTATION in place of the REMOVE rows from row AT\n(an index), the others as they are, as `presentation-set-rows!`\nshows rows: what changed in a long presentation, without making\nits other rows again. The rows are columned among themselves.",
+      "description": "(presentation-splice-rows! presentation at remove rows)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1512\n\nShow ROWS in PRESENTATION in place of the REMOVE rows from row AT\n(an index), the others as they are, as `presentation-set-rows!`\nshows rows: what changed in a long presentation, without making\nits other rows again. The rows are columned among themselves.",
       "is_macro": false
     },
     "presentation?": {
-      "description": "(presentation? obj)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1484\n\nReturn #t if OBJ is a presentation.",
+      "description": "(presentation? obj)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1497\n\nReturn #t if OBJ is a presentation.",
       "is_macro": false
     },
     "prev-grapheme": {
@@ -1344,28 +1388,36 @@
       "description": "(proposal-accept! proposal #:seen (seen #f) #:adopt (adopt #f))  procedure, <techne-editor access>:12\n\nMake PROPOSAL's changes as one edit; return the new revision.\nThey are moved past what changed since, and made by the grant's actor:\nrefused, saying by whom, if that touched the same text, and refused if\nthe text changed since revision SEEN, given (what `proposal-preview`\nshowed). A revoked grant's proposal is accepted only to ADOPT it, on\nthis world's authority.",
       "is_macro": false
     },
+    "proposal-document": {
+      "description": "(proposal-document proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:414\n\nReturn the document PROPOSAL would change, or refuse if closed.",
+      "is_macro": false
+    },
     "proposal-file!": {
-      "description": "(proposal-file! service grant base edits note)  built-in procedure, @source@/crates/techne-editor/src/access.rs:254\n\nFile what SERVICE proposes through GRANT, held by it: EDITS, each\n(from to text), of the text at revision BASE, with a NOTE saying\nwhat for. Return the proposal, a number.",
+      "description": "(proposal-file! service grant base edits note)  built-in procedure, @source@/crates/techne-editor/src/access.rs:319\n\nFile what SERVICE proposes through GRANT, held by it: EDITS, each\n(from to text), of the text at revision BASE, with a NOTE saying\nwhat for. Return the proposal, a number.",
       "is_macro": false
     },
     "proposal-note": {
-      "description": "(proposal-note proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:286\n\nReturn PROPOSAL's note.",
+      "description": "(proposal-note proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:351\n\nReturn PROPOSAL's note.",
       "is_macro": false
     },
     "proposal-preview": {
-      "description": "(proposal-preview proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:295\n\nReturn PROPOSAL's changes as they would be made now, as\n(revision ((from to text) ...)): the revision they are of, and\neach change of the text at it. Refused, saying by whom, if what\nchanged since touched the same text.",
+      "description": "(proposal-preview proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:360\n\nReturn PROPOSAL's changes as they would be made now, as\n(revision ((from to text) ...)): the revision they are of, and\neach change of the text at it. Refused, saying by whom, if what\nchanged since touched the same text.",
       "is_macro": false
     },
     "proposal-reject!": {
-      "description": "(proposal-reject! proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:348\n\nReject PROPOSAL: it is not made, nor offered any more.",
+      "description": "(proposal-reject! proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:470\n\nReject PROPOSAL: it is not made, nor offered any more.",
       "is_macro": false
     },
     "proposal-state": {
-      "description": "(proposal-state proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:273\n\nReturn what PROPOSAL is: pending, revoked (its grant was, or its\nservice's world ended), applied or rejected; decided long ago,\nit is no longer known.",
+      "description": "(proposal-state proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:338\n\nReturn what PROPOSAL is: pending, revoked (its grant was, or its\nservice's world ended), applied, rejected or superseded (merged\ninto a new proposal identity); decided long ago, no longer known.",
       "is_macro": false
     },
     "proposals": {
-      "description": "(proposals document)  built-in procedure, @source@/crates/techne-editor/src/access.rs:262\n\nReturn the proposals for DOCUMENT waiting to be decided, oldest\nfirst.",
+      "description": "(proposals document)  built-in procedure, @source@/crates/techne-editor/src/access.rs:327\n\nReturn the proposals for DOCUMENT waiting to be decided, oldest\nfirst.",
+      "is_macro": false
+    },
+    "proposals-accept!": {
+      "description": "(proposals-accept! proposals seen)  built-in procedure, @source@/crates/techne-editor/src/access.rs:427\n\nAccept PROPOSALS as previewed at SEEN, a revision per proposal.\nEvery proposal is checked before any document changes, without a\ntask running between. Refused for duplicates, revoked grants,\nconflicts or a stale preview. A journal failure can still leave\na partial result: the error says how many were applied, recorded\nin the current operation; the others stay pending.",
       "is_macro": false
     },
     "ranges": {
@@ -1381,71 +1433,75 @@
       "is_macro": false
     },
     "record-arguments": {
-      "description": "(record-arguments record)  procedure, @lisp@/editor/operations.scm:394\n\nReturn the `arguments` field of RECORD, a `operation-record` record.",
+      "description": "(record-arguments record)  procedure, @lisp@/editor/operations.scm:407\n\nReturn the `arguments` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-choices": {
-      "description": "(record-choices record)  procedure, @lisp@/editor/operations.scm:404\n\nReturn the `choices` field of RECORD, a `operation-record` record.",
+      "description": "(record-choices record)  procedure, @lisp@/editor/operations.scm:417\n\nReturn the `choices` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-code": {
-      "description": "(record-code record)  procedure, @lisp@/editor/operations.scm:376\n\nReturn the `code` field of RECORD, a `operation-record` record.",
+      "description": "(record-code record)  procedure, @lisp@/editor/operations.scm:389\n\nReturn the `code` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-command": {
-      "description": "(record-command record)  procedure, @lisp@/editor/operations.scm:373\n\nReturn the `command` field of RECORD, a `operation-record` record.",
+      "description": "(record-command record)  procedure, @lisp@/editor/operations.scm:386\n\nReturn the `command` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-condition": {
-      "description": "(record-condition record)  procedure, @lisp@/editor/operations.scm:385\n\nReturn the `condition` field of RECORD, a `operation-record` record.",
+      "description": "(record-condition record)  procedure, @lisp@/editor/operations.scm:398\n\nReturn the `condition` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-contract": {
-      "description": "(record-contract record)  procedure, @lisp@/editor/operations.scm:397\n\nReturn the `contract` field of RECORD, a `operation-record` record.",
+      "description": "(record-contract record)  procedure, @lisp@/editor/operations.scm:410\n\nReturn the `contract` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-document": {
-      "description": "(record-document record)  procedure, @lisp@/editor/operations.scm:379\n\nReturn the `document` field of RECORD, a `operation-record` record.",
+      "description": "(record-document record)  procedure, @lisp@/editor/operations.scm:392\n\nReturn the `document` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-effects": {
-      "description": "(record-effects record)  procedure, @lisp@/editor/operations.scm:396\n\nReturn the `effects` field of RECORD, a `operation-record` record.",
+      "description": "(record-effects record)  procedure, @lisp@/editor/operations.scm:409\n\nReturn the `effects` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-operation": {
-      "description": "(record-operation record)  procedure, @lisp@/editor/operations.scm:371\n\nReturn the `op` field of RECORD, a `operation-record` record.",
+      "description": "(record-operation record)  procedure, @lisp@/editor/operations.scm:384\n\nReturn the `op` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-pending?": {
-      "description": "(record-pending? r)  procedure, @lisp@/editor/operations.scm:416\n\nReturn #t if the operation of record R has not ended.",
+      "description": "(record-pending? r)  procedure, @lisp@/editor/operations.scm:431\n\nReturn #t if the operation of record R has not ended.",
       "is_macro": false
     },
     "record-prefix": {
-      "description": "(record-prefix record)  procedure, @lisp@/editor/operations.scm:381\n\nReturn the `prefix` field of RECORD, a `operation-record` record.",
+      "description": "(record-prefix record)  procedure, @lisp@/editor/operations.scm:394\n\nReturn the `prefix` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-principal": {
-      "description": "(record-principal record)  procedure, @lisp@/editor/operations.scm:395\n\nReturn the `principal` field of RECORD, a `operation-record` record.",
+      "description": "(record-principal record)  procedure, @lisp@/editor/operations.scm:408\n\nReturn the `principal` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-revision": {
-      "description": "(record-revision record)  procedure, @lisp@/editor/operations.scm:380\n\nReturn the `revision` field of RECORD, a `operation-record` record.",
+      "description": "(record-revision record)  procedure, @lisp@/editor/operations.scm:393\n\nReturn the `revision` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-runs": {
-      "description": "(record-runs record)  procedure, @lisp@/editor/operations.scm:383\n\nReturn the `runs` field of RECORD, a `operation-record` record.",
+      "description": "(record-runs record)  procedure, @lisp@/editor/operations.scm:396\n\nReturn the `runs` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-settled": {
-      "description": "(record-settled record)  procedure, @lisp@/editor/operations.scm:405\n\nReturn the `settled` field of RECORD, a `operation-record` record.",
+      "description": "(record-settled record)  procedure, @lisp@/editor/operations.scm:418\n\nReturn the `settled` field of RECORD, a `operation-record` record.",
+      "is_macro": false
+    },
+    "record-unavailable-arguments": {
+      "description": "(record-unavailable-arguments record)  procedure, @lisp@/editor/operations.scm:422\n\nReturn the `unavailable` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-violation": {
-      "description": "(record-violation record)  procedure, @lisp@/editor/operations.scm:399\n\nReturn the `violation` field of RECORD, a `operation-record` record.",
+      "description": "(record-violation record)  procedure, @lisp@/editor/operations.scm:412\n\nReturn the `violation` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "recovery-choice?": {
-      "description": "(recovery-choice? obj)  procedure, @lisp@/editor/operations.scm:321\n\nReturn #t if OBJ is a `recovery-choice` record.",
+      "description": "(recovery-choice? obj)  procedure, @lisp@/editor/operations.scm:334\n\nReturn #t if OBJ is a `recovery-choice` record.",
       "is_macro": false
     },
     "region-text": {
@@ -1526,6 +1582,10 @@
     },
     "revert-document!": {
       "description": "(revert-document! d)  procedure, @lisp@/editor/files.scm:138\n\nRead the file of the document D again, its unsaved edits replaced.\nThe text becomes the file's as one edit by the current principal, which\nundo takes back. Return #t if the text changed.",
+      "is_macro": false
+    },
+    "review-operation-proposals": {
+      "description": "(review-operation-proposals s r)  procedure, @lisp@/editor/staging.scm:113\n\nReview the operation's staged proposals as read-only diffs.\nAccept only after review: changed text or proposals require refreshing.",
       "is_macro": false
     },
     "rich-code-language": {
@@ -1617,7 +1677,7 @@
       "is_macro": false
     },
     "run-command": {
-      "description": "(run-command s name n #:operation (operation #t))  procedure, @lisp@/editor/dispatch.scm:576\n\nRun the command NAME in session S with the count N.\nThe run is an operation, a child of the current one, unless OPERATION\nis #f: a key of the minibuffer, which only reads, runs in none.\nWhat commands record for the next one (a kill to append to, a goal\ncolumn) moves from now to last here; an error becomes the message.\nReturn #t when the command finished, #f when it raised an error.",
+      "description": "(run-command s name n #:operation (operation #t))  procedure, @lisp@/editor/dispatch.scm:603\n\nRun the command NAME in session S with the count N.\nThe run is an operation, a child of the current one, unless OPERATION\nis #f: a key of the minibuffer, which only reads, runs in none.\nWhat commands record for the next one (a kill to append to, a goal\ncolumn) moves from now to last here; an error becomes the message.\nReturn #t when the command finished, #f when it raised an error.",
       "is_macro": false
     },
     "run-hook!": {
@@ -1749,7 +1809,7 @@
       "is_macro": false
     },
     "set-view-read-only!": {
-      "description": "(set-view-read-only! view read-only)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1401\n\nMake VIEW refuse edits if READ-ONLY is true.",
+      "description": "(set-view-read-only! view read-only)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1414\n\nMake VIEW refuse edits if READ-ONLY is true.",
       "is_macro": false
     },
     "sget": {
@@ -1865,7 +1925,7 @@
       "is_macro": false
     },
     "take-violations!": {
-      "description": "(take-violations! s)  procedure, @lisp@/editor/dispatch.scm:537\n\nReturn and forget the violations raised in session S since last asked.\nThey are those of commands and hooks, oldest first, each as \"who: what\nit says\".",
+      "description": "(take-violations! s)  procedure, @lisp@/editor/dispatch.scm:564\n\nReturn and forget the violations raised in session S since last asked.\nThey are those of commands and hooks, oldest first, each as \"who: what\nit says\".",
       "is_macro": false
     },
     "target": {
@@ -1945,27 +2005,27 @@
       "is_macro": false
     },
     "text-range": {
-      "description": "(text-range document from to revision)  procedure, @lisp@/editor/contracts.scm:91\n\nMake a `text-range` record.\nIts fields are DOCUMENT, FROM, TO and REVISION.",
+      "description": "(text-range document from to revision)  procedure, @lisp@/editor/contracts.scm:92\n\nMake a `text-range` record.\nIts fields are DOCUMENT, FROM, TO and REVISION.",
       "is_macro": false
     },
     "text-range-document": {
-      "description": "(text-range-document record)  procedure, @lisp@/editor/contracts.scm:93\n\nReturn the `document` field of RECORD, a `text-range` record.",
+      "description": "(text-range-document record)  procedure, @lisp@/editor/contracts.scm:94\n\nReturn the `document` field of RECORD, a `text-range` record.",
       "is_macro": false
     },
     "text-range-from": {
-      "description": "(text-range-from r)  procedure, @lisp@/editor/contracts.scm:98\n\nReturn where the start of range R is now.",
+      "description": "(text-range-from r)  procedure, @lisp@/editor/contracts.scm:99\n\nReturn where the start of range R is now.",
       "is_macro": false
     },
     "text-range-text": {
-      "description": "(text-range-text r)  procedure, @lisp@/editor/contracts.scm:108\n\nReturn the text of range R as it is now.",
+      "description": "(text-range-text r)  procedure, @lisp@/editor/contracts.scm:109\n\nReturn the text of range R as it is now.",
       "is_macro": false
     },
     "text-range-to": {
-      "description": "(text-range-to r)  procedure, @lisp@/editor/contracts.scm:103\n\nReturn where the end of range R is now.",
+      "description": "(text-range-to r)  procedure, @lisp@/editor/contracts.scm:104\n\nReturn where the end of range R is now.",
       "is_macro": false
     },
     "text-range?": {
-      "description": "(text-range? obj)  procedure, @lisp@/editor/contracts.scm:91\n\nReturn #t if OBJ is a `text-range` record.",
+      "description": "(text-range? obj)  procedure, @lisp@/editor/contracts.scm:92\n\nReturn #t if OBJ is a `text-range` record.",
       "is_macro": false
     },
     "texts-lines-matcher": {
@@ -1977,11 +2037,11 @@
       "is_macro": false
     },
     "traced-operation-records": {
-      "description": "(traced-operation-records)  procedure, @lisp@/editor/operations.scm:585\n\nReturn the records of the operations in the trace, newest first.",
+      "description": "(traced-operation-records)  procedure, @lisp@/editor/operations.scm:612\n\nReturn the records of the operations in the trace, newest first.",
       "is_macro": false
     },
     "undo-operation!": {
-      "description": "(undo-operation! s r)  procedure, @lisp@/editor/operation-views.scm:194\n\nUndo the changes of R's operation from session S, as an operation.\nIn each document they must all still be in its history, made as one\nactor (an accepted proposal's are its grant's), and be that actor's\nlatest undo units, holding no other operation's changes; no later\nchange by anyone may touch the same text. Else it is refused, saying\nwhy, before any document changes: all are checked in one call, which\nno task interrupts. The undo is a child of the operation undone, run\nfor the current principal, a revision a unit in each document. A\nfailure part way (a journal) says which documents it was undone in and\nwhich not. Return the undo's operation.",
+      "description": "(undo-operation! s r)  procedure, @lisp@/editor/operation-views.scm:199\n\nUndo the changes of R's operation from session S, as an operation.\nIn each document they must all still be in its history, made as one\nactor (an accepted proposal's are its grant's), and be that actor's\nlatest undo units, holding no other operation's changes; no later\nchange by anyone may touch the same text. Else it is refused, saying\nwhy, before any document changes: all are checked in one call, which\nno task interrupts. The undo is a child of the operation undone, run\nfor the current principal, a revision a unit in each document. A\nfailure part way (a journal) says which documents it was undone in and\nwhich not. Return the undo's operation.",
       "is_macro": false
     },
     "unified-diff": {
@@ -2005,11 +2065,11 @@
       "is_macro": false
     },
     "view-edit!": {
-      "description": "(view-edit! view edits group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1343\n\nMake EDITS, each (from to text), in VIEW's document as one change.\nGROUP is \"new\" for a new undo unit or \"extend\" to join the last one.\nReturn the new revision; raise an error if the edit is refused (the\nview is read-only, or a lens cannot make it).",
+      "description": "(view-edit! view edits group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1344\n\nMake EDITS, each (from to text), in VIEW's document as one change.\nGROUP is \"new\" for a new undo unit or \"extend\" to join the last one.\nReturn the new revision; raise an error if the edit is refused (the\nview is read-only, or a lens cannot make it).",
       "is_macro": false
     },
     "view-edit-at!": {
-      "description": "(view-edit-at! view base edits group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1356\n\nMake EDITS, made against the text at revision BASE, in VIEW.\nThey are moved past what changed since, or refused, saying by whom,\nwhen that touched the same text. This is for a command that looked at\nthe text, waited, then edits what it saw. GROUP is as `view-edit!`\ntakes it. Return the new revision.",
+      "description": "(view-edit-at! view base edits group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1362\n\nMake EDITS, made against the text at revision BASE, in VIEW.\nThey are moved past what changed since, or refused, saying by whom,\nwhen that touched the same text. This is for a command that looked at\nthe text, waited, then edits what it saw. GROUP is as `view-edit!`\ntakes it. Return the new revision.",
       "is_macro": false
     },
     "view-id": {
@@ -2025,15 +2085,15 @@
       "is_macro": false
     },
     "view-read-only?": {
-      "description": "(view-read-only? view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1397\n\nReturn #t if VIEW refuses edits.",
+      "description": "(view-read-only? view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1410\n\nReturn #t if VIEW refuses edits.",
       "is_macro": false
     },
     "view-rebase-at": {
-      "description": "(view-rebase-at view base edits)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1366\n\nReturn EDITS, made against the text at revision BASE, as\n`view-edit-at!` would make them in VIEW now, moved past what\nchanged since; raise its error where it would refuse them. Nothing\nis edited.",
+      "description": "(view-rebase-at view base edits)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1375\n\nReturn EDITS, made against the text at revision BASE, as\n`view-edit-at!` would make them in VIEW now, moved past what\nchanged since; raise its error where it would refuse them. Nothing\nis edited.",
       "is_macro": false
     },
     "view-redo!": {
-      "description": "(view-redo! view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1472\n\nRedo the last change undone in VIEW's document; return the revision.",
+      "description": "(view-redo! view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1485\n\nRedo the last change undone in VIEW's document; return the revision.",
       "is_macro": false
     },
     "view-scroll": {
@@ -2053,11 +2113,11 @@
       "is_macro": false
     },
     "view-undo!": {
-      "description": "(view-undo! view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1466\n\nUndo the last change of VIEW's document; return the new revision.",
+      "description": "(view-undo! view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1479\n\nUndo the last change of VIEW's document; return the new revision.",
       "is_macro": false
     },
     "views-edit-at!": {
-      "description": "(views-edit-at! batch group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1379\n\nMake each of BATCH, a list of (view base edits), as `view-edit-at!`\ndoes, all or none. Each is rebased first, and none made if one is\nrefused; if making one fails, those made are undone. Return the\nnew revisions, or raise an error \"views-edit-at!: INDEX: why\",\nINDEX the first entry refused, from 0.",
+      "description": "(views-edit-at! batch group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1389\n\nMake each of BATCH, a list of (view base edits), as `view-edit-at!`\ndoes, all or none. Each is rebased first, and none made if one is\nrefused; if making one fails, those made are undone. Return the\nnew revisions, or raise an error \"views-edit-at!: INDEX: why\",\nINDEX the first entry refused, from 0.",
       "is_macro": false
     },
     "visit!": {
@@ -2065,11 +2125,11 @@
       "is_macro": false
     },
     "with-choices": {
-      "description": "(with-choices e choices)  procedure, @lisp@/editor/operations.scm:353\n\nMake the condition E offer CHOICES, recovery choices; return E.",
+      "description": "(with-choices e choices)  procedure, @lisp@/editor/operations.scm:366\n\nMake the condition E offer CHOICES, recovery choices; return E.",
       "is_macro": false
     },
     "without-operation": {
-      "description": "(without-operation thunk)  procedure, @lisp@/editor/operations.scm:307\n\nCall THUNK in no operation: what it commits names none.\nFor the editor's own text (*Messages*), which no command changes.",
+      "description": "(without-operation thunk)  procedure, @lisp@/editor/operations.scm:320\n\nCall THUNK in no operation: what it commits names none.\nFor the editor's own text (*Messages*), which no command changes.",
       "is_macro": false
     },
     "word-end": {
@@ -2118,6 +2178,7 @@
     "%operation-outcome",
     "%operation-phase",
     "%operation-recorded-bytes",
+    "%operation-stage!",
     "%process-exited?",
     "%process-spawn",
     "%process-stream",
@@ -2240,9 +2301,11 @@
     "operation-made-last-change?",
     "operation-omitted",
     "operation-parent-serial",
+    "operation-proposals",
     "operation-runtime",
     "operation-saves",
     "operation-serial",
+    "operation-staged?",
     "presentation-key-at",
     "presentation-refresh!",
     "presentation-row-count",
@@ -2271,12 +2334,14 @@
     "process-wait",
     "process-write",
     "proposal-accept!",
+    "proposal-document",
     "proposal-file!",
     "proposal-note",
     "proposal-preview",
     "proposal-reject!",
     "proposal-state",
     "proposals",
+    "proposals-accept!",
     "relocation-cancel!",
     "remote-value-written",
     "remote-value?",

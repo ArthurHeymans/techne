@@ -29,7 +29,8 @@
 (require "../schema.scm")
 
 (provide text-range text-range? text-range-document text-range-from text-range-to text-range-revision
-         text-range-text command-schema exposed-command-schemas define-reader! command-available)
+         text-range-text command-schema exposed-command-schemas define-reader! command-available
+         command-context-arguments read-command-argument!)
 
 ;;; Kinds
 
@@ -328,6 +329,66 @@ once, from the context, before any prompt."
                      (else (failed! s name (guard (x (#t x)) (error "No way to read this argument:" (car e))))))))))))
 
 (set-command-acquirer! acquire!)
+
+;;; Argument forms reuse the same readers, without acquiring or executing
+;;; a command just to display it. Context is captured before its pane opens.
+
+(define (command-context-arguments s name)
+  "Return command NAME's context arguments and declared defaults in S.
+Capture them before showing an argument form, so point, the buffer and
+the region continue to name the source, not the form. Each reader sees
+only conformed, valid predecessors. Invalid captured values stay
+editable, but a context that cannot be read is left missing."
+  (let* ((contract (or (command-contract name) (error "This command has no contract" name)))
+         (prefix (current-prefix s)))
+    (let loop ((es (contract-entries contract)) (captured (dict)) (valid (dict)))
+      (if (null? es)
+          captured
+          (let* ((e (car es)) (key (car e)) (r (reading contract e))
+                 (read (context-reader? (car r))) (default (memq #:default (cddr e)))
+                 ;; A list distinguishes a captured #f from missing/invalid.
+                 (value (guard (x (#t '()))
+                          (cond (read (list (read s e (cdr r) valid prefix)))
+                                (default (list (cadr default)))
+                                (else '()))))
+                 (conformed (if (null? value) '()
+                                (guard (x (#t '()))
+                                  (list (contract-conform-argument name key (car value) valid))))))
+            (loop (cdr es)
+                  (if (null? value) captured
+                      (dict-set captured key (if (null? conformed) (car value) (car conformed))))
+                  (if (null? conformed) valid (dict-set valid key (car conformed)))))))))
+
+(define (read-command-argument! s name key args k #:initial [initial '()])
+  "Read argument KEY of command NAME in S, then call (K value).
+ARGS holds validated arguments before it, for dependent schemas and
+readers. INITIAL is empty or (value), filling its prompt. Context
+arguments are edited as non-evaluated Scheme data rather than silently
+recaptured from the form. Without INITIAL, keep the reader's own default.
+Sensitive arguments are never prefilled."
+  (let* ((contract (or (command-contract name) (error "This command has no contract" name)))
+         (e (or (assq key (contract-entries contract)) (error "Not an argument" key)))
+         (resolved (cons key (cons (entry-schema* e args) (cddr e))))
+         (r (reading contract resolved)) (how (car r))
+         (secret (memq #:sensitive (cddr e)))
+         (value (and (pair? initial) (car initial)))
+         (kind (and (pair? initial) (schema-kind-of value)))
+         (text (if (or secret (null? initial)) ""
+                   (let ((v (if kind (schema-kind-data kind value) value)))
+                     (if (and (string? v) (not (context-reader? how))) v
+                         (call-with-output-string (lambda (p) (write v p)))))))
+         (options (append (if (or secret (pair? initial)) (list #:initial text) '()) (cdr r))))
+    (cond ((context-reader? how)
+           (completing-read s (string-append (symbol->string key) " (data): ") '()
+                            #:initial text #:require-match #f
+                            #:accept (lambda (s c)
+                                       (let* ((p (open-input-string (candidate-text c))) (v (read p)))
+                                         (when (or (eof-object? v) (not (eof-object? (read p))))
+                                           (error "Give one datum, not evaluated"))
+                                         (k v)))))
+          ((procedure? how) (how s args k))
+          ((hash-table-ref/default %prompts how #f) => (lambda (read) (read s resolved options args k)))
+          (else (error "No way to read this argument" key)))))
 
 ;;; For agents
 

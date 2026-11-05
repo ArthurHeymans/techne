@@ -67,8 +67,10 @@ impl Grant {
 }
 
 /// A proposal waiting to be decided.
+#[derive(Clone)]
 struct Proposal {
-    grant: u64,
+    /// None for a trusted editor operation, whose transaction names it.
+    grant: Option<u64>,
     doc: Weak<RefCell<Document>>,
     tx: Transaction,
     note: String,
@@ -130,7 +132,7 @@ impl Access {
         if g.right != Right::Stage {
             return Err("the grant allows reading, not proposing".into());
         }
-        let pending = self.proposals.values().filter(|p| p.grant == id).count();
+        let pending = self.proposals.values().filter(|p| p.grant == Some(id)).count();
         if pending >= PENDING {
             return Err(format!("{PENDING} proposals of this grant wait already"));
         }
@@ -146,12 +148,75 @@ impl Access {
         };
         let changes = ChangeSet::from_edits(len, crate::edit_args(edits)).map_err(|e| e.to_string())?;
         let tx = Transaction { base, actor: g.actor.clone(), changes, group: Group::New, operation: None };
-        let p = Proposal { grant: id, doc: Rc::downgrade(&doc), tx, note };
+        let p = Proposal { grant: Some(id), doc: Rc::downgrade(&doc), tx, note };
         let pid = self.fresh();
         // Those of documents gone are decided by nobody.
         self.proposals.retain(|_, p| p.doc.strong_count() > 0);
         self.proposals.insert(pid, p);
         Ok(pid)
+    }
+
+    /// Stage a batch without changing any document or view. Validate the
+    /// whole batch before publishing; one operation keeps one proposal per
+    /// document. Subsequent, disjoint edits merge against the unchanged text.
+    pub(crate) fn stage(&mut self, op: &crate::operation::Operation, batch: &[crate::BatchEntry<'_>]) -> Result<Vec<i64>, String> {
+        op.check_open("stage")?;
+        if op.ended() {
+            return Err("stage: the operation has ended".into());
+        }
+        let mut planned = Vec::new();
+        let mut revisions = Vec::new();
+        let mut documents = Vec::new();
+        for (view, base, edits) in batch {
+            let mut v = view.borrow_mut();
+            let doc = v.text.document().cloned().ok_or("stage: editing through a presentation is not supported")?;
+            if documents.iter().any(|d| Rc::ptr_eq(d, &doc)) {
+                return Err("stage: the same document twice in a batch".into());
+            }
+            documents.push(doc.clone());
+            let mut edits = v.rebase_at(*base, edits.clone())?;
+            let existing = self
+                .proposals
+                .iter()
+                .find(|(_, p)| p.grant.is_none() && p.tx.operation == Some(op.id()) && p.doc.ptr_eq(&Rc::downgrade(&doc)));
+            if let Some((_, p)) = existing {
+                let old = doc.borrow().rebase(p.tx.clone()).map_err(|e| format!("Refused: {e} since"))?;
+                edits.extend(old.changes.edits().map(|(r, t)| (r, t.to_string())));
+                edits.sort_by_key(|(r, _)| r.start);
+            }
+            let mut tx = doc.borrow().edit(&v.actor, edits).map_err(|e| e.to_string())?;
+            tx.operation = Some(op.id());
+            revisions.push(doc.borrow().revision() as i64);
+            if !tx.changes.is_identity() {
+                planned.push((
+                    existing.map(|(&id, _)| id),
+                    Proposal {
+                        grant: None,
+                        doc: Rc::downgrade(&doc),
+                        tx,
+                        note: format!("{} (operation {})", op.command_name(), op.id().serial),
+                    },
+                ));
+            }
+        }
+        self.proposals.retain(|_, p| p.doc.strong_count() > 0);
+        let pending = self.proposals.values().filter(|p| p.grant.is_none()).count();
+        let added = planned.iter().filter(|(id, _)| id.is_none()).count();
+        if pending + added > PENDING || op.proposal_count() + added > PENDING {
+            return Err(format!("stage: at most {PENDING} operation proposals may wait, or belong to one operation"));
+        }
+        for (replacing, p) in planned {
+            // An identity names immutable proposal contents, not merely a
+            // document revision: staging itself never advances that revision.
+            // Retiring the old identity also invalidates direct native accepts.
+            let id = self.fresh();
+            if let Some(old) = replacing {
+                self.decide(old, "superseded");
+            }
+            self.proposals.insert(id, p);
+            op.proposed(id, replacing);
+        }
+        Ok(revisions)
     }
 
     fn proposal(&self, id: u64) -> Result<&Proposal, String> {
@@ -268,8 +333,8 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
     let a = access.clone();
     techne_vm::procedures! { vm;
         /// Return what PROPOSAL is: pending, revoked (its grant was, or its
-        /// service's world ended), applied or rejected; decided long ago,
-        /// it is no longer known.
+        /// service's world ended), applied, rejected or superseded (merged
+        /// into a new proposal identity); decided long ago, no longer known.
         "(proposal-state proposal)" => move |id: usize| -> Result<&'static str, String> {
             let access = a.borrow();
             let id = id as u64;
@@ -277,7 +342,7 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
                 return Ok(how);
             }
             let p = access.proposal(id)?;
-            Ok(if access.holds(p.grant) { "pending" } else { "revoked" })
+            Ok(if p.grant.is_none_or(|g| access.holds(g)) { "pending" } else { "revoked" })
         };
     }
     let a = access.clone();
@@ -308,6 +373,7 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
         };
     }
     let a = access.clone();
+    let c = current.clone();
     techne_vm::procedures! { vm;
         /// Accept PROPOSAL (`proposal-accept!`).
         #[vm]
@@ -316,7 +382,7 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
             let (doc, mut tx) = {
                 let access = a.borrow();
                 let p = access.proposal(id)?;
-                if !adopt && !access.holds(p.grant) {
+                if !adopt && !p.grant.is_none_or(|g| access.holds(g)) {
                     return Err("proposal-accept!: the grant is revoked; adopt the proposal to accept it".into());
                 }
                 access.rebased(id)?
@@ -325,7 +391,7 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
                 return Err("proposal-accept!: the text changed since the preview".into());
             }
             // Made in the operation accepting it, by the grant's actor.
-            let rev = current.commit(vm, "proposal-accept!", |op| {
+            let rev = c.commit(vm, "proposal-accept!", |op| {
                 tx.operation = op.map(|o| o.id());
                 let applied = doc.borrow_mut().apply(tx);
                 match applied {
@@ -340,6 +406,62 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
             })?;
             a.borrow_mut().decide(id, "applied");
             Ok(rev as i64)
+        };
+    }
+    let a = access.clone();
+    techne_vm::procedures! { vm;
+        /// Return the document PROPOSAL would change, or refuse if closed.
+        "(proposal-document proposal)" => move |id: usize| -> Result<Foreign<RefCell<Document>>, String> {
+            a.borrow().proposal(id as u64)?.doc.upgrade().map(Foreign).ok_or("the document is gone".into())
+        };
+    }
+    let a = access.clone();
+    techne_vm::procedures! { vm;
+        /// Accept PROPOSALS as previewed at SEEN, a revision per proposal.
+        /// Every proposal is checked before any document changes, without a
+        /// task running between. Refused for duplicates, revoked grants,
+        /// conflicts or a stale preview. A journal failure can still leave
+        /// a partial result: the error says how many were applied, recorded
+        /// in the current operation; the others stay pending.
+        #[vm]
+        "(proposals-accept! proposals seen)" => move |vm: &mut Vm, ids: Vec<usize>, seen: Vec<usize>| -> Result<Vec<i64>, String> {
+            if ids.len() != seen.len() || ids.is_empty() {
+                return Err("proposals-accept!: give a preview revision for each proposal".into());
+            }
+            let mut plans = Vec::new();
+            {
+                let access = a.borrow();
+                for (&id, &seen) in ids.iter().zip(&seen) {
+                    let p = access.proposal(id as u64)?;
+                    if !p.grant.is_none_or(|g| access.holds(g)) {
+                        return Err("proposals-accept!: a grant is revoked".into());
+                    }
+                    let (doc, tx) = access.rebased(id as u64)?;
+                    if doc.borrow().revision() != seen as Revision {
+                        return Err(format!("proposals-accept!: proposal {id}: the text changed since the preview"));
+                    }
+                    if plans.iter().any(|(d, _): &(Rc<RefCell<Document>>, Transaction)| Rc::ptr_eq(d, &doc)) {
+                        return Err("proposals-accept!: the same document twice".into());
+                    }
+                    plans.push((doc, tx));
+                }
+            }
+            current.commit(vm, "proposals-accept!", |op| {
+                let mut revisions = Vec::new();
+                for (&id, (doc, mut tx)) in ids.iter().zip(plans) {
+                    tx.operation = op.map(|o| o.id());
+                    let result = doc.borrow_mut().apply(tx);
+                    match result {
+                        Ok(rev) => {
+                            if let Some(op) = op { op.changed(&doc, rev); }
+                            a.borrow_mut().decide(id as u64, "applied");
+                            revisions.push(rev as i64);
+                        }
+                        Err(e) => return (Err(format!("proposals-accept!: applied {} of {}; proposal {id} failed: {e}", revisions.len(), ids.len())), !revisions.is_empty()),
+                    }
+                }
+                (Ok(revisions), true)
+            })
         };
     }
     let a = access.clone();

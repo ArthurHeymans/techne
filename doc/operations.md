@@ -1,8 +1,9 @@
 # Commands, operations and recovery
 
 Status: design; steps 1 to 3 of "Order of work" are built, of step 4
-undo and forget, and of step 5 the deferred choices of a refused save
-(`lisp/editor/operations.scm`, `operation-views.scm`, `contracts.scm`,
+undo and forget, of step 5 the deferred choices of a refused save,
+and step 6's argument forms, again and staged document edits
+(`lisp/editor/forms.scm`, `staging.scm`, `operations.scm`, `operation-views.scm`, `contracts.scm`,
 `recovery.scm`, `crates/techne-editor/src/operation.rs`).
 It implements REQUIREMENTS.md, "Embark is
 foundational" (commands describe their arguments, effects and
@@ -323,9 +324,10 @@ recipe and an agent's adapter call `invoke` directly.
 
 **Modes.** `apply` commits. `stage` plans: `read` and `query` effects
 run (a rename asks its server for the edits), edits become proposals
-(`access.rs`, generalized from services to operations), and `external`
-effects are refused, which ends the operation failed, or partial when
-something had committed, with a choice to apply. `check` validates and admits only. Staging serves an agent's
+(`access.rs`, generalized from services to operations). A command declaring
+`external` or `settings` is refused before its body runs: apply it explicitly
+instead. An effect noted while running is refused too; if proposals were
+already filed the operation ends partial, and those proposals stay reviewable. `check` validates and admits only. Staging serves an agent's
 staged edits, a preview of what a rename will change, and a recipe's
 dry run. Bodies written to stage must not assume their edits landed: a
 code action that applies its edits and then asks its server to run a
@@ -389,10 +391,59 @@ that the same arguments mean the same thing now. Recipes (PLAN.md,
 Stage 6) are sequences of operations checked the same way.
 
 The argument **form** is the Transient of EDITOR.md, section 10: a row
-per argument, a key to change each, RET to invoke. The same form, empty
-or with context defaults, runs a command with arguments from M-x. Until
-it exists, "again" asks through the command's prompts, filled with the
-old arguments.
+per argument, a key to change each, RET to invoke. `M-x command-form`
+chooses a command with a contract and opens it with context captured from
+the source pane and declared defaults. Number keys edit its first ten
+arguments; `e` edits the row at point, `o` clears it (omitting an optional
+argument), RET applies, and C-c C-s stages. Changing an argument rechecks
+all dependent ones, using validated predecessors. Readers are the command's
+existing readers, launched in the source pane and retaining their own initial
+values when none has been supplied in the form; sensitive values are never
+prefilled. Context acquisition conforms each captured/default value before
+passing it to a dependent reader; invalid values stay editable but are not
+passed as valid predecessors. A context reference is edited as non-evaluated
+data.
+An operation's `again-operation` action opens this same form with its
+complete recorded arguments. Sensitive, shortened and non-data arguments
+are not replayed: required ones must be entered again. A changed body or
+contract is shown for review; a change while the form is open refuses the
+first attempt to run, so the new contract can be reviewed. Invoking uses
+the original pane, or refuses if that pane was closed.
+
+**Staging, as built** (`forms.scm`, `staging.scm`, `access.rs`, `operation.rs`).
+The operation carries staging through asynchronous requests and nested
+invocations, even one asking to apply. `view-edit!`, `view-edit-at!` and
+`views-edit-at!` file proposals without changing source revisions, selections
+or undo. An operation keeps one proposal per document, merging later disjoint
+edits against the unchanged source; overlapping edits are refused, not
+simulated. Proposal identities name immutable contents: merging retires the
+old identity as `superseded` and files a fresh one, even when the source
+revision did not change. Old previews therefore cannot accept unreviewed
+edits, including after an operation is continued. A batch is validated
+before any proposal is published. At most 256 operation proposals may wait,
+and one operation records at most 256.
+
+Forgetting or evicting an operation's kept record explicitly rejects its
+pending proposals before discarding their identities. This changes no source
+text and releases proposal capacity; it does not leave inaccessible work in
+the proposal table. Applied/rejected proposals need no further cleanup.
+
+Inspect the staged operation, then its `proposals` row, or choose
+`review-operation-proposals` on it. The review is read-only diffs. C-c C-c
+accepts the whole pending set as previewed; C-c C-k rejects it; `g` refreshes.
+Acceptance is a new operation linked to the staged one. Every preview revision
+and conflict is checked in one native call before any edit, so a stale second
+file changes neither. A journal failure after one document commits is still
+partial, explicitly naming how many applied; it is not a cross-file journal
+transaction. Undo of the accepting operation uses the existing multi-document
+undo. Proposals are in memory, not restored after a runtime restart.
+
+Presentation/lens edits, undo/redo, file reload/revert and settings do not yet
+have staging implementations and are refused. The Rust additions keep the
+revision/commit invariant below Lisp, reusing the existing proposal table;
+forms, readers, diffs and review policy are Scheme. Staging trusted commands
+is not a sandbox for arbitrary Lisp or its raw file/process primitives.
+Agent authority checks remain step 7, before an external adapter may invoke.
 
 ## Recovery
 
@@ -593,8 +644,8 @@ Each step one change, measured before the next.
    closed since, and one that undid changes (redo brings those back;
    undoing only its edits would leave them undone). Forgetting takes a
    record out of both logs; its changes still name it, by number.
-   *Again is not built yet*: it waits on the form (step 6), through
-   which it asks.
+   *Again built with step 6*: `again-operation` opens the argument form,
+   resolving references again and requiring missing or redacted values.
 5. **Recovery and pending decisions**, beginning with saving a changed
    file and accepting proposals; then live decisions in tasks.
    *Acceptance:* PLAN.md's for step 10: a refused save offers choices;
@@ -632,6 +683,14 @@ Each step one change, measured before the next.
    dependent ones; a staged rename changes no document, leaves one
    proposal per file and runs no external effect; accepting the
    proposals is one operation linked to it.
+   *Built* (`forms.scm`, `staging.scm`, `tests/forms.rs`, `tests/lsp.rs`):
+   both key profiles exercise argument editing and dependent validation;
+   an actual asynchronous two-file LSP rename stages, then accepts past
+   a disjoint human edit. A stale preview or conflicting second file
+   changes neither. Native commit checks prevent staged saves and undo;
+   declared external/settings effects are refused before the body runs.
+   The editor's observed external effects are refused when noted, including
+   a language server's execute-command after its staged edits.
 7. **Agent principals and authority**: the checks of "Authority", in
    Rust, before anything outside the editor can invoke.
    *Acceptance:* a test principal is refused an unexposed command, a

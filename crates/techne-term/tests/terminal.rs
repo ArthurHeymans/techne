@@ -560,3 +560,76 @@ fn inlays_are_drawn_in_the_line() {
     assert_eq!(t.styles(0)[6], shadow, "the inlay keeps its face");
     assert_eq!(t.styles(0)[10], region, "the text after it is in the region");
 }
+
+#[test]
+fn command_forms_and_staged_diffs_draw_as_rows_without_editing_the_source() {
+    let mut t = Tty::new("alpha\nbeta\n", 110, 26);
+    t.send(KITTY);
+    t.rt.eval(
+        r#"
+      (define source (session-document (current-session)))
+      (define-command (replace-word s at text) "Replace the word at AT with TEXT."
+        #:arguments '((at location) (text string #:default "ALPHA"))
+        #:effects '(read edit)
+        (view-edit-at! (make-view (location-document at) "user")
+                       (document-revision (location-document at))
+                       (list (list (location-position at) (+ 5 (location-position at)) text)) "new"))
+      (open-command-form! (current-session) 'replace-word)
+    "#,
+    )
+    .unwrap();
+    t.redraw();
+    let screen = |t: &Tty| (0..t.grid.rows).map(|r| t.grid.row_text(r).trim_end().to_string()).collect::<Vec<_>>().join("\n");
+    let form = screen(&t);
+    assert!(form.contains("RET apply") && form.contains("[1] at") && form.contains("[2] text") && form.contains("ALPHA"), "{form}");
+    println!("Argument form grid:\n{form}");
+    // C-c C-s invokes stage, not an edit of either the form or its source.
+    t.send(b"\x03\x13");
+    assert_eq!(t.rt.eval("(document-string source)").unwrap(), "\"alpha\\nbeta\\n\"");
+    t.rt.eval(
+        "(define staged (find (lambda (r) (eq? (record-command r) 'replace-word)) (kept-operation-records)))
+               (review-operation-proposals (current-session) staged)",
+    )
+    .unwrap();
+    t.redraw();
+    let review = screen(&t);
+    assert!(review.contains("C-c C-c accept all") && review.contains("-alpha") && review.contains("+ALPHA"), "{review}");
+    for (text, colour) in [("-alpha", [0xf3, 0x8b, 0xa8]), ("+ALPHA", [0xa6, 0xe3, 0xa1])] {
+        let (r, c) = (0..t.grid.rows).find_map(|r| t.grid.row_text(r).find(text).map(|c| (r, c))).unwrap();
+        assert_eq!(fg(t.grid.cell(r, c).style), Some(colour), "{text} has its diff face");
+    }
+    println!("Staged review grid:\n{review}");
+    t.send(b"\x03\x03");
+    assert_eq!(t.rt.eval("(document-string source)").unwrap(), "\"ALPHA\\nbeta\\n\"");
+}
+
+#[test]
+fn a_form_file_reader_draws_the_source_directory_and_returns_to_the_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let path = project.join("source.scm");
+    std::fs::write(&path, "").unwrap();
+    let mut t = Tty::new("", 160, 20);
+    t.send(KITTY);
+    t.rt.eval(&format!(
+        "(show-document! (current-session) (file-document {:?}))
+         (open-command-form! (current-session) 'find-file)",
+        path.display().to_string()
+    ))
+    .unwrap();
+    t.redraw();
+    t.send(b"1");
+    let prefix = format!("{}/", project.display());
+    let row = (0..t.grid.rows)
+        .find(|&r| t.grid.row_text(r).contains(&format!("Find file: {prefix}")))
+        .expect("the source directory is visible in the input");
+    assert_eq!(t.rt.snapshot().minibuffer.unwrap().input, prefix);
+    assert_eq!(t.grid.cursor.unwrap().0, row, "the caret is on the input, not on a form row");
+    let screen = (0..t.grid.rows).map(|r| t.grid.row_text(r).trim_end().to_string()).collect::<Vec<_>>().join("\n");
+    println!("Source-directory prompt grid:\n{screen}");
+    t.send(b"\x07");
+    assert!(t.rt.snapshot().minibuffer.is_none());
+    assert!(t.rt.snapshot().pane().status.contains("command-form"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "", "reading and aborting makes no edit");
+}

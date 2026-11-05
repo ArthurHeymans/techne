@@ -34,6 +34,8 @@
 (require "operations.scm")
 (require "operation-views.scm")
 (require "contracts.scm")
+(require "forms.scm")
+(require "staging.scm")
 (require "shell.scm")
 (require "remote.scm")
 (require "syntax.scm")
@@ -67,7 +69,7 @@
          error-text make-generated-buffer! buffer-named set-buffer-state! session-buffer display-buffer!
          make-request-slot request! request-pending? cancel-request! append-bounded-output! log-history
          current-operation start-operation! operation? operation-serial operation-runtime operation-parent-serial operation-command
-         operation-committed? operation-phase operation-outcome operation-procedure call-in-operation without-operation
+         operation-committed? operation-staged? operation-proposals operation-phase operation-outcome operation-procedure call-in-operation without-operation
          operation-failed! operation-cancelled! operation-hold! operation-release! command-joins!
          operation-record? record-operation record-command record-code code-id record-document record-revision record-prefix
          record-runs record-condition record-pending? operation-record-of find-operation-record
@@ -76,11 +78,13 @@
          condition-choices with-choices error-with-choices record-choices record-settled
          revert-document! file-text changed-on-disk? line-diff unified-diff text-lines
          pending-decisions choice-applicable choose-recovery! dismiss-decision!
-         record-arguments record-principal record-effects record-contract record-violation take-violations!
+         record-arguments record-unavailable-arguments record-principal record-effects record-contract record-violation take-violations!
          kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
          operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes
          invoke make-contract command-contract contract? contract-params contract-entries contract-effects contract-expose
          command-schema exposed-command-schemas define-reader! command-available current-principal note-effect!
+         open-command-form! argument-form? form-command form-arguments form-problems form-set-argument! form-clear-argument! form-invoke!
+         review-operation-proposals accept-operation-proposals!
          text-range text-range? text-range-document text-range-from text-range-to text-range-text
          keymap-sources explain-key
          read-file-name read-directory-name normal-directory abbreviate-path absolute-path project-root

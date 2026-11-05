@@ -21,6 +21,8 @@
 (require "lens.scm")
 (require "inspect.scm")
 (require "operation-views.scm")
+(require "forms.scm")
+(require "staging.scm")
 (require "recovery.scm")
 (require "shell.scm")
 (require "repl.scm")
@@ -200,6 +202,11 @@ After a yank, it replaces the text yanked."
   "Go to the command's definition."
   (let ((where (procedure-location (command name))))
     (if where (visit! s (car where) (cadr where) (caddr where)) (error "No source for" name))))
+
+;; Keep running a command its default action; forms are an explicit one.
+(define-action command (configure-command s name)
+  "Open the command's argument form, without executing it."
+  (open-command-form! s name))
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)

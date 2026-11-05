@@ -558,7 +558,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
     let current = operation::Current::default();
     operation::install(vm, current.clone());
     service::install(vm, access.clone());
-    access::install(vm, access, current.clone());
+    access::install(vm, access.clone(), current.clone());
 
     techne_vm::procedures! { vm;
         /// Return a new document holding TEXT, with no file.
@@ -1334,6 +1334,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         };
     }
     let c = current.clone();
+    let staging = access.clone();
     techne_vm::procedures! { vm;
         /// Make EDITS, each (from to text), in VIEW's document as one change.
         /// GROUP is "new" for a new undo unit or "extend" to join the last one.
@@ -1342,10 +1343,15 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         #[vm]
         "(view-edit! view edits group)" => move |vm: &mut Vm, v: ViewArg, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
             let group = self::group("view-edit!", &group)?;
+            if let Some(op) = c.get(vm).filter(|o| o.staged()) {
+                let base = v.borrow().text.revision();
+                return staging.borrow_mut().stage(&op, &[(&v.0, base, edit_args(edits))]).map(|r| r[0]);
+            }
             view_commit(&c, vm, "view-edit!", &v, |v, op| v.edit_in(edit_args(edits), group, op))
         };
     }
     let c = current.clone();
+    let staging = access.clone();
     techne_vm::procedures! { vm;
         /// Make EDITS, made against the text at revision BASE, in VIEW.
         /// They are moved past what changed since, or refused, saying by whom,
@@ -1355,6 +1361,9 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         #[vm]
         "(view-edit-at! view base edits group)" => move |vm: &mut Vm, v: ViewArg, base: i64, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
             let group = self::group("view-edit-at!", &group)?;
+            if let Some(op) = c.get(vm).filter(|o| o.staged()) {
+                return staging.borrow_mut().stage(&op, &[(&v.0, base as Revision, edit_args(edits))]).map(|r| r[0]);
+            }
             view_commit(&c, vm, "view-edit-at!", &v, |v, op| v.edit_at_in(base as Revision, edit_args(edits), group, op))
         };
     }
@@ -1369,6 +1378,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         };
     }
     let c = current.clone();
+    let staging = access.clone();
     techne_vm::procedures! { vm;
         /// Make each of BATCH, a list of (view base edits), as `view-edit-at!`
         /// does, all or none. Each is rebased first, and none made if one is
@@ -1379,6 +1389,9 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         "(views-edit-at! batch group)" => move |vm: &mut Vm, batch: Vec<BatchArg>, group: String| -> Result<Vec<i64>, String> {
             let g = self::group("views-edit-at!", &group)?;
             let views: Vec<_> = batch.iter().map(|b| (&*b.0 .0, b.1 as Revision, edit_args(b.2.clone()))).collect();
+            if let Some(op) = c.get(vm).filter(|o| o.staged()) {
+                return staging.borrow_mut().stage(&op, &views);
+            }
             c.commit(vm, "views-edit-at!", |op| {
                 let before: Vec<_> = views.iter().map(|(v, ..)| Before::of(&v.borrow(), op)).collect();
                 let done = edit_all_at(&views, g, op.map(|o| o.id()))

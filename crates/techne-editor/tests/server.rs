@@ -153,6 +153,9 @@ fn quitting_in_the_modal_profile_is_done_with_the_file() {
     e.keys("x : q RET");
     waiting.join().unwrap().unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+    // Consume the closing frame before reopening. Otherwise the snapshot
+    // of the first edit ("ne") can satisfy the next wait before it opens.
+    e.snapshot(|s| s.pane().status.starts_with("*scratch*"));
     // :wq saves it first.
     let waiting = open_waiting(&socket, &file);
     e.snapshot(|s| s.pane().text == "ne\n");
