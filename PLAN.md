@@ -863,14 +863,18 @@ deltas, layers, projections) is added only when a slice needs it.
    edit as layers are. `keyfuzz`'s own (`KNOWN_SLOW`): search-all-buffers
    narrowing over a line of a megabyte (72 M, as on main: the matcher
    takes the line whole; the plan, matching the part of a long line shown
-   rather than all of it), completion-at-point at the budget's edge
-   (28.09 M) in one random state of the minibuffer corpus, indenting
-   after an open bracket (as on main), and a session's first definition
-   motion, which compiles its language's definitions query (the plan:
-   compile it on the worker when the language is first used), and
-   indent-sexp on an unclosed list (50 M, as on main: it reindents to the
-   end of the buffer; the plan, indenting what is shown first, the rest
-   in a task).
+   rather than all of it), opening completion-at-point (some 39 M:
+   Scheme's source builds and sorts every name; the plan, cache the
+   names by the module's generation). Filtering an open completion popup
+   now uses the minibuffer's incremental matcher: keyfuzz's six-key
+   `buffers` reproducer fell from 28.33 M to 20.66 M, with named
+   `completion-filter` and `completion-delete` workloads (20.67 M and
+   20.36 M). Other known cases are indenting after an open bracket (as
+   on main), a session's first definition motion, which compiles its
+   language's definitions query (the plan: compile it on the worker when
+   the language is first used), and indent-sexp on an unclosed list
+   (50 M, as on main: it reindents to the end of the buffer; the plan,
+   indenting what is shown first, the rest in a task).
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes
