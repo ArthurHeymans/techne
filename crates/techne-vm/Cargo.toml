@@ -35,7 +35,7 @@ cranelift-codegen = "0.134"
 cranelift-frontend = "0.134"
 cranelift-jit = "0.137"
 cranelift-module = "0.134"
-cranelift-native = "0.134"
+cranelift-native = "0.137"
 rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
 regex-cursor = { version = "0.1.5", default-features = false, features = ["perf-inline"] }
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }

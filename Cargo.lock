@@ -925,7 +925,7 @@ dependencies = [
  "cranelift-control 0.137.1",
  "cranelift-entity 0.137.1",
  "cranelift-module 0.137.1",
- "cranelift-native 0.137.1",
+ "cranelift-native",
  "libc",
  "log",
  "memmap2",
@@ -956,17 +956,6 @@ dependencies = [
  "cranelift-codegen 0.137.1",
  "cranelift-control 0.137.1",
  "hashbrown 0.17.1",
-]
-
-[[package]]
-name = "cranelift-native"
-version = "0.134.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16a41083b1fd953debd6f32d21fcda765b258f323ce907fdd6b4715f2769c478"
-dependencies = [
- "cranelift-codegen 0.134.4",
- "libc",
- "target-lexicon",
 ]
 
 [[package]]
@@ -4261,7 +4250,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module 0.134.4",
- "cranelift-native 0.134.4",
+ "cranelift-native",
  "ctrlc",
  "getrandom 0.4.3",
  "hmac",
