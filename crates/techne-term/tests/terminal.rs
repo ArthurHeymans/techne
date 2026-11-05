@@ -612,15 +612,15 @@ fn a_form_file_reader_draws_the_source_directory_and_returns_to_the_form() {
     std::fs::write(&path, "").unwrap();
     let mut t = Tty::new("", 160, 20);
     t.send(KITTY);
-    t.rt.eval(&format!(
-        "(show-document! (current-session) (file-document {:?}))
-         (open-command-form! (current-session) 'find-file)",
-        path.display().to_string()
-    ))
-    .unwrap();
+    t.rt.eval(&format!("(show-document! (current-session) (file-document {:?}))", path.display().to_string())).unwrap();
+    // The file reader shows the source directory abbreviated (~/...),
+    // which on a runner whose temp dir is under $HOME differs from the
+    // literal path: ask the editor what it shows.
+    let prefix = t.rt.eval("(abbreviate-path (default-directory (current-session)))").unwrap();
+    let prefix = prefix.trim_matches('"').to_string();
+    t.rt.eval("(open-command-form! (current-session) 'find-file)").unwrap();
     t.redraw();
     t.send(b"1");
-    let prefix = format!("{}/", project.display());
     let row = (0..t.grid.rows)
         .find(|&r| t.grid.row_text(r).contains(&format!("Find file: {prefix}")))
         .expect("the source directory is visible in the input");

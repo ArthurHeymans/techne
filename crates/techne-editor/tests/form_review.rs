@@ -127,8 +127,13 @@ fn form_readers_keep_the_source_directory_and_their_declared_initial_value() {
       (define form-doc (session-document (current-session)))
     "#,
     );
+    // The file reader shows the source directory abbreviated (~/...),
+    // which on a runner whose temp dir is under $HOME differs from the
+    // literal path: ask the editor what it shows.
+    let shown = eval(&mut rt, "(abbreviate-path here)");
+    let shown = shown.trim_matches('"');
     keys(&mut rt, "1");
-    assert_eq!(rt.snapshot().minibuffer.unwrap().input, format!("{}/", project.display()));
+    assert_eq!(rt.snapshot().minibuffer.unwrap().input, shown);
     keys(&mut rt, "C-g");
     assert_eq!(eval(&mut rt, "(document=? (session-document (current-session)) form-doc)"), "#t", "aborting keeps the form focused");
     // Test a declared initial thunk as well as the file reader's implicit
@@ -144,8 +149,11 @@ fn form_readers_keep_the_source_directory_and_their_declared_initial_value() {
       (define other (open-command-form! (current-session) 'choose-name))
     "#,
     );
+    // A prompt reader's declared initial is used as written, not abbreviated.
+    let declared = eval(&mut rt, "here");
+    let declared = declared.trim_matches('"');
     keys(&mut rt, "1");
-    assert_eq!(rt.snapshot().minibuffer.unwrap().input, format!("{}/", project.display()));
+    assert_eq!(rt.snapshot().minibuffer.unwrap().input, declared);
     keys(&mut rt, "C-g");
 }
 
