@@ -137,7 +137,7 @@ const STAGING: &str = r#"
 (define w (make-view other "user"))
 (define-command (rename-two s word) "Replace the first word in two documents."
   #:arguments '((word string))
-  #:effects '(read edit)
+  #:effects '(read edit) #:stageable #t
   (views-edit-at! (list (list v (document-revision source) (list (list 0 3 word)))
                        (list w (document-revision other) (list (list 0 3 word)))) "new"))
 (invoke (current-session) 'rename-two (dict 'word "ONE") #:mode 'stage)
@@ -204,8 +204,8 @@ fn external_effects_settings_undo_and_nested_apply_are_refused_when_staging() {
         &mut rt,
         "(define runs 0)
        (define-command (external s) \"An external effect.\" #:arguments '() #:effects '(external) (set! runs (+ runs 1)))
-       (define-command (nested s) \"Try an apply inside stage.\" #:arguments '() #:effects '(edit) (invoke s 'external (dict)))
-       (define-command (undoing s) \"Try undo.\" #:arguments '() #:effects '(edit) (view-undo! (session-view s)))
+       (define-command (nested s) \"Try an apply inside stage.\" #:arguments '() #:effects '(edit) #:stageable #t (invoke s 'external (dict)))
+       (define-command (undoing s) \"Try undo.\" #:arguments '() #:effects '(edit) #:stageable #t (view-undo! (session-view s)))
        (define-command (setting s) \"Try an undeclared setting.\" #:arguments '() (set-option! 'read-only #t))",
     );
     for cmd in ["external", "nested", "undoing", "setting"] {
@@ -220,7 +220,7 @@ fn external_effects_settings_undo_and_nested_apply_are_refused_when_staging() {
         &mut rt,
         r#"
       (define-command (mixed s) "Propose an edit, then attempt an external step."
-        #:arguments '() #:effects '(query edit)
+        #:arguments '() #:effects '(query edit) #:stageable #t
         (view-edit! (session-view s) '((0 3 "ABC")) "new")
         (note-effect! 'external)
         (set! runs (+ runs 1)))
@@ -234,13 +234,33 @@ fn external_effects_settings_undo_and_nested_apply_are_refused_when_staging() {
 }
 
 #[test]
+fn staging_an_edit_command_without_stageable_is_refused_before_it_runs() {
+    let mut rt = Runtime::with_document(Document::new("abc"), "emacs").unwrap();
+    eval(
+        &mut rt,
+        "(define runs 0)
+       (define-command (edit-word s) \"Edit, reading nothing back.\" #:arguments '() #:effects '(edit)
+         (set! runs (+ runs 1)) (view-edit! (session-view s) '((0 3 \"ABC\")) \"new\"))",
+    );
+    // Nothing marks the body as tolerating edits that have not landed, so
+    // staging is refused rather than offered to every contract command.
+    assert!(refused(&mut rt, &format!("(invoke {S} 'edit-word (dict) #:mode 'stage)")).contains("#:stageable"));
+    assert_eq!(eval(&mut rt, "runs"), "0", "the body did not run");
+    assert_eq!(eval(&mut rt, "(operation-proposals (record-operation (car (kept-operation-records))))"), "()");
+    assert_eq!(eval(&mut rt, "(document-string (session-document (current-session)))"), "\"abc\"");
+    eval(&mut rt, &format!("(invoke {S} 'edit-word (dict))"));
+    assert_eq!(eval(&mut rt, "runs"), "1", "applying it is unaffected");
+    assert_eq!(eval(&mut rt, "(document-string (session-document (current-session)))"), "\"ABC\"");
+}
+
+#[test]
 fn stages_merge_disjoint_edits_but_refuse_partial_invalid_batches() {
     let mut rt = Runtime::with_document(Document::new("one two"), "emacs").unwrap();
     eval(
         &mut rt,
         "(define source (session-document (current-session)))
        (define v (session-view (current-session)))
-       (define-command (twice s) \"Stage two disjoint edits.\" #:arguments '() #:effects '(edit)
+       (define-command (twice s) \"Stage two disjoint edits.\" #:arguments '() #:effects '(edit) #:stageable #t
          (view-edit! v '((0 3 \"ONE\")) \"new\")
          (view-edit! v '((4 7 \"TWO\")) \"new\"))
        (invoke (current-session) 'twice (dict) #:mode 'stage)
@@ -251,7 +271,7 @@ fn stages_merge_disjoint_edits_but_refuse_partial_invalid_batches() {
     assert_eq!(eval(&mut rt, "(document-string source)"), "\"one two\"");
     eval(
         &mut rt,
-        "(define-command (invalid-batch s) \"An invalid second entry.\" #:arguments '() #:effects '(edit)
+        "(define-command (invalid-batch s) \"An invalid second entry.\" #:arguments '() #:effects '(edit) #:stageable #t
        (views-edit-at! (list (list v 0 '((0 3 \"bad\")))
                             (list (make-view (make-document \"x\") \"user\") 0 '((0 20 \"no\")))) \"new\"))",
     );
@@ -297,7 +317,7 @@ fn staging_never_saves_and_does_not_escape_through_an_unheld_task() {
       (define v (session-view (current-session)))
       (view-edit! v '((0 8 "edited")) "new")
       (define-command (save-sneakily s) "Attempt to save without declaring it."
-        #:arguments '() #:effects '(edit) (document-save! source))
+        #:arguments '() #:effects '(edit) #:stageable #t (document-save! source))
     "#,
     );
     assert!(refused(&mut rt, &format!("(invoke {S} 'save-sneakily (dict) #:mode 'stage)")).contains("stage mode"));
@@ -307,7 +327,7 @@ fn staging_never_saves_and_does_not_escape_through_an_unheld_task() {
         r#"
       (define late #f)
       (define-command (deferred s) "Attempt an unheld background edit."
-        #:arguments '() #:effects '(edit)
+        #:arguments '() #:effects '(edit) #:stageable #t
         (spawn (lambda ()
           (set! late (guard (e (#t (error-text e))) (view-edit! v '((0 6 "ESCAPED")) "new") "escaped")))))
       (invoke (current-session) 'deferred (dict) #:mode 'stage)

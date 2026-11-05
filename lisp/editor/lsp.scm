@@ -1446,6 +1446,7 @@ AT is point, NAME the name there, and NEW-NAME is read, the old name
            (name context #:value ,(lambda (s args) (name-at-location (dict-ref args 'at))))
            (new-name ,read-new-name))
   #:effects '(read query edit)
+  #:stageable #t
   #:expose '(agents)
   ;; It renames later, when the server answers: its operation says how.
   #:result 'any

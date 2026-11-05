@@ -31,7 +31,7 @@ const STAGE: &str = r#"
 (define source (session-document (current-session)))
 (define v (session-view (current-session)))
 (define-command (stage-word s word) "Replace the first word with WORD."
-  #:arguments '((word string)) #:effects '(edit)
+  #:arguments '((word string)) #:effects '(edit) #:stageable #t
   (view-edit! v (list (list 0 3 word)) "new"))
 (invoke (current-session) 'stage-word (dict 'word "ONE") #:mode 'stage)
 (define staged (car (kept-operation-records)))
@@ -71,42 +71,44 @@ fn continuing_a_staged_operation_cannot_accept_unreviewed_content() {
 }
 
 #[test]
-fn forgetting_or_evicting_an_operation_discards_its_pending_proposals() {
-    for policy in ["forget", "count", "bytes", "both-logs"] {
+fn forgetting_discards_pending_proposals_but_eviction_spares_them() {
+    // Forgetting is a decision: the proposals are rejected, not orphaned.
+    let mut rt = runtime();
+    eval(&mut rt, STAGE);
+    eval(&mut rt, "(forget-operation! staged)");
+    assert_eq!(eval(&mut rt, "(operation-proposals (record-operation staged))"), "()");
+    assert_eq!(eval(&mut rt, "(proposals source)"), "()", "pending proposals must not be orphaned");
+    assert_eq!(eval(&mut rt, "(map proposal-state ids)"), "(\"rejected\")");
+    assert_eq!(eval(&mut rt, "(document-string source)"), "\"one two\"");
+
+    // Eviction is not a decision: under either bound, unrelated operations
+    // must not silently discard staged work awaiting review. It stays
+    // acceptable; once decided, its record is evictable again.
+    for policy in ["count", "bytes"] {
         let mut rt = runtime();
         eval(&mut rt, STAGE);
         eval(&mut rt, "(define-command (ping s) \"An invocation with no effects.\" #:arguments '() #t)");
         match policy {
-            "forget" => {
-                eval(&mut rt, "(forget-operation! staged)");
-            }
             "count" => {
-                eval(&mut rt, "(set! operations-kept-max 1) (invoke (current-session) 'ping (dict))");
+                eval(&mut rt, "(set! operations-kept-max 1)");
             }
-            "bytes" => {
-                eval(&mut rt, "(set! operations-kept-bytes 0) (invoke (current-session) 'ping (dict))");
+            _ => {
+                eval(&mut rt, "(set! operations-kept-bytes 0)");
             }
-            "both-logs" => {
-                eval(&mut rt, "(set! operation-trace-max 1) (set! operations-kept-max 1) (invoke (current-session) 'ping (dict))");
-            }
-            _ => unreachable!(),
         }
-        assert_eq!(eval(&mut rt, "(operation-proposals (record-operation staged))"), "()", "{policy}");
-        assert_eq!(eval(&mut rt, "(proposals source)"), "()", "{policy}: pending proposals must not be orphaned");
-        assert_eq!(eval(&mut rt, "(map proposal-state ids)"), "(\"rejected\")", "{policy}");
+        eval(&mut rt, "(invoke (current-session) 'ping (dict)) (invoke (current-session) 'ping (dict))");
+        assert_eq!(eval(&mut rt, "(if (memq staged (kept-operation-records)) 'kept 'gone)"), "kept", "{policy}");
+        assert_eq!(eval(&mut rt, "(map proposal-state ids)"), "(\"pending\")", "{policy}");
+        assert_eq!(eval(&mut rt, "(proposals source)"), eval(&mut rt, "ids"), "{policy}");
         assert_eq!(eval(&mut rt, "(document-string source)"), "\"one two\"");
-        // Repeated eviction must release capacity, not exhaust the global
-        // 256-proposal limit while all the corresponding records disappear.
         eval(
             &mut rt,
-            r#"
-          (set! operations-kept-max 1)
-          (set! operations-kept-bytes 4194304)
-          (do ((i 0 (+ i 1))) ((= i 260))
-            (invoke (current-session) 'stage-word (dict 'word "ONE") #:mode 'stage))
-        "#,
+            "(define seen (map (lambda (id) (car (proposal-preview id))) ids))
+             (accept-operation-proposals! (current-session) staged ids seen)",
         );
-        assert_eq!(eval(&mut rt, "(length (proposals source))"), "1", "{policy}: capacity is reclaimed");
+        assert_eq!(eval(&mut rt, "(document-string source)"), "\"ONE two\"", "{policy}: still acceptable");
+        eval(&mut rt, "(set! operations-kept-max 1) (set! operations-kept-bytes 4194304) (invoke (current-session) 'ping (dict))");
+        assert_eq!(eval(&mut rt, "(if (memq staged (kept-operation-records)) 'kept 'gone)"), "gone", "{policy}: decided, so evictable");
     }
 }
 

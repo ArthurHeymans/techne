@@ -20,7 +20,7 @@
 (provide press press-keys type-text command-doc
          define-command register-command! command command-names run-command command-joins! message!
          invoke make-contract command-contract command-code contract? contract-params contract-entries contract-read
-         contract-effects contract-expose contract-available contract-result contract-hash
+         contract-effects contract-expose contract-available contract-stageable contract-result contract-hash
          contract-argument-schema contract-sensitive set-command-acquirer! contract-conform-argument ->data error-text messages-document message-log-max
          log-history log-message!
          failed! set-failure-note! take-violations!
@@ -193,8 +193,8 @@ DOC documents both the procedure and the command; BODY runs when it is
 invoked. With #:arguments after DOC, it is a command with a contract,
 a procedure of the session and its arguments, in order: (define-command
 (name s arg ...) doc #:arguments '((arg schema option ...) ...) ...
-body ...), with #:read, #:effects, #:expose, #:available and #:result
-after #:arguments as `make-contract` takes them."
+body ...), with #:read, #:effects, #:expose, #:available, #:stageable
+and #:result after #:arguments as `make-contract` takes them."
     ((_ (name s param ...) doc #:arguments arguments rest ...)
      (%command-options (name s param ...) doc (arguments) rest ...))
     ((_ (name s n) doc body ...)
@@ -211,6 +211,7 @@ after #:arguments as `make-contract` takes them."
     ((_ head doc (opt ...) #:effects v rest ...) (%command-options head doc (opt ... #:effects v) rest ...))
     ((_ head doc (opt ...) #:expose v rest ...) (%command-options head doc (opt ... #:expose v) rest ...))
     ((_ head doc (opt ...) #:available v rest ...) (%command-options head doc (opt ... #:available v) rest ...))
+    ((_ head doc (opt ...) #:stageable v rest ...) (%command-options head doc (opt ... #:stageable v) rest ...))
     ((_ head doc (opt ...) #:result v rest ...) (%command-options head doc (opt ... #:result v) rest ...))
     ((_ (name s param ...) doc (opt ...) body ...)
      (begin
@@ -225,7 +226,7 @@ after #:arguments as `make-contract` takes them."
 ;;; takes, as data, and what it may do.
 
 (define-record-type contract
-  (%make-contract params entries read effects expose available result hash)
+  (%make-contract params entries read effects expose available stageable result hash)
   contract?
   ;; The arguments' names, in order.
   (params contract-params)
@@ -242,11 +243,15 @@ after #:arguments as `make-contract` takes them."
   (expose contract-expose)
   ;; (session) -> #t, or why it cannot run there; or #f.
   (available contract-available)
+  ;; Whether its body tolerates staging: it does not read its own edits
+  ;; back, nor assume another effect of its landed (doc/operations.md,
+  ;; "Invocation"). Only a stageable command's `edit` effect may stage.
+  (stageable contract-stageable)
   (result contract-result)
   ;; Its identity: a changed contract makes old arguments suspect.
   (hash contract-hash))
 
-(define (make-contract entries #:read [read '()] #:effects [effects '()] #:expose [expose '()] #:available [available #f] #:result [result #f])
+(define (make-contract entries #:read [read '()] #:effects [effects '()] #:expose [expose '()] #:available [available #f] #:stageable [stageable #f] #:result [result #f])
   "Return the contract of a command taking the arguments ENTRIES.
 ENTRIES are (name schema option ...), as a dict schema's, SCHEMA a
 procedure of the arguments before when it depends on them; options
@@ -255,16 +260,18 @@ be recorded or written). READ says how to ask the user for each: (name
 how option ...). EFFECTS is what it may do, a list of `read`, `query`,
 `edit`, `settings`, `external`, or a procedure of the arguments giving
 it. EXPOSE lists who else may invoke it (`agents`). AVAILABLE is a
-procedure of the session giving #t or why not. RESULT is the schema of
-what it returns."
+procedure of the session giving #t or why not. STAGEABLE, #t, says the
+body does not read its own edits back nor assume another effect of its
+landed, so its `edit` effect may run in `stage` mode. RESULT is the
+schema of what it returns."
   (for-each (lambda (e)
               ;; Its schema is checked when invoked: kinds it names may
               ;; be defined after it (contracts.scm).
               (unless (and (pair? e) (symbol? (car e)) (pair? (cdr e)) (or (procedure? (cadr e)) (symbol? (cadr e)) (pair? (cadr e))))
                 (error "make-contract: not an argument (name schema option ...):" e)))
             entries)
-  (%make-contract (map car entries) entries read effects expose available result
-                  (contract-hash* entries effects expose result)))
+  (%make-contract (map car entries) entries read effects expose available stageable result
+                  (contract-hash* entries effects expose stageable result)))
 
 ;; A number for what a contract says: written, procedures as such.
 (define (contract-hash* . parts)
@@ -354,50 +361,51 @@ not, as `invoke` would."
 
 ;; What a record keeps of a value: data, walked down, bounded (strings
 ;; and lists cut short, saying so), a kind's value as its data, what is
-;; not data written (a procedure as #<procedure>): no live object.
+;; not data written (a procedure as #<procedure>): no live object. One
+;; walk makes the data and says whether it preserves V exactly: what the
+;; walk cuts or writes is evidence for a record, never silently an
+;; argument for another invocation, so the two cannot disagree.
+(define (data+exact v [depth 0])
+  "Return (data . exact?): what a record keeps of V (as `->data`), and
+whether that is V whole, as data a later invocation may take again."
+  (let ((kind (and (not (string? v)) (schema-kind-of v))))
+    (cond (kind
+           (if (< depth 4) (data+exact (schema-kind-data kind v) (+ depth 1)) (cons "…" #f)))
+          ((string? v)
+           (if (> (string-length v) 200)
+               (cons (string-append (substring v 0 200) "… (" (number->string (string-length v)) " characters)") #f)
+               (cons v #t)))
+          ((or (boolean? v) (symbol? v) (keyword? v) (char? v) (number? v) (null? v)) (cons v #t))
+          ((>= depth 4) (cons "…" #f))
+          ((list? v)
+           (let* ((cut (> (length v) 32))
+                  (parts (map (lambda (x) (data+exact x (+ depth 1))) (if cut (take v 32) v))))
+             (cons (if cut (append (map car parts) (list (string-append "… (" (number->string (length v)) " in all)"))) (map car parts))
+                   (and (not cut) (every cdr parts)))))
+          ((vector? v) (let ((r (data+exact (vector->list v) depth))) (cons (list->vector (car r)) (cdr r))))
+          ((dict? v)
+           (let* ((ks (dict-keys v)) (cut (> (length ks) 32)))
+             (let loop ((ks (if cut (take ks 32) ks)) (d (dict)) (exact (not cut)))
+               (if (null? ks)
+                   (cons d exact)
+                   (let ((k (data+exact (car ks) (+ depth 1))) (x (data+exact (dict-ref v (car ks)) (+ depth 1))))
+                     (loop (cdr ks) (dict-set d (car k) (car x)) (and exact (cdr k) (cdr x))))))))
+          (else (let ((w (call-with-output-string (lambda (p) (write v p)))))
+                  (cons (if (> (string-length w) 80) (string-append (substring w 0 80) "…") w) #f))))))
+
 (define (->data v [depth 0])
   "Return what a record keeps of V: data, bounded, no live object.
 Long strings and lists are cut short, saying so; a kind's value is its
 data; what is not data is written. DEPTH is how deep V is in what is
 kept, four at most."
-  (let ((kind (and (not (string? v)) (schema-kind-of v))))
-    (cond (kind
-           (if (< depth 4) (->data (schema-kind-data kind v) (+ depth 1)) "…"))
-          ((string? v)
-           (if (> (string-length v) 200)
-               (string-append (substring v 0 200) "… (" (number->string (string-length v)) " characters)")
-               v))
-          ((or (boolean? v) (symbol? v) (keyword? v) (char? v) (number? v) (null? v)) v)
-          ((>= depth 4) "…")
-          ((list? v)
-           (let ((items (map (lambda (x) (->data x (+ depth 1))) (if (> (length v) 32) (take v 32) v))))
-             (if (> (length v) 32) (append items (list (string-append "… (" (number->string (length v)) " in all)"))) items)))
-          ((vector? v) (list->vector (->data (vector->list v) depth)))
-          ((dict? v)
-           (fold (lambda (k d) (dict-set d (->data k (+ depth 1)) (->data (dict-ref v k) (+ depth 1))))
-                 (dict) (let ((ks (dict-keys v))) (if (> (length ks) 32) (take ks 32) ks))))
-          (else (let ((w (call-with-output-string (lambda (p) (write v p)))))
-                  (if (> (string-length w) 80) (string-append (substring w 0 80) "…") w))))))
+  (car (data+exact v depth)))
 
-;; Whether `->data` preserves V exactly, including values nested in
-;; collections and editor references. A shortened record is evidence,
-;; never silently an argument for another invocation.
-(define (reusable-data? v [depth 0])
-  (let ((kind (and (not (string? v)) (schema-kind-of v))))
-    (cond (kind (and (< depth 4) (reusable-data? (schema-kind-data kind v) (+ depth 1))))
-          ((string? v) (<= (string-length v) 200))
-          ((or (boolean? v) (symbol? v) (keyword? v) (char? v) (number? v) (null? v)) #t)
-          ((>= depth 4) #f)
-          ((list? v) (and (<= (length v) 32) (every (lambda (x) (reusable-data? x (+ depth 1))) v)))
-          ((vector? v) (reusable-data? (vector->list v) depth))
-          ((dict? v) (let ((ks (dict-keys v)))
-                       (and (<= (length ks) 32)
-                            (every (lambda (k) (and (reusable-data? k (+ depth 1)) (reusable-data? (dict-ref v k) (+ depth 1)))) ks))))
-          (else #f))))
-
-;; An argument's value as data, for a record.
+;; An argument's value as data, for a record, as (data exact?): a
+;; sensitive one is "<redacted>" and never exact.
 (define (argument-data e value)
-  (if (entry-flag? e #:sensitive) "<redacted>" (->data value)))
+  (if (entry-flag? e #:sensitive)
+      (list "<redacted>" #f)
+      (let ((r (data+exact value))) (list (car r) (cdr r)))))
 
 ;; How acquisition reads a command's arguments from the user, then
 ;; invokes it (contracts.scm): (session name count).
@@ -419,7 +427,8 @@ out. It runs as an operation, a child of the current one, recording the
 arguments as data. MODE `check` stops there and returns #t; `apply`
 runs it and returns what it returns. `stage` runs reads and queries,
 but edits become revision-checked proposals; settings and external
-effects are refused, as are edits through presentations and undo.
+effects are refused, as are edits through presentations and undo, and
+the `edit` effect of a command that does not declare #:stageable.
 Errors are raised to the caller, sensitive irritants redacted.
 The operation is a child of PARENT when given (the failed one a recovery
 choice is of), and
@@ -436,14 +445,17 @@ STARTED, if given, is called with its record before the command runs."
            (vals (map (lambda (k) (dict-ref done k #f)) (contract-params contract)))
            (effects (let ((e (contract-effects contract))) (if (procedure? e) (apply e vals) e)))
            (secrets (filter-map (lambda (ev) (and (entry-flag? (car ev) #:sensitive) (cdr ev))) (map cons (contract-entries contract) vals)))
-           (data (map (lambda (e v) (cons (car e) (argument-data e v))) (contract-entries contract) vals))
-           (unavailable (filter-map (lambda (ev)
-                                      (let ((e (car ev)) (v (cdr ev)))
-                                        (and (or (entry-flag? e #:sensitive)
-                                                 (not (dict-contains? done (car e)))
-                                                 (not (reusable-data? v)))
-                                             (car e))))
-                                    (map cons (contract-entries contract) vals))))
+           (kept (map (lambda (e v) (cons (car e) (argument-data e v))) (contract-entries contract) vals))
+           (data (map (lambda (k) (cons (car k) (cadr k))) kept))
+           (unavailable (let loop ((es (contract-entries contract)) (ks kept) (acc '()))
+                          (if (null? es)
+                              (reverse acc)
+                              (loop (cdr es) (cdr ks)
+                                    (if (or (entry-flag? (car es) #:sensitive)
+                                            (not (dict-contains? done (caar es)))
+                                            (not (caddr (car ks))))
+                                        (cons (caar es) acc)
+                                        acc))))))
       (case mode
         ((check) #t)
         ((apply stage)
@@ -461,6 +473,8 @@ STARTED, if given, is called with its record before the command runs."
                           (call-in-operation
                            (record-operation r)
                            (lambda ()
+                             (when (and (operation-staged? (record-operation r)) (memq 'edit effects) (not (contract-stageable contract)))
+                               (error "Cannot stage this command: it does not declare #:stageable, so its body may assume its edits landed; apply it instead" name))
                              (when (and (operation-staged? (record-operation r)) (any (lambda (e) (memq e '(settings external))) effects))
                                (error "Cannot stage settings or external effects; apply explicitly instead" name))
                              (let ((result (apply (caddr c) s vals)))
