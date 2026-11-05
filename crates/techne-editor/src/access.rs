@@ -27,7 +27,7 @@ use std::{
     },
 };
 
-use techne_text::{ChangeSet, Document, Group, Revision, Transaction, document::Actor};
+use techne_text::{ChangeSet, Document, Group, OperationId, Revision, Transaction, document::Actor};
 use techne_vm::{
     api::{Arg, Foreign, FromValue, IntoValue, Value},
     vm::{Error, Vm},
@@ -66,11 +66,31 @@ impl Grant {
     }
 }
 
+/// Where a proposal came from, and so what can end it undecided.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// A service, through its grant: the grant revoked, or its service's
+    /// world ended, leaves the proposal revoked.
+    Grant(u64),
+    /// A staged operation: there is no grant to revoke; the proposal is
+    /// decided, or rejected when its operation's record is forgotten.
+    Operation(OperationId),
+}
+
+impl Origin {
+    /// Whether what made the proposal still stands.
+    fn holds(&self, access: &Access) -> bool {
+        match self {
+            Origin::Grant(id) => access.holds(*id),
+            Origin::Operation(_) => true,
+        }
+    }
+}
+
 /// A proposal waiting to be decided.
 #[derive(Clone)]
 struct Proposal {
-    /// None for a trusted editor operation, whose transaction names it.
-    grant: Option<u64>,
+    origin: Origin,
     doc: Weak<RefCell<Document>>,
     tx: Transaction,
     note: String,
@@ -132,7 +152,7 @@ impl Access {
         if g.right != Right::Stage {
             return Err("the grant allows reading, not proposing".into());
         }
-        let pending = self.proposals.values().filter(|p| p.grant == Some(id)).count();
+        let pending = self.proposals.values().filter(|p| p.origin == Origin::Grant(id)).count();
         if pending >= PENDING {
             return Err(format!("{PENDING} proposals of this grant wait already"));
         }
@@ -148,7 +168,7 @@ impl Access {
         };
         let changes = ChangeSet::from_edits(len, crate::edit_args(edits)).map_err(|e| e.to_string())?;
         let tx = Transaction { base, actor: g.actor.clone(), changes, group: Group::New, operation: None };
-        let p = Proposal { grant: Some(id), doc: Rc::downgrade(&doc), tx, note };
+        let p = Proposal { origin: Origin::Grant(id), doc: Rc::downgrade(&doc), tx, note };
         let pid = self.fresh();
         // Those of documents gone are decided by nobody.
         self.proposals.retain(|_, p| p.doc.strong_count() > 0);
@@ -175,10 +195,8 @@ impl Access {
             }
             documents.push(doc.clone());
             let mut edits = v.rebase_at(*base, edits.clone())?;
-            let existing = self
-                .proposals
-                .iter()
-                .find(|(_, p)| p.grant.is_none() && p.tx.operation == Some(op.id()) && p.doc.ptr_eq(&Rc::downgrade(&doc)));
+            let existing =
+                self.proposals.iter().find(|(_, p)| p.origin == Origin::Operation(op.id()) && p.doc.ptr_eq(&Rc::downgrade(&doc)));
             if let Some((_, p)) = existing {
                 let old = doc.borrow().rebase(p.tx.clone()).map_err(|e| format!("Refused: {e} since"))?;
                 edits.extend(old.changes.edits().map(|(r, t)| (r, t.to_string())));
@@ -191,7 +209,7 @@ impl Access {
                 planned.push((
                     existing.map(|(&id, _)| id),
                     Proposal {
-                        grant: None,
+                        origin: Origin::Operation(op.id()),
                         doc: Rc::downgrade(&doc),
                         tx,
                         note: format!("{} (operation {})", op.command_name(), op.id().serial),
@@ -200,7 +218,7 @@ impl Access {
             }
         }
         self.proposals.retain(|_, p| p.doc.strong_count() > 0);
-        let pending = self.proposals.values().filter(|p| p.grant.is_none()).count();
+        let pending = self.proposals.values().filter(|p| matches!(p.origin, Origin::Operation(_))).count();
         let added = planned.iter().filter(|(id, _)| id.is_none()).count();
         if pending + added > PENDING || op.proposal_count() + added > PENDING {
             return Err(format!("stage: at most {PENDING} operation proposals may wait, or belong to one operation"));
@@ -342,7 +360,7 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
                 return Ok(how);
             }
             let p = access.proposal(id)?;
-            Ok(if p.grant.is_none_or(|g| access.holds(g)) { "pending" } else { "revoked" })
+            Ok(if p.origin.holds(&access) { "pending" } else { "revoked" })
         };
     }
     let a = access.clone();
@@ -382,7 +400,7 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
             let (doc, mut tx) = {
                 let access = a.borrow();
                 let p = access.proposal(id)?;
-                if !adopt && !p.grant.is_none_or(|g| access.holds(g)) {
+                if !adopt && !p.origin.holds(&access) {
                     return Err("proposal-accept!: the grant is revoked; adopt the proposal to accept it".into());
                 }
                 access.rebased(id)?
@@ -433,7 +451,7 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
                 let access = a.borrow();
                 for (&id, &seen) in ids.iter().zip(&seen) {
                     let p = access.proposal(id as u64)?;
-                    if !p.grant.is_none_or(|g| access.holds(g)) {
+                    if !p.origin.holds(&access) {
                         return Err("proposals-accept!: a grant is revoked".into());
                     }
                     let (doc, tx) = access.rebased(id as u64)?;
