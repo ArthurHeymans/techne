@@ -4257,7 +4257,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "caseless",
- "cranelift-codegen 0.134.4",
+ "cranelift-codegen 0.137.1",
  "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module 0.134.4",
