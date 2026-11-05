@@ -107,12 +107,9 @@ It is a child of PARENT, an operation, or else of the current one, run
 for PRINCIPAL. It ends when what holds it is released, the first hold
 `call-in-operation`'s. CODE is the procedure that runs, DOCUMENT the id
 of the document it starts in, at REVISION, and PREFIX its prefix
-argument, for its record."
-  (let ((start (lambda () (record-operation (%begin-operation! command s (code-id code) document revision prefix principal)))))
-    (if parent
-        (let ((old (current-operation)))
-          (dynamic-wind (lambda () (%task-local-set! %key parent)) start (lambda () (%task-local-set! %key old))))
-        (start))))
+argument, for its record. PARENT records lineage only: staging is
+inherited from the operation currently running, not an explicit parent."
+  (record-operation (%begin-operation! command s (code-id code) document revision prefix principal parent)))
 
 ;; Who each operation runs for, by its object, held as long as it is:
 ;; work it leaves (a task, a callback) keeps its principal after it ends.
@@ -121,15 +118,15 @@ argument, for its record."
 ;; As `start-operation!`, without keywords, which cost: every key runs it.
 ;; CODE is the code's number (`code-id`). Return the operation's record.
 (define (%start-operation! command s code document revision prefix)
-  (%begin-operation! command s code document revision prefix "user"))
-(define (%begin-operation! command s code document revision prefix principal)
-  (let* ((parent (current-operation))
-         (op (%make-operation (symbol->string command) parent))
+  (%begin-operation! command s code document revision prefix "user" #f))
+(define (%begin-operation! command s code document revision prefix principal parent)
+  (let* ((running (current-operation))
+         (op (%make-operation (symbol->string command) (or parent running)))
          (r (make-record op command code document revision prefix 1 #f #f #f #f principal #f #f #f '() #f #f '())))
     ;; A task left after its operation ended still cannot shed staging by
     ;; running an opaque command. A provenance parent alone (acceptance)
     ;; is different from the operation current while code executes.
-    (when (and parent (operation-staged? parent)) (%operation-stage! op))
+    (when (and running (operation-staged? running)) (%operation-stage! op))
     (hash-table-set! %principals op principal)
     (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f '() '()))
     (set-record-traced! r (ring-push! %trace r 96))

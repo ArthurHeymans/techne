@@ -77,7 +77,7 @@
       "is_macro": false
     },
     "call-in-operation": {
-      "description": "(call-in-operation op thunk #:fail (fail #t))  procedure, @lisp@/editor/operations.scm:289\n\nCall THUNK with OP current, holding OP while it runs.\nA condition THUNK raises fails OP (a task's cancellation cancels it),\nunless FAIL is #f, and is raised again: a preview failing, say, is\nshown, and the reading goes on.",
+      "description": "(call-in-operation op thunk #:fail (fail #t))  procedure, @lisp@/editor/operations.scm:286\n\nCall THUNK with OP current, holding OP while it runs.\nA condition THUNK raises fails OP (a task's cancellation cancels it),\nunless FAIL is #f, and is raised again: a preview failing, say, is\nshown, and the reading goes on.",
       "is_macro": false
     },
     "call-with-process": {
@@ -137,23 +137,23 @@
       "is_macro": false
     },
     "choice-arguments": {
-      "description": "(choice-arguments record)  procedure, @lisp@/editor/operations.scm:340\n\nReturn the `arguments` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-arguments record)  procedure, @lisp@/editor/operations.scm:337\n\nReturn the `arguments` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choice-command": {
-      "description": "(choice-command record)  procedure, @lisp@/editor/operations.scm:338\n\nReturn the `command` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-command record)  procedure, @lisp@/editor/operations.scm:335\n\nReturn the `command` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choice-doc": {
-      "description": "(choice-doc record)  procedure, @lisp@/editor/operations.scm:337\n\nReturn the `doc` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-doc record)  procedure, @lisp@/editor/operations.scm:334\n\nReturn the `doc` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choice-label": {
-      "description": "(choice-label record)  procedure, @lisp@/editor/operations.scm:336\n\nReturn the `label` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-label record)  procedure, @lisp@/editor/operations.scm:333\n\nReturn the `label` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choice-settles?": {
-      "description": "(choice-settles? record)  procedure, @lisp@/editor/operations.scm:341\n\nReturn the `settles` field of RECORD, a `recovery-choice` record.",
+      "description": "(choice-settles? record)  procedure, @lisp@/editor/operations.scm:338\n\nReturn the `settles` field of RECORD, a `recovery-choice` record.",
       "is_macro": false
     },
     "choose-recovery!": {
@@ -161,7 +161,7 @@
       "is_macro": false
     },
     "code-id": {
-      "description": "(code-id code)  procedure, @lisp@/editor/operations.scm:187\n\nReturn the number naming the procedure CODE in records, or #f.\nA command redefined runs another procedure, under another number.",
+      "description": "(code-id code)  procedure, @lisp@/editor/operations.scm:184\n\nReturn the number naming the procedure CODE in records, or #f.\nA command redefined runs another procedure, under another number.",
       "is_macro": false
     },
     "column": {
@@ -197,7 +197,7 @@
       "is_macro": false
     },
     "condition-choices": {
-      "description": "(condition-choices e)  procedure, @lisp@/editor/operations.scm:362\n\nReturn the recovery choices the condition E offers, a list.",
+      "description": "(condition-choices e)  procedure, @lisp@/editor/operations.scm:359\n\nReturn the recovery choices the condition E offers, a list.",
       "is_macro": false
     },
     "contract-effects": {
@@ -237,7 +237,7 @@
       "is_macro": false
     },
     "current-principal": {
-      "description": "(current-principal)  procedure, @lisp@/editor/operations.scm:175\n\nReturn who the current operation runs for: \"user\", an agent's name.\nEnded, it runs for whom it ran for: work it left (a task, a callback)\nkeeps that principal. \"user\" without an operation.",
+      "description": "(current-principal)  procedure, @lisp@/editor/operations.scm:172\n\nReturn who the current operation runs for: \"user\", an agent's name.\nEnded, it runs for whom it ran for: work it left (a task, a callback)\nkeeps that principal. \"user\" without an operation.",
       "is_macro": false
     },
     "current-session": {
@@ -465,7 +465,7 @@
       "is_macro": false
     },
     "error-with-choices": {
-      "description": "(error-with-choices choices message . irritants)  procedure, @lisp@/editor/operations.scm:371\n\nRaise an error of MESSAGE and IRRITANTS offering CHOICES.\nCHOICES are recovery choices (`make-choice`): the operation it fails\nkeeps them, for the user, or who it ran for, to choose from.",
+      "description": "(error-with-choices choices message . irritants)  procedure, @lisp@/editor/operations.scm:368\n\nRaise an error of MESSAGE and IRRITANTS offering CHOICES.\nCHOICES are recovery choices (`make-choice`): the operation it fails\nkeeps them, for the user, or who it ran for, to choose from.",
       "is_macro": false
     },
     "eval-region!": {
@@ -549,11 +549,11 @@
       "is_macro": false
     },
     "find-operation-record": {
-      "description": "(find-operation-record serial)  procedure, @lisp@/editor/operations.scm:684\n\nReturn the record of the operation SERIAL of this runtime, or #f.\n#f when it is forgotten: past the bounds of the logs, ended.",
+      "description": "(find-operation-record serial)  procedure, @lisp@/editor/operations.scm:681\n\nReturn the record of the operation SERIAL of this runtime, or #f.\n#f when it is forgotten: past the bounds of the logs, ended.",
       "is_macro": false
     },
     "forget-operation!": {
-      "description": "(forget-operation! r)  procedure, @lisp@/editor/operations.scm:675\n\nForget the operation of record R: its record leaves the logs.\nIts changes still name it, by number; asked for, it is forgotten.\nAny pending proposals it owns are rejected, without editing their\nsources. A pending operation is not forgotten: it is an error.",
+      "description": "(forget-operation! r)  procedure, @lisp@/editor/operations.scm:672\n\nForget the operation of record R: its record leaves the logs.\nIts changes still name it, by number; asked for, it is forgotten.\nAny pending proposals it owns are rejected, without editing their\nsources. A pending operation is not forgotten: it is an error.",
       "is_macro": false
     },
     "form-arguments": {
@@ -653,7 +653,7 @@
       "is_macro": false
     },
     "kept-operation-records": {
-      "description": "(kept-operation-records)  procedure, @lisp@/editor/operations.scm:640\n\nReturn the records of the operations kept, newest first.\nThey are those that made a change or failed, as far back as their\nbounds (`operations-kept-max`) let them be kept.",
+      "description": "(kept-operation-records)  procedure, @lisp@/editor/operations.scm:637\n\nReturn the records of the operations kept, newest first.\nThey are those that made a change or failed, as far back as their\nbounds (`operations-kept-max`) let them be kept.",
       "is_macro": false
     },
     "keymap-sequences": {
@@ -837,7 +837,7 @@
       "is_macro": false
     },
     "make-choice": {
-      "description": "(make-choice label command arguments #:doc (doc \"\") #:settles (settles #t))  procedure, @lisp@/editor/operations.scm:343\n\nReturn a recovery choice, LABEL: invoking COMMAND with ARGUMENTS.\nARGUMENTS is a dict of data, as `invoke` takes them, which say what the\nchoice expects (a document as of a revision): invoked, they are checked\nagainst the state then, and refused if stale. DOC says what it does. A\nchoice that only shows something (comparing) does not settle the\nfailure: SETTLES #f.",
+      "description": "(make-choice label command arguments #:doc (doc \"\") #:settles (settles #t))  procedure, @lisp@/editor/operations.scm:340\n\nReturn a recovery choice, LABEL: invoking COMMAND with ARGUMENTS.\nARGUMENTS is a dict of data, as `invoke` takes them, which say what the\nchoice expects (a document as of a revision): invoked, they are checked\nagainst the state then, and refused if stale. DOC says what it does. A\nchoice that only shows something (comparing) does not settle the\nfailure: SETTLES #f.",
       "is_macro": false
     },
     "make-contract": {
@@ -1113,7 +1113,7 @@
       "is_macro": false
     },
     "note-effect!": {
-      "description": "(note-effect! effect)  procedure, @lisp@/editor/operations.scm:138\n\nNote that the current operation has EFFECT: `settings`, `external`.\nWhat changes text and saves files is noted where it commits; this is\nfor the rest: a setting changed, a process started. An invocation that\ndid not declare it has it as a violation.",
+      "description": "(note-effect! effect)  procedure, @lisp@/editor/operations.scm:135\n\nNote that the current operation has EFFECT: `settings`, `external`.\nWhat changes text and saves files is noted where it commits; this is\nfor the rest: a setting changed, a process started. An invocation that\ndid not declare it has it as a violation.",
       "is_macro": false
     },
     "open-command-form!": {
@@ -1129,7 +1129,7 @@
       "is_macro": false
     },
     "operation-cancelled!": {
-      "description": "(operation-cancelled! op)  procedure, @lisp@/editor/operations.scm:278\n\nCancel OP, unless it failed already: what it holds is cancelled.",
+      "description": "(operation-cancelled! op)  procedure, @lisp@/editor/operations.scm:275\n\nCancel OP, unless it failed already: what it holds is cancelled.",
       "is_macro": false
     },
     "operation-change-counts": {
@@ -1153,15 +1153,15 @@
       "is_macro": false
     },
     "operation-failed!": {
-      "description": "(operation-failed! op condition)  procedure, @lisp@/editor/operations.scm:270\n\nSay that OP failed with CONDITION; the first failure is the one kept.\nOP is ending from then: what it holds is cancelled.",
+      "description": "(operation-failed! op condition)  procedure, @lisp@/editor/operations.scm:267\n\nSay that OP failed with CONDITION; the first failure is the one kept.\nOP is ending from then: what it holds is cancelled.",
       "is_macro": false
     },
     "operation-hold!": {
-      "description": "(operation-hold! op #:cancel (cancel #f))  procedure, @lisp@/editor/operations.scm:215\n\nKeep OP from ending until the token returned is released.\nCANCEL, if given, is a thunk stopping the work holding it, called when\nOP fails or is cancelled. Return #f, holding nothing, if OP has ended.",
+      "description": "(operation-hold! op #:cancel (cancel #f))  procedure, @lisp@/editor/operations.scm:212\n\nKeep OP from ending until the token returned is released.\nCANCEL, if given, is a thunk stopping the work holding it, called when\nOP fails or is cancelled. Return #f, holding nothing, if OP has ended.",
       "is_macro": false
     },
     "operation-logs-bytes": {
-      "description": "(operation-logs-bytes)  procedure, @lisp@/editor/operations.scm:693\n\nReturn about how many bytes the logs' records hold: (trace kept).",
+      "description": "(operation-logs-bytes)  procedure, @lisp@/editor/operations.scm:690\n\nReturn about how many bytes the logs' records hold: (trace kept).",
       "is_macro": false
     },
     "operation-made-last-change?": {
@@ -1185,7 +1185,7 @@
       "is_macro": false
     },
     "operation-procedure": {
-      "description": "(operation-procedure proc #:fail (fail #t))  procedure, @lisp@/editor/operations.scm:311\n\nReturn PROC made to run in the operation current now.\nReturn PROC itself when there is none, or PROC is #f. FAIL is as\n`call-in-operation` takes it.",
+      "description": "(operation-procedure proc #:fail (fail #t))  procedure, @lisp@/editor/operations.scm:308\n\nReturn PROC made to run in the operation current now.\nReturn PROC itself when there is none, or PROC is #f. FAIL is as\n`call-in-operation` takes it.",
       "is_macro": false
     },
     "operation-proposals": {
@@ -1193,15 +1193,15 @@
       "is_macro": false
     },
     "operation-record-of": {
-      "description": "(operation-record-of op)  procedure, @lisp@/editor/operations.scm:196\n\nReturn the record of OP while it is pending, else #f.",
+      "description": "(operation-record-of op)  procedure, @lisp@/editor/operations.scm:193\n\nReturn the record of OP while it is pending, else #f.",
       "is_macro": false
     },
     "operation-record?": {
-      "description": "(operation-record? obj)  procedure, @lisp@/editor/operations.scm:380\n\nReturn #t if OBJ is a `operation-record` record.",
+      "description": "(operation-record? obj)  procedure, @lisp@/editor/operations.scm:377\n\nReturn #t if OBJ is a `operation-record` record.",
       "is_macro": false
     },
     "operation-release!": {
-      "description": "(operation-release! op token #:cancelled (cancelled #f))  procedure, @lisp@/editor/operations.scm:226\n\nRelease the hold TOKEN on OP; it ends when nothing holds it.\nCANCELLED says the work holding it was cancelled rather than done.",
+      "description": "(operation-release! op token #:cancelled (cancelled #f))  procedure, @lisp@/editor/operations.scm:223\n\nRelease the hold TOKEN on OP; it ends when nothing holds it.\nCANCELLED says the work holding it was cancelled rather than done.",
       "is_macro": false
     },
     "operation-runtime": {
@@ -1261,7 +1261,7 @@
       "is_macro": false
     },
     "pending-operation-records": {
-      "description": "(pending-operation-records)  procedure, @lisp@/editor/operations.scm:650\n\nReturn the records of the operations not ended, newest first.\nThey are listed from the work holding them, kept in the logs or not.",
+      "description": "(pending-operation-records)  procedure, @lisp@/editor/operations.scm:647\n\nReturn the records of the operations not ended, newest first.\nThey are listed from the work holding them, kept in the logs or not.",
       "is_macro": false
     },
     "point": {
@@ -1437,75 +1437,75 @@
       "is_macro": false
     },
     "record-arguments": {
-      "description": "(record-arguments record)  procedure, @lisp@/editor/operations.scm:407\n\nReturn the `arguments` field of RECORD, a `operation-record` record.",
+      "description": "(record-arguments record)  procedure, @lisp@/editor/operations.scm:404\n\nReturn the `arguments` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-choices": {
-      "description": "(record-choices record)  procedure, @lisp@/editor/operations.scm:417\n\nReturn the `choices` field of RECORD, a `operation-record` record.",
+      "description": "(record-choices record)  procedure, @lisp@/editor/operations.scm:414\n\nReturn the `choices` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-code": {
-      "description": "(record-code record)  procedure, @lisp@/editor/operations.scm:389\n\nReturn the `code` field of RECORD, a `operation-record` record.",
+      "description": "(record-code record)  procedure, @lisp@/editor/operations.scm:386\n\nReturn the `code` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-command": {
-      "description": "(record-command record)  procedure, @lisp@/editor/operations.scm:386\n\nReturn the `command` field of RECORD, a `operation-record` record.",
+      "description": "(record-command record)  procedure, @lisp@/editor/operations.scm:383\n\nReturn the `command` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-condition": {
-      "description": "(record-condition record)  procedure, @lisp@/editor/operations.scm:398\n\nReturn the `condition` field of RECORD, a `operation-record` record.",
+      "description": "(record-condition record)  procedure, @lisp@/editor/operations.scm:395\n\nReturn the `condition` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-contract": {
-      "description": "(record-contract record)  procedure, @lisp@/editor/operations.scm:410\n\nReturn the `contract` field of RECORD, a `operation-record` record.",
+      "description": "(record-contract record)  procedure, @lisp@/editor/operations.scm:407\n\nReturn the `contract` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-document": {
-      "description": "(record-document record)  procedure, @lisp@/editor/operations.scm:392\n\nReturn the `document` field of RECORD, a `operation-record` record.",
+      "description": "(record-document record)  procedure, @lisp@/editor/operations.scm:389\n\nReturn the `document` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-effects": {
-      "description": "(record-effects record)  procedure, @lisp@/editor/operations.scm:409\n\nReturn the `effects` field of RECORD, a `operation-record` record.",
+      "description": "(record-effects record)  procedure, @lisp@/editor/operations.scm:406\n\nReturn the `effects` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-operation": {
-      "description": "(record-operation record)  procedure, @lisp@/editor/operations.scm:384\n\nReturn the `op` field of RECORD, a `operation-record` record.",
+      "description": "(record-operation record)  procedure, @lisp@/editor/operations.scm:381\n\nReturn the `op` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-pending?": {
-      "description": "(record-pending? r)  procedure, @lisp@/editor/operations.scm:431\n\nReturn #t if the operation of record R has not ended.",
+      "description": "(record-pending? r)  procedure, @lisp@/editor/operations.scm:428\n\nReturn #t if the operation of record R has not ended.",
       "is_macro": false
     },
     "record-prefix": {
-      "description": "(record-prefix record)  procedure, @lisp@/editor/operations.scm:394\n\nReturn the `prefix` field of RECORD, a `operation-record` record.",
+      "description": "(record-prefix record)  procedure, @lisp@/editor/operations.scm:391\n\nReturn the `prefix` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-principal": {
-      "description": "(record-principal record)  procedure, @lisp@/editor/operations.scm:408\n\nReturn the `principal` field of RECORD, a `operation-record` record.",
+      "description": "(record-principal record)  procedure, @lisp@/editor/operations.scm:405\n\nReturn the `principal` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-revision": {
-      "description": "(record-revision record)  procedure, @lisp@/editor/operations.scm:393\n\nReturn the `revision` field of RECORD, a `operation-record` record.",
+      "description": "(record-revision record)  procedure, @lisp@/editor/operations.scm:390\n\nReturn the `revision` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-runs": {
-      "description": "(record-runs record)  procedure, @lisp@/editor/operations.scm:396\n\nReturn the `runs` field of RECORD, a `operation-record` record.",
+      "description": "(record-runs record)  procedure, @lisp@/editor/operations.scm:393\n\nReturn the `runs` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-settled": {
-      "description": "(record-settled record)  procedure, @lisp@/editor/operations.scm:418\n\nReturn the `settled` field of RECORD, a `operation-record` record.",
+      "description": "(record-settled record)  procedure, @lisp@/editor/operations.scm:415\n\nReturn the `settled` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-unavailable-arguments": {
-      "description": "(record-unavailable-arguments record)  procedure, @lisp@/editor/operations.scm:422\n\nReturn the `unavailable` field of RECORD, a `operation-record` record.",
+      "description": "(record-unavailable-arguments record)  procedure, @lisp@/editor/operations.scm:419\n\nReturn the `unavailable` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "record-violation": {
-      "description": "(record-violation record)  procedure, @lisp@/editor/operations.scm:412\n\nReturn the `violation` field of RECORD, a `operation-record` record.",
+      "description": "(record-violation record)  procedure, @lisp@/editor/operations.scm:409\n\nReturn the `violation` field of RECORD, a `operation-record` record.",
       "is_macro": false
     },
     "recovery-choice?": {
-      "description": "(recovery-choice? obj)  procedure, @lisp@/editor/operations.scm:334\n\nReturn #t if OBJ is a `recovery-choice` record.",
+      "description": "(recovery-choice? obj)  procedure, @lisp@/editor/operations.scm:331\n\nReturn #t if OBJ is a `recovery-choice` record.",
       "is_macro": false
     },
     "region-text": {
@@ -1845,7 +1845,7 @@
       "is_macro": false
     },
     "start-operation!": {
-      "description": "(start-operation! command s #:code (code #f) #:document (document #f) #:revision (revision #f) #:prefix (prefix #f) #:parent (parent #f) #:principal (principal \"user\"))  procedure, @lisp@/editor/operations.scm:103\n\nStart an operation of COMMAND, a symbol, in session S, and return it.\nIt is a child of PARENT, an operation, or else of the current one, run\nfor PRINCIPAL. It ends when what holds it is released, the first hold\n`call-in-operation`'s. CODE is the procedure that runs, DOCUMENT the id\nof the document it starts in, at REVISION, and PREFIX its prefix\nargument, for its record.",
+      "description": "(start-operation! command s #:code (code #f) #:document (document #f) #:revision (revision #f) #:prefix (prefix #f) #:parent (parent #f) #:principal (principal \"user\"))  procedure, @lisp@/editor/operations.scm:103\n\nStart an operation of COMMAND, a symbol, in session S, and return it.\nIt is a child of PARENT, an operation, or else of the current one, run\nfor PRINCIPAL. It ends when what holds it is released, the first hold\n`call-in-operation`'s. CODE is the procedure that runs, DOCUMENT the id\nof the document it starts in, at REVISION, and PREFIX its prefix\nargument, for its record. PARENT records lineage only: staging is\ninherited from the operation currently running, not an explicit parent.",
       "is_macro": false
     },
     "string->regexp": {
@@ -2041,7 +2041,7 @@
       "is_macro": false
     },
     "traced-operation-records": {
-      "description": "(traced-operation-records)  procedure, @lisp@/editor/operations.scm:646\n\nReturn the records of the operations in the trace, newest first.",
+      "description": "(traced-operation-records)  procedure, @lisp@/editor/operations.scm:643\n\nReturn the records of the operations in the trace, newest first.",
       "is_macro": false
     },
     "undo-operation!": {
@@ -2129,11 +2129,11 @@
       "is_macro": false
     },
     "with-choices": {
-      "description": "(with-choices e choices)  procedure, @lisp@/editor/operations.scm:366\n\nMake the condition E offer CHOICES, recovery choices; return E.",
+      "description": "(with-choices e choices)  procedure, @lisp@/editor/operations.scm:363\n\nMake the condition E offer CHOICES, recovery choices; return E.",
       "is_macro": false
     },
     "without-operation": {
-      "description": "(without-operation thunk)  procedure, @lisp@/editor/operations.scm:320\n\nCall THUNK in no operation: what it commits names none.\nFor the editor's own text (*Messages*), which no command changes.",
+      "description": "(without-operation thunk)  procedure, @lisp@/editor/operations.scm:317\n\nCall THUNK in no operation: what it commits names none.\nFor the editor's own text (*Messages*), which no command changes.",
       "is_macro": false
     },
     "word-end": {

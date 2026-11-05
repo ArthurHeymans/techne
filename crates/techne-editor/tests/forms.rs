@@ -173,6 +173,42 @@ fn staging_leaves_sources_and_selections_unchanged_and_accepts_as_one_linked_ope
 }
 
 #[test]
+fn an_explicit_staged_parent_records_lineage_without_staging_new_work() {
+    let mut rt = Runtime::with_document(Document::new("one two"), "emacs").unwrap();
+    eval(&mut rt, STAGING);
+    assert_eq!(eval(&mut rt, "(operation-phase (record-operation staged))"), "ended");
+    eval(&mut rt, "(define child (start-operation! 'direct-edit (current-session) #:parent (record-operation staged)))");
+    assert_eq!(eval(&mut rt, "(operation-staged? child)"), "#f");
+    assert_eq!(eval(&mut rt, "(operation-parent-serial child)"), eval(&mut rt, "(operation-serial (record-operation staged))"));
+    eval(&mut rt, "(call-in-operation child (lambda () (view-edit! v '((0 3 \"NOW\")) \"new\")))");
+    assert_eq!(eval(&mut rt, "(document-string source)"), "\"NOW two\"");
+    assert_eq!(eval(&mut rt, "(operation-proposals child)"), "()");
+    assert_eq!(eval(&mut rt, "(current-operation)"), "#f");
+}
+
+#[test]
+fn an_explicit_unstaged_parent_cannot_shed_the_running_operations_staging() {
+    let mut rt = Runtime::with_document(Document::new("one two"), "emacs").unwrap();
+    eval(&mut rt, STAGING);
+    eval(
+        &mut rt,
+        "(define ancestor (start-operation! 'ancestor (current-session)))
+         (call-in-operation ancestor (lambda () #f))
+         (define child #f)
+         (define-command (with-explicit-parent s) \"Edit with an unstaged ancestor while staging.\"
+           #:arguments '() #:effects '(edit) #:stageable #t
+           (set! child (start-operation! 'staged-edit s #:parent ancestor))
+           (call-in-operation child (lambda () (view-edit! v '((4 7 \"TWO\")) \"new\"))))
+         (invoke (current-session) 'with-explicit-parent (dict) #:mode 'stage)",
+    );
+    assert_eq!(eval(&mut rt, "(operation-staged? child)"), "#t");
+    assert_eq!(eval(&mut rt, "(operation-parent-serial child)"), eval(&mut rt, "(operation-serial ancestor)"));
+    assert_eq!(eval(&mut rt, "(document-string source)"), "\"one two\"");
+    assert_eq!(eval(&mut rt, "(length (operation-proposals child))"), "1");
+    assert_eq!(eval(&mut rt, "(current-operation)"), "#f");
+}
+
+#[test]
 fn all_proposals_are_checked_before_any_is_applied() {
     let mut rt = Runtime::with_document(Document::new("one two"), "emacs").unwrap();
     eval(&mut rt, STAGING);
