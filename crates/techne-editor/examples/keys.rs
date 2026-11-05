@@ -83,7 +83,31 @@ const WORKLOADS: &[Workload] = &[
     // no narrower input.
     Workload { name: "search-yank-line", profile: "emacs", text: lines, eval: "", setup: "C-k C-c s s", timed: "C-y", coloured: false },
     Workload { name: "command-first-key", profile: "emacs", text: lines, eval: "", setup: "M-x", timed: "s", coloured: false },
+    // keyfuzz's buffers seed 0, shrunk to C-x k C-c - C-M-i -:
+    // filtering Scheme's completion names after each key must not walk
+    // every candidate again in Lisp. Deleting must broaden them too.
+    Workload {
+        name: "completion-filter",
+        profile: "emacs",
+        text: String::new,
+        eval: COMPLETION_BUFFERS,
+        setup: "C-x k C-c - C-M-i",
+        timed: "-",
+        coloured: false,
+    },
+    Workload {
+        name: "completion-delete",
+        profile: "emacs",
+        text: String::new,
+        eval: COMPLETION_BUFFERS,
+        setup: "C-x k C-c - C-M-i -",
+        timed: "DEL",
+        coloured: false,
+    },
 ];
+
+const COMPLETION_BUFFERS: &str = "(do ((i 0 (+ i 1))) ((= i 40))
+  (make-generated-buffer! (string-append \"b\" (number->string i)) (make-document (make-string (* i 50) #\\x)) 'scheme-mode))";
 
 const RUST: &str = "(set-option! 'syntax-language 'rust #:buffer (current-buffer (current-session)))";
 
