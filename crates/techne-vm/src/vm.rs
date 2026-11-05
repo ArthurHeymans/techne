@@ -49,6 +49,8 @@ mod template;
 pub use slots::Moves;
 pub(crate) use slots::Slots;
 pub use template::Snapshot;
+#[cfg(all(test, not(miri)))]
+mod fuel_tests;
 mod retained;
 pub(crate) mod scopes;
 #[cfg(test)]

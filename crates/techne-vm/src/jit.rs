@@ -2327,6 +2327,9 @@ impl Jit {
             fuel,
             fuel_var,
             loops,
+            // Multiple polls per iteration pay for boundary publication.
+            // Pure loops retain the smaller old live ranges/counter path.
+            defer_fuel: loops && !sites.is_empty() && std::env::var("TECHNE_JIT_FUEL").as_deref() == Ok("1"),
             regs_end,
             cage,
             code_table,
@@ -2515,6 +2518,9 @@ impl Jit {
                     b.ins().store(flags(), x, g.r, (i * 8) as i32);
                 }
             }
+            // Publish before REDO's refund; publishing after it would
+            // overwrite the increment the interpreter is owed.
+            g.publish_fuel(&mut b);
             // Registers are as the interpreter left them.
             let status = match status {
                 GUARD => INTERPRET,
@@ -2604,6 +2610,9 @@ struct Gen {
     /// counts in memory: reading the fuel when called and after each call
     /// would cost more.
     loops: bool,
+    /// Count at every original poll, but publish only at foreign/native
+    /// boundaries. Inlined work shares this function's SSA counter.
+    defer_fuel: bool,
     regs_end: ir::Value,
     /// `JitCtx::cage`: values name addresses in it (`Gen::ptr`).
     cage: ir::Value,
@@ -2695,6 +2704,15 @@ fn flags() -> MemFlagsData {
 }
 
 impl Gen {
+    /// Make the exact current count visible before another execution
+    /// mechanism (including a collecting helper) can inspect/change it.
+    fn publish_fuel(&self, b: &mut FunctionBuilder) {
+        if self.defer_fuel {
+            let f = b.use_var(self.fuel_var);
+            b.ins().store(flags(), f, self.fuel, 0);
+        }
+    }
+
     /// Re-read the fuel after a call that may have counted.
     fn load_fuel(&self, b: &mut FunctionBuilder) {
         if !self.loops {
@@ -3047,6 +3065,7 @@ impl Gen {
             b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
             let bp = b.ins().iadd_imm_s(self.bp, s.off as i64);
             b.ins().store(flags(), bp, self.ctx, offset_of!(JitCtx, bp) as i32);
+            self.publish_fuel(b);
             b.ins().return_(&[v]);
         }
     }
@@ -3069,6 +3088,7 @@ impl Gen {
         b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
         b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
         let res = b.ins().bor_imm_s(status, h as i64);
+        self.publish_fuel(b);
         b.ins().return_(&[res]);
         b.switch_to_block(ok);
     }
@@ -3165,8 +3185,14 @@ impl Gen {
     }
 
     fn call(&self, b: &mut FunctionBuilder, sig: ir::SigRef, f: *const (), args: &[ir::Value]) -> Option<ir::Value> {
+        self.publish_fuel(b);
         let f = b.ins().iconst(I64, f as i64);
         let inst = b.ins().call_indirect(sig, f, args);
+        // Even a cold storage/collection helper can shorten the slice.
+        // Never publish the stale pre-helper SSA count over its request.
+        if self.defer_fuel {
+            self.load_fuel(b);
+        }
         b.inst_results(inst).first().copied()
     }
 
@@ -3176,7 +3202,9 @@ impl Gen {
         let f = if self.loops { b.use_var(self.fuel_var) } else { b.ins().load(I32, flags(), self.fuel, 0) };
         let f = b.ins().iadd_imm_s(f, -1);
         b.def_var(self.fuel_var, f);
-        b.ins().store(flags(), f, self.fuel, 0);
+        if !self.defer_fuel {
+            b.ins().store(flags(), f, self.fuel, 0);
+        }
         let tick = self.exit(b, resume, if self.guarded(resume) { GUARD_TICK } else { TICK });
         Self::guard(b, f, tick);
     }
@@ -3729,6 +3757,7 @@ impl Gen {
         let code = b.ins().iconst(I64, self.code_ptr);
         let ret_pc = b.ins().iconst(I64, next as i64);
         self.call(b, self.sigs.unwind, jit_unwind_push as *const (), &[self.vm, code, ret_pc, self.bp]);
+        self.publish_fuel(b);
         b.ins().return_(&[res]);
 
         b.switch_to_block(done);
@@ -3863,6 +3892,7 @@ impl Gen {
         let depth32 = b.ins().ireduce(I32, depth);
         let zero = b.ins().iconst(I32, 0);
         let args = [self.vm, self.ctx, frame, callee_bp, zero, depth32];
+        self.publish_fuel(b);
         let inst = match target {
             Target::Own => b.ins().call(self.own, &args),
             Target::Entry(entry) => b.ins().call_indirect(self.sigs.jit, entry, &args),
@@ -3905,6 +3935,7 @@ impl Gen {
             self.known_native(b, pc, base, n, f, k, slow, returned, true, |g, b, v| {
                 b.ins().store(flags(), v, g.r, -8);
                 let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
+                g.publish_fuel(b);
                 b.ins().return_(&[res]);
             });
         } else if let Some(&site) = self.site_at.get(&pc) {
@@ -3975,6 +4006,7 @@ impl Gen {
         let args = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
         let n = b.ins().iconst(I64, n as i64);
         let f = b.ins().iconst(I64, k.f as usize as i64);
+        self.publish_fuel(b);
         let inst = b.ins().call_indirect(self.sigs.native, f, &[self.vm, args, n]);
         let (v, error) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
         // A stop the native made (out of memory, say) ends the slice.
@@ -3993,8 +4025,10 @@ impl Gen {
         let base_v = b.ins().iconst(I64, base as i64);
         let native = b.ins().iconst(I64, k.value as i64);
         let helper = b.ins().iconst(I64, jit_native_unusual as *const () as i64);
+        self.publish_fuel(b);
         let inst = b.ins().call_indirect(self.sigs.unusual, helper, &[self.vm, v, error, self.bp, base_v, native]);
         let (status, frame) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
+        self.load_fuel(b);
         // Where the frame is now: the register stack may have moved.
         self.spill_to(b, pc, &deferred, frame);
         b.ins().jump(returned, &[BlockArg::Value(status)]);
@@ -4069,6 +4103,7 @@ impl Gen {
         b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
         b.ins().store(flags(), entry, self.ctx, offset_of!(JitCtx, tail) as i32);
         let res = b.ins().iconst(I64, (TAILCALL as i64) << 32);
+        self.publish_fuel(b);
         b.ins().return_(&[res]);
     }
 
@@ -4176,6 +4211,7 @@ impl Gen {
         b.ins().br_table(k, jt);
         b.switch_to_block(returned);
         let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
+        self.publish_fuel(b);
         b.ins().return_(&[res]);
     }
 
@@ -4312,6 +4348,7 @@ impl Gen {
                 let v = self.get(b, r);
                 b.ins().store(flags(), v, self.r, -8);
                 let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
+                self.publish_fuel(b);
                 b.ins().return_(&[res]);
             }
             Op::Call { .. } | Op::CallG { .. } => self.call_op(b, pc, op),
