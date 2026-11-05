@@ -33,7 +33,7 @@ num-rational = { version = "0.4", default-features = false, features = ["num-big
 num-traits = "0.2"
 cranelift-codegen = "0.134"
 cranelift-frontend = "0.134"
-cranelift-jit = "0.134"
+cranelift-jit = "0.137"
 cranelift-module = "0.134"
 cranelift-native = "0.134"
 rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
