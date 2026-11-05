@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793916472797,
+  "lastUpdate": 1793916474913,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -48733,6 +48733,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 104469,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1356a30db5e74bc70cf85a7d8fce60c4e5c31e0c",
+          "message": "Merge pull request #332 from ArthurHeymans/harden-staged-operations\n\neditor: stage only declared commands and keep staged work",
+          "timestamp": "2026-11-05T23:00:24+01:00",
+          "tree_id": "f392be0ce73aa52051161bb65978eeef4a022bfa",
+          "url": "https://github.com/ArthurHeymans/techne/commit/1356a30db5e74bc70cf85a7d8fce60c4e5c31e0c"
+        },
+        "date": 1793916474858,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 684992799,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 636313484,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104656,
             "unit": "data"
           }
         ]
