@@ -83,6 +83,7 @@ use crate::{
 };
 
 mod fast;
+mod invariant;
 
 /// `(vm, ctx, registers at bp, bp, entry pc, native depth) -> pc | status << 32`.
 pub type JitFn = unsafe extern "C" fn(*mut Vm, *mut JitCtx, *mut Value, u64, u32, u32) -> u64;
@@ -2364,6 +2365,10 @@ impl Jit {
                 .filter(|(_, s)| matches!(orig[s.call], Op::CallG { g, .. } | Op::TailCallG { g, .. } if cached.iter().any(|c| c.0 == g)))
                 .map(|(i, _)| (i, b.declare_var(I64)))
                 .collect(),
+            cached_calls: if loops { invariant::calls(job, &sites) } else { Vec::new() }
+                .into_iter()
+                .map(|(site, r)| (site, r, b.declare_var(I64)))
+                .collect(),
             guards,
             guard_blocks: HashMap::new(),
             at: 0,
@@ -2387,6 +2392,9 @@ impl Jit {
             sites,
             site_at,
         };
+        if !g.cached_calls.is_empty() && std::env::var_os("TECHNE_JIT_LOG").is_some() {
+            eprintln!("jit-call-cache: {} {} invariant guards", job.name, g.cached_calls.len());
+        }
         // Dead registers start as 0; each entry point loads its live ones.
         let zero = b.ins().iconst(I64, 0);
         g.vars.iter().chain(&g.shifts).for_each(|v| b.def_var(*v, zero));
@@ -2395,7 +2403,12 @@ impl Jit {
             b.def_var(l, zero);
             b.def_var(w, zero);
         });
-        g.cached.iter().map(|c| c.value).chain(g.same.iter().map(|s| s.1)).for_each(|v| b.def_var(v, zero));
+        g.cached
+            .iter()
+            .map(|c| c.value)
+            .chain(g.same.iter().map(|s| s.1))
+            .chain(g.cached_calls.iter().map(|c| c.2))
+            .for_each(|v| b.def_var(v, zero));
         let fzero = b.ins().f64const(0.0);
         g.fvals.iter().for_each(|v| b.def_var(*v, fzero));
         let trap = b.create_block();
@@ -2435,6 +2448,7 @@ impl Jit {
                 }
             }
             g.reload(&mut b, &g.flow.live_in[h].clone());
+            g.reload_calls(&mut b, h);
             g.reload_globals(&mut b, h);
             for r in g.vecs[h].and(&g.flow.live_in[h]).iter() {
                 let x = g.get(&mut b, r as Reg);
@@ -2641,6 +2655,9 @@ struct Gen {
     /// By call inlined through a global kept: whether the global holds the
     /// closure inlined (non-zero if so; see `enter_inlined`), kept with it.
     same: Vec<(usize, Variable)>,
+    /// By indirect inline site: its immutable argument source and a cached
+    /// code-identity guard. Actual closures/environments are never cached.
+    cached_calls: Vec<(usize, Reg, Variable)>,
     /// The fixnums and floats native code checks on an edge (from, to)
     /// into an entry point that assumes them (`known_regs`).
     guards: HashMap<(usize, usize), (Regs, Regs)>,
@@ -2834,6 +2851,30 @@ impl Gen {
             let eq = b.ins().icmp(IntCC::Equal, f, expected);
             let eq = b.ins().uextend(I64, eq);
             b.def_var(same, eq);
+        }
+    }
+
+    /// Refresh identity guards on native/OSR entry and after an implicit
+    /// self-tail parameter rebind. A false guard takes the normal call
+    /// fallback; a non-procedure must not raise before it is actually used.
+    fn reload_calls(&self, b: &mut FunctionBuilder, pc: usize) {
+        for &(site, r, var) in &self.cached_calls {
+            if !self.flow.live_in[pc].contains(r) {
+                continue;
+            }
+            let f = self.get(b, r);
+            let k = self.closure_calls[&(self.sites[site].call as u32)];
+            let bad = b.create_block();
+            let done = b.create_block();
+            self.check_callee(b, f, k, bad);
+            let one = b.ins().iconst(I64, 1);
+            b.def_var(var, one);
+            b.ins().jump(done, &[]);
+            b.switch_to_block(bad);
+            let zero = b.ins().iconst(I64, 0);
+            b.def_var(var, zero);
+            b.ins().jump(done, &[]);
+            b.switch_to_block(done);
         }
     }
 
@@ -3788,7 +3829,12 @@ impl Gen {
     /// closure it expects, else go to `slow`.
     fn enter_inlined(&mut self, b: &mut FunctionBuilder, pc: usize, f: ir::Value, site: usize, slow: Block) {
         if let Some(&k) = self.closure_calls.get(&(pc as u32)) {
-            self.check_callee(b, f, k, slow);
+            if let Some(&(_, _, var)) = self.cached_calls.iter().find(|c| c.0 == site) {
+                let same = b.use_var(var);
+                Self::guard(b, same, slow);
+            } else {
+                self.check_callee(b, f, k, slow);
+            }
         } else {
             let same = match self.same.iter().find(|s| s.0 == site) {
                 Some(&(_, same)) => b.use_var(same),
@@ -4074,6 +4120,7 @@ impl Gen {
             for (i, v) in self.vars.clone().into_iter().enumerate() {
                 b.def_var(v, args.get(i).copied().unwrap_or(zero));
             }
+            self.reload_calls(b, 0);
             // What the start assumes of the arguments (`Job::observed`),
             // checked as on edges into other entry points (`Gen::target`).
             let live = &self.flow.live_in[0];

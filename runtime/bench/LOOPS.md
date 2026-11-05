@@ -69,3 +69,33 @@ Both publication and respecting that notification are asserted, without
 timing thresholds or process-global environment mutation. It is excluded
 under Miri since it deliberately executes native code. The enabled prototype
 passes 117 library tests, recursive-kernel fixtures and all stop/kill tests.
+
+## 2. Cache invariant indirect guard results
+
+A repeated indirect inline site can take its callee from a copy of an
+immutable formal argument. Follow copies backwards only within a unique
+straight-line predecessor chain; reject joins, non-copy definitions and
+arguments defined anywhere in the body. Only cyclic, already monomorphic
+inline sites qualify. Feedback remains bounded to four sites.
+
+Compute a **boolean code-identity guard** at each native/OSR entry. False
+uses the existing generic call path, not interpreter-only execution, and
+must not raise for a non-procedure before the call is reached. Refresh after
+self-tail jumps implicitly rebind parameters. Code identity is immutable
+across collection; actual closures/captures are read from the current
+registers, never memoized. There are no sampled-environment roots.
+
+Initially opt-in `TECHNE_JIT_CALL_CACHE=1`; `TECHNE_JIT_LOG=1` reports selected
+guards. With fuel publication retained, a five-pair / ten-call same-binary
+control gives indirect **7.720 -> 6.031 ms** (-21.9%), HOF 333.706 -> 331.160
+ms, qsort 160.209 -> 160.502 ms. Do not claim the latter two small differences
+as reliable new gains. Whole-process counts (two calls) fall 116,824,190 ->
+95,700,613 for indirect, 2,213,628,530 -> 2,155,900,791 for HOF.
+
+`tests/call_cache.rs` asserts concrete expected values as well as matching
+interpreter exit status/stdout/full source traces. It also verifies which
+cases actually select/reject caching: distinct captures of one code, a new
+target, unused/bad callbacks, self-tail rebinding, boxed assignment, CFG joins,
+and a native collection inside an inlined callback with a captured pair.
+Both ordinary and full-GC-stress variants pass. Raw measurements:
+`/tmp/techne-loops/cache-{wall,ablation,counts}.json`.
