@@ -17,7 +17,7 @@ pub(super) struct Plan {
 }
 
 pub(super) fn plan(job: &Job) -> Option<Plan> {
-    if std::env::var("TECHNE_JIT_FAST").as_deref() != Ok("1")
+    if std::env::var("TECHNE_JIT_FAST").as_deref() == Ok("0")
         || job.rest
         || !(1..=3).contains(&job.nparams)
         || job.ops.len() > 32

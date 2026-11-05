@@ -246,6 +246,14 @@ fully hygienic.
     with checks on the generic fallback's result. Use/definition metadata
     is computed once for the analyses, and register sets iterate only
     their set bits, not all 64 positions per word.
+  - Small fixed-arity (1–3 arguments), self-recursive integer functions
+    can also use a bounded numeric call kernel: native arguments/results,
+    one numeric SSA form and no per-recursion VM-register traffic. It checks
+    actual closure identity, tags, fuel and capacity/depth; exact slow exits
+    materialize initialized frames before anything can collect. The original
+    entry/OSR path stays compiled for other inputs. Kernel and fallback code
+    are budgeted/reclaimed together; no recompilation. The extra compilation
+    costs milliseconds, not zero; see [FAST-CALLS.md](bench/FAST-CALLS.md).
   - A function that loops counts the calls and back-edges for preemption
     and stops in a machine register, writing it through to memory (which
     callees and the interpreter count in): the count does not wait for
@@ -261,7 +269,8 @@ fully hygienic.
     threshold (`1` compiles everything synchronously, for testing),
     `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_INLINE=0`
     runs no function inline, `TECHNE_JIT_FEEDBACK=0` disables indirect-call
-    feedback/specialization, `TECHNE_JIT_PAIRS=0` disables pair facts
+    feedback/specialization, `TECHNE_JIT_PAIRS=0` disables pair facts,
+    `TECHNE_JIT_FAST=0` disables numeric recursive kernels
     (developer ablations), `TECHNE_JIT_LOG=1`
     reports compiled functions and compile times (and entry points handed
     back to the interpreter), `TECHNE_JIT_IR=1` reports

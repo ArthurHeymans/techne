@@ -22,6 +22,20 @@ pressure rather than frequent deoptimization in fib/tak, rejects a numeric
 register-retention experiment, and fixes the retained compiler-workspace test
 without loosening it. The final runtime timings stay essentially unchanged.
 
+## Bounded numeric recursive calls, 2026-11-05
+
+A subsequent [numeric kernel](FAST-CALLS.md), keeping the ordinary JIT as
+fallback: fib **155.8 -> 100.5 ms** (-35.5%), tak **231.4 -> 125.2 ms**
+(-45.9%). Five alternating process pairs / ten calls; whole-process counted
+instructions fall 38.0% / 45.6%. Other workloads admit no kernel.
+
+Fresh matching Node 24.21 controls are 74.2 / 117.3 ms: these two Techne
+workloads are now **1.35x / 1.07x** warmed Node, not a general parity claim.
+The tradeoff is explicit: selected native compilations cost 5.0 -> 8.3 ms
+and 8.5 -> 14.1 ms, code mappings 4 -> 8 and 8 -> 16 KiB. Admission, precise
+GC/error/preemption exits, depth bounds, measurements and reproduction are
+in [FAST-CALLS.md](FAST-CALLS.md). `TECHNE_JIT_FAST=0` is the same-binary control.
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror

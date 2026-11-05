@@ -14,21 +14,19 @@ fn numeric_kernel_is_compiled_and_can_be_ablated() {
         format!("{DENSE} (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (list (fib 20) (dense 4000)))"),
     )
     .unwrap();
-    for fast in ["0", "1"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
-            .arg(&file)
-            .env("TECHNE_JIT", "1")
-            .env("TECHNE_JIT_SYNC", "1")
-            .env("TECHNE_JIT_FAST", fast)
-            .env("TECHNE_JIT_LOG", "1")
-            .output()
-            .unwrap();
+    for fast in [Some("0"), Some("1"), None] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_techne-vm"));
+        command.arg(&file).env("TECHNE_JIT", "1").env("TECHNE_JIT_SYNC", "1").env_remove("TECHNE_JIT_FAST").env("TECHNE_JIT_LOG", "1");
+        if let Some(value) = fast {
+            command.env("TECHNE_JIT_FAST", value);
+        }
+        let out = command.output().unwrap();
         let log = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{log}");
         assert_eq!(out.stdout, b"(6765 64160000)");
         for name in ["fib", "dense"] {
             assert!(log.contains(&format!("jit: {name} compiled")), "{log}");
-            assert_eq!(log.contains(&format!("fast-jit: {name}")), fast == "1", "{log}");
+            assert_eq!(log.contains(&format!("fast-jit: {name}")), fast != Some("0"), "{log}");
         }
     }
 }

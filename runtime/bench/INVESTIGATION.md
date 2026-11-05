@@ -65,7 +65,9 @@ The next call experiment should reduce setup/context pressure or provide a
 narrow fast-entry/return contract, rather than merely extending live ranges.
 Cold exits must still reconstruct initialized, rooted frames before GC; a
 fast-path no-GC claim cannot silently include a fallback native that collects.
-No such new ABI or root-publication policy is implemented in this change.
+No such new ABI or root-publication policy was implemented in that
+investigation. The subsequent [numeric kernel](FAST-CALLS.md) implements the
+narrow contract separately, retaining the original ordinary call strategy.
 
 ### 3. HOF is now predominantly an allocation/list problem
 
@@ -177,6 +179,17 @@ nix develop --command cargo test --release -p techne-vm \
 # Attribution: add TECHNE_JIT_MEMORY=1 and TECHNE_JIT_SYNC=1.
 # Control: TECHNE_JIT_CACHE=1 restores the known failing retention behavior.
 ```
+
+## Subsequent numeric call kernel
+
+The separately measured [FAST-CALLS.md](FAST-CALLS.md) follow-up now retains
+a checked self-recursive integer ABI: fib 155.8 -> 100.5 ms, tak 231.4 ->
+125.2 ms, with exact materialization instead of replay. This is not the
+rejected keep-numbers experiment: it passes numeric arguments/results and
+reduces context/setup pressure. Selected native compilations add about
+3.3/5.7 ms and double their code mappings. Other functions retain the old
+compiled entry/OSR behavior. The kernel is default-on, ablated with
+`TECHNE_JIT_FAST=0`; the earlier tables above remain historical measurements.
 
 New diagnostics tests check operand-class reporting, unchanged arithmetic,
 bounded storage and UTF-8 truncation. The release run passed 116 library tests,
