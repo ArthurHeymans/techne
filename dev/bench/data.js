@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793886004337,
+  "lastUpdate": 1793886006045,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -48037,6 +48037,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 100884,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bd48f83b134926cdce2b56bd4a344cff24ae8c2c",
+          "message": "Merge pull request #331 from ArthurHeymans/command-forms-staged-edits\n\neditor: review command arguments and stage changes",
+          "timestamp": "2026-11-05T14:26:12+01:00",
+          "tree_id": "ef94f24f4fc4e0b4f2721d1e243cd4271d2afbd7",
+          "url": "https://github.com/ArthurHeymans/techne/commit/bd48f83b134926cdce2b56bd4a344cff24ae8c2c"
+        },
+        "date": 1793886005999,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 683946574,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 635226746,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104474,
             "unit": "data"
           }
         ]
