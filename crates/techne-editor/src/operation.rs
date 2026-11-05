@@ -39,6 +39,11 @@ pub struct Operation {
     phase: Cell<Phase>,
     committed: Cell<bool>,
     /// Staging follows the operation through tasks and nested invocations.
+    /// Only what runs *in* a staged operation inherits it: starting an
+    /// operation in a staged current operation stages it
+    /// (`%operation-stage!`, `operations.scm`), while an operation named
+    /// only as a parent (the staged operation an acceptance runs for)
+    /// stages nothing.
     staged: Cell<bool>,
     outcome: RefCell<Option<String>>,
     /// Shared by the runs of a command joining one operation, each an
@@ -92,7 +97,7 @@ impl Operation {
             command,
             phase: Cell::new(Phase::Open),
             committed: Cell::new(false),
-            staged: Cell::new(parent.is_some_and(|p| p.staged() && !p.ended())),
+            staged: Cell::new(false),
             outcome: RefCell::new(None),
             effects: Rc::default(),
         }

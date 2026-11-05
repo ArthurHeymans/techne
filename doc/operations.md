@@ -331,7 +331,11 @@ already filed the operation ends partial, and those proposals stay reviewable. `
 staged edits, a preview of what a rename will change, and a recipe's
 dry run. Bodies written to stage must not assume their edits landed: a
 code action that applies its edits and then asks its server to run a
-command is staged as the edits and a refused command.
+command is staged as the edits and a refused command. That a body so
+tolerates staging is part of its contract (`#:stageable #t`): the
+`edit` effect of a command without it is refused in stage mode, before
+the body runs, rather than staging being offered to every contract
+command. Of the editor's commands `lsp-rename` declares it.
 
 **An agent's session.** A body takes a session for views and messages.
 An agent gets a headless session with views of its own over the shared
@@ -423,10 +427,19 @@ edits, including after an operation is continued. A batch is validated
 before any proposal is published. At most 256 operation proposals may wait,
 and one operation records at most 256.
 
-Forgetting or evicting an operation's kept record explicitly rejects its
-pending proposals before discarding their identities. This changes no source
-text and releases proposal capacity; it does not leave inaccessible work in
-the proposal table. Applied/rejected proposals need no further cleanup.
+Forgetting an operation's kept record explicitly rejects its pending
+proposals before discarding their identities: no source text changes,
+proposal capacity is released, and no inaccessible work is left in the
+proposal table. Eviction is not a decision, though: the kept log spares a
+record while its proposals are pending, past its bounds (how many, itself
+bounded by the proposals'), so unrelated operations cannot silently
+discard work awaiting review. Once the proposals are decided the record
+is evictable again; applied/rejected proposals need no further cleanup.
+A proposal names where it came from (`Origin` in `access.rs`): a service's
+grant, whose revocation leaves it revoked, or a staged operation, which
+nothing revokes. Staging itself is inherited only from the operation code
+runs *in*; an operation named merely as a parent (the staged operation an
+acceptance runs for) stages nothing.
 
 Inspect the staged operation, then its `proposals` row, or choose
 `review-operation-proposals` on it. The review is read-only diffs. C-c C-c

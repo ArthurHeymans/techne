@@ -185,7 +185,9 @@ edits the row at point. \[form-clear] clears it (omitting an optional
 argument). Changing an argument rechecks later arguments' types.
 \[form-apply] validates and applies; \[form-stage] stages document edits
 as proposals, leaving source text and undo unchanged. Settings and external
-effects cannot be staged.
+effects cannot be staged, nor the edits of a command whose contract does
+not declare that its body tolerates staging (it would see the old text,
+not its own edits); renaming through a language server declares it.
 
 \[operations] lists recorded operations. Inspect one to see its arguments,
 outcome and changes; its ~again-operation~ action fills the argument form
@@ -200,9 +202,10 @@ set is refused: \[view-refresh] and review it again. A conflicting later
 file changes neither; a journal failure part way is reported as partial.
 Accepted edits remain unsaved, and undo of the accepting operation uses
 its existing multi-document checks. Merging more edits replaces a proposal's
-identity, so an old review cannot accept its new contents. Forgetting or
-evicting the operation's kept record rejects any proposals still pending;
-no source text changes. Pending proposals are not restored after restarting
+identity, so an old review cannot accept its new contents. Forgetting the
+operation's kept record rejects any proposals still pending, changing no
+source text; the record is otherwise kept, past the log's usual bounds,
+while its proposals wait, so they do not vanish unreviewed. Pending proposals are not restored after restarting
 the runtime.
 
 * Modes and options

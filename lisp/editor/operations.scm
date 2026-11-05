@@ -107,12 +107,9 @@ It is a child of PARENT, an operation, or else of the current one, run
 for PRINCIPAL. It ends when what holds it is released, the first hold
 `call-in-operation`'s. CODE is the procedure that runs, DOCUMENT the id
 of the document it starts in, at REVISION, and PREFIX its prefix
-argument, for its record."
-  (let ((start (lambda () (record-operation (%begin-operation! command s (code-id code) document revision prefix principal)))))
-    (if parent
-        (let ((old (current-operation)))
-          (dynamic-wind (lambda () (%task-local-set! %key parent)) start (lambda () (%task-local-set! %key old))))
-        (start))))
+argument, for its record. PARENT records lineage only: staging is
+inherited from the operation currently running, not an explicit parent."
+  (record-operation (%begin-operation! command s (code-id code) document revision prefix principal parent)))
 
 ;; Who each operation runs for, by its object, held as long as it is:
 ;; work it leaves (a task, a callback) keeps its principal after it ends.
@@ -121,15 +118,15 @@ argument, for its record."
 ;; As `start-operation!`, without keywords, which cost: every key runs it.
 ;; CODE is the code's number (`code-id`). Return the operation's record.
 (define (%start-operation! command s code document revision prefix)
-  (%begin-operation! command s code document revision prefix "user"))
-(define (%begin-operation! command s code document revision prefix principal)
-  (let* ((parent (current-operation))
-         (op (%make-operation (symbol->string command) parent))
+  (%begin-operation! command s code document revision prefix "user" #f))
+(define (%begin-operation! command s code document revision prefix principal parent)
+  (let* ((running (current-operation))
+         (op (%make-operation (symbol->string command) (or parent running)))
          (r (make-record op command code document revision prefix 1 #f #f #f #f principal #f #f #f '() #f #f '())))
     ;; A task left after its operation ended still cannot shed staging by
     ;; running an opaque command. A provenance parent alone (acceptance)
     ;; is different from the operation current while code executes.
-    (when (and parent (operation-staged? parent)) (%operation-stage! op))
+    (when (and running (operation-staged? running)) (%operation-stage! op))
     (hash-table-set! %principals op principal)
     (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f '() '()))
     (set-record-traced! r (ring-push! %trace r 96))
@@ -516,7 +513,7 @@ undecided again."
 ;;; a queue, growing to its bound.
 
 (define-record-type ring
-  (%make-ring items head count bytes max max-bytes evicted)
+  (%make-ring items head count bytes max max-bytes evicted keep)
   ring?
   ;; (item . bytes), oldest at HEAD.
   (items ring-items set-ring-items!)
@@ -526,9 +523,13 @@ undecided again."
   (max ring-max)
   (max-bytes ring-max-bytes)
   ;; (item) -> what forgetting an item does.
-  (evicted ring-evicted))
+  (evicted ring-evicted)
+  ;; (item) -> whether eviction must spare it for now: an item it holds
+  ;; stays past the bounds until whatever holds it lets go.
+  (keep ring-keep))
 
-(define (make-ring max max-bytes evicted) (%make-ring (make-vector 64 #f) 0 0 0 max max-bytes evicted))
+(define (make-ring max max-bytes evicted #:keep [keep (lambda (item) #f)])
+  (%make-ring (make-vector 64 #f) 0 0 0 max max-bytes evicted keep))
 
 (define operation-trace-max 4096
   "The most operations the trace keeps: every command run, newest kept.")
@@ -536,16 +537,30 @@ undecided again."
   "About the most bytes the trace's records hold.")
 (define operations-kept-max 1000
   "The most operations kept once they changed something or failed.
-Evicting a record rejects any staged proposals it still owns.")
+A record whose staged proposals are still pending is spared, past this
+bound; forgetting such a record rejects the proposals.")
 (define operations-kept-bytes (* 4 1024 1024)
   "About the most bytes the kept operations' records hold.
-Evicting a record rejects any staged proposals it still owns.")
+A record whose staged proposals are still pending is spared, past this
+bound; forgetting such a record rejects the proposals.")
 
 (define %trace (make-ring (lambda () operation-trace-max) (lambda () operation-trace-bytes) (lambda (r) #f)))
+
+(define (record-has-pending-proposals? r)
+  "Return #t while a proposal of record R's operation waits undecided.
+The record is those proposals' review path, so eviction spares it:
+unrelated operations cannot silently discard staged work. How many can
+be spared is bounded by the proposal table's own bound. Forgetting the
+record (`forget-operation!`) remains the way to reject them."
+  (any (lambda (id) (guard (e (#t #f)) (equal? (proposal-state id) "pending")))
+       (operation-proposals (record-operation r))))
+
 ;; A record no longer kept forgets what its operation changed: only the
-;; trace, which keeps no more than the record, may still list it. Pending
-;; proposals are rejected before their identities go, not orphaned in the
-;; proposal table where they would consume capacity without a review path.
+;; trace, which keeps no more than the record, may still list it. A
+;; record whose proposals were decided or forgotten has none pending;
+;; one forgotten on purpose has its pending proposals rejected before
+;; their identities go, not orphaned in the proposal table where they
+;; would consume capacity without a review path.
 (define %kept
   (make-ring (lambda () operations-kept-max) (lambda () operations-kept-bytes)
              (lambda (r)
@@ -555,7 +570,8 @@ Evicting a record rejects any staged proposals it still owns.")
                            ;; left to discard. Cleanup is idempotent.
                            (guard (e (#t #f)) (proposal-reject! id)))
                          (operation-proposals (record-operation r)))
-               (%operation-forget-effects! (record-operation r)))))
+               (%operation-forget-effects! (record-operation r)))
+             #:keep record-has-pending-proposals?))
 
 (define (ring-ref ring i)
   (let ((v (ring-items ring)))
@@ -576,20 +592,35 @@ Evicting a record rejects any staged proposals it still owns.")
     ;; #f when it was forgotten at once (a bound of 0).
     (and (cdr entry) entry)))
 
-;; Forget the oldest items of RING while it holds more than its bounds.
+;; Forget RING's I'th oldest item, 0 the oldest: the common case, 0,
+;; moves only the head; a later one (the oldest spared) shifts the rest.
+(define (ring-forget-at! ring i)
+  (let* ((v (ring-items ring)) (n (vector-length v))
+         (slot (lambda (j) (modulo (+ (ring-head ring) j) n)))
+         (entry (vector-ref v (slot i))))
+    (if (= i 0)
+        (begin (vector-set! v (ring-head ring) #f)
+               (set-ring-head! ring (modulo (+ 1 (ring-head ring)) n)))
+        (begin
+          (do ((j i (+ j 1))) ((= j (- (ring-count ring) 1)))
+            (vector-set! v (slot j) (vector-ref v (slot (+ j 1)))))
+          (vector-set! v (slot (- (ring-count ring) 1)) #f)))
+    (set-ring-count! ring (- (ring-count ring) 1))
+    (set-ring-bytes! ring (- (ring-bytes ring) (cdr entry)))
+    ;; An entry forgotten says so, for whoever holds it.
+    (set-cdr! entry #f)
+    ((ring-evicted ring) (car entry))))
+
+;; Forget the oldest items of RING while it holds more than its bounds,
+;; sparing any its keep holds: with everything held it stays past them.
 (define (ring-evict! ring)
-  (let ((v (ring-items ring)) (max ((ring-max ring))) (max-bytes ((ring-max-bytes ring))))
+  (let ((max ((ring-max ring))) (max-bytes ((ring-max-bytes ring))))
     (let loop ()
       (when (and (> (ring-count ring) 0) (or (> (ring-count ring) max) (> (ring-bytes ring) max-bytes)))
-        (let ((oldest (vector-ref v (ring-head ring))))
-          (vector-set! v (ring-head ring) #f)
-          (set-ring-head! ring (modulo (+ 1 (ring-head ring)) (vector-length v)))
-          (set-ring-count! ring (- (ring-count ring) 1))
-          (set-ring-bytes! ring (- (ring-bytes ring) (cdr oldest)))
-          ;; An entry forgotten says so, for whoever holds it.
-          (set-cdr! oldest #f)
-          ((ring-evicted ring) (car oldest))
-          (loop))))))
+        (let seek ((i 0))
+          (cond ((= i (ring-count ring)) #f)
+                (((ring-keep ring) (car (ring-ref ring i))) (seek (+ i 1)))
+                (else (ring-forget-at! ring i) (loop))))))))
 
 ;; Charge ENTRY of RING with BYTES now, its item having grown.
 (define (ring-recharge! ring entry bytes)

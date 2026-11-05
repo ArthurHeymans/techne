@@ -570,7 +570,7 @@ fn command_forms_and_staged_diffs_draw_as_rows_without_editing_the_source() {
       (define source (session-document (current-session)))
       (define-command (replace-word s at text) "Replace the word at AT with TEXT."
         #:arguments '((at location) (text string #:default "ALPHA"))
-        #:effects '(read edit)
+        #:effects '(read edit) #:stageable #t
         (view-edit-at! (make-view (location-document at) "user")
                        (document-revision (location-document at))
                        (list (list (location-position at) (+ 5 (location-position at)) text)) "new"))

@@ -81,7 +81,7 @@
          record-arguments record-unavailable-arguments record-principal record-effects record-contract record-violation take-violations!
          kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
          operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes
-         invoke make-contract command-contract contract? contract-params contract-entries contract-effects contract-expose
+         invoke make-contract command-contract contract? contract-params contract-entries contract-effects contract-expose contract-stageable
          command-schema exposed-command-schemas define-reader! command-available current-principal note-effect!
          open-command-form! argument-form? form-command form-arguments form-problems form-set-argument! form-clear-argument! form-invoke!
          review-operation-proposals accept-operation-proposals!
