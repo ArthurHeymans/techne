@@ -116,6 +116,126 @@ fn completing_while_typing() {
     assert_eq!(shown(&mut rt), ["greet-everyone"]);
 }
 
+/// Filtering uses the minibuffer's matcher without changing source order,
+/// smart case or Unicode matching. Deleting restores candidates filtered out
+/// earlier, including when a new pattern branches from the previous one.
+#[test]
+fn filtering_and_restoring_candidates_in_both_profiles() {
+    for profile in ["emacs", "modal"] {
+        let mut rt = Runtime::with_document(Document::new(""), profile).unwrap();
+        rt.eval(
+            r#"(define-mode test-completion-mode "A completion source for a test."
+                 #:parent 'scheme-mode
+                 #:complete (lambda (b p)
+                   (cons 0 (map (lambda (name) (candidate name #:annotation name))
+                                '("zeta-map" "Alpha-map" "alpha-reduce" "äpfel-map" "Äpfel-list")))))
+               (set-buffer-mode! (current-buffer (current-session)) 'test-completion-mode)"#,
+        )
+        .unwrap();
+        if profile == "modal" {
+            keys(&mut rt, "i");
+        }
+        keys(&mut rt, "C-M-i");
+        let all = shown(&mut rt);
+        assert_eq!(all, ["zeta-map", "Alpha-map", "alpha-reduce", "äpfel-map", "Äpfel-list"]);
+        type_text(&mut rt, "alpha");
+        assert_eq!(shown(&mut rt), ["Alpha-map", "alpha-reduce"]);
+        type_text(&mut rt, "-r");
+        assert_eq!(shown(&mut rt), ["alpha-reduce"]);
+        keys(&mut rt, "DEL DEL");
+        assert_eq!(text(&mut rt), "alpha");
+        assert_eq!(shown(&mut rt), ["Alpha-map", "alpha-reduce"]);
+        type_text(&mut rt, "-m");
+        assert_eq!(shown(&mut rt), ["Alpha-map"], "branching must restore candidates discarded by -r");
+        keys(&mut rt, "DEL DEL");
+        assert_eq!(shown(&mut rt), ["Alpha-map", "alpha-reduce"]);
+        keys(&mut rt, "DEL DEL DEL DEL DEL");
+        assert_eq!(shown(&mut rt), all);
+        type_text(&mut rt, "A");
+        assert_eq!(shown(&mut rt), ["Alpha-map"], "upper case is literal");
+        keys(&mut rt, "DEL");
+        type_text(&mut rt, "ä");
+        assert_eq!(shown(&mut rt), ["äpfel-map", "Äpfel-list"]);
+        keys(&mut rt, "DEL");
+        type_text(&mut rt, "Ä");
+        assert_eq!(shown(&mut rt), ["Äpfel-list"]);
+        let completion = rt.snapshot().completion.unwrap();
+        assert_eq!(completion.rows[0].text(1), "Äpfel-list", "annotation belongs to the matched entry");
+        keys(&mut rt, "C-n");
+        assert_eq!(text(&mut rt), "Äpfel-list");
+        keys(&mut rt, "C-n");
+        assert_eq!(text(&mut rt), "Ä", "cycling returns to the typed prompt");
+        type_text(&mut rt, "z");
+        assert!(shown(&mut rt).is_empty(), "no match closes the popup");
+        assert_eq!(text(&mut rt), "Äz");
+        keys(&mut rt, "DEL C-M-i");
+        assert_eq!(shown(&mut rt), ["Äpfel-list"]);
+        keys(&mut rt, "C-g");
+        assert!(shown(&mut rt).is_empty());
+        assert!(rt.take_errors().is_empty());
+    }
+}
+
+/// Editing a selected preview keeps its text, then filters from that text
+/// rather than the original prompt. It also clears the candidate selection.
+#[test]
+fn editing_a_selected_preview_in_both_profiles() {
+    for profile in ["emacs", "modal"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = file(dir.path(), "a.scm", "", profile);
+        if profile == "modal" {
+            keys(&mut rt, "i");
+        }
+        type_text(&mut rt, "(vector-r");
+        keys(&mut rt, "C-M-i C-n");
+        assert_eq!(text(&mut rt), "(vector-ref");
+        assert_eq!(rt.snapshot().completion.unwrap().selected, Some(0));
+        keys(&mut rt, "DEL");
+        assert_eq!(text(&mut rt), "(vector-re");
+        assert_eq!(shown(&mut rt), ["vector-ref"]);
+        assert_eq!(rt.snapshot().completion.unwrap().selected, None);
+        keys(&mut rt, "C-n");
+        assert_eq!(text(&mut rt), "(vector-ref");
+        type_text(&mut rt, "x");
+        assert_eq!(text(&mut rt), "(vector-refx");
+        assert!(shown(&mut rt).is_empty());
+        assert!(rt.take_errors().is_empty());
+    }
+}
+
+/// Match indices differ from entry indices after filtering. Scrolling and
+/// selecting beyond the first page must retain the corresponding annotation.
+#[test]
+fn filtered_candidates_scroll_and_select_by_entry() {
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    rt.eval(
+        r#"(define-mode test-completion-mode "A paged completion source for a test."
+             #:parent 'scheme-mode
+             #:complete (lambda (b p)
+               (cons 0 (map (lambda (i)
+                              (candidate (string-append (if (even? i) "skip-" "keep-") (number->string i))
+                                         #:annotation (number->string i)))
+                            (iota 50)))))
+           (set-buffer-mode! (current-buffer (current-session)) 'test-completion-mode)"#,
+    )
+    .unwrap();
+    type_text(&mut rt, "keep-");
+    keys(&mut rt, "C-M-i");
+    assert_eq!(shown(&mut rt).len(), 16);
+    for _ in 0..17 {
+        keys(&mut rt, "C-n");
+    }
+    let completion = rt.snapshot().completion.unwrap();
+    assert_eq!(completion.selected, Some(15));
+    assert_eq!(completion.rows[0].text(0), "keep-3");
+    assert_eq!(completion.rows[15].text(0), "keep-33");
+    assert_eq!(completion.rows[15].text(1), "33");
+    assert_eq!(text(&mut rt), "keep-33");
+    keys(&mut rt, "C-g");
+    assert_eq!(text(&mut rt), "keep-");
+    assert!(rt.take_errors().is_empty());
+}
+
 /// Another actor edits while the popup is open: an edit before the
 /// identifier is followed; one inside it is kept, and the popup closes.
 #[test]

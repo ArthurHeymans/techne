@@ -67,7 +67,7 @@ first, each annotated with its kind."
 ;;; The popup
 
 (define-record-type popup
-  (make-popup view start revision shown candidates typed matches selected offset)
+  (make-popup view start revision shown candidates matcher typed matches selected offset)
   popup?
   (view popup-view)
   ;; Where the identifier starts in the document at REVISION, followed
@@ -76,8 +76,12 @@ first, each annotated with its kind."
   (start popup-start set-popup-start!)
   (revision popup-revision set-popup-revision!)
   (shown popup-shown set-popup-shown!)
+  ;; Candidates in the source's order, indexed by the same entries as
+  ;; the minibuffer's incremental matcher. Only the few shown or selected
+  ;; are looked up: typing never walks the full candidate list in Lisp.
   (candidates popup-candidates)
-  ;; What was typed from START, and the candidates matching it, a vector.
+  (matcher popup-matcher)
+  ;; What was typed from START, and how many candidates match it.
   (typed popup-typed set-popup-typed!)
   (matches popup-matches set-popup-matches!)
   ;; The selected candidate, -1 for none (the prompt); the first shown.
@@ -88,9 +92,8 @@ first, each annotated with its kind."
 ;; The open popup, for its commands, which M-x can run without one.
 (define (open-popup s) (or (popup s) (error "No completion is showing")))
 
-(define (matching candidates typed)
-  (let ((parts (pattern-parts typed)))
-    (list->vector (filter (lambda (c) (matches? c parts)) candidates))))
+(define (popup-match pop i)
+  (vector-ref (popup-candidates pop) (matcher-match (popup-matcher pop) i)))
 
 (define (close-completion! s)
   (sset! s 'completion #f)
@@ -103,11 +106,13 @@ first, each annotated with its kind."
     (cond ((not found) (when manual (message! s "No completion here")))
           (else
            (let* ((typed (document-substring d (car found) p))
-                  (matches (matching (cdr found) typed)))
-             (if (= (vector-length matches) 0)
+                  (candidates (list->vector (cdr found)))
+                  (matcher (make-matcher (map candidate-text (cdr found))))
+                  (matches (matcher-filter! matcher typed)))
+             (if (= matches 0)
                  (when manual (message! s "No match"))
                  (begin
-                   (sset! s 'completion (make-popup v (car found) (document-revision d) typed (cdr found) typed matches -1 0))
+                   (sset! s 'completion (make-popup v (car found) (document-revision d) typed candidates matcher typed matches -1 0))
                    (sset! s 'overlay-map completion-map))))))))
 
 ;; Where the popup's identifier starts now: #f when another actor changed
@@ -141,9 +146,9 @@ first, each annotated with its kind."
 ;; Select candidate I, cycling through them and the prompt (-1), and show
 ;; it in the text.
 (define (select-completion! s i)
-  (let* ((pop (popup s)) (n (vector-length (popup-matches pop))) (i (- (modulo (+ i 1) (+ n 1)) 1)))
+  (let* ((pop (popup s)) (n (popup-matches pop)) (i (- (modulo (+ i 1) (+ n 1)) 1)))
     (set-popup-selected! pop i)
-    (put-completion! s (if (< i 0) (popup-typed pop) (candidate-text (vector-ref (popup-matches pop) i))))))
+    (put-completion! s (if (< i 0) (popup-typed pop) (candidate-text (popup-match pop i))))))
 
 (define-command (completion-at-point s n)
   "Complete the text before point: show what completes it under it."
@@ -199,8 +204,8 @@ With none selected, close the popup and do what RET does without it."
              (if (or (not start) (< p start) (not (= (car (identifier-span d p)) start)))
                  (close-completion! s)
                  (let* ((typed (document-substring d start p))
-                        (matches (matching (popup-candidates pop) typed)))
-                   (if (= (vector-length matches) 0)
+                        (matches (matcher-filter! (popup-matcher pop) typed)))
+                   (if (= matches 0)
                        (close-completion! s)
                        (begin (popup-saw! pop start typed)
                               (set-popup-typed! pop typed)
@@ -235,7 +240,7 @@ It is (view start rows selected): the view and position the popup is
 aligned with, rows around the selected one, and that one's index."
   (let ((pop (popup s)))
     (and pop
-         (let* ((all (popup-matches pop)) (n (vector-length all)) (i (popup-selected pop))
+         (let* ((n (popup-matches pop)) (i (popup-selected pop))
                 (offset (cond ((< i 0) 0)
                               ((< i (popup-offset pop)) i)
                               ((>= i (+ (popup-offset pop) completion-rows)) (+ (- i completion-rows) 1))
@@ -245,6 +250,6 @@ aligned with, rows around the selected one, and that one's index."
            (list (popup-view pop)
                  (or (document-map-position (view-document (popup-view pop)) (popup-start pop) (popup-revision pop))
                      (popup-start pop))
-                 (map (lambda (k) (let ((c (vector-ref all k))) (candidate-row c (match-spans c parts))))
+                 (map (lambda (k) (let ((c (popup-match pop k))) (candidate-row c (match-spans c parts))))
                       (iota (min completion-rows (- n offset)) offset))
                  (and (>= i 0) (- i offset)))))))
