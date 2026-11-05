@@ -379,6 +379,22 @@ kept, four at most."
           (else (let ((w (call-with-output-string (lambda (p) (write v p)))))
                   (if (> (string-length w) 80) (string-append (substring w 0 80) "…") w))))))
 
+;; Whether `->data` preserves V exactly, including values nested in
+;; collections and editor references. A shortened record is evidence,
+;; never silently an argument for another invocation.
+(define (reusable-data? v [depth 0])
+  (let ((kind (and (not (string? v)) (schema-kind-of v))))
+    (cond (kind (and (< depth 4) (reusable-data? (schema-kind-data kind v) (+ depth 1))))
+          ((string? v) (<= (string-length v) 200))
+          ((or (boolean? v) (symbol? v) (keyword? v) (char? v) (number? v) (null? v)) #t)
+          ((>= depth 4) #f)
+          ((list? v) (and (<= (length v) 32) (every (lambda (x) (reusable-data? x (+ depth 1))) v)))
+          ((vector? v) (reusable-data? (vector->list v) depth))
+          ((dict? v) (let ((ks (dict-keys v)))
+                       (and (<= (length ks) 32)
+                            (every (lambda (k) (and (reusable-data? k (+ depth 1)) (reusable-data? (dict-ref v k) (+ depth 1)))) ks))))
+          (else #f))))
+
 ;; An argument's value as data, for a record.
 (define (argument-data e value)
   (if (entry-flag? e #:sensitive) "<redacted>" (->data value)))
@@ -401,9 +417,12 @@ name) may invoke it, that it is available, and conforms and validates
 ARGS, refusing with what is wrong, values of sensitive arguments left
 out. It runs as an operation, a child of the current one, recording the
 arguments as data. MODE `check` stops there and returns #t; `apply`
-runs it and returns what it returns. Errors are raised to the caller,
-irritants that are sensitive values redacted. The operation is a child
-of PARENT when given (the failed one a recovery choice is of), and
+runs it and returns what it returns. `stage` runs reads and queries,
+but edits become revision-checked proposals; settings and external
+effects are refused, as are edits through presentations and undo.
+Errors are raised to the caller, sensitive irritants redacted.
+The operation is a child of PARENT when given (the failed one a recovery
+choice is of), and
 STARTED, if given, is called with its record before the command runs."
   (let* ((c (or (registry-ref %commands name) (error "No such command" name)))
          (contract (or (list-ref c 4) (error "This command takes no arguments as data: it has no contract" name))))
@@ -417,14 +436,20 @@ STARTED, if given, is called with its record before the command runs."
            (vals (map (lambda (k) (dict-ref done k #f)) (contract-params contract)))
            (effects (let ((e (contract-effects contract))) (if (procedure? e) (apply e vals) e)))
            (secrets (filter-map (lambda (ev) (and (entry-flag? (car ev) #:sensitive) (cdr ev))) (map cons (contract-entries contract) vals)))
-           (data (map (lambda (e v) (cons (car e) (argument-data e v))) (contract-entries contract) vals)))
+           (data (map (lambda (e v) (cons (car e) (argument-data e v))) (contract-entries contract) vals))
+           (unavailable (filter-map (lambda (ev)
+                                      (let ((e (car ev)) (v (cdr ev)))
+                                        (and (or (entry-flag? e #:sensitive)
+                                                 (not (dict-contains? done (car e)))
+                                                 (not (reusable-data? v)))
+                                             (car e))))
+                                    (map cons (contract-entries contract) vals))))
       (case mode
         ((check) #t)
-        ((stage) (error "Staging is not built yet (doc/operations.md, \"Order of work\", step 6)"))
-        ((apply)
+        ((apply stage)
          (let* ((d (view-document (session-view s)))
                 (r (start-invocation! name s (command-code-id c) (document-id d) (document-revision d)
-                                      data principal effects (contract-hash contract) secrets #:parent parent))
+                                      data principal effects (contract-hash contract) secrets #:parent parent #:mode mode #:unavailable unavailable))
                 (result (guard (e ((and (pair? secrets) (error-object? e))
                                    ;; Raised again without the secrets.
                                    (raise (with-choices
@@ -436,6 +461,8 @@ STARTED, if given, is called with its record before the command runs."
                           (call-in-operation
                            (record-operation r)
                            (lambda ()
+                             (when (and (operation-staged? (record-operation r)) (any (lambda (e) (memq e '(settings external))) effects))
+                               (error "Cannot stage settings or external effects; apply explicitly instead" name))
                              (let ((result (apply (caddr c) s vals)))
                                ;; Checked in the operation, which fails with it,
                                ;; and redacted where it may hold a secret.

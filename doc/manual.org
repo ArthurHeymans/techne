@@ -176,6 +176,35 @@ reason.
 A view is a lens of rows the editor makes: the inspector, help,
 checkdoc. RET on a row does the default action on what it stands for.
 
+* Command arguments and staged changes
+
+\[command-form] chooses a command with a contract and opens its arguments
+without running it. Its source pane supplies point, the region and buffer;
+number keys 1 through 0 edit the first ten arguments, and \[form-edit]
+edits the row at point. \[form-clear] clears it (omitting an optional
+argument). Changing an argument rechecks later arguments' types.
+\[form-apply] validates and applies; \[form-stage] stages document edits
+as proposals, leaving source text and undo unchanged. Settings and external
+effects cannot be staged.
+
+\[operations] lists recorded operations. Inspect one to see its arguments,
+outcome and changes; its ~again-operation~ action fills the argument form
+from its record. References are checked again; sensitive or shortened
+arguments must be entered again. A changed definition or contract is shown
+for review rather than silently replayed.
+
+A staged operation's ~proposals~ row opens read-only diffs.
+\[accept-reviewed-proposals] accepts all as shown, as one linked operation;
+\[reject-reviewed-proposals] rejects them. A changed document or proposal
+set is refused: \[view-refresh] and review it again. A conflicting later
+file changes neither; a journal failure part way is reported as partial.
+Accepted edits remain unsaved, and undo of the accepting operation uses
+its existing multi-document checks. Merging more edits replaces a proposal's
+identity, so an old review cannot accept its new contents. Forgetting or
+evicting the operation's kept record rejects any proposals still pending;
+no source text changes. Pending proposals are not restored after restarting
+the runtime.
+
 * Modes and options
 
 A buffer has one major mode, chosen by its file's name, and minor modes

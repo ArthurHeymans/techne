@@ -38,6 +38,8 @@ pub struct Operation {
     command: String,
     phase: Cell<Phase>,
     committed: Cell<bool>,
+    /// Staging follows the operation through tasks and nested invocations.
+    staged: Cell<bool>,
     outcome: RefCell<Option<String>>,
     /// Shared by the runs of a command joining one operation, each an
     /// object of its own (`%operation-continue`).
@@ -64,6 +66,7 @@ struct Effects {
     saved: Vec<String>,
     saved_bytes: usize,
     saved_omitted: usize,
+    proposals: Vec<u64>,
 }
 
 /// This runtime's id: operations are numbered within it, so together they
@@ -89,6 +92,7 @@ impl Operation {
             command,
             phase: Cell::new(Phase::Open),
             committed: Cell::new(false),
+            staged: Cell::new(parent.is_some_and(|p| p.staged() && !p.ended())),
             outcome: RefCell::new(None),
             effects: Rc::default(),
         }
@@ -106,6 +110,7 @@ impl Operation {
             // What runs before changed is the operation's still: failing
             // now, it is partial.
             committed: Cell::new(self.committed.get()),
+            staged: Cell::new(self.staged.get()),
             outcome: RefCell::new(None),
             effects: self.effects.clone(),
         }
@@ -113,6 +118,28 @@ impl Operation {
 
     pub fn id(&self) -> OperationId {
         self.id
+    }
+
+    pub(crate) fn command_name(&self) -> &str {
+        &self.command
+    }
+
+    pub(crate) fn staged(&self) -> bool {
+        self.staged.get()
+    }
+
+    pub(crate) fn proposal_count(&self) -> usize {
+        self.effects.borrow().proposals.len()
+    }
+
+    pub(crate) fn proposed(&self, id: u64, replacing: Option<u64>) {
+        let mut effects = self.effects.borrow_mut();
+        if let Some(at) = replacing.and_then(|old| effects.proposals.iter().position(|&p| p == old)) {
+            effects.proposals[at] = id;
+        } else {
+            effects.proposals.push(id);
+        }
+        self.committed();
     }
 
     /// Whether a change may be made in it now, or why not: it is ending.
@@ -195,7 +222,11 @@ impl Current {
     /// The operation a native about to commit commits in, or why it may
     /// not: its operation is ending. `who` names the native.
     pub(crate) fn committing(&self, vm: &Vm, who: &str) -> Result<Option<Rc<Operation>>, String> {
-        let op = self.get(vm).filter(|op| op.phase.get() != Phase::Ended);
+        let op = self.get(vm);
+        if let Some(op) = op.as_ref().filter(|op| op.staged()) {
+            return Err(format!("{who}: refused in stage mode (operation {})", op.id.serial));
+        }
+        let op = op.filter(|op| !op.ended());
         if let Some(op) = &op {
             op.check_open(who)?;
         }
@@ -238,6 +269,17 @@ pub(crate) fn install(vm: &mut Vm, current: Current) {
         "(%make-operation command parent)" => |command: String, parent: Option<Op>| {
             Foreign::new(Operation::new(command, parent.as_deref()))
         };
+    }
+    techne_vm::procedures! { vm;
+        /// Make OPERATION stage edits rather than commit them. Nested
+        /// operations inherit staging; it cannot be turned off.
+        "(%operation-stage! operation)" => |op: Op| op.staged.set(true);
+        /// Return #t if OPERATION stages edits instead of committing them.
+        "(operation-staged? operation)" => |op: Op| op.staged();
+        /// Return OPERATION's current proposal identities, in document order.
+        /// Merging more edits replaces an identity, invalidating old previews.
+        /// Applied/rejected proposals stay named; `proposal-state` says which.
+        "(operation-proposals operation)" => |op: Op| op.effects.borrow().proposals.iter().map(|&id| id as i64).collect::<Vec<_>>();
     }
     techne_vm::procedures! { vm;
         /// Return the number of OPERATION, never reused in this runtime.
@@ -323,7 +365,7 @@ pub(crate) fn install(vm: &mut Vm, current: Current) {
         /// Return about how many bytes what OPERATION recorded holds.
         "(%operation-recorded-bytes operation)" => |op: Op| {
             let e = op.effects.borrow();
-            24 * e.changes.len() + 32 * e.counted.len() + e.saved_bytes
+            24 * e.changes.len() + 32 * e.counted.len() + e.saved_bytes + 8 * e.proposals.len()
         };
     }
     techne_vm::procedures! { vm;

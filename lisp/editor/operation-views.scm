@@ -44,7 +44,7 @@
     (row (string-append (number->string (serial r)) " ")
          (list (list (symbol->string (operation-command op)) 'function)
                (if (> (record-runs r) 1) (string-append " ×" (number->string (record-runs r))) ""))
-         (string-append "  " (outcome-text r))
+         (string-append "  " (outcome-text r) (if (operation-staged? op) " (staged)" ""))
          (string-append "  " (or (and (record-document r) (buffer-of-document (record-document r))) ""))
          (string-append "  " (changes-text r))
          (if (record-condition r) (list "  " (list (record-condition r) 'error)) "")
@@ -125,6 +125,11 @@ showing the changes it made."
      (list (row "operation" (number->string (serial r)))
            (row "command" (symbol->string name) #:target (target 'command name))
            (row "outcome" (outcome-text r)))
+     (if (operation-staged? op)
+         (list (row "mode" "staged")
+               (row "proposals" (number->string (length (operation-proposals op)))
+                    #:target (target 'staged-operation r)))
+         '())
      (if (> (record-runs r) 1) (list (row "runs" (number->string (record-runs r)))) '())
      (if parent
          (list (if parent-record
@@ -242,7 +247,8 @@ in each, or if a later change touches the same text."
   (undo-operation! s r))
 
 (define-action operation (forget-operation s r)
-  "Forget the operation: its record leaves the list of operations."
+  "Forget the operation's record, rejecting any proposals still pending.
+Its committed edits stay; no source text is changed by forgetting it."
   (forget-operation! r)
   (message! s (string-append "Forgot operation " (number->string (serial r)))))
 

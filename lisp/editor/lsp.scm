@@ -1456,7 +1456,8 @@ AT is point, NAME the name there, and NEW-NAME is read, the old name
       (asking s "Renaming…"
               (lambda () (rename! ls d (rename-target ls d (location-position at) (document-revision d)) new-name))
               (lambda (files)
-                (message! s (string-append "Renamed " old " to " new-name " in " (number->string files)
+                (message! s (string-append (if (and (current-operation) (operation-staged? (current-operation))) "Staged rename of " "Renamed ")
+                                           old " to " new-name " in " (number->string files)
                                            (if (= files 1) " file" " files"))))))
     #t))
 
@@ -1629,6 +1630,7 @@ the region, or of the thing at point."
          (edit (dict-ref action "edit" #f))
          (command (dict-ref action "command" #f)))
     (when (dict? edit) (lsp-apply-workspace-edit! ls edit #:revisions revisions))
+    (when (or (dict? command) (string? command)) (note-effect! 'external))
     (cond ((dict? command)
            (lsp-request ls "workspace/executeCommand"
                         (dict "command" (dict-ref command "command") "arguments" (dict-ref command "arguments" #()))))

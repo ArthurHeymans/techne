@@ -31,11 +31,12 @@ num-complex = { version = "0.4", default-features = false, features = ["std"] }
 num-integer = "0.1"
 num-rational = { version = "0.4", default-features = false, features = ["num-bigint", "std"] }
 num-traits = "0.2"
-cranelift-codegen = "0.134"
-cranelift-frontend = "0.134"
+# These exchange Rust types and must be upgraded together.
+cranelift-codegen = "0.137"
+cranelift-frontend = "0.137"
 cranelift-jit = "0.137"
-cranelift-module = "0.134"
-cranelift-native = "0.134"
+cranelift-module = "0.137"
+cranelift-native = "0.137"
 rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
 regex-cursor = { version = "0.1.5", default-features = false, features = ["perf-inline"] }
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }

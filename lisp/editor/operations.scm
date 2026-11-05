@@ -22,10 +22,10 @@
 (provide current-operation start-operation! %start-operation! start-invocation! current-principal note-effect! continue-operation! call-in-operation operation-procedure without-operation
          operation-hold! operation-release! operation-failed! operation-cancelled!
          operation? operation-serial operation-runtime operation-parent-serial operation-command
-         operation-committed? operation-phase operation-outcome operation-pending?
+         operation-committed? operation-staged? operation-proposals operation-phase operation-outcome operation-pending?
          set-operation-ended-handler! cancelled-condition?
          operation-record-of operation-record? record-operation record-command record-code code-id record-document record-revision
-         record-arguments record-principal record-effects record-contract record-violation
+         record-arguments record-unavailable-arguments record-principal record-effects record-contract record-violation
          record-prefix record-runs record-condition record-pending? record-choices record-settled set-record-settled!
          make-choice recovery-choice? choice-label choice-doc choice-command choice-arguments choice-settles?
          condition-choices with-choices error-with-choices
@@ -123,8 +123,13 @@ argument, for its record."
 (define (%start-operation! command s code document revision prefix)
   (%begin-operation! command s code document revision prefix "user"))
 (define (%begin-operation! command s code document revision prefix principal)
-  (let* ((op (%make-operation (symbol->string command) (current-operation)))
-         (r (make-record op command code document revision prefix 1 #f #f #f #f principal #f #f #f '() #f #f)))
+  (let* ((parent (current-operation))
+         (op (%make-operation (symbol->string command) parent))
+         (r (make-record op command code document revision prefix 1 #f #f #f #f principal #f #f #f '() #f #f '())))
+    ;; A task left after its operation ended still cannot shed staging by
+    ;; running an opaque command. A provenance parent alone (acceptance)
+    ;; is different from the operation current while code executes.
+    (when (and parent (operation-staged? parent)) (%operation-stage! op))
     (hash-table-set! %principals op principal)
     (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f '() '()))
     (set-record-traced! r (ring-push! %trace r 96))
@@ -136,6 +141,8 @@ What changes text and saves files is noted where it commits; this is
 for the rest: a setting changed, a process started. An invocation that
 did not declare it has it as a violation."
   (let* ((op (current-operation)) (p (and op (pending-of op))))
+    (when (and op (operation-staged? op) (memq effect '(settings external)))
+      (error "Refused in stage mode:" effect))
     (when p
       (unless (memq effect (pending-observed p))
         (set-pending-observed! p (cons effect (pending-observed p))))
@@ -144,16 +151,22 @@ did not declare it has it as a violation."
 ;; An invocation (`invoke`): an operation of COMMAND with ARGUMENTS as
 ;; data, by PRINCIPAL, declaring EFFECTS, under the contract of hash
 ;; CONTRACT, whose sensitive argument values are SECRETS. Return its record.
-(define (start-invocation! command s code document revision arguments principal effects contract secrets #:parent [parent #f])
+(define (start-invocation! command s code document revision arguments principal effects contract secrets #:parent [parent #f]
+                           #:mode [mode 'apply] #:unavailable [unavailable '()])
   "Start an operation of COMMAND invoked with ARGUMENTS; return its record.
 It runs in session S, CODE the number of what runs (`code-id`); DOCUMENT is the
 id of the document it starts in, at REVISION. ARGUMENTS are data,
 ((name . data) ...), sensitive ones redacted; PRINCIPAL invoked it,
 declaring EFFECTS, under the contract of hash CONTRACT. SECRETS are the
 values of its sensitive arguments, kept out of what its failure says.
-It is a child of PARENT, an operation, or else of the current one."
+It is a child of PARENT, an operation, or else of the current one.
+MODE `stage` stages changes; nested operations inherit staging.
+UNAVAILABLE names arguments redacted or shortened in the record, which
+must be acquired again rather than replayed from incomplete data."
   (let* ((op (%make-operation (symbol->string command) (or parent (current-operation))))
-         (r (make-record op command code document revision #f 1 #f #f #f arguments principal effects contract #f '() #f #f)))
+         (r (make-record op command code document revision #f 1 #f #f #f arguments principal effects contract #f '() #f #f unavailable)))
+    (when (or (eq? mode 'stage) (and (current-operation) (operation-staged? (current-operation))))
+      (%operation-stage! op))
     (hash-table-set! %principals op principal)
     (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f secrets '()))
     (set-record-traced! r (ring-push! %trace r (trace-bytes r)))
@@ -365,7 +378,7 @@ keeps them, for the user, or who it ran for, to choose from."
 
 (define-record-type operation-record
   (make-record op command code document revision prefix runs condition kept outcome arguments principal effects contract violation
-               choices settled traced)
+               choices settled traced unavailable)
   operation-record?
   ;; The operation, the object of its last run when runs joined it.
   (op record-operation set-record-operation!)
@@ -404,7 +417,9 @@ keeps them, for the user, or who it ran for, to choose from."
   (choices record-choices set-record-choices!)
   (settled record-settled %set-record-settled!)
   ;; Its entry in the trace.
-  (traced record-traced set-record-traced!))
+  (traced record-traced set-record-traced!)
+  ;; Redacted, shortened, non-data or absent: never replay these values.
+  (unavailable record-unavailable-arguments))
 
 (define (set-record-settled! r by)
   "Say who settled the failure of R's operation: BY.
@@ -436,7 +451,7 @@ undecided again."
   (let ((declared (record-effects r)))
     (and (list? declared)
          (let ((did (delete-duplicates
-                     (append (if (> (operation-change-total op) 0) '(edit) '())
+                     (append (if (or (> (operation-change-total op) 0) (pair? (operation-proposals op))) '(edit) '())
                              (if (pair? (operation-saves op)) '(external) '())
                              observed))))
            (let ((missing (remove (lambda (e) (memq e declared)) did)))
@@ -447,7 +462,9 @@ undecided again."
 ;; What the trace is charged for record R: its arguments and choices,
 ;; which it holds as long as the kept operations do.
 (define (trace-bytes r)
-  (+ 96 (if (record-arguments r) (data-bytes (record-arguments r)) 0) (choices-bytes (record-choices r))))
+  (+ 96 (if (record-arguments r) (data-bytes (record-arguments r)) 0)
+     (if (pair? (record-unavailable-arguments r)) (data-bytes (record-unavailable-arguments r)) 0)
+     (choices-bytes (record-choices r))))
 
 (define (choice-bytes c)
   (+ 64 (string-length (choice-label c)) (string-length (choice-doc c)) (data-bytes (choice-arguments c))))
@@ -488,6 +505,7 @@ undecided again."
 ;; an operation records is bounded (`operation.rs`).
 (define (record-bytes r)
   (+ 160
+     (if (pair? (record-unavailable-arguments r)) (data-bytes (record-unavailable-arguments r)) 0)
      (if (record-condition r) (string-length (record-condition r)) 0)
      (if (record-arguments r) (data-bytes (record-arguments r)) 0)
      (choices-bytes (record-choices r))
@@ -517,17 +535,26 @@ undecided again."
 (define operation-trace-bytes (* 512 1024)
   "About the most bytes the trace's records hold.")
 (define operations-kept-max 1000
-  "The most operations kept once they changed something or failed.")
+  "The most operations kept once they changed something or failed.
+Evicting a record rejects any staged proposals it still owns.")
 (define operations-kept-bytes (* 4 1024 1024)
-  "About the most bytes the kept operations' records hold.")
+  "About the most bytes the kept operations' records hold.
+Evicting a record rejects any staged proposals it still owns.")
 
 (define %trace (make-ring (lambda () operation-trace-max) (lambda () operation-trace-bytes) (lambda (r) #f)))
 ;; A record no longer kept forgets what its operation changed: only the
-;; trace, which keeps no more than the record, may still list it.
+;; trace, which keeps no more than the record, may still list it. Pending
+;; proposals are rejected before their identities go, not orphaned in the
+;; proposal table where they would consume capacity without a review path.
 (define %kept
   (make-ring (lambda () operations-kept-max) (lambda () operations-kept-bytes)
              (lambda (r)
                (set-record-kept! r #f)
+               (for-each (lambda (id)
+                           ;; Applied, rejected or long forgotten: nothing
+                           ;; left to discard. Cleanup is idempotent.
+                           (guard (e (#t #f)) (proposal-reject! id)))
+                         (operation-proposals (record-operation r)))
                (%operation-forget-effects! (record-operation r)))))
 
 (define (ring-ref ring i)
@@ -613,8 +640,9 @@ They are listed from the work holding them, kept in the logs or not."
 
 (define (forget-operation! r)
   "Forget the operation of record R: its record leaves the logs.
-Its changes still name it, by number; asked for, it is forgotten. A
-pending operation is not forgotten: it is an error."
+Its changes still name it, by number; asked for, it is forgotten.
+Any pending proposals it owns are rejected, without editing their
+sources. A pending operation is not forgotten: it is an error."
   (when (record-pending? r) (error "forget-operation: it is still pending" (operation-serial (record-operation r))))
   (let ((it? (lambda (x) (eq? x r))))
     (> (+ (ring-remove! %kept it?) (ring-remove! %trace it?)) 0)))

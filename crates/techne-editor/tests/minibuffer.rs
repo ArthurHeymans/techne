@@ -274,7 +274,7 @@ fn acting_on_candidates() {
     keys(&mut rt, "C-;");
     let s = rt.snapshot();
     assert!(s.minibuffer.as_ref().unwrap().prompt.ends_with("Act on forward-char: "));
-    assert_eq!(shown(&s), ["run-named-command", "describe-named-command", "find-command-definition"]);
+    assert_eq!(shown(&s), ["run-named-command", "describe-named-command", "find-command-definition", "configure-command"]);
     type_text(&mut rt, "desc");
     keys(&mut rt, "RET");
     let help = rt.snapshot().pane().text.to_string();
@@ -295,6 +295,17 @@ fn acting_on_candidates() {
     // Nothing at point to act on in a file.
     keys(&mut rt, "C-;");
     assert_eq!(rt.snapshot().echo, "No target at point");
+    // Configuring a contracted command is explicit, not its default
+    // action, and opens a form without applying a setting.
+    keys(&mut rt, "M-x");
+    type_text(&mut rt, "set-option");
+    keys(&mut rt, "C-;");
+    type_text(&mut rt, "configure");
+    keys(&mut rt, "RET");
+    let s = rt.snapshot();
+    assert!(s.pane().status.contains("command-form"), "{}", s.pane().status);
+    assert!(s.pane().text.to_string().contains("set-option"));
+    assert_eq!(rt.eval("(option (buffer-named \"b.txt\") 'read-only)").unwrap(), "#f");
 }
 
 /// A line's candidate made after the text changed (it was not shown when

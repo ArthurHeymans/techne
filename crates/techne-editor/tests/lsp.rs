@@ -833,3 +833,38 @@ fn a_superseded_format_is_cancelled_and_a_refused_one_failed() {
     let last = eval(&mut f, "(car (ended-of 'lsp-format))");
     assert!(last.contains("lsp-format failed #f #f"), "{last}");
 }
+
+#[test]
+fn a_staged_rename_is_reviewed_and_accepted_after_a_concurrent_human_edit() {
+    let original = "fn foo() {}\nfoo();\n";
+    let mut f = Fixture::new("m.rs", original, "utf-8");
+    std::fs::write(f.dir.join("other.rs"), "fn other() { foo(); }\n").unwrap();
+    eval(&mut f, WATCH);
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:0E"));
+    eval(
+        &mut f,
+        "(define source (session-document (current-session)))
+       (invoke (current-session) 'lsp-rename (dict 'at (location source 3) 'new-name \"bar\") #:mode 'stage)
+       (define staged (car (pending-operation-records)))",
+    );
+    // The request and delivery retain stage mode through their tasks.
+    f.keys("C-e SPC / / h u m a n");
+    f.until("staged", |s, _| s.echo.contains("Staged rename of foo to bar in 2 files"));
+    assert_eq!(eval(&mut f, "(record-pending? staged)"), "#f");
+    assert_eq!(eval(&mut f, "(length (operation-proposals (record-operation staged)))"), "2");
+    assert!(eval(&mut f, "(document-string source)").contains("foo"));
+    assert_eq!(eval(&mut f, "(document-string (buffer-document (buffer-named \"other.rs\")))"), "\"fn other() { foo(); }\\n\"");
+    eval(&mut f, "(review-operation-proposals (current-session) staged)");
+    let shown = text(&f.rt.snapshot());
+    assert!(shown.contains("-fn foo()") && shown.contains("+fn bar()"), "{shown}");
+    f.keys("C-c C-c");
+    assert!(eval(&mut f, "(document-string source)").contains("bar() {} //human"));
+    assert_eq!(eval(&mut f, "(document-string (buffer-document (buffer-named \"other.rs\")))"), "\"fn other() { bar(); }\\n\"");
+    assert_eq!(std::fs::read_to_string(&f.path).unwrap(), original, "acceptance edits buffers, not files");
+    let parent = eval(
+        &mut f,
+        "(operation-parent-serial (record-operation (find (lambda (r) (eq? (record-command r) 'accept-staged-proposals)) (kept-operation-records))))",
+    );
+    assert_eq!(parent, eval(&mut f, "(operation-serial (record-operation staged))"));
+}

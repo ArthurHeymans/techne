@@ -681,7 +681,9 @@ ranges, choices, records), used by command arguments, options and restart
 arguments alike, so that a human and an agent invoking a command get the same
 validation; not one semantic system for options, recovery and serialization.
 The vocabulary exists (`lisp/schema.scm`, schemas as data, with JSON Schema
-for agents); options use it, command and restart arguments are next.
+for agents); options and command arguments use it. Command argument forms
+and staged document edits are built (`doc/operations.md`, step 6);
+live restart arguments and agent authority checks are still ahead.
 
 **Workstream B — editor probe** (EDITOR.md). Narrow vertical slices: every
 slice ends with something visible or usable, and general machinery (keyed
@@ -1015,6 +1017,16 @@ a command remembered per project, its output in *compilation*, whose
 `file:line:column` places are location targets, with next and previous
 error. The output is parsed for places, not yet for what kind of message
 names them (error, warning, note).
+
+Commands with contracts now have argument forms (`M-x command-form`),
+operation replay through a form, and staged document edits with read-only
+diff review. An asynchronous two-file LSP rename can be staged, reviewed
+and accepted past a disjoint human edit; stale previews and conflicts
+refuse before any file changes. The acceptance is its own operation,
+linked to the staged one, and undo checks every document. Settings and
+external effects cannot be staged; this is not an agent sandbox.
+The next operations steps are agent principals and native authority checks,
+then the MCP adapter (`doc/operations.md`, steps 7 and 8).
 
 **Exit:** open a remote project, refine search results into a lens, edit through
 it, run a build and act on its output. Inspect and redefine the responsible
