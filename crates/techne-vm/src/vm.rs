@@ -1448,6 +1448,7 @@ impl Vm {
         // start with an empty nursery, and count only their own collections.
         vm.collect_raw();
         vm.heap.stats = Default::default();
+        vm.heap.note_nursery_stats();
         vm
     }
 
@@ -3013,8 +3014,18 @@ impl Vm {
     /// are split into several objects. `words` must fit the nursery.
     pub(crate) fn reserve_nursery(&mut self, words: usize) -> *mut u64 {
         debug_assert!(words <= self.heap.nursery_capacity());
-        if !self.heap.has_room(words) {
+        // A collection here is not a window exhaustion: the policy must not
+        // shrink under a reservation checked against the capacity above, not
+        // even by a shrink target still pending from an earlier refused
+        // resize. Hold the span across that collection only.
+        let held = !self.heap.has_room(words);
+        if held {
+            self.heap.hold_reserve(words);
             self.collect_raw();
+        }
+        debug_assert!(words <= self.heap.nursery_capacity(), "a bulk reservation outgrew the nursery it was checked against");
+        if held {
+            self.heap.release_reserve();
         }
         self.heap.bump(words)
     }
@@ -3028,6 +3039,12 @@ impl Vm {
         if words >= LARGE_WORDS || words > self.heap.nursery_capacity() {
             self.check_memory();
             return self.heap.alloc_old(words);
+        }
+        // Running out of window, not a forced collection (GC stress or one
+        // asked for): only that is what the survivor-sized nursery policy
+        // reacts to.
+        if !self.heap.forced_collection() {
+            self.heap.note_window_exhausted();
         }
         self.collect_raw();
         self.heap.bump(words)
@@ -3158,11 +3175,15 @@ impl Vm {
         self.release_dead_modules();
         // Only now: the codes dropped above were looked at until then.
         self.heap.release_empty();
-        // The nursery, empty, grows if the world has room for it.
+        // The nursery, empty, resizes to what the policy asks: growth needs
+        // the world's room, a smaller reservation only replaces it.
         let growth = self.heap.nursery_growth();
-        if growth > 0 && growth <= self.room() {
-            self.heap.grow_nursery();
+        if growth == 0 || growth <= self.room() {
+            self.heap.resize_nursery();
         }
+        // Reported even when a resize was refused or skipped: the target is
+        // what the policy asked for, the capacity what it settled on.
+        self.heap.note_nursery_stats();
     }
 
     /// The codes running or about to: frames and handlers of every stack,

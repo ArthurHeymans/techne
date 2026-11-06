@@ -18,6 +18,9 @@ fully hygienic.
 - **Heap** (`heap.rs`): generational, with the structure of OCaml's heap.
   - Nursery: 256 KiB until the world's first collection, then 8 MiB
     (`TECHNE_NURSERY_KB`) if its memory limit has room; bump-allocated
+    (`TECHNE_NURSERY_ADAPT=1` opts into a survivor-sized capacity instead,
+    still budget-admitted and off by default: see
+    [bench/ADAPTIVE-NURSERY.md](bench/ADAPTIVE-NURSERY.md)); bump-allocated
     (also inline in JIT code), copied out en masse by each minor
     collection. A world that never collects holds little. Bulk lists may
     use the entire existing nursery: a list of small pairs is not one
