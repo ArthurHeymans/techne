@@ -35,6 +35,29 @@ fn string(vm: &Vm, v: Value, who: &str) -> Result<String, Error> {
     str_arg(vm, v, who).map(str::to_owned)
 }
 
+/// `repr` with an optional byte bound. Bounded runtime inspection cannot
+/// use `write` followed by substring: that first walks and copies the
+/// whole graph. No Scheme printer is called, and no cycle-label prepass
+/// runs; cycles, like large values, end at the bound.
+fn repr_string(vm: &mut Vm, args: usize, n: usize) -> R {
+    let text = if n == 1 {
+        vm.printed(|vm| vm.regs[args], true, crate::builtins::Sharing::Cycles)?
+    } else {
+        let limit = match arg(vm, args, 1) {
+            v if v.is_int() && (3..=4096).contains(&v.as_int()) => v.as_int() as usize,
+            _ => return Err(Error::new("repr: limit must be an exact integer from 3 to 4096 bytes")),
+        };
+        vm.admit_items(limit, 8, 256)?;
+        let mut text = String::new();
+        if !crate::builtins::print_within(&mut text, arg(vm, args, 0), true, crate::builtins::Sharing::None, limit) {
+            text.truncate(text.floor_char_boundary(limit - 3));
+            text.push_str("...");
+        }
+        text
+    };
+    Ok(vm.make_string_raw(&text))
+}
+
 // ----- documentation -----
 
 /// `(binding-description name [module])`: what NAME denotes in MODULE (the
@@ -1187,7 +1210,10 @@ pub fn install(vm: &mut Vm) {
         /// Return a new symbol, distinct from every other; PREFIX is ignored.
         "(gensym [prefix])" => |vm: &mut Vm, _, _| { vm.admit(32 + reader::SYMBOL_BYTES + reader::intern_growth())?; let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
         /// Return OBJ written as `write` writes it, as a string.
-        "(repr obj)" => |vm: &mut Vm, a, _| { let s = vm.printed(|vm| vm.regs[a], true, crate::builtins::Sharing::Cycles)?; Ok(vm.make_string_raw(&s)) };
+        /// With LIMIT (3 to 4096 bytes), return a bounded diagnostic prefix,
+        /// ending in ... if clipped; cycles are clipped, not labelled. It
+        /// need not be readable Scheme. No user printer is called.
+        "(repr obj [limit])" => repr_string;
     }
     vm.requiring(Capability::Files, |vm| {
         crate::natives! { vm;

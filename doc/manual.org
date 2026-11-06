@@ -301,6 +301,53 @@ indent its first argument by four and its body by two, as Emacs's
 scheme-indent-function property does; names starting with def have a
 body already.
 
+** Tracing Lisp
+
+Import ~(techne debug)~ in the module whose procedures you want to trace:
+
+#+begin_src scheme
+(import (techne debug))
+(trace compute)
+(compute input)
+(untrace compute)
+#+end_src
+
+~(trace)~ lists the bindings still traced; ~(untrace)~ stops all tracing.
+Calls, results and raised conditions stream to the call's current output
+port, including its nREPL request. Restarts remain live. An escape or
+cancellation records an unwind; a killed task runs no cleanup and need
+not record an exit.
+
+The default log keeps 200 events, then suppresses further recording and
+prints one limit notice. ~(clear-trace-log! (current-trace-log))~ discards
+those events and rearms it. For a separate log without streamed output:
+
+#+begin_src scheme
+(define log (make-trace-log #:limit 100 #:port #f))
+(parameterize ((current-trace-log log)) (compute input))
+(trace-log-events log)
+(trace-log-truncated? log)
+#+end_src
+
+Events are dicts with call and task numbers, nesting depth, phase,
+module/name summaries and a bounded value summary. They do not keep
+argument or result objects alive. Tasks sharing a log share its limit;
+a new task starts at nesting depth zero. ~#f~ for ~current-trace-log~
+disables tracing for that dynamic extent.
+
+Tracing replaces a binding, not every reference to its old procedure.
+Bindings are identified lexically, including through renamed imports,
+not by the module of an evaluation calling an enable/disable procedure.
+An earlier saved alias is not intercepted. Redefining the binding
+replaces its wrapper: trace it again for the new definition. Untrace
+never overwrites that new definition, and saved wrappers become
+pass-through when retired. Guarded global JIT calls see the wrapper;
+lexically inlined calls and sealed primitives are not intercepted.
+Tracing collects returns, so it adds stack frames; after 32 nested
+traced calls, deeper calls run without instrumentation. This is
+observational tracing, not stepping or rollback, and its summaries may
+contain sensitive data: trace only what you intend to disclose.
+
 ** Strings and Unicode performance
 
 Strings are UTF-8. Character indexes count characters, not bytes.

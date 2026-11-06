@@ -116,6 +116,7 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "cond-expand",
     "match",
     "%with-escape",
+    "%binding-identity",
 ];
 
 /// How each special form, and `syntax-rules`, is written, and its
@@ -210,6 +211,11 @@ pub const SPECIAL_FORM_DOCS: &[(&str, &str, &str)] = &[
         "Evaluate the BODY of the first clause whose PATTERN matches.\nPatterns are literals, (quote datum), _, variables, lists (with a\ntrailing ...), dotted lists, vectors, (? pred pattern ...), (and\npattern ...), (or pattern ...), (not pattern), (cons p q), (list\npattern ...), (vector pattern ...) and records by type name, (point\nx y). A GUARD must also hold. It is an error if no clause matches.",
     ),
     ("%with-escape", "(%with-escape f)", "Call F with an escape-only continuation."),
+    (
+        "%binding-identity",
+        "(%binding-identity name)",
+        "Return (slot module name) for the module binding NAME resolves to.\nPrivate live metadata for binding accessors, not a persistent reference.\nKeep a getter referring to the binding alongside it to retain its module.",
+    ),
     // Syntax only within other forms.
     (
         "syntax-rules",
@@ -925,6 +931,26 @@ impl<'v> Compiler<'v> {
             "quasiquote" => {
                 let expanded = quasi(arg(1)?, 1, &self.meter).map_err(|e| self.halted(e))?;
                 self.expr(&expanded)
+            }
+            "%binding-identity" => {
+                if items.len() != 2 {
+                    return err("%binding-identity: expected one identifier");
+                }
+                let name = arg(1)?.sym().ok_or_else(|| Error::new("%binding-identity: expected an identifier"))?;
+                let Resolved::Global { module, sym } = self.resolve(name) else {
+                    return err("%binding-identity: expected a module binding, not a lexical variable");
+                };
+                let Some(GlobalBinding::Var(g)) = self.vm.lookup_global(module, sym) else {
+                    return err("%binding-identity: expected a bound module variable");
+                };
+                // Resolve hygiene and import renames here, not in the
+                // dynamically current evaluation's module. Callers keep
+                // accessors whose global references retain this slot's owner.
+                literal(&Sexp::list_of(vec![
+                    Sexp::Int(g as i64),
+                    Sexp::Str(self.vm.module_name(self.vm.global_owner(g))),
+                    Sexp::Sym(reader::intern(&self.vm.global_name(g))),
+                ]))
             }
             "unquote" | "unquote-splicing" => err(format!("{name} outside quasiquote")),
             "if" => {
