@@ -125,6 +125,25 @@ lifetime/promotion and reversal work, not assume wide-loop unboxing is the
 largest win. No new throughput speedup is claimed. Methods, caveats, exact
 counts, feature-gated tests and reproduction: [HOF.md](HOF.md).
 
+## Large lists without room skip the collection, 2026-11-06
+
+`reverse` reserves its whole result before building it. When the nursery
+had no room left, it collected first, promoting the argument list it still
+held; that list then died at once in the old generation. In HOF this was
+over half of all pair promotion. A list of at least half the nursery that
+does not fit now goes to the old generation directly, while no old cycle
+runs (during one, its pairs would survive the cycle and outrun marking).
+Smaller lists, and lists during a cycle, collect as before.
+
+Whole-process cachegrind counts against main `4db749c8`: HOF **-13.25%**
+(JIT) and **-6.25%** (interpreter, recovering the accepted interpreter-HOF
+cost above); callbacks -0.32% / -0.15%; every other program within ±0.2%.
+Twenty warmed HOF calls: promoted words 133.8M -> 94.3M, minor-collection
+time -27%, largest marking slice 731,078 -> 627,485 words, peak RSS
+**99.3 -> 102.0 MiB (+2.6%)**. Warmed HOF wall time on an Intel N100 (CPU 3,
+two campaigns of 5 alternating process pairs, ten calls): **-5.6% / -7.6%**;
+bintrees, qsort and hash within ±0.5%.
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror
