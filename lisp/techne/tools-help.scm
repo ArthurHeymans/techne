@@ -1,5 +1,5 @@
 (define (tool-help [topic #f])
-  "Return a short orientation and signatures; detailed help is opt-in.
+  "Return short tool help, or detailed help selected by TOPIC.
 'guide returns contracts and limits, 'recipes returns runnable examples.
 Other symbols describe live bindings; strings discover matching bindings.
 Use tool-describe to page a long docstring. Help needs no file/process grants."

@@ -83,7 +83,7 @@ or foreign handle is an error; query again."
     (define (tool-search project query #:prefix [prefix ""] #:limit [limit 8] #:offset [offset 0]
                          #:before [before 0] #:after [after 0] #:chars [chars 8000] #:group-by [group-by #f]
                          #:enclosing [enclosing 'auto])
-      "Find literal QUERY with source context or per-file matching-line counts.
+      "Find literal QUERY in PROJECT, with context or grouped line counts.
 Search files whose names start with PREFIX. LIMIT is 1 to 50, OFFSET is
 an item offset. Normally items carry paths, revisions, lines and handles.
 Previews center on the match and contain at most 240 characters; inspect
@@ -125,7 +125,7 @@ ceiling (default 50, 1 to 50), from item OFFSET. A first item exceeding CHARS
 is returned alone for progress, with budget-exceeded true. Characters counts
 the emitted labels and joining newlines. Follow next, not an assumed page size.
 For a known small file prefer tool-read; for a known definition use
- tool-read-symbol directly. Scope distinguishes module, member, local
+tool-read-symbol directly. Scope distinguishes module, member, local
 and library definitions. Line and end-line are 1-based and inclusive.
 Rust spans include attached outer attributes and documentation comments.
 Complete covers syntactic enumeration, not generated runtime bindings or
