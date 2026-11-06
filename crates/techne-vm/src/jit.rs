@@ -85,6 +85,7 @@ use crate::{
 mod fast;
 mod integer;
 mod invariant;
+mod strings;
 
 /// `(vm, ctx, registers at bp, bp, entry pc, native depth) -> pc | status << 32`.
 pub type JitFn = unsafe extern "C" fn(*mut Vm, *mut JitCtx, *mut Value, u64, u32, u32) -> u64;
@@ -827,7 +828,12 @@ impl KnownNative {
 
     /// Its inline case, for a call with `n` arguments.
     fn inline(&self, n: u16) -> Option<Inline> {
-        self.inline.filter(|i| i.arity() == n && (*i != Inline::IntegerAdd || integer::enabled()))
+        self.inline.filter(|i| {
+            i.arity() == n
+                && (*i != Inline::IntegerAdd || integer::enabled())
+                && (*i != Inline::Substring || strings::enabled("TECHNE_JIT_SUBSTRING"))
+                && (*i != Inline::StringEq || strings::enabled("TECHNE_JIT_STRING_EQ"))
+        })
     }
 }
 
@@ -848,11 +854,15 @@ pub enum Inline {
     RecordRef,
     /// Exact integers through i64; allocation/overflow use the native fallback.
     IntegerAdd,
+    /// Bounded flat ASCII copy, preserving fresh mutable string identity.
+    Substring,
+    /// Bounded flat UTF-8 byte equality.
+    StringEq,
 }
 
 impl Inline {
     /// Each, and the global holding its native.
-    pub const ALL: [(Inline, &str); 8] = [
+    pub const ALL: [(Inline, &str); 10] = [
         (Inline::StringLength, "string-length"),
         (Inline::StringRef, "string-ref"),
         (Inline::VectorLength, "vector-length"),
@@ -861,13 +871,15 @@ impl Inline {
         (Inline::CharEq, "char=?"),
         (Inline::RecordRef, "%record-ref"),
         (Inline::IntegerAdd, "+"),
+        (Inline::Substring, "substring"),
+        (Inline::StringEq, "string=?"),
     ];
 
     fn arity(self) -> u16 {
         match self {
             Inline::StringLength | Inline::VectorLength | Inline::CharToInteger => 1,
-            Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq | Inline::IntegerAdd => 2,
-            Inline::RecordRef => 3,
+            Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq | Inline::IntegerAdd | Inline::StringEq => 2,
+            Inline::RecordRef | Inline::Substring => 3,
         }
     }
 }
@@ -2308,7 +2320,25 @@ impl Jit {
             guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).1.union(m);
         }
         let (fix, flo) = (fix.regs, flo.regs);
-        let cached = cached_globals(orig, &shape.succs, &sites.iter().map(|s| s.call).collect::<Vec<_>>());
+        let mut cached_sites: Vec<_> = sites.iter().map(|s| s.call).collect();
+        if strings::enabled("TECHNE_JIT_NATIVE_CACHE") {
+            cached_sites.extend(orig.iter().enumerate().filter_map(|(pc, op)| match *op {
+                Op::CallG { g, n, .. }
+                    if job.native_globals.get(&g).is_some_and(|k| {
+                        matches!(
+                            k.inline(n),
+                            Some(
+                                Inline::StringRef | Inline::StringLength | Inline::CharEq | Inline::CharToInteger | Inline::BytevectorU8Ref
+                            )
+                        )
+                    }) =>
+                {
+                    Some(pc)
+                }
+                _ => None,
+            }));
+        }
+        let cached = cached_globals(orig, &shape.succs, &cached_sites);
         let vec_globals: Vec<u32> = cached.iter().filter(|c| c.1).map(|c| c.0).collect();
         let vecs = vectors(orig, n, &job.captures, heads, &shape, &vec_globals);
         let pairs = if std::env::var("TECHNE_JIT_PAIRS").as_deref() == Ok("0") {
@@ -2363,6 +2393,15 @@ impl Jit {
                 .iter()
                 .map(|&(g, lens)| Cached { g, value: b.declare_var(I64), lens: lens.then(|| (b.declare_var(I64), b.declare_var(I64))) })
                 .collect(),
+            native_same: cached
+                .iter()
+                .filter_map(|&(g, _)| {
+                    job.native_globals
+                        .get(&g)
+                        .filter(|_| strings::enabled("TECHNE_JIT_NATIVE_CACHE"))
+                        .map(|k| (g, k.value, b.declare_var(I64)))
+                })
+                .collect(),
             same: sites
                 .iter()
                 .enumerate()
@@ -2396,6 +2435,9 @@ impl Jit {
             sites,
             site_at,
         };
+        if !g.native_same.is_empty() && std::env::var_os("TECHNE_JIT_LOG").is_some() {
+            eprintln!("jit-native-cache: {} {} guards", job.name, g.native_same.len());
+        }
         if !g.cached_calls.is_empty() && std::env::var_os("TECHNE_JIT_LOG").is_some() {
             eprintln!("jit-call-cache: {} {} invariant guards", job.name, g.cached_calls.len());
         }
@@ -2411,6 +2453,7 @@ impl Jit {
             .iter()
             .map(|c| c.value)
             .chain(g.same.iter().map(|s| s.1))
+            .chain(g.native_same.iter().map(|s| s.2))
             .chain(g.cached_calls.iter().map(|c| c.2))
             .for_each(|v| b.def_var(v, zero));
         let fzero = b.ins().f64const(0.0);
@@ -2659,6 +2702,8 @@ struct Gen {
     /// By call inlined through a global kept: whether the global holds the
     /// closure inlined (non-zero if so; see `enter_inlined`), kept with it.
     same: Vec<(usize, Variable)>,
+    /// Cached known-native identity, refreshed wherever cached globals are.
+    native_same: Vec<(u32, u64, Variable)>,
     /// By indirect inline site: its immutable argument source and a cached
     /// code-identity guard. Actual closures/environments are never cached.
     cached_calls: Vec<(usize, Reg, Variable)>,
@@ -2843,6 +2888,14 @@ impl Gen {
                 let (l, w) = self.lens_of(b, x);
                 b.def_var(lens.0, l);
                 b.def_var(lens.1, w);
+            }
+        }
+        for &(g, expected, var) in &self.native_same {
+            if wanted(g) {
+                let f = self.global(b, g);
+                let same = b.ins().icmp_imm_s(IntCC::Equal, f, expected as i64);
+                let same = b.ins().uextend(I64, same);
+                b.def_var(var, same);
             }
         }
         for &(site, same) in &self.same {
@@ -3352,13 +3405,20 @@ impl Gen {
     /// Reserve nursery words, without collecting; initialize all fields
     /// before any boundary can observe the new object.
     fn alloc_words(&self, b: &mut FunctionBuilder, words: i64, slow: Block) -> ir::Value {
+        let bytes = b.ins().iconst(I64, words * 8);
+        self.alloc_bytes(b, bytes, slow)
+    }
+
+    /// A bounded, word-aligned byte size, including the header. Callers
+    /// prove that bound before reserving and initialize before any boundary.
+    fn alloc_bytes(&self, b: &mut FunctionBuilder, bytes: ir::Value, slow: Block) -> ir::Value {
         let top_ptr = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_top) as i32);
         let inline = b.ins().icmp_imm_s(IntCC::NotEqual, top_ptr, 0);
         Self::guard(b, inline, slow);
         let top = b.ins().load(I64, flags(), top_ptr, 0);
         let end = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_end) as i32);
         let end = b.ins().load(I64, flags(), end, 0);
-        let new = b.ins().iadd_imm_s(top, words * 8);
+        let new = b.ins().iadd(top, bytes);
         let room = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new, end);
         Self::guard(b, room, slow);
         b.ins().store(flags(), new, top_ptr, 0);
@@ -4032,12 +4092,19 @@ impl Gen {
             b.ins().jump(slow, &[]);
             return;
         }
-        let same = b.ins().icmp_imm_s(IntCC::Equal, f, k.value as i64);
+        let cached = match self.ops[pc] {
+            Op::CallG { g, .. } | Op::TailCallG { g, .. } => self.native_same.iter().find(|s| s.0 == g && s.1 == k.value),
+            _ => None,
+        };
+        let same = match cached {
+            Some(s) => b.use_var(s.2),
+            None => b.ins().icmp_imm_s(IntCC::Equal, f, k.value as i64),
+        };
         Self::guard(b, same, slow);
         if let Some(i) = k.inline(n) {
             let call = b.create_block();
             let args: Vec<_> = (1..=n).map(|a| self.get(b, base + a)).collect();
-            let v = self.inline_native(b, i, &args, call);
+            let v = self.inline_native(b, pc, base, i, &args, call);
             done(self, b, v);
             b.switch_to_block(call);
         }
@@ -4169,7 +4236,7 @@ impl Gen {
 
     /// The common case of native `i` with `args`: its value, in a new block;
     /// anything else goes to `call`.
-    fn inline_native(&self, b: &mut FunctionBuilder, i: Inline, args: &[ir::Value], call: Block) -> ir::Value {
+    fn inline_native(&self, b: &mut FunctionBuilder, pc: usize, base: Reg, i: Inline, args: &[ir::Value], call: Block) -> ir::Value {
         use crate::heap::{ASCII, INDIRECT};
         let x = args[0];
         // The object, of `kind` with `flags` among `checked`, and its length.
@@ -4179,12 +4246,20 @@ impl Gen {
         };
         // The byte at fixnum index `args[1]` of the bytes of `x`.
         let byte = |b: &mut FunctionBuilder, len: ir::Value| {
-            let k = args[1];
-            let int = Self::is_int(b, k);
-            let idx = Self::untag(b, k);
-            let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
-            let ok = b.ins().band(int, in_range);
-            Self::guard(b, ok, call);
+            let idx;
+            if self.fix[pc].contains(base + 2) && std::env::var("TECHNE_JIT_INDEX").as_deref() == Ok("1") {
+                let s = b.use_var(self.shifts[(base + 2) as usize]);
+                idx = b.ins().sshr_imm_s(s, 16);
+                let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+                Self::guard(b, in_range, call);
+            } else {
+                let k = args[1];
+                let int = Self::is_int(b, k);
+                idx = Self::untag(b, k);
+                let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+                let ok = b.ins().band(int, in_range);
+                Self::guard(b, ok, call);
+            }
             let addr = self.wrap(b, x, idx);
             b.ins().uload8(I64, flags(), addr, 8)
         };
@@ -4195,6 +4270,8 @@ impl Gen {
         };
         match i {
             Inline::IntegerAdd => self.integer_add(b, args[0], args[1], call),
+            Inline::Substring => self.substring(b, args, call),
+            Inline::StringEq => self.string_eq(b, args, call),
             Inline::StringLength => {
                 let (_, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
                 tag(b, len, TAG_INT)
