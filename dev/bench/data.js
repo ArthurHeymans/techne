@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793987193396,
+  "lastUpdate": 1793987195020,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -49772,6 +49772,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642688373,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106059,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "999ef06e059f3e27393ac52cfe3984f112be9bf2",
+          "message": "Merge pull request #339 from ArthurHeymans/tools/scheme-tool-tests\n\ntechne tool: run regression tests directly in Scheme",
+          "timestamp": "2026-11-06T18:37:22+01:00",
+          "tree_id": "0bd1a8671446f186945cbf899d8bc3ad9510a3a1",
+          "url": "https://github.com/ArthurHeymans/techne/commit/999ef06e059f3e27393ac52cfe3984f112be9bf2"
+        },
+        "date": 1793987194951,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690380485,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642687487,
             "unit": "instructions"
           },
           {
