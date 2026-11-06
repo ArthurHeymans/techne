@@ -131,12 +131,18 @@ fn cycles(mut vm: Vm, slack: usize) {
     eval(&mut vm, &format!("(define kept (eval '(make-counter) {module}))"));
     assert_eq!(eval(&mut vm, "(kept)"), r#"(1 2 "hello from the package")"#);
     eval(&mut vm, "(unload-package 'pkg)");
+    // Shared package/evaluation helpers can cross their default JIT hotness
+    // threshold late, retaining a larger compiler workspace independently
+    // of package generations. Under CPU contention that step used to land
+    // between the early and late samples. Warm those helpers first; retain
+    // the same 2000 measured cycles, eight samples and all memory tolerances.
+    let warmup = 2000;
     let mut samples = Vec::new();
-    for i in 1..=2000 {
+    for i in 1..=warmup + 2000 {
         eval(&mut vm, &load);
         assert_eq!(eval(&mut vm, &format!("(eval '(work 2000) {module})")), "3998000");
         eval(&mut vm, "(unload-package 'pkg)");
-        if i % 250 == 0 {
+        if i > warmup && (i - warmup) % 250 == 0 {
             samples.push(sizes(&mut vm));
         }
     }
