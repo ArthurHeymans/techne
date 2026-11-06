@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793957014814,
+  "lastUpdate": 1793957016584,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -49081,6 +49081,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 104656,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "83af19f6e335c1d57ec9f1b7848a0d2ef9bd6b34",
+          "message": "Merge pull request #335 from ArthurHeymans/editor/capture-recordings\n\neditor: add built-in screenshots and frame recordings",
+          "timestamp": "2026-11-06T10:14:20+01:00",
+          "tree_id": "c528cbfffa4e9e0a243c69d44d9a705f79b72fbd",
+          "url": "https://github.com/ArthurHeymans/techne/commit/83af19f6e335c1d57ec9f1b7848a0d2ef9bd6b34"
+        },
+        "date": 1793957016515,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690954765,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642333529,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106059,
             "unit": "data"
           }
         ]
