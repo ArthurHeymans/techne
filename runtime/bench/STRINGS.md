@@ -323,6 +323,39 @@ nix develop --command cargo test --release -p techne-vm \
   --features counting-allocator,hostile --test hostile
 ```
 
+### Subsequent concurrent feedback fix
+
+A later remote commit, `4d55450d`, moved disabled/settled feedback guards into
+the interpreter dispatch loop and added numeric-kernel internal-loop coverage.
+It is also preserved beneath this series, together with the review's explicit
+interpreter-HOF tradeoff in `RESULTS.md`; no accepted-regression setting or
+benchmark threshold is changed here. This fixes profiling overhead, not the
+string/real native lowering measured above.
+
+The final combined source was rebuilt and revalidated after that second rebase:
+118 library tests, all regular integration targets (including the new loop
+fixture and fuzz campaigns), 378 conformance trials, 13 hostile tests, strict
+Clippy, no-default-feature check and formatting pass. Logs are
+`/tmp/techne-scan/latest-{tests,conformance,hostile,clippy,check,build}.log`.
+Built binary `/tmp/techne-scan/latest`, SHA-256
+`8670c3ff16bd5a2d3a78823e23bd5d931be051e5337ebfac6af81fa8fc111297`.
+The measured reviewed hashes/table above remain explicitly the frozen
+`fc4a2f34` comparison, not measurements relabeled as this later build.
+
+### Publication after #334 merged
+
+PR #334 and the intervening editor/debugger work merged while this campaign
+was running. The follow-up is rebased onto `main` at `8dad6b8b`; both review
+fixes and unrelated merged work are preserved. The post-merge source passes
+**119 library tests**, all regular counting-allocator integration targets,
+**378 conformance trials**, **13 hostile tests**, strict Clippy, formatting and
+the no-default-feature check. Logs are
+`/tmp/techne-scan/postmerge-{tests,conformance,hostile,clippy,check,build}.log`.
+Build `/tmp/techne-scan/postmerge`, SHA-256
+`937feaa18f21458b5969d1c574cff68b7b08531b5512ec3c33cb89d22a765674`.
+The performance tables remain measurements of the explicitly frozen reviewed
+pair above, not newly invented timings for this final rebase.
+
 Next targets remain HOF list intermediates/GC and wide-accumulator boxing,
 callback overhead, and vector loops. The regressing local-proof prototype is
 not evidence that every bounds strategy must fail, nor permission to weaken
