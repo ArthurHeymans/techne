@@ -83,6 +83,7 @@ use crate::{
 };
 
 mod fast;
+mod integer;
 mod invariant;
 
 /// `(vm, ctx, registers at bp, bp, entry pc, native depth) -> pc | status << 32`.
@@ -826,7 +827,7 @@ impl KnownNative {
 
     /// Its inline case, for a call with `n` arguments.
     fn inline(&self, n: u16) -> Option<Inline> {
-        self.inline.filter(|i| i.arity() == n)
+        self.inline.filter(|i| i.arity() == n && (*i != Inline::IntegerAdd || integer::enabled()))
     }
 }
 
@@ -845,11 +846,13 @@ pub enum Inline {
     CharEq,
     /// A field of a record of the type given (record accessors).
     RecordRef,
+    /// Exact integers through i64; allocation/overflow use the native fallback.
+    IntegerAdd,
 }
 
 impl Inline {
     /// Each, and the global holding its native.
-    pub const ALL: [(Inline, &str); 7] = [
+    pub const ALL: [(Inline, &str); 8] = [
         (Inline::StringLength, "string-length"),
         (Inline::StringRef, "string-ref"),
         (Inline::VectorLength, "vector-length"),
@@ -857,12 +860,13 @@ impl Inline {
         (Inline::CharToInteger, "char->integer"),
         (Inline::CharEq, "char=?"),
         (Inline::RecordRef, "%record-ref"),
+        (Inline::IntegerAdd, "+"),
     ];
 
     fn arity(self) -> u16 {
         match self {
             Inline::StringLength | Inline::VectorLength | Inline::CharToInteger => 1,
-            Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq => 2,
+            Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq | Inline::IntegerAdd => 2,
             Inline::RecordRef => 3,
         }
     }
@@ -3339,6 +3343,15 @@ impl Gen {
     /// Inline nursery allocation of `words` words with `header`; goes to
     /// `slow` when the nursery is full or allocation must go through the VM.
     fn alloc(&self, b: &mut FunctionBuilder, words: i64, header: u64, slow: Block) -> ir::Value {
+        let p = self.alloc_words(b, words, slow);
+        let h = b.ins().iconst(I64, header as i64);
+        b.ins().store(flags(), h, p, 0);
+        p
+    }
+
+    /// Reserve nursery words, without collecting; initialize all fields
+    /// before any boundary can observe the new object.
+    fn alloc_words(&self, b: &mut FunctionBuilder, words: i64, slow: Block) -> ir::Value {
         let top_ptr = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_top) as i32);
         let inline = b.ins().icmp_imm_s(IntCC::NotEqual, top_ptr, 0);
         Self::guard(b, inline, slow);
@@ -3349,8 +3362,6 @@ impl Gen {
         let room = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new, end);
         Self::guard(b, room, slow);
         b.ins().store(flags(), new, top_ptr, 0);
-        let h = b.ins().iconst(I64, header as i64);
-        b.ins().store(flags(), h, top, 0);
         top
     }
 
@@ -4181,6 +4192,7 @@ impl Gen {
             b.ins().icmp_imm_s(IntCC::Equal, t, TAG_CHAR)
         };
         match i {
+            Inline::IntegerAdd => self.integer_add(b, args[0], args[1], call),
             Inline::StringLength => {
                 let (_, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
                 tag(b, len, TAG_INT)

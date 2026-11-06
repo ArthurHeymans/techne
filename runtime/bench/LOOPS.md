@@ -99,3 +99,47 @@ target, unused/bad callbacks, self-tail rebinding, boxed assignment, CFG joins,
 and a native collection inside an inlined callback with a captured pair.
 Both ordinary and full-GC-stress variants pass. Raw measurements:
 `/tmp/techne-loops/cache-{wall,ablation,counts}.json`.
+
+## 3. Exact scalar addition through first-class `+`
+
+`my-fold` still called the Rust native for every addition. Its accumulator
+leaves the 48-bit fixnum range, but fits signed i64. Add a bounded two-argument
+native inline case: decode fixnums or one-limb sign-magnitude integers, check
+signed overflow, normalize back to a fixnum or allocate the original two-word
+integer representation in the existing nursery. Mask payload addresses as well
+as headers. Unsupported kinds, out-of-i64 operands, overflow and exhausted
+nursery space use the existing collecting native path with original arguments.
+No mutation of existing number objects or exact-to-float coercion.
+
+Ordinary fixnum/float inputs reuse the existing floating arithmetic contract
+rather than merely paying extra guards before calling Rust. Preserve the
+native procedure's fold from zero: its signed-zero behavior differs from the
+binary bytecode. A new differential test caught this; retain the initial
+zero addition instead of weakening the expectation. Integer overflow never
+falls into the floating path. Initially opt-in `TECHNE_JIT_WIDE_ADD=1`.
+
+Independent i128-oracle tests exhaust 441 pairs around fixnum, i64 and larger
+integer edges. Additional cases cover ratios, complex/inexact values,
+infinities, NaNs, signed zero, immutable aliases, changed procedures, source
+error traces and full-GC stress. The selection/ablation marker is checked.
+
+New Scheme/JS `wide` and `flosum` controls make this mechanism measurable apart
+from list allocation; they are not substitutes for the unchanged HOF workload.
+Three same-binary pairs / eight calls with the earlier changes held enabled:
+
+| Workload | Scalar case off ms | On ms |
+|---|---:|---:|
+| wide control | 72.029 | 21.739 |
+| inexact sum control | 34.973 | 15.340 |
+| hof | 321.683 | 301.293 |
+
+The integer-only trial improved HOF but mildly regressed inexact sums; the
+retained floating fallback avoids that regression. Its original HOF counts
+fell 2,155,899,372 -> 1,922,429,247 (whole process, two calls); final combined
+counts are measured separately. Raw records: `wide-{wall,counts,controls}.json`
+and `scalar-wall.json` in `/tmp/techne-loops/`.
+
+This remains Rust because native number representation, allocation boundaries
+and exact fallback/root publication belong to the VM mechanism. Workloads and
+the comparison tool stay Scheme. The runner now labels each JSON record's
+`side`, so same-binary ablations are not ambiguous from identical paths.

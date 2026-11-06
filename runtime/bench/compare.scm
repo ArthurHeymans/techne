@@ -89,7 +89,7 @@
               (error "malformed benchmark output" program result))
             (if expected (unless (string=? answer expected) (error "results differ" program expected answer)) (set! expected answer))
             (if (= index 0) (set! before (cons value before)) (set! after (cons value after)))
-            (set! records (cons (dict "program" program "binary" binary "sample" sample "value" value
+            (set! records (cons (dict "program" program "binary" binary "side" (if (= index 0) "before" "after") "sample" sample "value" value
                                      "unit" (if counts? "whole-process instructions" "hot ms") "result" answer
                                      "iterations_us" (list->vector times) "log" (cadr result)) records))
             (save!)))
