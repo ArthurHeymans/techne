@@ -2,7 +2,7 @@
 ;;; processes stay in the world; only bounded answers cross the connection.
 (define-library (techne tools)
   (export tool-project tool-session-project tool-root tool-files tool-read tool-expand
-          tool-search tool-symbols tool-read-symbol tool-edit! tool-refresh!
+          tool-search tool-symbols tool-read-symbol tool-cite tool-edit! tool-refresh!
           tool-discover tool-describe tool-ref tool-batch tool-help
           tool-run tool-process-result tool-process-done? tool-process-cancel!
           tool-find tool-lines tool-apply! tool-show tool-stamp tool-check)
@@ -49,47 +49,90 @@ file contents. Skipped and problems describe incomplete traversal. Call
 `tool-refresh!` to relist after files change."
       (%response (%tool-files project prefix limit offset)))
 
-    (define (tool-read project path #:from [from 1] #:lines [lines 40] #:chars [chars 8000])
+    (define (tool-read project path #:from [from 1] #:lines [lines 200] #:chars [chars 16000])
       "Read a bounded region of PATH in PROJECT, starting at line FROM.
-Read LINES lines at most, 1 to 200; return CHARS characters at most,
+For a known small file, read it directly rather than listing definitions first.
+Defaults are 200 lines and 16000 characters. Read LINES lines at most,
+1 to 200; return CHARS characters at most,
 1 to 16000. Lines are 1-based: a trailing newline ends the final line,
 not an extra empty line. An empty file has line 1. The reply names its
-revision and expandable snapshot handle.
-Use `tool-expand` with the returned next offset for clipped text."
+revision and a handle for the selected region, NOT the entire file.
+`region-complete` means this region was fully returned; `file-eof`
+means the returned text reaches the end of the file. `file-lines`
+counts source lines, including line 1 for an empty file.
+If `next` is present, finish this region with `tool-expand` first.
+Once complete, `next-line` gives the next source line for `tool-read`.
+Do not infer file EOF from `truncated` or `next`: they describe only
+character clipping inside the selected region. `tool-show` numbers source
+and states snapshot file-lines by default; #:numbered #f opts out."
       (%response (%tool-read project path from lines chars)))
 
     (define (tool-expand project handle #:offset [offset 0] #:chars [chars 8000])
       "Read CHARS characters of PROJECT's snapshot HANDLE from OFFSET.
 CHARS is 1 to 16000. OFFSET and next count Unicode characters, not bytes.
 A handle is immutable: it still reads the old text after a file changes.
-Characters gives the full length of the selected handle, even when this
-reply is clipped. An evicted, refreshed or foreign handle is an error;
-query again."
+Characters gives the length of the selected REGION, not the file.
+Expansion cannot escape that region. `region-complete` is true after
+its last character; `file-eof` is true only if that also reaches file
+EOF. File fields and next-line are #f for kept process output. When
+present, `next-line` starts the next source-line region; use `tool-read`
+there, never infer a line from a character offset. An evicted, refreshed
+or foreign handle is an error; query again."
       (%response (%tool-expand project handle offset chars)))
 
-    (define (tool-search project query #:prefix [prefix ""] #:limit [limit 8] #:offset [offset 0])
-      "Find lines containing literal QUERY in PROJECT, bounded by LIMIT.
-Search files whose names start with PREFIX. Return at most LIMIT items,
-1 to 50, from OFFSET, with paths, revisions, lines and expandable handles.
+    (define (tool-search project query #:prefix [prefix ""] #:limit [limit 8] #:offset [offset 0]
+                         #:before [before 0] #:after [after 0] #:chars [chars 8000] #:group-by [group-by #f]
+                         #:enclosing [enclosing 'auto])
+      "Find literal QUERY with source context or per-file matching-line counts.
+Search files whose names start with PREFIX. LIMIT is 1 to 50, OFFSET is
+an item offset. Normally items carry paths, revisions, lines and handles.
 Previews center on the match and contain at most 240 characters; inspect
 preview-truncated and preview-offset for clipping, and column for the
-1-based Unicode match column. Total
-counts matching lines, not occurrences. Complete is false if files were
-skipped or a scan limit was reached; inspect skipped and problems.
-Binary files are excluded from text search and counted separately."
-      (%response (%tool-search project query prefix limit offset)))
+1-based Unicode match column. Each hit's handle still covers one line.
+BEFORE and AFTER, each 0 to 8, add context from the SAME immutable source.
+Each hit then has context-handle and context (an expandable read reply).
+CHARS, 1 to 16000, bounds context text across the entire reply, not per
+hit. Inspect context-truncated: clipped contexts have next offsets;
+a context of #f means the budget ran out, so expand context-handle.
+With GROUP-BY 'path, items instead give path/revision/count for matching
+files, no handles; context options cannot be combined with grouping.
+Total always counts matching LINES, not occurrences. Grouped replies
+also give files (matching-file count), unit matching-lines, and next
+pages files rather than hits. Counts cover the scan, not just this page.
+Complete is false if files were skipped or a scan limit was reached;
+never treat incomplete totals as full-repository counts. Binary files
+are excluded from text search and counted separately.
+Replies identify match-mode literal and echo query/prefix (at most 240
+characters each, with query-truncated/prefix-truncated flags). Regex
+operators are ordinary characters; batch literal queries for alternatives.
+Zero-hit rendering shows this mode, scope and scanned-text-file count.
+ENCLOSING defaults to auto: recognized code gets its innermost named
+owner, scope, source span and expandable handle; grouped counts and
+unsupported languages stay plain. #f opts out; #t requests annotation
+including diagnostics for unsupported languages. It uses the
+same immutable snapshot and parser as tool-symbols, not a disk reread.
+Inspect enclosing-status and enclosing-complete: unavailable or partial
+syntax is not proof that a match has no owner. With partial syntax an
+owner is only a candidate. This is syntactic navigation, not semantic
+reference resolution. Grouped counts cannot request enclosing metadata."
+      (%response (%tool-search project query prefix limit offset before after chars group-by enclosing)))
 
-    (define (tool-symbols project path #:name [name ""] #:limit [limit 10] #:offset [offset 0])
+    (define (tool-symbols project path #:name [name ""] #:limit [limit 50] #:offset [offset 0] #:chars [chars 8000])
       "List definitions of PATH in PROJECT with source spans and handles.
-NAME selects an exact name, or all names when empty. Return LIMIT items
-at most, 1 to 50, from OFFSET. Scope distinguishes module, member, local
+NAME selects an exact name, or all names when empty. Page by CHARS rendered
+label characters (default 8000, 1 to 16000), with LIMIT as an additional item
+ceiling (default 50, 1 to 50), from item OFFSET. A first item exceeding CHARS
+is returned alone for progress, with budget-exceeded true. Characters counts
+the emitted labels and joining newlines. Follow next, not an assumed page size.
+For a known small file prefer tool-read; for a known definition use
+ tool-read-symbol directly. Scope distinguishes module, member, local
 and library definitions. Line and end-line are 1-based and inclusive.
 Rust spans include attached outer attributes and documentation comments.
 Complete covers syntactic enumeration, not generated runtime bindings or
 conditional-compilation semantics. Scheme uses the exact reader.
 Other source languages reuse the editor language declarations and
 definition queries. Unsupported languages are an error, not guessed symbols."
-      (%response (%tool-symbols project path name limit offset)))
+      (%response (%tool-symbols project path name limit offset chars)))
 
     (define (tool-read-symbol project path name #:chars [chars 8000])
       "Read the single definition NAME in PATH of PROJECT, within CHARS.
@@ -101,6 +144,18 @@ CHARS is 1 to 16000. An absent or ambiguous name is an error: use
           (error "tool-read-symbol: expected one definition; use tool-symbols" name (tool-ref reply 'total)))
         (cons (list (quote complete) (tool-ref reply (quote complete)))
               (tool-expand project (tool-ref (car items) (quote handle)) #:chars chars))))
+
+    (define (tool-cite project path #:from [from 1] #:to [to from] #:revision [revision #f])
+      "Check citation line bounds and optionally REVISION of PATH in PROJECT.
+FROM and TO are inclusive, positive 31-bit line numbers. The valid field
+is #f for past-end ranges or a stale expected revision; these are data,
+not CLI failures. File-lines reports the actual snapshot length. Empty
+files have line 1. A valid result supplies a canonical citation string
+and the revision of the disk text read for this check. It does NOT
+verify that a claim is supported, that the caller read those lines, or
+that the disk stays unchanged. Batch independent checks with tool-batch.
+Invalid arguments, missing paths and non-text files are errors."
+      (%response (%tool-cite project path from to revision)))
 
     (define (tool-edit! project path revision edits)
       "Apply checked replacements EDITS to PATH in PROJECT at REVISION.
@@ -118,7 +173,7 @@ conditional atomic rename, not a lock against other programs."
 
     (define (%count n max who)
       (unless (and (integer? n) (exact? n) (<= 1 n max))
-        (error who "count out of range" n)))
+        (error who (string-append "count out of range; expected 1 to " (number->string max)) n)))
     (define (%offset n)
       (unless (and (integer? n) (exact? n) (>= n 0))
         (error "tool: offset must be a non-negative integer")))
@@ -382,7 +437,7 @@ again, or cancel it. Timed-out says its own timeout killed it."
       (define (snapshot name state)
         (let* ((text (apply string-append (reverse (vector-ref state 2))))
                (s (%snapshot (%repository-nonce) (string-append "<" name " of " (%job-program job) ">")
-                             (%repository-nonce) text (%utf8-size text))))
+                             (%repository-nonce) text (%utf8-size text) #f)))
           (%keep! (%job-project job) s)
           (list (%handle (%job-project job) s 0 (string-length text)) (string-length text))))
       (define (stream state kept)
@@ -536,14 +591,26 @@ disk now. `techne tool` compares a session's with its own, restarting
 a session that runs older code."
       (if now (%tools-stamp) %loaded-stamp))
 
-    (define (tool-show reply)
-      "Return REPLY as plain text for reading, rather than as data.
+    (define (tool-show reply #:numbered [numbered #t])
+      "Return REPLY as plain text, with numbered source views by default.
 Search and find hits become FILE:LINE: TEXT lines, definitions
-FILE:LINE-END KIND NAME, reads their text with a note how to expand a
-clipped one, process results their status and streams, batches each
-answer. Lists show their items in turn; anything else is written.
-From the CLI, `techne tool --text ROOT (tool-show FORM)` prints it as is."
-      (%tool-show reply))
+FILE:LINE-END KIND NAME. With NUMBERED true, disk source gets one
+filename/revision/file-lines header followed by LINE: TEXT using original
+absolute line numbers. The header scopes every line in that block, including
+search context and expanded snapshots. Never count displayed lines to cite.
+Kept process output retains its label on each line; it is not a source file.
+Use #:numbered #f for the old plain source text without coordinates.
+Notes distinguish character clipping in a region from more file lines.
+Process results show status and streams; batches show each answer.
+Lists show their items in turn; anything else is written.
+From the CLI, `techne tool --text ROOT (tool-show FORM)` prints it as is.
+With --text, disk-source replies and flat lists containing them are
+rendered automatically, even without tool-show; omit --text for structured
+data. Explicit tool-show is still useful for other reply kinds."
+      (%tool-show reply numbered))
     (include "tools-core.scm")
+    (include "tools-search.scm")
+    (include "tools-enclosing.scm")
+    (include "tools-cite.scm")
     (include "tools-help.scm")
 ))

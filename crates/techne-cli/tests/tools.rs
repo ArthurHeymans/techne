@@ -43,6 +43,15 @@ impl Session {
         assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
+    fn text(&self, root: &Path, source: &str) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["tool", "--text", root.to_str().unwrap(), source, &self.name])
+            .env("TECHNE_NODE_DIR", &self.node_dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -86,13 +95,69 @@ fn text_prints_strings_as_they_are_and_stdin_needs_no_escaping() {
     assert!(String::from_utf8(out.stdout).unwrap().starts_with("made: created, revision "));
     assert_eq!(std::fs::read_to_string(dir.path().join("made")).unwrap(), "says \"quoted\" \\ back\n");
     let text = Command::new(env!("CARGO_BIN_EXE_techne"))
-        .args(["tool", "--text", dir.path().to_str().unwrap(), "(tool-show (tool-read project \"made\"))", &session.name])
+        .args(["tool", "--text", dir.path().to_str().unwrap(), "(tool-show (tool-read project \"made\") #:numbered #f)", &session.name])
         .env("TECHNE_NODE_DIR", &session.node_dir)
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(text.stdout).unwrap(), "says \"quoted\" \\ back\n");
     // Without --text a string is written, so a handle can be pasted back.
     assert_eq!(session.query(dir.path(), "(tool-ref (tool-read project \"made\") 'path)"), r#""made""#);
+}
+
+#[test]
+fn text_renders_source_replies_and_lists_without_a_show_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(dir.path());
+    let path = dir.path().join("source.rs");
+    std::fs::write(&path, "zero\né😀\nlast").unwrap();
+    session.query(dir.path(), "(define saved (tool-read project \"source.rs\" #:from 2 #:lines 1 #:chars 1))");
+    let handle = session.query(dir.path(), "(tool-ref saved 'handle)");
+    let text = session.text(dir.path(), "saved");
+    assert!(text.starts_with("[snapshot file-lines: 3; \"source.rs\"; revision "), "{text}");
+    assert!(text.contains("]\n2: é\n") && !text.contains("source.rs:2:"), "{text}");
+    let revision = session.query(dir.path(), "(tool-ref saved 'revision)");
+    assert!(text.contains(revision.trim_matches('"')), "{text}");
+    assert!(text.contains("[truncated region:") && text.contains("#:offset 1"), "{text}");
+    let batch = session.text(
+        dir.path(),
+        "(list (tool-read project \"source.rs\" #:from 1 #:lines 1) (tool-read project \"source.rs\" #:from 3 #:lines 1))",
+    );
+    assert_eq!(batch.matches("[snapshot file-lines: 3;").count(), 2, "{batch}");
+    assert!(batch.contains("]\n1: zero") && batch.contains("]\n3: last"), "{batch}");
+    let mixed = session.text(dir.path(), "(list (tool-read project \"source.rs\" #:from 3 #:lines 1) \"tail\")");
+    assert!(mixed.contains("]\n3: last") && mixed.ends_with("\ntail\n"), "{mixed}");
+    // Explicit string rendering/raw opt-out is not formatted twice.
+    assert_eq!(session.text(dir.path(), "(tool-show (tool-read project \"source.rs\" #:lines 3) #:numbered #f)"), "zero\né😀\nlast\n");
+    let structured = session.query(dir.path(), "(tool-read project \"source.rs\" #:from 2 #:lines 1)");
+    assert!(structured.starts_with("((path ") && structured.contains("(text \"é😀\\n\")"), "{structured}");
+    // Formatting uses the saved reply, not another live file read.
+    std::fs::write(&path, "changed").unwrap();
+    let expanded = session.text(dir.path(), &format!("(tool-expand project {handle} #:offset 1)"));
+    assert!(expanded.contains("]\n2: 😀") && !expanded.contains("changed"), "{expanded}");
+    assert!(expanded.contains(revision.trim_matches('"')), "{expanded}");
+}
+
+#[test]
+fn text_preserves_ordinary_data_and_does_not_turn_output_labels_into_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(dir.path());
+    assert_eq!(session.text(dir.path(), "42"), "42\n");
+    assert_eq!(session.text(dir.path(), "#t"), "#t\n");
+    assert_eq!(session.text(dir.path(), "'( #t 7 \"ok\")"), "(#t 7 \"ok\")\n");
+    assert_eq!(
+        session.text(dir.path(), "'((path \"source.rs\") (text \"not a snapshot\"))"),
+        "((path \"source.rs\") (text \"not a snapshot\"))\n"
+    );
+    assert_eq!(session.text(dir.path(), "'((x 1 2))"), "((x 1 2))\n");
+    assert_eq!(session.text(dir.path(), "\"plain\\ntext\""), "plain\ntext\n");
+    let output = session.text(
+        dir.path(),
+        r#"(let* ((job (tool-run project "printf" '("captured\n") #:keep 64))
+        (result (tool-process-result job #:wait 2)))
+        (tool-expand project (tool-ref (tool-ref result 'stdout) 'handle)))"#,
+    );
+    assert!(output.contains("(file-lines #f)") && output.contains("(text \"captured\\n\")"), "{output}");
+    assert!(!output.contains("[snapshot file-lines:"), "{output}");
 }
 
 /// Copy the directory FROM to TO, recursively.

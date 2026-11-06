@@ -41,7 +41,12 @@ fn help_is_bounded_live_and_available_without_file_or_process_grants() {
         r#"
       (import (techne tools))
       (define h (tool-help))
-      (unless (= 18 (length (tool-ref h 'recipes))) (error "recipes must be one structured value"))
+      (unless (< (string-length (tool-show h)) 1800) (error "default help grew unbounded"))
+      (unless (string-contains (tool-show h) "\n(tool-read project PATH") (error "help signatures need separate lines"))
+      (unless (not (tool-ref h 'recipes)) (error "recipes must be opt-in"))
+      (unless (pair? (tool-ref h 'signatures)) (error "missing signatures"))
+      (unless (= 22 (length (tool-help 'recipes))) (error "missing detailed recipes"))
+      (unless (tool-ref (tool-help 'guide) 'limits) (error "missing opt-in contracts"))
       (unless (string? (tool-ref h 'purpose)) (error "missing purpose"))
       (define (help-fixture x) "A live help fixture." x)
       (unless (string=? "A live help fixture." (tool-ref (tool-help 'help-fixture) 'text)) (error "stale help"))
@@ -79,14 +84,88 @@ fn headless_queries_use_editor_language_declarations_and_unicode_coordinates() {
 fn expansion_reports_eof_positions_and_library_names_are_canonical() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("line"), "needle\n").unwrap();
+    fs::write(dir.path().join("pages"), "é one\n\nthree\nlast").unwrap();
+    fs::write(dir.path().join("empty"), "").unwrap();
+    fs::write(dir.path().join("blank"), "\n").unwrap();
+    fs::write(dir.path().join("inline.rs"), "fn one() {} fn two() {}\n").unwrap();
     fs::write(dir.path().join("library.sld"), "(define-library (example\n  names) (export))").unwrap();
     let mut vm = world(dir.path());
     vm.eval_source(
         r#"
+      (define (source-head r)
+        (string-append "[snapshot file-lines: " (number->string (tool-ref r 'file-lines))
+          "; " (call-with-output-string (lambda (port) (write (tool-ref r 'path) port)))
+          "; revision " (tool-ref r 'revision) "]"))
       (define r (tool-read p "line"))
       (check 2 (tool-ref (tool-expand p (tool-ref r 'handle) #:offset 7) 'line))
       (check "" (tool-ref (tool-expand p (tool-ref r 'handle) #:offset 7) 'text))
       (check "(example names)" (tool-ref (car (tool-ref (tool-symbols p "library.sld") 'items)) 'name))
+      ;; A complete one-line region is not a complete file.
+      (define first (tool-read p "pages" #:lines 1))
+      (check '(#t #f 4 2 6)
+        (map (lambda (key) (tool-ref first key)) '(region-complete file-eof file-lines next-line characters)))
+      (check "é one\n" (tool-ref (tool-expand p (tool-ref first 'handle)) 'text))
+      (check (string-append (source-head first) "\n1: é one\n[region complete; more file lines: (tool-read project \"pages\" #:from 2)]")
+        (tool-show first #:numbered #t))
+      (define clipped (tool-read p "pages" #:lines 1 #:chars 1))
+      (check '(#f #f #f 1)
+        (map (lambda (key) (tool-ref clipped key)) '(region-complete file-eof next-line next)))
+      (define rest (tool-expand p (tool-ref clipped 'handle) #:offset (tool-ref clipped 'next)))
+      (check " one\n" (tool-ref rest 'text))
+      (check '(#t #f 2) (map (lambda (key) (tool-ref rest key)) '(region-complete file-eof next-line)))
+      (check #t (string-prefix? (string-append (source-head clipped) "\n1: é\n[truncated region:") (tool-show clipped #:numbered #t)))
+      (define middle (tool-read p "pages" #:from (tool-ref rest 'next-line) #:lines 2))
+      (check "\nthree\n" (tool-ref middle 'text))
+      (check 4 (tool-ref middle 'next-line))
+      (check #t (string-prefix? (string-append (source-head middle) "\n2: \n3: three\n") (tool-show middle #:numbered #t)))
+      (define last (tool-read p "pages" #:from (tool-ref middle 'next-line)))
+      (check '(#t #t #f) (map (lambda (key) (tool-ref last key)) '(region-complete file-eof next-line)))
+      (check (string-append (source-head last) "\n4: last") (tool-show last))
+      (check "last" (tool-show last #:numbered #f))
+      (check (string-append (source-head last) "\n4: last") (tool-show (tool-batch (list (lambda () last)))))
+      (check '(1 #t #t #f)
+        (map (lambda (key) (tool-ref (tool-read p "empty") key)) '(file-lines region-complete file-eof next-line)))
+      (define blank (tool-read p "blank"))
+      (check (string-append (source-head blank) "\n1: ") (tool-show blank))
+      (check (source-head r) (tool-show (tool-expand p (tool-ref r 'handle) #:offset 7)))
+      (define empty (tool-read p "empty"))
+      (check (source-head empty) (tool-show empty))
+      ;; A definition ending mid-line must not advertise skipping to another line.
+      (define definition (tool-read-symbol p "inline.rs" "one"))
+      (check '(#t #f #f)
+        (map (lambda (key) (tool-ref definition key)) '(region-complete file-eof next-line)))
+      (define range-error (guard (e (#t (condition/report-string e))) (tool-files p #:limit 100)))
+      (check #t (and (string-contains range-error "expected 1 to 50") #t))
+    "#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("pages"), "changed").unwrap();
+    vm.eval_source(
+        r#"
+      ;; Expansion metadata belongs to the immutable snapshot, not current disk.
+      (define old (tool-expand p (tool-ref first 'handle)))
+      (check '(4 #f 2) (map (lambda (key) (tool-ref old key)) '(file-lines file-eof next-line)))
+      (check (source-head first) (source-head old))
+      (check #t (and (string-contains (tool-show old) (tool-ref first 'revision)) #t))
+      (check '(1 #t #f)
+        (map (lambda (key) (tool-ref (tool-read p "pages") key)) '(file-lines file-eof next-line)))
+    "#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("<stdout of sh>"), "actual\nfile\n").unwrap();
+    vm.eval_source(
+        r#"
+      ;; Kept output is not a disk file; do not suggest tool-read on its label.
+      (define job (tool-run p "sh" '("-c" "printf 'a\\nb\\n'") #:keep 100))
+      (define output (tool-process-result job))
+      (define h (tool-ref (tool-ref output 'stdout) 'handle))
+      (define output-line (tool-lines p h #:from 1 #:lines 1))
+      (check '(#t #f #f #f)
+        (map (lambda (key) (tool-ref output-line key)) '(region-complete file-lines file-eof next-line)))
+      (check "<stdout of sh>:1: a" (tool-show output-line #:numbered #t))
+      ;; Origin is explicit, not guessed from a filename that looks like output.
+      (check '(2 2 #f)
+        (map (lambda (key) (tool-ref (tool-read p "<stdout of sh>" #:lines 1) key)) '(file-lines next-line file-eof)))
     "#,
     )
     .unwrap();

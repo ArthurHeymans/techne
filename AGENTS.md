@@ -2,12 +2,17 @@
 
 ## Dogfooding
 
-We want to dogfood our techne lisp.
-Find or build a techne binary and use it with the `techne tool` command.
-If you notice any issue or can suggest any improvements to these tools notify the user.
-This tool can use scheme in a stateful way. This is available for you so you don't need to repeat yourself.
-Unless there is a very good reason not to, try to make new tools in techne lisp if you think they are reusable
-and useful. Don't hillclimb this however.
+Use `techne tool` for repository inspection, editing and command execution.
+No shell/Python fallback: we deliberately dogfood to improve Techne's design,
+not to claim efficiency parity.
+
+- Find or build a binary. Start with `(tool-help)`; request `'recipes`, `'guide`
+  or a binding's help only when needed. Reuse session state and batch queries.
+- Run external programs through Techne's process tools. Launching `techne tool`
+  from the harness is transport, not permission to bypass it with shell scripts.
+- Report friction and correctness bugs. When blocked, improve the tools in
+  reusable Scheme rather than working around them in shell/Python. No prompt
+  hill-climbing or benchmark reruns unless requested.
 
 ## Scheme first; Rust only when Scheme is not feasible
 
