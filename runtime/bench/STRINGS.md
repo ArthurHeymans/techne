@@ -3,6 +3,9 @@
 Baseline: PR #334 tip (`739462e6`), frozen as `/tmp/techne-scan/before`,
 SHA-256 `a58d853271955ecf6dab7d58f2a729a7644f8990d17412a87076ff68012c8665`.
 Workloads/arguments unchanged; no comparison against an older VM baseline.
+A concurrent review commit, `fc4a2f34`, restored list admission and fixed CI
+lints. It is preserved beneath the series; final campaigns below were rerun
+against that reviewed baseline, not just the original frozen binary.
 
 ## Profile and bounded mechanisms
 
@@ -179,32 +182,42 @@ default-on, while retaining both independent zero-valued ablations.
 
 ## Final combined measurements
 
-Frozen final binary `/tmp/techne-scan/final`, SHA-256
-`8ecce4e1e0c0438da39dd5a86393247353bc49fa59d115bcb488eafcf80b0128`.
+The final combined series preserves concurrent review commit `fc4a2f34`:
+original list admission and its new low-memory test, plus CI lint fixes.
+
+- Reviewed baseline `/tmp/techne-scan/before-reviewed`, SHA-256
+  `b9c57a8e867d2f297d5d588fa694b8e89dc4d2c4d4236faac74002b848073f6f`.
+- Final `/tmp/techne-scan/final-reviewed`, SHA-256
+  `965248be98c3d633d82f555c00635912a6765828cdf37dfa2d1fa928a47c2756`.
+
 Three alternating pairs / eight calls, medians of the last four and then
 across processes. Same EPYC 3151 / CPU 4 / release counting-allocator build.
+The pre-review final binary (`/tmp/techne-scan/final`, SHA-256 `8ecce4e1…`)
+and its campaigns are historical, not the reviewed tip.
 
 | Workload | PR tip ms | Final ms |
 |---|---:|---:|
-| direct control | 4.351 | 4.355 |
-| indirect control | 6.034 | 6.029 |
-| fib | 100.611 | 100.568 |
-| tak | 125.172 | 124.909 |
-| nqueens | 259.001 | 251.510 |
-| bintrees | 846.269 | 836.013 |
-| hof | 305.814 | 302.410 |
-| qsort | 164.186 | 163.869 |
-| mandel | **41.828** | **38.247** |
-| hash | 327.006 | 324.309 |
-| orgparse | **75.366** | **62.369** |
+| direct control | 4.350 | 4.344 |
+| indirect control | 6.024 | 6.029 |
+| fib | 100.560 | 100.428 |
+| tak | 126.214 | 124.992 |
+| nqueens | 261.562 | 250.050 |
+| bintrees | 839.729 | 836.880 |
+| hof | 303.058 | 303.337 |
+| qsort | 164.114 | 160.894 |
+| mandel | **41.395** | **38.659** |
+| hash | 327.553 | 330.601 |
+| orgparse | **74.860** | **62.510** |
 
-Retained gains: parsing **17.2%**, Mandelbrot **8.6%**. The other controls
+Retained gains on the reviewed baseline: parsing **16.5%**, Mandelbrot **6.6%**.
+The preceding pre-review campaign gave **17.2% / 8.6%**; the recheck supports
+the mechanisms without pretending all wall samples agree exactly. The other controls
 show wall-time/layout variability, not claimed algorithmic gains. In particular,
 no vector-bound improvement is retained. Native block-order/hash and binary
 layout effects mean unchanged instruction counts do not guarantee identical
 wall samples; only the selected mechanisms have corroborating ablations/counts.
 
-Same-binary all-six-off/default, five pairs / ten calls: orgparse **74.73 ->
+The pre-review same-binary all-six-off/default, five pairs / ten calls: orgparse **74.73 ->
 62.51 ms** (-16.4%), mandel **42.01 -> 38.31 ms** (-8.8%), exact ratio-division
 control **274.33 -> 275.16 ms** (+0.3%, effectively flat).
 
@@ -212,27 +225,31 @@ One Cachegrind pair / two calls, **whole process**, including boot/compilation:
 
 | Workload | Before instructions | Final instructions | Change |
 |---|---:|---:|---:|
-| orgparse | 631,892,123 | 528,825,161 | **-16.3%** |
-| mandel | 288,660,204 | 262,352,454 | **-9.1%** |
+| orgparse | 631,884,006 | 528,823,169 | **-16.3%** |
+| mandel | 288,658,802 | 262,345,663 | **-9.1%** |
 | qsort | 1,252,915,465 | 1,252,957,343 | +0.003% |
 | nqueens | 1,801,162,234 | 1,801,172,700 | +0.0006% |
 | exact-div control | 1,581,918,645 | 1,582,904,888 | +0.062% |
 
+The qsort/nqueens/exact-div counted controls above are the pre-review campaign;
+the target orgparse/mandel counts were repeated on the reviewed pair.
+
 ### Compilation and memory are not free
 
-Native-job elapsed sums (process medians): orgparse **57.22 -> 64.51 ms**,
-mandel **19.28 -> 22.76 ms**, HOF 22.86 -> 22.73 ms, qsort 37.86 -> 37.89 ms.
+Reviewed native-job elapsed sums (process medians): orgparse **56.41 -> 63.71 ms**,
+mandel **19.09 -> 22.66 ms**. Earlier controls: HOF 22.86 -> 22.73 ms,
+qsort 37.86 -> 37.89 ms.
 The conservative string admission avoids the aggressive prototype's 82 ms.
-First-call medians, including warming/compilation: orgparse 139.94 -> 133.24 ms,
-mandel 58.28 -> 58.28 ms. These samples are not whole-process startup figures.
+Reviewed first-call medians, including warming/compilation: orgparse
+138.57 -> 132.26 ms, mandel 57.80 -> 58.36 ms. These samples are not whole-process startup figures.
 
 Three alternating eight-call processes with owner diagnostics, median peak RSS:
 
 | Workload | Before KiB | Final KiB | Machine mappings before -> final |
 |---|---:|---:|---:|
-| orgparse | 36,248 | 36,008 | 56 -> 64 KiB |
-| mandel | 15,996 | 16,268 | 20 -> 20 KiB |
-| hof | 100,648 | 100,408 | 32 -> 32 KiB |
+| orgparse | 36,248 | 35,580 | 56 -> 64 KiB |
+| mandel | 15,996 | 15,780 | 20 -> 20 KiB |
+| hof | 100,648 | 99,788 | 32 -> 32 KiB |
 
 RSS is effectively flat, not a memory-reduction claim. Mandelbrot's final
 owner total after compilation is about 385 KiB larger, mostly reusable compiler
@@ -244,21 +261,22 @@ limits are unchanged. No general statement about reduced promotion/GC work.
 Three alternating Node/Techne process pairs / ten calls, CPU 4, medians of the
 last five and then across processes. Results agree (normalizing printed list
 syntax only). Unlike the preceding answer's reused Node figures, both sides
-are fresh here. These are warmed times, not startup/compilation comparisons.
+are fresh here, repeated after incorporating the concurrent review fix.
+These are warmed times, not startup/compilation comparisons.
 
 | Workload | Node ms | Techne ms | Techne / Node |
 |---|---:|---:|---:|
-| fib | 74.098 | 100.443 | 1.36x |
-| tak | 119.860 | 124.317 | **1.04x** |
-| nqueens | 142.026 | 250.913 | 1.77x |
-| bintrees | 591.930 | 841.813 | 1.42x |
-| hof | 157.618 | 309.182 | 1.96x |
-| qsort | 103.180 | 164.324 | 1.59x |
-| mandel | 32.998 | 38.664 | **1.17x** |
-| hash | 249.405 | 326.152 | 1.31x |
-| orgparse | 37.284 | 62.443 | **1.67x** |
-| direct control | 2.774 | 4.353 | 1.57x |
-| indirect control | 2.782 | 6.023 | 2.16x |
+| fib | 74.187 | 100.460 | 1.35x |
+| tak | 119.852 | 124.511 | **1.04x** |
+| nqueens | 142.226 | 249.699 | 1.76x |
+| bintrees | 592.113 | 840.156 | 1.42x |
+| hof | 157.443 | 309.434 | 1.97x |
+| qsort | 103.324 | 164.977 | 1.60x |
+| mandel | 33.029 | 38.726 | **1.17x** |
+| hash | 250.008 | 334.997 | 1.34x |
+| orgparse | 37.491 | 63.347 | **1.69x** |
+| direct control | 2.785 | 4.341 | 1.56x |
+| indirect control | 2.790 | 6.024 | 2.16x |
 
 Geometric mean over the nine applications: **1.45x** Node, down from the
 preceding approximate 1.50x comparison. HOF still includes Scheme lists versus
@@ -266,7 +284,8 @@ JS arrays. No universal V8 parity, list-fusion, or parsing-language rewrite.
 
 ### Final validation and raw records
 
-Final defaults pass **117 library tests**, all regular counting-allocator
+Final reviewed defaults pass **118 library tests** (including the concurrent
+list-admission regression), all regular counting-allocator
 integration targets (including budgets, memory, reclamation, frames, stop/kill,
 confinement, snapshots and safety ratchets), **378** language/R7RS/SRFI trials,
 and separately **13 hostile tests**. The explicit 40-seed differential campaign
@@ -276,16 +295,19 @@ contracts. No test, expected failure, raw-access ratchet or memory plateau bound
 was relaxed. The much larger external R7RS benchmark campaign is not claimed
 complete. No heavyweight optimization tier or recompilation was introduced.
 
-`cargo check --no-default-features`, formatting and diff checks pass. LSP cannot
+`cargo check --no-default-features`, formatting, diff checks and strict
+`cargo clippy --features counting-allocator --lib --tests -- -D warnings` pass. LSP cannot
 confirm the >5,000-line core file; the small-file probes are inconclusive, not
 proof of clean analysis. Compilation and active tests provide validation.
 
-Final raw records in `/tmp/techne-scan/`: `final-runtime.json`,
-`final-ablation.json`, `final-instructions.json`, `node-vs-vm.json`,
-`rss-{orgparse,mandel,hof}-{before,final}-*.{txt,log,out}`,
-`validated-{tests,conformance,hostile,fuzz,check,build}.log`. Historical
+Final reviewed records in `/tmp/techne-scan/`: `reviewed-runtime.json`,
+`reviewed-instructions.json`, `reviewed-node-vs-vm.json`,
+`rss-{orgparse,mandel,hof}-{before-reviewed,final-reviewed}-*.{txt,log,out}`,
+`reviewed-{tests,conformance,hostile,check,build,clippy}.log`. Earlier independent
+ablations/fuzzing: `final-ablation.json`, `final-instructions.json`,
+`validated-fuzz.log`. Historical `final-runtime.json`, `node-vs-vm.json`,
 `strings-{runtime,ablation}.json` and `aggressive-*.json` are superseded by the
-final combined campaign, not silently substituted.
+reviewed combined campaign, not silently substituted.
 
 ```sh
 # Same final binary; original mechanisms versus final defaults.
