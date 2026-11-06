@@ -458,7 +458,17 @@ pub fn inlinable(
         forward(pc, op)
             && match *op {
                 CallG { .. } | TailCallG { .. } if nested.contains_key(&(pc as u32)) => true,
-                CallG { g, n, .. } | TailCallG { g, n, .. } => native(g).inspect(|k| calls += k.inline(n).is_none() as usize).is_some(),
+                CallG { g, n, .. } | TailCallG { g, n, .. } => native(g)
+                    .inspect(|k| {
+                        let inline = k.inline(n);
+                        // Bounded byte loops are larger than a scalar native case.
+                        // Count them against the existing complex-native budget;
+                        // =1 restores bytecode-only admission for measurement.
+                        let heavy = std::env::var("TECHNE_JIT_STRING_INLINE").as_deref() != Ok("1")
+                            && matches!(inline, Some(Inline::Substring | Inline::StringEq));
+                        calls += (inline.is_none() || heavy) as usize;
+                    })
+                    .is_some(),
                 Closure { .. }
                 | PushHandler { .. }
                 | PopHandler
@@ -4247,7 +4257,7 @@ impl Gen {
         // The byte at fixnum index `args[1]` of the bytes of `x`.
         let byte = |b: &mut FunctionBuilder, len: ir::Value| {
             let idx;
-            if self.fix[pc].contains(base + 2) && std::env::var("TECHNE_JIT_INDEX").as_deref() == Ok("1") {
+            if self.fix[pc].contains(base + 2) && std::env::var("TECHNE_JIT_INDEX").as_deref() != Ok("0") {
                 let s = b.use_var(self.shifts[(base + 2) as usize]);
                 idx = b.ins().sshr_imm_s(s, 16);
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);

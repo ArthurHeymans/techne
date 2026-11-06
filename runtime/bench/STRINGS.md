@@ -57,8 +57,7 @@ four, then across three processes. Same-binary independent comparisons:
 Different sessions show frequency/timing variability: do not add these
 percentages or treat them as a fresh Node comparison. A same-binary combined
 Cachegrind comparison (two calls, includes startup and compilation) falls
-631,994,344 -> 554,301,229 instructions, **12.3% fewer**. Final cross-binary,
-compilation and memory comparisons follow before default enablement.
+631,994,344 -> 554,301,229 instructions, **12.3% fewer**. Final comparisons and the more conservative default admission are below.
 
 ## Correctness
 
@@ -89,6 +88,51 @@ PROGS=orgparse RUNS=5 ITERS=10 \
 # Run COUNTS=1 RUNS=1 ITERS=2 separately inside nix develop.
 ```
 
-Raw local records: `/tmp/techne-scan/{org.callgrind,org-exclusive.txt,
-index-wall,strings-wall,sub-vs-both-wall,native-cache-wall,strings-counts}.json`
-(the first two are profile files, not JSON), plus `prototype-tests.log`.
+Raw local records in `/tmp/techne-scan/`: `org.callgrind`, `org-exclusive.txt`,
+`{index-wall,strings-wall,sub-vs-both-wall,native-cache-wall,strings-counts}.json`,
+plus `prototype-tests.log`.
+
+## Default admission and rejected experiments
+
+The four mechanisms are enabled by default; independently set
+`TECHNE_JIT_INDEX=0`, `TECHNE_JIT_SUBSTRING=0`, `TECHNE_JIT_STRING_EQ=0` or
+`TECHNE_JIT_NATIVE_CACHE=0` to ablate them.
+
+Bounded string loops now count against the existing one-complex-native-call
+inlining budget. A prefix predicate containing both substring and equality
+therefore stays a separate compiled function instead of duplicating the two
+byte loops at three caller sites. Compared with the aggressive prototype,
+this loses about 2% of parsing speed (61.20 -> 62.38 ms) but reduces native
+compilation **82.09 -> 64.24 ms**. `TECHNE_JIT_STRING_INLINE=1` restores that
+aggressive bytecode-only admission for measurement; the default is conservative.
+No general inline size or depth limit increases.
+
+Final three alternating pairs / eight calls: orgparse **75.66 -> 62.88 ms**,
+**16.9% faster**. Five-pair / ten-call same-binary all-off/default control:
+**75.60 -> 62.68 ms**, **17.1% faster**. Other application workloads have no
+claimed gain. Initial aggressive default measurements and fresh Node controls
+are preserved separately as `aggressive-runtime.json` and
+`aggressive-node-vs-vm.json`; they are not the final conservative policy.
+
+Mandelbrot is repeatedly 2–5% slower cross-binary despite unchanged generated
+instructions (normalized native row/iter assembly agrees) and essentially
+identical whole-process counts. In the same-binary all-off/default control it
+is flat (44.284 -> 44.292 ms). This is a real wall-time caveat, not a credited
+optimization or evidence that unchanged instruction counts guarantee equal
+speed. Native block emission currently depends on randomized hash-table order.
+
+Two further prototypes were rejected and removed:
+
+- Straight-line vector access reuse, with separate mutability proofs, removed
+  two guards in partition but regressed qsort **1.5–1.8%** in independent paired
+  runs. No bounds or immutability check is removed in the retained code.
+- Sorting entry/exit block emission to stabilize hash-dependent IR order did
+  not improve Mandelbrot and regressed qsort **2.3%**. Determinism alone is not
+  performance evidence; the ordering change is not retained.
+
+The first full default validation passed all regular counting-allocator
+integration targets, 117 library tests, 378 conformance trials, and separately
+all 13 hostile/confinement tests. Hostile probes now include substring, string
+equality and a forged huge-header bounded copy. The final conservative policy's
+four string fixtures pass, including absent/on/off overrides. Broader final
+revalidation, counted instructions and RSS are recorded in the follow-up below.

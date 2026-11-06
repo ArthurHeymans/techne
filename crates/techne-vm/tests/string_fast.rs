@@ -3,15 +3,11 @@
 #![cfg(feature = "counting-allocator")]
 use std::{fs, process::Command};
 
-fn run(path: &std::path::Path, jit: &str, enabled: bool, stress: bool, log: bool) -> std::process::Output {
+fn run(path: &std::path::Path, jit: &str, enabled: Option<bool>, stress: bool, log: bool) -> std::process::Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_techne-vm"));
     c.arg(path)
         .env("TECHNE_JIT", jit)
         .env("TECHNE_JIT_SYNC", "1")
-        .env("TECHNE_JIT_INDEX", if enabled { "1" } else { "0" })
-        .env("TECHNE_JIT_SUBSTRING", if enabled { "1" } else { "0" })
-        .env("TECHNE_JIT_STRING_EQ", if enabled { "1" } else { "0" })
-        .env("TECHNE_JIT_NATIVE_CACHE", if enabled { "1" } else { "0" })
         .env("TECHNE_GC_VERIFY", "1")
         .env_remove("TECHNE_GC_STRESS")
         .env_remove("TECHNE_GC_STATS")
@@ -20,6 +16,13 @@ fn run(path: &std::path::Path, jit: &str, enabled: bool, stress: bool, log: bool
         .env_remove("TECHNE_JIT_ASM")
         .env_remove("TECHNE_JIT_STATS")
         .env_remove("TECHNE_JIT_MEMORY");
+    for flag in ["TECHNE_JIT_INDEX", "TECHNE_JIT_SUBSTRING", "TECHNE_JIT_STRING_EQ", "TECHNE_JIT_NATIVE_CACHE"] {
+        if let Some(enabled) = enabled {
+            c.env(flag, if enabled { "1" } else { "0" });
+        } else {
+            c.env_remove(flag);
+        }
+    }
     if stress {
         c.env("TECHNE_GC_STRESS", "full");
     }
@@ -58,18 +61,20 @@ fn ranges_and_equalities_have_an_independent_ascii_oracle() {
         expected.push_str(&format!("(#t {} #f)\n", if s == other { "#t" } else { "#f" }));
     }
     fs::write(&path, source).unwrap();
-    for (jit, enabled, stress) in [("0", false, false), ("20", false, false), ("20", true, false), ("20", true, true)] {
+    for (jit, enabled, stress) in
+        [("0", Some(false), false), ("20", Some(false), false), ("20", Some(true), false), ("20", Some(true), true), ("20", None, false)]
+    {
         let out = run(&path, jit, enabled, stress, false);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(out.stdout, expected.as_bytes());
         assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
     }
-    for enabled in [false, true] {
+    for enabled in [Some(false), Some(true), None] {
         let out = run(&path, "20", enabled, false, true);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let log = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(log.contains("jit-substring:"), enabled, "{log}");
-        assert_eq!(log.contains("jit-string-eq:"), enabled, "{log}");
+        assert_eq!(log.contains("jit-substring:"), enabled != Some(false), "{log}");
+        assert_eq!(log.contains("jit-string-eq:"), enabled != Some(false), "{log}");
     }
 }
 
@@ -85,6 +90,8 @@ fn strings_keep_unicode_redirects_fresh_identity_errors_and_gc() {
         // Many small nursery copies, held through periodic collections.
         r#"(let loop ((n 512) (held '())) (if (= n 0) (begin (collect-garbage) (write (list (length held) (car held)))) (let ((s (cut "abcdefghijk" 1 10))) (loop (- n 1) (cons s held)))))"#,
         r#"(define (scan s) (let loop ((i 0) (r '())) (if (= i (string-length s)) r (loop (+ i 1) (cons (at s i) r))))) (write (list (scan "abc") (scan "λ🦀")))"#,
+        r#"(define s (make-string 33 #\λ)) (write (list (same s (make-string 33 #\λ)) (same s (string-append (make-string 32 #\λ) "z")) (cut s 31 33)))"#,
+        r#"(define s (string #\a (integer->char 0) #\b)) (write (list (same s (string-copy s)) (cut s 0 2)))"#,
         r#"(cut "abc" -1 2)"#,
         r#"(cut "abc" 2 1)"#,
         r#"(cut "abc" 0 4)"#,
@@ -100,10 +107,10 @@ fn strings_keep_unicode_redirects_fresh_identity_errors_and_gc() {
     let path = dir.path().join("strings.scm");
     for (index, tail) in cases.into_iter().enumerate() {
         fs::write(&path, format!("{PRELUDE}\n{tail}")).unwrap();
-        let reference = run(&path, "0", false, false, false);
-        assert_eq!(reference.status.success(), index < 8, "{tail}: {}", String::from_utf8_lossy(&reference.stderr));
+        let reference = run(&path, "0", Some(false), false, false);
+        assert_eq!(reference.status.success(), index < 10, "{tail}: {}", String::from_utf8_lossy(&reference.stderr));
         for stress in [false, true] {
-            let out = run(&path, "20", true, stress, false);
+            let out = run(&path, "20", Some(true), stress, false);
             assert_eq!(out.status, reference.status, "{tail}: {}", String::from_utf8_lossy(&out.stderr));
             assert_eq!(out.stdout, reference.stdout, "{tail}");
             assert_eq!(out.stderr, reference.stderr, "{tail}");
@@ -131,11 +138,11 @@ fn native_guard_cache_refreshes_after_calls_and_rejects_local_writes() {
         );
         fs::write(&path, source).unwrap();
         for enabled in [false, true] {
-            let out = run(&path, "20", enabled, false, false);
+            let out = run(&path, "20", Some(enabled), false, false);
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
             assert_eq!(out.stdout, expected.as_bytes());
         }
-        let out = run(&path, "20", true, false, true);
+        let out = run(&path, "20", Some(true), false, true);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(String::from_utf8_lossy(&out.stderr).contains("jit-native-cache: drive"));
     }
