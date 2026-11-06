@@ -1,0 +1,396 @@
+# Bounded string and real-native hillclimb
+
+Baseline: PR #334 tip (`739462e6`), frozen as `/tmp/techne-scan/before`,
+SHA-256 `a58d853271955ecf6dab7d58f2a729a7644f8990d17412a87076ff68012c8665`.
+Workloads/arguments unchanged; no comparison against an older VM baseline.
+A concurrent review commit, `fc4a2f34`, restored list admission and fixed CI
+lints. It is preserved beneath the series; final campaigns below were rerun
+against that reviewed baseline, not just the original frozen binary.
+
+## Profile and bounded mechanisms
+
+Callgrind on three orgparse calls reports 888.6 million whole-process
+instructions. Generated code accounts for most execution; `substring`
+accounts for 14.0% inclusively. Those costs overlap. The per-character loop
+also retags and decodes an already-proven fixnum index at every string read.
+
+The initial, independently ablatable prototype adds:
+
+- `TECHNE_JIT_INDEX=1`: reuse the existing proven shifted fixnum at byte/string
+  native indices. Keep unsigned bounds checks; no inferred range or unchecked
+  read. The disabled branch retains its original combined tag/range guard.
+- `TECHNE_JIT_SUBSTRING=1`: inline three-argument substring of flat ASCII
+  sources when the result is at most 64 bytes. Validate tags and the complete
+  range first. Reserve the exact rounded size in the already-admitted nursery,
+  initialize the original header, bytes and padding, and return a *fresh mutable*
+  string. Allocation pressure, unsupported values and representations take the
+  original native with unchanged arguments; no collection during construction.
+- `TECHNE_JIT_STRING_EQ=1`: inline two-string byte equality for flat UTF-8
+  strings of at most 64 bytes (or unequal lengths). Validate both string kinds
+  before returning false. Redirected/long strings use the original native.
+- `TECHNE_JIT_NATIVE_CACHE=1`: extend the existing 16-global cache to repeated
+  inline character/byte/string-read natives. Cache a boolean identity fact,
+  refresh with the existing anticipated-global reload machinery at entries and
+  after actual calls, and reject globals assigned anywhere in the combined
+  body. A failed guard retains the generic call. No cached string pointers or
+  mutable ASCII/length facts.
+
+The 64-byte loops are bounded implementation work inside an existing native
+case, not unbounded guest loops with missing polls. No original guest poll or
+fuel decrement moves. Source addresses are cage-masked at every byte access.
+The shared nursery reservation mechanism handles both fixed and bounded
+variable sizes. No global inlining limit, nursery size or optimizer tier grows.
+
+These changes belong in Rust because they lower existing native operations
+and preserve the VM's allocation/confinement/exit invariants; Scheme cannot
+remove its own generated ABI/tag traffic. Parsing policy and reusable
+measurement machinery remain Scheme. No parsing workload is rewritten.
+
+## Initial measurements (opt-in checkpoint)
+
+EPYC 3151, CPU 4; alternating fresh processes, eight calls, medians of the last
+four, then across three processes. Same-binary independent comparisons:
+
+- Proven indices: orgparse 76.33 -> 73.69 ms; mandel/qsort effectively flat.
+- Substring and equality together, indices held enabled: 73.77 -> 68.57 ms.
+- Equality on top of substring, five pairs / ten calls: 66.81 -> 63.33 ms.
+- Native guard cache on top of the other cases: 62.88 -> 61.05 ms;
+  qsort 159.83 -> 159.86 ms, HOF 303.54 -> 301.97 ms (not claimed gains).
+
+Different sessions show frequency/timing variability: do not add these
+percentages or treat them as a fresh Node comparison. A same-binary combined
+Cachegrind comparison (two calls, includes startup and compilation) falls
+631,994,344 -> 554,301,229 instructions, **12.3% fewer**. Final comparisons
+and the more conservative default admission are below.
+
+## Correctness
+
+The opt-in checkpoint passes 117 library tests, the numeric/callback/scalar
+fixtures, all 15 stop and 15 reclamation tests unchanged, and four new string
+fixtures. Independent ASCII-oracle cases span empty/word-boundary/64-byte/long
+ranges and comparisons. Differential cases cover UTF-8, redirected strings,
+mutation of fresh copies, changed indirect targets, exact error/source traces,
+GC stress, collection inside inlined callers, and native guard refresh after a
+collecting non-inline call or direct global assignment. A 64 KiB nursery run
+keeps 30,000 copied strings alive through nursery exhaustion and full collection.
+
+A first stress fixture retaining 20,000 strings under full-GC-on-every-allocation
+exceeded its five-minute outer budget; the bounded stress fixture uses 512 and
+the separate nursery-pressure fixture uses 30,000 without quadratic full-GC
+stress. No existing test or memory bound was weakened. No timed-out child remains.
+
+## Reproduce
+
+```sh
+nix develop --command cargo build --release -p techne-vm \
+  --features counting-allocator --bin techne-vm
+
+PROGS=orgparse RUNS=5 ITERS=10 \
+  AFTER_ENV='TECHNE_JIT_INDEX=1 TECHNE_JIT_SUBSTRING=1 TECHNE_JIT_STRING_EQ=1 TECHNE_JIT_NATIVE_CACHE=1' \
+  techne run runtime/bench/compare.scm \
+  /path/to/frozen/before target/release/techne-vm /tmp/strings-wall.json
+# Run COUNTS=1 RUNS=1 ITERS=2 separately inside nix develop.
+```
+
+Raw local records in `/tmp/techne-scan/`: `org.callgrind`, `org-exclusive.txt`,
+`{index-wall,strings-wall,sub-vs-both-wall,native-cache-wall,strings-counts}.json`,
+plus `prototype-tests.log`.
+
+## Default admission and rejected experiments
+
+The four mechanisms are enabled by default; independently set
+`TECHNE_JIT_INDEX=0`, `TECHNE_JIT_SUBSTRING=0`, `TECHNE_JIT_STRING_EQ=0` or
+`TECHNE_JIT_NATIVE_CACHE=0` to ablate them.
+
+Bounded string loops now count against the existing one-complex-native-call
+inlining budget. A prefix predicate containing both substring and equality
+therefore stays a separate compiled function instead of duplicating the two
+byte loops at three caller sites. Compared with the aggressive prototype,
+this loses about 2% of parsing speed (61.20 -> 62.38 ms) but reduces native
+compilation **82.09 -> 64.24 ms**. `TECHNE_JIT_STRING_INLINE=1` restores that
+aggressive bytecode-only admission for measurement; the default is conservative.
+No general inline size or depth limit increases.
+
+String-only checkpoint, three alternating pairs / eight calls: orgparse **75.66 -> 62.88 ms**,
+**16.9% faster**. Five-pair / ten-call same-binary all-off/default control:
+**75.60 -> 62.68 ms**, **17.1% faster**. Other application workloads have no
+claimed gain. Initial aggressive default measurements and fresh Node controls
+are preserved separately as `aggressive-runtime.json` and
+`aggressive-node-vs-vm.json`; they are not the final conservative policy.
+
+That string-only binary repeatedly ran Mandelbrot 2–5% slower despite unchanged generated
+instructions (normalized native row/iter assembly agrees) and essentially
+identical whole-process counts. In the same-binary all-off/default control it
+is flat (44.284 -> 44.292 ms). This is a real wall-time caveat, not a credited
+optimization or evidence that unchanged instruction counts guarantee equal
+speed. Native block emission currently depends on randomized hash-table order.
+
+Two further prototypes were rejected and removed:
+
+- Straight-line vector access reuse, with separate mutability proofs, removed
+  two guards in partition but regressed qsort **1.5–1.8%** in independent paired
+  runs. No bounds or immutability check is removed in the retained code.
+- Sorting entry/exit block emission to stabilize hash-dependent IR order did
+  not improve Mandelbrot and regressed qsort **2.3%**. Determinism alone is not
+  performance evidence; the ordering change is not retained.
+
+The first full default validation passed all regular counting-allocator
+integration targets, 117 library tests, 378 conformance trials, and separately
+all 13 hostile/confinement tests. Hostile probes now include substring, string
+equality and a forged huge-header bounded copy. The final conservative policy's
+four string fixtures pass, including absent/on/off overrides. Broader final
+revalidation, counted instructions and RSS are recorded in the follow-up below.
+
+## Explicit inexact conversion and genuinely inexact division
+
+A separate Mandelbrot profile finds 8.6% of whole-process instructions inside
+native builtins, plus generated code's spill/reload/setup around their calls.
+Its row function converts integer coordinates explicitly and divides them by
+an integer size; its existing arithmetic bytecodes already handle the other
+floating operations.
+
+Add two scalar native cases, with independent ablations:
+
+- `TECHNE_JIT_INEXACT=0` disables inline `inexact` and `exact->inexact` on
+  fixnums/floats. A fixnum uses the same signed integer-to-f64 conversion;
+  an already-inexact value is returned verbatim, including signed zero and
+  NaN bits. Other number kinds and type errors retain the original native.
+- `TECHNE_JIT_FLOAT_DIV=0` disables two-argument `/` on scalar fixnum/float
+  operands when at least one is **already inexact**. Exact/exact division
+  retains exact integers/ratios and its zero-division error. Complex numbers,
+  large integers, ratios, different arities and changed targets fall back.
+  Floating zero, infinities and NaNs match the existing IEEE native fast path.
+
+Neither case collects or retains pointers. Fallback retains original arguments
+and logical frames. This is explicit conversion/native ABI lowering, not a
+policy that silently coerces exact arithmetic to floats. It belongs in Rust
+for the same reason as existing arithmetic lowering, not a new native subsystem.
+
+Conversion alone looked flat (41.45 -> 41.25 ms), but the pair improves
+Mandelbrot **41.71 -> 38.19 ms** in five same-binary pairs / ten calls. With
+division held enabled, conversion improves **41.26 -> 38.24 ms**. Removing
+both sets of native call boundaries matters; do not add individual speedups.
+The unchanged-purpose `steady/exact-div.scm` negative control performs exact
+first-class ratio divisions: 282.45 -> 281.73 ms in the prototype, essentially
+flat. It is not a JavaScript-equivalent floating benchmark.
+
+Two new fixtures check selection/ablation/default behavior and exact expected
+answers, plus aliases, changed targets, collecting callbacks, exact/large/
+complex/inexact values, nonfinite/signed-zero cases, arity/type errors and full
+source traces under ordinary/full-GC execution. All pass. The cases are now
+default-on, while retaining both independent zero-valued ablations.
+
+## Final combined measurements
+
+The final combined series preserves concurrent review commit `fc4a2f34`:
+original list admission and its new low-memory test, plus CI lint fixes.
+
+- Reviewed baseline `/tmp/techne-scan/before-reviewed`, SHA-256
+  `b9c57a8e867d2f297d5d588fa694b8e89dc4d2c4d4236faac74002b848073f6f`.
+- Final `/tmp/techne-scan/final-reviewed`, SHA-256
+  `965248be98c3d633d82f555c00635912a6765828cdf37dfa2d1fa928a47c2756`.
+
+Three alternating pairs / eight calls, medians of the last four and then
+across processes. Same EPYC 3151 / CPU 4 / release counting-allocator build.
+The pre-review final binary (`/tmp/techne-scan/final`, SHA-256 `8ecce4e1…`)
+and its campaigns are historical, not the reviewed tip.
+
+| Workload | PR tip ms | Final ms |
+|---|---:|---:|
+| direct control | 4.350 | 4.344 |
+| indirect control | 6.024 | 6.029 |
+| fib | 100.560 | 100.428 |
+| tak | 126.214 | 124.992 |
+| nqueens | 261.562 | 250.050 |
+| bintrees | 839.729 | 836.880 |
+| hof | 303.058 | 303.337 |
+| qsort | 164.114 | 160.894 |
+| mandel | **41.395** | **38.659** |
+| hash | 327.553 | 330.601 |
+| orgparse | **74.860** | **62.510** |
+
+Retained gains on the reviewed baseline: parsing **16.5%**, Mandelbrot **6.6%**.
+The preceding pre-review campaign gave **17.2% / 8.6%**; the recheck supports
+the mechanisms without pretending all wall samples agree exactly. The other controls
+show wall-time/layout variability, not claimed algorithmic gains. In particular,
+no vector-bound improvement is retained. Native block-order/hash and binary
+layout effects mean unchanged instruction counts do not guarantee identical
+wall samples; only the selected mechanisms have corroborating ablations/counts.
+
+The pre-review same-binary all-six-off/default, five pairs / ten calls: orgparse **74.73 ->
+62.51 ms** (-16.4%), mandel **42.01 -> 38.31 ms** (-8.8%), exact ratio-division
+control **274.33 -> 275.16 ms** (+0.3%, effectively flat).
+
+One Cachegrind pair / two calls, **whole process**, including boot/compilation:
+
+| Workload | Before instructions | Final instructions | Change |
+|---|---:|---:|---:|
+| orgparse | 631,884,006 | 528,823,169 | **-16.3%** |
+| mandel | 288,658,802 | 262,345,663 | **-9.1%** |
+| qsort | 1,252,915,465 | 1,252,957,343 | +0.003% |
+| nqueens | 1,801,162,234 | 1,801,172,700 | +0.0006% |
+| exact-div control | 1,581,918,645 | 1,582,904,888 | +0.062% |
+
+The qsort/nqueens/exact-div counted controls above are the pre-review campaign;
+the target orgparse/mandel counts were repeated on the reviewed pair.
+
+### Compilation and memory are not free
+
+Reviewed native-job elapsed sums (process medians): orgparse **56.41 -> 63.71 ms**,
+mandel **19.09 -> 22.66 ms**. Earlier controls: HOF 22.86 -> 22.73 ms,
+qsort 37.86 -> 37.89 ms.
+The conservative string admission avoids the aggressive prototype's 82 ms.
+Reviewed first-call medians, including warming/compilation: orgparse
+138.57 -> 132.26 ms, mandel 57.80 -> 58.36 ms. These samples are not whole-process startup figures.
+
+Three alternating eight-call processes with owner diagnostics, median peak RSS:
+
+| Workload | Before KiB | Final KiB | Machine mappings before -> final |
+|---|---:|---:|---:|
+| orgparse | 36,248 | 35,580 | 56 -> 64 KiB |
+| mandel | 15,996 | 15,780 | 20 -> 20 KiB |
+| hof | 100,648 | 99,788 | 32 -> 32 KiB |
+
+RSS is effectively flat, not a memory-reduction claim. Mandelbrot's final
+owner total after compilation is about 385 KiB larger, mostly reusable compiler
+workspace; it remains accounted. Peak sizes, nursery and original reclamation
+limits are unchanged. No general statement about reduced promotion/GC work.
+
+### Fresh Node 24.21.0 controls
+
+Three alternating Node/Techne process pairs / ten calls, CPU 4, medians of the
+last five and then across processes. Results agree (normalizing printed list
+syntax only). Unlike the preceding answer's reused Node figures, both sides
+are fresh here, repeated after incorporating the concurrent review fix.
+These are warmed times, not startup/compilation comparisons.
+
+| Workload | Node ms | Techne ms | Techne / Node |
+|---|---:|---:|---:|
+| fib | 74.187 | 100.460 | 1.35x |
+| tak | 119.852 | 124.511 | **1.04x** |
+| nqueens | 142.226 | 249.699 | 1.76x |
+| bintrees | 592.113 | 840.156 | 1.42x |
+| hof | 157.443 | 309.434 | 1.97x |
+| qsort | 103.324 | 164.977 | 1.60x |
+| mandel | 33.029 | 38.726 | **1.17x** |
+| hash | 250.008 | 334.997 | 1.34x |
+| orgparse | 37.491 | 63.347 | **1.69x** |
+| direct control | 2.785 | 4.341 | 1.56x |
+| indirect control | 2.790 | 6.024 | 2.16x |
+
+Geometric mean over the nine applications: **1.45x** Node, down from the
+preceding approximate 1.50x comparison. HOF still includes Scheme lists versus
+JS arrays. No universal V8 parity, list-fusion, or parsing-language rewrite.
+
+### Final validation and raw records
+
+Final reviewed defaults pass **118 library tests** (including the concurrent
+list-admission regression), all regular counting-allocator
+integration targets (including budgets, memory, reclamation, frames, stop/kill,
+confinement, snapshots and safety ratchets), **378** language/R7RS/SRFI trials,
+and separately **13 hostile tests**. The explicit 40-seed differential campaign
+passes in five modes, **zero skipped**, alongside exact-integer fuzzing. New
+string/real fixtures check absent/default, on and off behavior and source/GC
+contracts. No test, expected failure, raw-access ratchet or memory plateau bound
+was relaxed. The much larger external R7RS benchmark campaign is not claimed
+complete. No heavyweight optimization tier or recompilation was introduced.
+
+`cargo check --no-default-features`, formatting, diff checks and strict
+`cargo clippy --features counting-allocator --lib --tests -- -D warnings` pass. LSP cannot
+confirm the >5,000-line core file; the small-file probes are inconclusive, not
+proof of clean analysis. Compilation and active tests provide validation.
+
+Final reviewed records in `/tmp/techne-scan/`: `reviewed-runtime.json`,
+`reviewed-instructions.json`, `reviewed-node-vs-vm.json`,
+`rss-{orgparse,mandel,hof}-{before-reviewed,final-reviewed}-*.{txt,log,out}`,
+`reviewed-{tests,conformance,hostile,check,build,clippy}.log`. Earlier independent
+ablations/fuzzing: `final-ablation.json`, `final-instructions.json`,
+`validated-fuzz.log`. Historical `final-runtime.json`, `node-vs-vm.json`,
+`strings-{runtime,ablation}.json` and `aggressive-*.json` are superseded by the
+reviewed combined campaign, not silently substituted.
+
+```sh
+# Same final binary; original mechanisms versus final defaults.
+PROGS='orgparse mandel exact-div' RUNS=5 ITERS=10 \
+  BEFORE_ENV='TECHNE_JIT_INDEX=0 TECHNE_JIT_SUBSTRING=0 TECHNE_JIT_STRING_EQ=0 TECHNE_JIT_NATIVE_CACHE=0 TECHNE_JIT_INEXACT=0 TECHNE_JIT_FLOAT_DIV=0' \
+  techne run runtime/bench/compare.scm \
+  target/release/techne-vm target/release/techne-vm /tmp/native-ablation.json
+# Run counted campaigns separately with adequate outer timeout.
+
+nix develop --command cargo test --release -p techne-vm \
+  --features counting-allocator --test string_fast --test real_fast --test stop --test reclaim
+nix develop --command cargo test --release -p techne-vm \
+  --features counting-allocator,hostile --test hostile
+```
+
+### Subsequent concurrent feedback fix
+
+A later remote commit, `4d55450d`, moved disabled/settled feedback guards into
+the interpreter dispatch loop and added numeric-kernel internal-loop coverage.
+It is also preserved beneath this series, together with the review's explicit
+interpreter-HOF tradeoff in `RESULTS.md`; no accepted-regression setting or
+benchmark threshold is changed here. This fixes profiling overhead, not the
+string/real native lowering measured above.
+
+The final combined source was rebuilt and revalidated after that second rebase:
+118 library tests, all regular integration targets (including the new loop
+fixture and fuzz campaigns), 378 conformance trials, 13 hostile tests, strict
+Clippy, no-default-feature check and formatting pass. Logs are
+`/tmp/techne-scan/latest-{tests,conformance,hostile,clippy,check,build}.log`.
+Built binary `/tmp/techne-scan/latest`, SHA-256
+`8670c3ff16bd5a2d3a78823e23bd5d931be051e5337ebfac6af81fa8fc111297`.
+The measured reviewed hashes/table above remain explicitly the frozen
+`fc4a2f34` comparison, not measurements relabeled as this later build.
+
+### Publication after #334 merged
+
+PR #334 and the intervening editor/debugger work merged while this campaign
+was running. The follow-up is rebased onto `main` at `8dad6b8b`; both review
+fixes and unrelated merged work are preserved. The post-merge source passes
+**119 library tests**, all regular counting-allocator integration targets,
+**378 conformance trials**, **13 hostile tests**, strict Clippy, formatting and
+the no-default-feature check. Logs are
+`/tmp/techne-scan/postmerge-{tests,conformance,hostile,clippy,check,build}.log`.
+Build `/tmp/techne-scan/postmerge`, SHA-256
+`937feaa18f21458b5969d1c574cff68b7b08531b5512ec3c33cb89d22a765674`.
+The performance tables remain measurements of the explicitly frozen reviewed
+pair above, not newly invented timings for this final rebase.
+
+### Adversarial review: self-tail cache invalidation
+
+GPT-6.1 Sol's independent review found a confirmed wrong-result regression.
+A non-inlineable **compiled** callee changed a cached `string-ref` global after
+its final visible read; an implicit self-tail jump then reused the old native.
+The interpreter and cache-off run returned `#\z`, while cache-on returned
+`#\a`. Collecting/interpreted mutators masked this by reentering a loader.
+
+The fix adds the possible pc-0 self-tail edge to **global anticipation only**.
+Existing invalidating-call return paths now refresh global values, vector
+lengths and native/Scheme identity facts needed on the next tail iteration.
+It does not add that edge to local kind/liveness analyses, where argument
+rebinding needs separate treatment, or blindly reload globals on every tail.
+
+The regression asserts both functions really compile and the mutator is not
+inlined. Native-to-closure, native-to-native, non-procedure and collecting
+replacement cases compare results/full errors against the interpreter with
+cache off/on/default and GC stress. A unit test covers direct and indirect
+implicit tail edges, and the absence of a pc-0 entry. The new fixture was
+observed failing before the fix and passing after it; compilation markers
+alone are not the execution evidence.
+
+Paired fixed-binary recheck: HOF 303.225 -> 303.158 ms, parsing 62.637 ->
+62.693 ms, Mandelbrot 38.413 -> 38.548 ms, effectively flat. Qsort wall time is
+160.454 -> 164.221 ms (+2.3%) despite identical per-function IR counts and
+1,252,891,324 -> 1,252,945,126 whole-process instructions (+0.0043%). Report
+this binary/layout-sensitive wall caveat, not a speedup or a reason to retain
+incorrect semantics. No regressing vector-bound optimization was reintroduced.
+The fixed default passes 120 library tests, all regular integration targets,
+378 conformance trials, 13 hostile tests, strict Clippy, formatting and the
+no-default-feature check. No tests or bounds were relaxed.
+Raw records: `/tmp/techne-hof/{self-tail-red,edge-unit,edge-green}.log`,
+`edge-runtime.json`, `edge-qsort-counts.json` and the frozen before/fixed binaries.
+
+Next targets remain HOF list intermediates/GC and wide-accumulator boxing,
+callback overhead, and vector loops. The regressing local-proof prototype is
+not evidence that every bounds strategy must fail, nor permission to weaken
+immutability or exact arithmetic.

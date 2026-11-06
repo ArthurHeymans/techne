@@ -32,6 +32,19 @@ fn register_iteration_is_sparse_ordered_and_crosses_words() {
 }
 
 #[test]
+fn global_anticipation_includes_implicit_self_tail_edges() {
+    for tail in [Op::TailCallG { base: 0, n: 0, g: 99 }, Op::TailCall { base: 0, n: 0 }] {
+        let ops = [Op::CallG { base: 0, n: 0, g: 7 }, Op::CallG { base: 0, n: 0, g: 8 }, Op::Mov { dst: 0, src: 0 }, tail];
+        let succs: Vec<_> = ops.iter().enumerate().map(|(pc, op)| successors(op, pc, ops.len())).collect();
+        let inline = |pc| pc == 0;
+        assert_eq!(anticipated(&ops, &[7], &succs, inline, false), [1, 0, 0, 0]);
+        // The non-inline mutator at pc 1 must reload global 7 on return,
+        // even though its next use is beyond the implicit pc-0 edge.
+        assert_eq!(anticipated(&ops, &[7], &succs, inline, true), [1, 0, 1, 1]);
+    }
+}
+
+#[test]
 fn feedback_is_monomorphic_bounded_and_does_not_respecialize() {
     let mut feedback = CallFeedback::default();
     feedback.observe(12, CallTarget::Code(7));

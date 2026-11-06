@@ -206,6 +206,7 @@ const PROBE: &str = r#"
 (define probes
   (list (lambda (x) x) car cdr (lambda (x) (vector-ref x 0)) vector-length (lambda (x) (vector->list x))
         string-length (lambda (x) (string-copy x)) (lambda (x) (string-ref x 0)) (lambda (x) (string->list x))
+        (lambda (x) (substring x 0 1)) (lambda (x) (string=? x "a"))
         bytevector-length (lambda (x) (bytevector-copy x)) (lambda (x) (bytevector-u8-ref x 0))
         symbol->string unbox (lambda (x) (x)) (lambda (x) (apply x '(1 2)))
         (lambda (x) (hash-table-ref/default x 'k #f)) (lambda (x) (hash-table->alist x))
@@ -295,6 +296,7 @@ fn a_header_claiming_the_whole_cage_reads_only_the_cage() {
                     ("(make-vector 4 1)", "(vector-ref x (- (vector-length x) 1))"),
                     ("(make-vector 4 1)", "(vector->list x)"),
                     ("(make-string 4 #\\a)", "(string-copy x (- (string-length x) 8))"),
+                    ("(make-string 4 #\\a)", "(substring x (- (string-length x) 8) (string-length x))"),
                     ("(make-bytevector 4 1)", "(bytevector-u8-ref x (- (bytevector-length x) 1))"),
                 ] {
                     let mut vm = hostile_world(jit);

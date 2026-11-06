@@ -76,6 +76,55 @@ rather than reverting it to hide this interpreter cost. PR #334 accepts
 this specific regression using the repository's `accepted-regression`
 mechanism; the 5% benchmark threshold remains unchanged.
 
+## Bounded string and real-native follow-up, 2026-11-06
+
+Against reviewed PR #334 tip `fc4a2f34`: orgparse **74.86 -> 62.51 ms**
+(-16.5%), Mandelbrot **41.40 -> 38.66 ms** (-6.6%). Earlier independent pairs
+before the concurrent review fix gave -17.2% / -8.6%. Same-binary all-off/default controls
+agree; whole-process instructions fall **16.3% / 9.1%**. Other application
+workloads have no claimed algorithmic improvement, and exact first-class
+ratio division stays flat. No workload rewrite or heavyweight optimizer.
+
+The retained cases lower small substring/equality operations, avoid redundant
+scalar index/native guards, and lower explicit inexact conversion and division
+with an already-inexact operand. Native compilation grows **56.4 -> 63.7 ms**
+for parsing, **19.1 -> 22.7 ms** for Mandelbrot. Parsing code mappings grow
+56 -> 64 KiB; RSS is effectively flat. More aggressive inlining, local vector
+bound reuse and sorted emission were rejected.
+
+Fresh paired **Node 24.21.0** controls: parsing **37.49 / 63.35 ms** Node/Techne
+(**1.69x**, previously about 2.03x); Mandelbrot **33.03 / 38.73 ms** (**1.17x**,
+previously about 1.27x). Across nine application benchmarks, warmed Techne is
+**1.45x** Node by geometric mean, not general parity. Tak is **1.04x**, HOF
+remains **1.97x** and includes list-versus-array representation costs.
+
+Full paired data, fresh Node table, compilation/RSS, independent ablations,
+118-library/378-conformance/13-hostile validation and reproduction:
+[STRINGS.md](STRINGS.md).
+
+## Adversarial correction and HOF allocation census, 2026-11-06
+
+The PR #337 review reproduced stale native identity after a compiled mutator
+and implicit self-tail jump. Global anticipation now includes the possible
+pc-0 edge, so the existing call-return reload points refresh needed globals.
+The regression was observed failing before and passing after the fix, with
+both functions compiled and the mutator not inlined. See [STRINGS.md](STRINGS.md)
+for the correctness fix and the paired qsort wall-time caveat.
+
+A separate, compile-time-optional nursery census profiles the unchanged warmed
+HOF source: one ten-round `run` requests **5,200,000 pairs / 124,800,000 bytes**
+and **320,061 wide integers / 5,120,976 bytes**. These are **96.058% / 3.942%**
+of guest allocation bytes; other objects total 400 bytes, and direct-old
+allocation requests are zero. Three processes and one/three warmups agree.
+
+The calibration test distinguishes actual inline allocation from native
+fallback under nursery exhaustion. Normal builds contain no census machinery.
+A fresh non-census Callgrind profile still emphasizes minor GC and reverse
+(overlapping inclusive costs). The next investigation should focus on pair
+lifetime/promotion and reversal work, not assume wide-loop unboxing is the
+largest win. No new throughput speedup is claimed. Methods, caveats, exact
+counts, feature-gated tests and reproduction: [HOF.md](HOF.md).
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror

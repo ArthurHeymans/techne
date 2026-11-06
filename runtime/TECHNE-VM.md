@@ -62,6 +62,13 @@ fully hygienic.
     progress and 64-word slices; `=full` completes a whole cycle on every
     allocation. `TECHNE_GC_STATS=1` prints counts, times, the longest pause,
     minor collection and slice, and the most words marked in one pause.
+    Developer builds with Cargo feature `allocation-census` can also set
+    `TECHNE_ALLOC_CENSUS=1`: `gc-stats` and CLI exit then report cumulative
+    nursery pair/integer counts and separately unclassified direct-old
+    requests. It samples before GC forwarding, includes the current nursery
+    tail, and does not count promotion again. It retains no guest roots, and is
+    compiled out of normal builds. See [HOF.md](bench/HOF.md) and the Scheme
+    [allocation runner](bench/allocations.scm); do not time census-enabled runs.
   - Code is collected too. Each `Code` (bytecode, constants, spans) has a
     handle on the heap holding its constants and the handles of the codes
     it makes closures of; the closures its machine code expects to call
@@ -273,6 +280,19 @@ fully hygienic.
     other kinds and allocation fallback call the native. The procedure's
     initial zero addition (including signed-zero semantics) is retained.
     See [LOOPS.md](bench/LOOPS.md) for measured tradeoffs and exclusions.
+  - String-native cases reuse proven fixnum indices, copy flat ASCII substrings
+    of at most 64 bytes into fresh mutable nursery strings, and compare bounded
+    flat UTF-8 strings. Unsupported representations, ranges and allocations use
+    the original native. Byte loops count against the existing complex-native
+    inline budget. Repeated character/string-read globals can cache native
+    identity guards with the existing 16-global entry/call reload discipline;
+    no string pointer, ASCII flag or length is cached across mutation.
+  - Explicit `inexact`/`exact->inexact` conversion handles fixnums and already-
+    inexact values inline. Two-argument `/` handles scalar fixnum/float inputs
+    only when at least one is already inexact. Exact division stays exact;
+    ratios, larger integers and complex inputs retain the native fallback.
+    See [STRINGS.md](bench/STRINGS.md) for parsing/Mandelbrot measurements,
+    compilation/memory costs and rejected experiments.
   - Environment: `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the
     threshold (`1` compiles everything synchronously, for testing),
     `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_INLINE=0`
@@ -282,7 +302,12 @@ fully hygienic.
     `TECHNE_JIT_FUEL=0` restores per-tick publication,
     `TECHNE_JIT_CALL_CACHE=0` disables invariant argument guard caching,
     `TECHNE_JIT_WIDE_ADD=0` disables first-class scalar addition (read once
-    per process); these are developer ablations, `TECHNE_JIT_LOG=1`
+    per process). `TECHNE_JIT_INDEX=0`, `TECHNE_JIT_SUBSTRING=0`,
+    `TECHNE_JIT_STRING_EQ=0`, `TECHNE_JIT_NATIVE_CACHE=0`,
+    `TECHNE_JIT_INEXACT=0` and `TECHNE_JIT_FLOAT_DIV=0` independently disable
+    the latest native cases; `TECHNE_JIT_STRING_INLINE=1` restores aggressive
+    bytecode-only admission for string callees. These are developer ablations,
+    `TECHNE_JIT_LOG=1`
     reports compiled functions and compile times (and entry points handed
     back to the interpreter), `TECHNE_JIT_IR=1` reports
     IR sizes (`=name` prints that function's IR), `TECHNE_JIT_ASM=name`
