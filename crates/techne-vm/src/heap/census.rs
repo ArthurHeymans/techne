@@ -28,6 +28,8 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Combine disjoint counter intervals, retaining any truncation warning.
+    /// Callers must not add the same nursery interval more than once.
     fn add(&mut self, other: Self) {
         self.nursery_objects += other.nursery_objects;
         self.nursery_words += other.nursery_words;
@@ -57,17 +59,24 @@ pub(super) struct Census {
 }
 
 impl Census {
+    /// Create fixed-size counters charged to the budget owner, declining an
+    /// explicit accounting reservation that cannot be admitted.
     pub fn new(budget: &Budget) -> Option<Box<Self>> {
         let _account = budget.enter();
         let charged = budget.charge(size_of::<Self>()).ok()?;
         Some(Box::new(Self { total: Snapshot::default(), _charged: charged }))
     }
 
+    /// Record one direct old-space request in object words, excluding GC
+    /// copies and allocator size-class slack.
     pub fn old(&mut self, words: usize) {
         self.total.direct_old_objects += 1;
         self.total.direct_old_words += words as u64;
     }
 
+    /// Record one newly evacuated object using its pre-forwarding header.
+    /// Destination words include a stored identity hash when present; already
+    /// forwarded objects must not be recorded again. No guest pointer is kept.
     pub fn promoted(&mut self, h: u64, words: usize) {
         self.total.promoted_objects += 1;
         self.total.promoted_words += words as u64;
@@ -140,6 +149,10 @@ impl Heap {
         Some((self.stats.minor, total.promoted_words, total.promoted_pair_words))
     }
 
+    /// Attribute one successful reverse preparation to a checkpoint from
+    /// this census. Consume each checkpoint once; counters must not reset
+    /// between samples. Disabled recording is a no-op. This neither allocates
+    /// nor scans the unfinished reservation that preparation just returned.
     pub(crate) fn count_reverse(&mut self, before: Option<(u64, u64, u64)>) {
         if let (Some(census), Some((minor, words, pair_words))) = (&mut self.census, before) {
             census.total.reverse_calls += 1;
@@ -149,6 +162,8 @@ impl Heap {
         }
     }
 
+    /// Commit the completed nursery interval before forwarding and top reset.
+    /// Call once per minor, never during construction of a reserved span.
     pub(super) fn count_nursery(&mut self) {
         if self.census.is_some() {
             let scanned = nursery(self);

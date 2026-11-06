@@ -625,6 +625,8 @@ pub(crate) fn marked(v: Value) -> bool {
 }
 
 impl Heap {
+    /// Construct an isolated cage and nursery under `budget`, initializing
+    /// process-level scanner configuration before any collection can run.
     pub(crate) fn new_in(budget: Budget) -> Heap {
         // Initialize outside collection: a minor only reads the ready flag.
         let _ = field_scan_enabled();
@@ -1167,6 +1169,10 @@ impl Heap {
 
     /// Copy the nursery object `v` points to into the old generation unless
     /// it is old or already copied.
+    ///
+    /// # Safety
+    /// `v` must be an initialized value belonging to this heap. Collection
+    /// must be exclusive, with valid object layouts and forwarding state.
     #[inline(always)]
     unsafe fn evacuate(&mut self, v: Value) -> Value {
         if !v.is_ptr() {
@@ -1221,6 +1227,10 @@ impl Heap {
 
     /// Select the scanner before walking objects, keeping configuration
     /// tests out of the field loop. Both variants keep the same visit order.
+    ///
+    /// # Safety
+    /// Roots must already have been evacuated. Remembered, promoted and weak
+    /// queues must name live objects in this heap, with the mutator stopped.
     unsafe fn scan_minor<const FAST: bool>(&mut self) {
         unsafe {
             if self.marking {
@@ -1234,6 +1244,10 @@ impl Heap {
 
     /// Scan remembered and promoted objects: evacuate the nursery objects
     /// they point to and, while marking, shade the old ones.
+    ///
+    /// # Safety
+    /// Queued objects must be initialized and writable in this heap. The
+    /// mutator must be stopped and `MARKING` must match the collector phase.
     unsafe fn scan_promoted<const MARKING: bool, const FAST: bool>(&mut self) {
         unsafe {
             for obj in std::mem::take(&mut self.remembered) {
@@ -1254,6 +1268,11 @@ impl Heap {
     /// After a minor collection's scan: evacuate the values of ephemerons
     /// whose key survived (old, or copied), until no more are found, then
     /// clear the entries whose key stayed behind in the nursery.
+    ///
+    /// # Safety
+    /// Strong scanning must be complete; weak queues must contain valid
+    /// ephemeron objects and entries from this minor collection. No mutator
+    /// may change fields or forwarding state during the weak fixed point.
     unsafe fn minor_ephemerons<const FAST: bool>(&mut self) {
         unsafe {
             // Each entry once: its value is kept if its key survived;
@@ -1354,6 +1373,13 @@ impl Heap {
         }
     }
 
+    /// Relocate a pointer field and shade its referent when marking. The
+    /// fast scanner leaves immediate bits untouched: they cannot move or shade.
+    ///
+    /// # Safety
+    /// `slot` must address a writable, initialized value field of a live
+    /// object in this heap. Collection must be exclusive and `MARKING` must
+    /// match the collector phase.
     #[inline(always)]
     unsafe fn scan_field<const MARKING: bool, const FAST: bool>(&mut self, slot: *mut u64) {
         unsafe {
@@ -1369,6 +1395,13 @@ impl Heap {
         }
     }
 
+    /// Visit traced fields in their original order, preserving closure-code
+    /// roots and deferring ephemerons. Fixed pairs still pass the cage check.
+    ///
+    /// # Safety
+    /// `obj` must name an initialized, writable live object in this heap,
+    /// with valid fields for its layout. The mutator must be stopped and
+    /// `MARKING` must match the collector phase.
     #[inline(always)]
     unsafe fn scan_object<const MARKING: bool, const FAST: bool>(&mut self, obj: *mut u64) {
         unsafe {
