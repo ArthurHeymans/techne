@@ -315,8 +315,9 @@ reaches everyone the usual way: save the buffer, deploy.
 Not all of this runs today: an exception handler can wait in its task,
 with the live restarts (runtime/TECHNE-VM.md, "Restarts"), and the
 nREPL server's evaluations do, each in a task of its own, several
-waiting at once while others run; debug instances, routing and `trace`
-are still to do (runtime work 7).
+waiting at once while others run. Bounded procedure tracing is available
+through `(techne debug)` and streams to the calling evaluation's output;
+debug instances and routing are still to do (runtime work 7).
 
 Dev worlds remain the place for experiments with preview storage; a
 debug instance is for the problem that only shows in production.
@@ -868,7 +869,9 @@ What techne-vm and techne-node need that they do not have:
    a form at a time and call it from Scheme, so what they evaluate can
    wait too. The nREPL server runs each evaluation in a task of its own,
    whose debugger waits on a channel for the client's choice, several at
-   once (`nrepl.rs`). Needed: `trace`; a routing hook in the host.
+   once (`nrepl.rs`). Procedure tracing is built in `(techne debug)`:
+   bounded, task-labelled call/result/condition snapshots, streamed through
+   ordinary nREPL output. Needed: a routing hook in the host.
 8. **Conditions as data.** A bounded export of a condition by Rust: its
    kind, message, irritants written briefly, source sites and frames, and
    a stable code for each kind of failure, without calling Scheme (nREPL

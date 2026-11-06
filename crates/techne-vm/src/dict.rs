@@ -434,27 +434,39 @@ pub(crate) fn lookup(vm: &mut Vm, d: Value, key: Value) -> Option<Value> {
     unsafe { find(root(d), key, hash, s).map(|(n, at)| field(n, at + s - 1)) }
 }
 
-/// The fields of every entry of dict or set `d`, keys and values in turn
-/// for a dict, in the order of the trie; none for any other value.
-pub fn entries(d: Value) -> Vec<Value> {
+/// Visit the fields of dict or set `d` in trie order, stopping when `f`
+/// returns false. Unlike `entries`, a bounded reader need not copy the
+/// whole collection. The trie has at most seven levels; nothing collects
+/// or mutates it during the visit.
+pub(crate) fn visit_entries(d: Value, mut f: impl FnMut(Value) -> bool) -> bool {
     if !is_dict_or_set(d) {
-        return Vec::new();
+        return true;
     }
     let s = stride_of(d);
-    let mut out = Vec::with_capacity(s * count(d));
     let mut todo = vec![root(d)];
     while let Some(n) = todo.pop() {
         unsafe {
             let len = len_of(n);
-            if is_collision(n) {
-                out.extend((2..len).map(|i| field(n, i)));
-                continue;
+            let data = if is_collision(n) { len } else { 2 + s * bitmaps(n).0.count_ones() as usize };
+            for i in 2..data {
+                if !f(field(n, i)) {
+                    return false;
+                }
             }
-            let data = 2 + s * bitmaps(n).0.count_ones() as usize;
-            out.extend((2..data).map(|i| field(n, i)));
             todo.extend((data..len).rev().map(|i| field(n, i).as_ptr()));
         }
     }
+    true
+}
+
+/// The fields of every entry of dict or set `d`, keys and values in turn
+/// for a dict, in the order of the trie; none for any other value.
+pub fn entries(d: Value) -> Vec<Value> {
+    let mut out = Vec::with_capacity(if is_dict_or_set(d) { stride_of(d) * count(d) } else { 0 });
+    visit_entries(d, |v| {
+        out.push(v);
+        true
+    });
     out
 }
 

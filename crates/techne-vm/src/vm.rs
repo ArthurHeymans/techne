@@ -1883,6 +1883,11 @@ impl Vm {
         symbol_name(self.global_names[g as usize])
     }
 
+    /// The module owning a resolved global slot, including through imports.
+    pub(crate) fn global_owner(&self, g: u32) -> u32 {
+        self.global_module[g as usize]
+    }
+
     /// Value of a global defined in the user module or root, by name.
     pub(crate) fn get_global_raw(&self, name: &str) -> Option<Value> {
         self.get_global_in_raw(USER_MODULE, name)

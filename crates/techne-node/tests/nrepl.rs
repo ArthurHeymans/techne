@@ -381,6 +381,72 @@ fn debugger_with_restarts() {
     assert_eq!(field(&c.eval("(+ 1 1)"), "value"), ["2"]);
 }
 
+/// Tracing uses ordinary output messages, belonging to the call's request,
+/// not to the connection that installed the wrapper. No new wire operation.
+#[test]
+fn tracing_streams_and_preserves_the_live_debugger() {
+    let server = server();
+    let mut a = Client::connect(&server);
+    let mut b = Client::connect(&server);
+    let setup = a.eval(
+        "(import (techne debug))
+         (define (traced x)
+           (restart-case (if (number? x) (+ x 1) (error \"trace failure\"))
+             (use-value (v) v)))
+         (trace traced)",
+    );
+    assert!(!has_status(&setup, "eval-error"), "{setup:?}");
+    let r = a.eval("(traced 4)");
+    assert_eq!(field(&r, "value"), ["5"]);
+    let output = field(&r, "out").concat();
+    assert!(output.contains("; trace ") && output.contains("phase call") && output.contains("phase return"), "{r:?}");
+    let r = b.eval("(traced 8)");
+    assert_eq!(field(&r, "value"), ["9"]);
+    assert!(field(&r, "out").concat().contains("; trace "), "{r:?}");
+    assert!(field(&a.eval("'unrelated"), "out").is_empty());
+    let r = b.eval("(parameterize ((current-trace-log #f)) (traced 9))");
+    assert_eq!(field(&r, "value"), ["10"]);
+    assert!(field(&r, "out").is_empty());
+
+    let id = a.send(vec![("op", B::str("eval")), ("code", B::str("(traced 'fail)")), ("techne-debug", B::Int(2))]);
+    let mut output = String::new();
+    let paused = loop {
+        let msg = a.next_for(&id);
+        if let Some(text) = msg.get("out").and_then(B::as_str) {
+            output.push_str(text);
+        }
+        if has_status(std::slice::from_ref(&msg), "techne-debug") {
+            break msg;
+        }
+        assert!(!has_status(std::slice::from_ref(&msg), "done"), "{msg:?}");
+    };
+    assert!(output.contains("phase condition"), "{output}");
+    assert_eq!(field(&b.eval("(traced 10)"), "value"), ["11"]);
+    a.request(vec![
+        ("op", B::str("techne-debug-restart")),
+        ("debug-id", paused.get("debug-id").unwrap().clone()),
+        ("restart", B::Int(0)),
+        ("args", B::str("41")),
+    ]);
+    let r = a.until_done(&id);
+    assert_eq!(field(&r, "value"), ["41"]);
+    assert!(field(&r, "out").concat().contains("phase return"), "{r:?}");
+
+    let r = a.eval(
+        "(parameterize ((current-trace-log (make-trace-log #:limit 3)))
+           (do ((i 0 (+ i 1))) ((= i 100)) (traced i)))",
+    );
+    assert!(!has_status(&r, "eval-error"), "{r:?}");
+    let output = field(&r, "out").concat();
+    assert_eq!(output.matches("trace limit reached").count(), 1, "{output}");
+    assert_eq!(output.lines().count(), 4, "{output}");
+    a.eval("(untrace traced)");
+    assert!(field(&b.eval("(traced 1)"), "out").is_empty());
+    let refused = a.eval("(trace +)");
+    assert!(has_status(&refused, "eval-error"), "{refused:?}");
+    assert_eq!(field(&a.eval("(trace)"), "value"), ["()"]);
+}
+
 #[test]
 fn inspector() {
     let server = server();

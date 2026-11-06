@@ -210,10 +210,24 @@ pub fn print_with(out: &mut String, v: Value, write: bool, sharing: Sharing) {
 /// datum's shared parts can make far more text than the datum holds, and
 /// `Sharing::None` none that ends); whether all of `v` was printed.
 pub fn print_within(out: &mut String, v: Value, write: bool, sharing: Sharing, limit: usize) -> bool {
+    // Diagnostic prefixes use None: finding all cycle labels first would
+    // traverse an entire graph even when only a few bytes were requested.
     let labels = if sharing == Sharing::None { FxHashMap::default() } else { labeled(v, sharing == Sharing::All) };
     let mut printer = Printer { out, write, labels, next: 0, limit, over: false };
     printer.print(v);
     !printer.over
+}
+
+/// An upper bound on a number's bits without copying its limbs. Ratios
+/// contain integers and complexes contain reals, so this walks at most
+/// seven values, independently of the sizes of their numeric payloads.
+fn printed_number_bits(v: Value) -> u64 {
+    if is_kind(v, Kind::Ratio) || is_kind(v, Kind::Complex) {
+        // Both kinds have two value fields; no collection occurs here.
+        unsafe { printed_number_bits(field(v.as_ptr(), 0)).saturating_add(printed_number_bits(field(v.as_ptr(), 1))) }
+    } else {
+        num::value_bits(v)
+    }
 }
 
 /// Bytes of `brief`.
@@ -344,6 +358,19 @@ impl Printer<'_> {
         left
     }
 
+    /// Bound an atom before escaping it: truncating only the final output
+    /// would still copy a symbol's entire (possibly enormous) name.
+    fn name(&mut self, name: &str, write: bool) {
+        let left = self.left();
+        let end = name.floor_char_boundary(left.min(name.len()));
+        self.over |= end < name.len();
+        if write {
+            self.out.push_str(&reader::symbol_repr(&name[..end]));
+        } else {
+            self.out.push_str(&name[..end]);
+        }
+    }
+
     fn print_step(&mut self, v: Value) {
         use std::fmt::Write as _;
         if self.left() == 0 {
@@ -363,16 +390,12 @@ impl Printer<'_> {
             }
         } else if v.is_symbol() {
             let name = symbol_name(v.as_symbol());
-            if write {
-                out.push_str(&reader::symbol_repr(&name));
-            } else {
-                out.push_str(&name);
-            }
+            self.name(&name, write);
         } else if v.is_native() {
             out.push_str("#<procedure>");
         } else if v.is_keyword() {
             out.push_str("#:");
-            out.push_str(&symbol_name(v.as_keyword()));
+            self.name(&symbol_name(v.as_keyword()), false);
         } else if v.is_cursor() {
             out.push_str(&format!("#<string-cursor {}>", v.as_cursor()));
         } else if let Some(s) = v.as_special() {
@@ -456,6 +479,14 @@ impl Printer<'_> {
                     out.push(')');
                 }
                 k if k == Kind::BigInt as u8 => {
+                    // Preflight BEFORE num::heap_int copies the limbs. A
+                    // decimal digit takes fewer than four bits; 256 covers
+                    // rounding each of at most four real integer parts up
+                    // to a limb, without clipping a value that could fit.
+                    if printed_number_bits(v) > (self.limit.saturating_sub(out.len()) as u64).saturating_mul(4).saturating_add(256) {
+                        self.over = true;
+                        return;
+                    }
                     let n = num::heap_int(Value::ptr(p));
                     // A decimal digit takes more than three bits.
                     if n.bits() / 3 > self.limit.saturating_sub(out.len()) as u64 {
@@ -465,6 +496,10 @@ impl Printer<'_> {
                     let _ = write!(out, "{}", num::to_string_radix(&n, 10));
                 }
                 k if k == Kind::Ratio as u8 || k == Kind::Complex as u8 => {
+                    if printed_number_bits(v) > (self.limit.saturating_sub(out.len()) as u64).saturating_mul(4).saturating_add(256) {
+                        self.over = true;
+                        return;
+                    }
                     if let Ok(n) = num::num(v, "write") {
                         // As for a big integer: no digits past the limit.
                         if n.bits() / 3 > self.limit.saturating_sub(out.len()) as u64 {
@@ -488,24 +523,27 @@ impl Printer<'_> {
                         return;
                     }
                     self.out.push_str(if k == Kind::Dict as u8 { "{" } else { "#{" });
-                    for (i, x) in crate::dict::entries(v).into_iter().enumerate() {
+                    let mut first = true;
+                    crate::dict::visit_entries(v, |x| {
                         if self.over {
-                            break;
+                            return false;
                         }
-                        if i > 0 {
+                        if !first {
                             self.out.push(' ');
                         }
+                        first = false;
                         self.print(x);
-                    }
+                        !self.over
+                    });
                     self.out.push('}');
                 }
                 k if k == Kind::Record as u8 => {
                     if !self.label(v) {
                         return;
                     }
-                    let rtd = unsafe { field(p, 0) };
+                    let name = unsafe { symbol_name(field(field(p, 0).as_ptr(), 0).as_symbol()) };
                     self.out.push_str("#<");
-                    self.out.push_str(&symbol_name(unsafe { field(rtd.as_ptr(), 0) }.as_symbol()));
+                    self.name(&name, false);
                     let saved = std::mem::replace(&mut self.write, true);
                     for &x in children(v) {
                         if self.over {
@@ -518,7 +556,9 @@ impl Printer<'_> {
                     self.out.push('>');
                 }
                 k if k == Kind::Rtd as u8 => {
-                    let _ = write!(out, "#<record-type {}>", symbol_name(unsafe { field(p, 0) }.as_symbol()));
+                    out.push_str("#<record-type ");
+                    self.name(&symbol_name(unsafe { field(p, 0) }.as_symbol()), false);
+                    self.out.push('>');
                 }
                 k if k == Kind::Foreign as u8 => out.push_str("#<foreign>"),
                 _ => out.push_str("#<unknown>"),
@@ -1800,6 +1840,23 @@ fn box_arg(v: Value, who: &str) -> Result<*mut u64, Error> {
     if is_kind(v, Kind::Box) { Ok(v.as_ptr()) } else { Err(type_error(who, "box", v)) }
 }
 
+fn box_value(v: Value, who: &str) -> R {
+    Ok(unsafe { field(box_arg(v, who)?, 0) })
+}
+
+fn update_box(vm: &mut Vm, args: usize, n: usize) -> R {
+    let cas = n == 3;
+    let who = if cas { "box-cas!" } else { "set-box!" };
+    let b = box_arg(arg(vm, args, 0), who)?;
+    if cas && box_value(Value::ptr(b), who)? != arg(vm, args, 1) {
+        return Ok(Value::FALSE);
+    }
+    let v = arg(vm, args, n - 1);
+    unsafe { set_field(b, 0, v) };
+    vm.write_barrier(b, v);
+    Ok(if cas { Value::TRUE } else { Value::VOID })
+}
+
 fn read_lines(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = str_arg(vm, arg(vm, args, 0), "read-lines")?.to_owned();
     // The text, the strings of its lines and the pairs (for lines of at
@@ -2390,11 +2447,14 @@ pub(crate) fn install(vm: &mut Vm) {
 
         "(box obj)" => make_box;
         /// Return what BOX holds.
-        "(unbox box)" => |vm: &mut Vm, a, _| Ok(unsafe { field(box_arg(arg(vm, a, 0), "unbox")?, 0) });
+        "(unbox box)" => |vm: &mut Vm, a, _| box_value(arg(vm, a, 0), "unbox");
         /// Make BOX hold OBJ.
-        "(set-box! box obj)" => |vm: &mut Vm, a, _| {
-            let (b, v) = (box_arg(arg(vm, a, 0), "set-box!")?, arg(vm, a, 1));
-            unsafe { set_field(b, 0, v) }; vm.write_barrier(b, v); Ok(Value::VOID) };
+        "(set-box! box obj)" => update_box;
+
+        /// If BOX holds EXPECTED (`eq?`), replace it with OBJ and return #t;
+        /// otherwise return #f. The check and write cannot be preempted.
+        /// Unlike a Scheme lock, no killed task can leave it held.
+        "(box-cas! box expected obj)" => update_box;
 
         /// Return a new hash table comparing keys with EQUIVALENCE.
 
@@ -2519,6 +2579,31 @@ mod tests {
             let mut out = String::new();
             let whole = print_within(&mut out, v, true, Sharing::Cycles, 64);
             assert!(!whole && out.len() <= 64, "{src}: {} bytes", out.len());
+        }
+    }
+
+    /// With an already admitted output buffer, clipping a large number
+    /// needs no allocation at all. Refuse the next allocation to catch
+    /// copying numeric limbs before checking the diagnostic bound.
+    #[cfg(feature = "counting-allocator")]
+    #[test]
+    fn clipped_numbers_do_not_copy_numeric_payloads() {
+        crate::alloc::contain_out_of_memory();
+        let mut vm = Vm::new();
+        let _world = vm.enter_account();
+        for source in ["(expt 2 500000)", "(/ (expt 2 500000) 3)", "(make-rectangular (/ (expt 2 500000) 3) 1)"] {
+            let value = vm.eval_source_raw(source).unwrap();
+            let mut out = String::with_capacity(64);
+            let account = crate::alloc::Account::new().unwrap();
+            account.set_limits(1, 1, std::sync::Arc::new(|| {}));
+            let entered = account.enter();
+            let held = std::hint::black_box(vec![0u8; 16]);
+            assert!(account.held() > 1); // Arm the next-allocation refusal.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| print_within(&mut out, value, true, Sharing::None, 3)));
+            drop(entered);
+            drop(held);
+            assert!(matches!(result, Ok(false)), "{source}: printing allocated or did not clip");
+            assert!(out.len() <= 3);
         }
     }
 

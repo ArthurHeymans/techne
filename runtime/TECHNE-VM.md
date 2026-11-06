@@ -645,6 +645,31 @@ fully hygienic.
     values). All sessions share one VM; each evaluation runs in a task of
     its own, so one waiting (in the debugger, say) holds up no other.
     Tests: `crates/techne-node/tests/nrepl.rs`.
+  - Opt-in procedure tracing: `(import (techne debug))`, then `(trace f)`
+    and `(untrace f)`; with no names, list traced bindings or untrace all.
+    Scheme wrappers record calls, returns, conditions and unwinds, with
+    task/call numbers and bounded value snapshots. A log keeps at most
+    200 events by default (1–1000 configurable), streams to each call's
+    current output port, including nREPL, and suppresses further output
+    after one limit notice; `clear-trace-log!` rearms it. Bind
+    `current-trace-log` to a `make-trace-log` for a separate capture, or
+    `#f` to disable. Values and live restarts are preserved; a hard kill
+    promises no exit event. Return collection adds frames, capped at 32
+    nested traced calls, then passes through without instrumentation.
+    Redefinition requires retracing; untrace never overwrites new code.
+    Existing aliases to the original and lexically inlined calls are
+    not intercepted; guarded global JIT calls are. This is not stepping.
+    Small runtime mechanisms support the Scheme policy: `repr`'s
+    optional byte limit (3–4096), which stops heap traversal without a
+    cycle-label prepass or copying large numeric payloads; and `box-cas!`,
+    whose identity check/write cannot be split by task preemption. A
+    Scheme lock would remain held if its task were killed. The private
+    `%binding-identity` compiler form resolves the actual slot/owner through
+    hygiene and import renames, rather than the calling evaluation's
+    module; both trace and untrace carry getters retaining that owner.
+    Tests:
+    `lisp/tests/debug-tests.scm`, nREPL's streaming/restart integration,
+    and a no-allocation test of clipped numeric printing.
   - Emacs: `editors/emacs/techne.el`, no dependencies. `techne-jack-in`,
     `techne-mode` (evaluate, load, interrupt, inspect, describe; completion,
     eldoc, xref), a REPL buffer, the debugger and inspector buffers. ERT
