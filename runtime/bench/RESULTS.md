@@ -76,6 +76,31 @@ rather than reverting it to hide this interpreter cost. PR #334 accepts
 this specific regression using the repository's `accepted-regression`
 mechanism; the 5% benchmark threshold remains unchanged.
 
+## Bounded string and real-native follow-up, 2026-11-06
+
+Against the preceding PR #334 tip: orgparse **75.37 -> 62.37 ms** (-17.2%),
+Mandelbrot **41.83 -> 38.25 ms** (-8.6%). Same-binary all-off/default controls
+agree; whole-process instructions fall **16.3% / 9.1%**. Other application
+workloads have no claimed algorithmic improvement, and exact first-class
+ratio division stays flat. No workload rewrite or heavyweight optimizer.
+
+The retained cases lower small substring/equality operations, avoid redundant
+scalar index/native guards, and lower explicit inexact conversion and division
+with an already-inexact operand. Native compilation grows **57.2 -> 64.5 ms**
+for parsing, **19.3 -> 22.8 ms** for Mandelbrot. Parsing code mappings grow
+56 -> 64 KiB; RSS is effectively flat. More aggressive inlining, local vector
+bound reuse and sorted emission were rejected.
+
+Fresh paired **Node 24.21.0** controls: parsing **37.28 / 62.44 ms** Node/Techne
+(**1.67x**, previously about 2.03x); Mandelbrot **33.00 / 38.66 ms** (**1.17x**,
+previously about 1.27x). Across nine application benchmarks, warmed Techne is
+**1.45x** Node by geometric mean, not general parity. Tak is **1.04x**, HOF
+remains **1.96x** and includes list-versus-array representation costs.
+
+Full paired data, fresh Node table, compilation/RSS, independent ablations,
+117-library/378-conformance/13-hostile validation and reproduction:
+[STRINGS.md](STRINGS.md).
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror

@@ -85,6 +85,7 @@ use crate::{
 mod fast;
 mod integer;
 mod invariant;
+mod real;
 mod strings;
 
 /// `(vm, ctx, registers at bp, bp, entry pc, native depth) -> pc | status << 32`.
@@ -843,6 +844,8 @@ impl KnownNative {
                 && (*i != Inline::IntegerAdd || integer::enabled())
                 && (*i != Inline::Substring || strings::enabled("TECHNE_JIT_SUBSTRING"))
                 && (*i != Inline::StringEq || strings::enabled("TECHNE_JIT_STRING_EQ"))
+                && (*i != Inline::Inexact || std::env::var("TECHNE_JIT_INEXACT").as_deref() != Ok("0"))
+                && (*i != Inline::FloatDiv || std::env::var("TECHNE_JIT_FLOAT_DIV").as_deref() != Ok("0"))
         })
     }
 }
@@ -868,11 +871,15 @@ pub enum Inline {
     Substring,
     /// Bounded flat UTF-8 byte equality.
     StringEq,
+    /// Fixnum conversion / already-inexact identity; other kinds use native.
+    Inexact,
+    /// Two scalar operands, at least one already inexact.
+    FloatDiv,
 }
 
 impl Inline {
     /// Each, and the global holding its native.
-    pub const ALL: [(Inline, &str); 10] = [
+    pub const ALL: [(Inline, &str); 13] = [
         (Inline::StringLength, "string-length"),
         (Inline::StringRef, "string-ref"),
         (Inline::VectorLength, "vector-length"),
@@ -883,12 +890,15 @@ impl Inline {
         (Inline::IntegerAdd, "+"),
         (Inline::Substring, "substring"),
         (Inline::StringEq, "string=?"),
+        (Inline::Inexact, "inexact"),
+        (Inline::Inexact, "exact->inexact"),
+        (Inline::FloatDiv, "/"),
     ];
 
     fn arity(self) -> u16 {
         match self {
-            Inline::StringLength | Inline::VectorLength | Inline::CharToInteger => 1,
-            Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq | Inline::IntegerAdd | Inline::StringEq => 2,
+            Inline::StringLength | Inline::VectorLength | Inline::CharToInteger | Inline::Inexact => 1,
+            Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq | Inline::IntegerAdd | Inline::StringEq | Inline::FloatDiv => 2,
             Inline::RecordRef | Inline::Substring => 3,
         }
     }
@@ -4282,6 +4292,8 @@ impl Gen {
             Inline::IntegerAdd => self.integer_add(b, args[0], args[1], call),
             Inline::Substring => self.substring(b, args, call),
             Inline::StringEq => self.string_eq(b, args, call),
+            Inline::Inexact => self.inexact(b, args[0], call),
+            Inline::FloatDiv => self.float_div(b, args[0], args[1], call),
             Inline::StringLength => {
                 let (_, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
                 tag(b, len, TAG_INT)
