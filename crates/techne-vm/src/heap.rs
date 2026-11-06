@@ -250,13 +250,6 @@ pub fn string_words(len: usize, ascii: bool) -> usize {
     bytevector_words(len) + if ascii || len < STRING_INDEX_STRIDE { 0 } else { 1 + len / STRING_INDEX_STRIDE }
 }
 
-/// Developer ablation, fixed for the process. Read once per minor, never
-/// per field; do not change Heap/Vm layout just to select a scanner.
-fn field_scan_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("TECHNE_GC_FIELD_SCAN").as_deref() != Ok("0"))
-}
-
 /// Size classes in words: exact up to 16, then about 12.5% apart.
 struct Classes {
     words: Vec<usize>,
@@ -625,11 +618,7 @@ pub(crate) fn marked(v: Value) -> bool {
 }
 
 impl Heap {
-    /// Construct an isolated cage and nursery under `budget`, initializing
-    /// process-level scanner configuration before any collection can run.
     pub(crate) fn new_in(budget: Budget) -> Heap {
-        // Initialize outside collection: a minor only reads the ready flag.
-        let _ = field_scan_enabled();
         #[cfg(feature = "allocation-census")]
         let census = if std::env::var("TECHNE_ALLOC_CENSUS").as_deref() == Ok("1") { census::Census::new(&budget) } else { None };
         let nursery_max = nursery_words();
@@ -1103,11 +1092,12 @@ impl Heap {
         unsafe {
             roots.visit(&mut |v| *v = self.evacuate(*v));
             roots.visit_unrooted(&mut |v| *v = self.evacuate(*v));
-            if field_scan_enabled() {
-                self.scan_minor::<true>();
+            if self.marking {
+                self.scan_promoted::<true>()
             } else {
-                self.scan_minor::<false>();
+                self.scan_promoted::<false>()
             }
+            self.minor_ephemerons();
         }
         self.sweep_foreign_nursery();
         if self.verify {
@@ -1225,30 +1215,13 @@ impl Heap {
         }
     }
 
-    /// Select the scanner before walking objects, keeping configuration
-    /// tests out of the field loop. Both variants keep the same visit order.
-    ///
-    /// # Safety
-    /// Roots must already have been evacuated. Remembered, promoted and weak
-    /// queues must name live objects in this heap, with the mutator stopped.
-    unsafe fn scan_minor<const FAST: bool>(&mut self) {
-        unsafe {
-            if self.marking {
-                self.scan_promoted::<true, FAST>();
-            } else {
-                self.scan_promoted::<false, FAST>();
-            }
-            self.minor_ephemerons::<FAST>();
-        }
-    }
-
     /// Scan remembered and promoted objects: evacuate the nursery objects
     /// they point to and, while marking, shade the old ones.
     ///
     /// # Safety
     /// Queued objects must be initialized and writable in this heap. The
     /// mutator must be stopped and `MARKING` must match the collector phase.
-    unsafe fn scan_promoted<const MARKING: bool, const FAST: bool>(&mut self) {
+    unsafe fn scan_promoted<const MARKING: bool>(&mut self) {
         unsafe {
             for obj in std::mem::take(&mut self.remembered) {
                 // Remembered objects are old (or freshly allocated old, which
@@ -1257,10 +1230,10 @@ impl Heap {
                 if MARKING {
                     self.shade(obj);
                 }
-                self.scan_object::<MARKING, FAST>(obj);
+                self.scan_object::<MARKING>(obj);
             }
             while let Some(obj) = self.scan.pop() {
-                self.scan_object::<MARKING, FAST>(obj);
+                self.scan_object::<MARKING>(obj);
             }
         }
     }
@@ -1273,7 +1246,7 @@ impl Heap {
     /// Strong scanning must be complete; weak queues must contain valid
     /// ephemeron objects and entries from this minor collection. No mutator
     /// may change fields or forwarding state during the weak fixed point.
-    unsafe fn minor_ephemerons<const FAST: bool>(&mut self) {
+    unsafe fn minor_ephemerons(&mut self) {
         unsafe {
             // Each entry once: its value is kept if its key survived;
             // otherwise it waits for the key to be copied (`evacuate`), as
@@ -1300,7 +1273,7 @@ impl Heap {
                     let v = Value::from_bits(*word(obj, i + 1));
                     *word(obj, i + 1) = self.evacuate(v).bits();
                 } else if let Some(obj) = self.scan.pop() {
-                    if self.marking { self.scan_object::<true, FAST>(obj) } else { self.scan_object::<false, FAST>(obj) }
+                    if self.marking { self.scan_object::<true>(obj) } else { self.scan_object::<false>(obj) }
                 } else {
                     break;
                 }
@@ -1373,19 +1346,18 @@ impl Heap {
         }
     }
 
-    /// Relocate a pointer field and shade its referent when marking. The
-    /// fast scanner leaves immediate bits untouched: they cannot move or shade.
+    /// Relocate a pointer field and shade its referent when marking. An
+    /// immediate is left untouched, unwritten: it cannot move or shade.
     ///
     /// # Safety
     /// `slot` must address a writable, initialized value field of a live
     /// object in this heap. Collection must be exclusive and `MARKING` must
     /// match the collector phase.
     #[inline(always)]
-    unsafe fn scan_field<const MARKING: bool, const FAST: bool>(&mut self, slot: *mut u64) {
+    unsafe fn scan_field<const MARKING: bool>(&mut self, slot: *mut u64) {
         unsafe {
             let v = Value::from_bits(*slot);
-            // An immediate cannot move or shade anything.
-            if !FAST || v.is_ptr() {
+            if v.is_ptr() {
                 let v = self.evacuate(v);
                 *slot = v.bits();
                 if MARKING {
@@ -1403,15 +1375,15 @@ impl Heap {
     /// with valid fields for its layout. The mutator must be stopped and
     /// `MARKING` must match the collector phase.
     #[inline(always)]
-    unsafe fn scan_object<const MARKING: bool, const FAST: bool>(&mut self, obj: *mut u64) {
+    unsafe fn scan_object<const MARKING: bool>(&mut self, obj: *mut u64) {
         unsafe {
             let h = *obj;
             // Pairs dominate promotion in list workloads. Their fixed two
             // fields need neither the dynamic loop nor closure/weak dispatch.
             // Keep malformed shapes on the original generic path.
-            if FAST && header_kind(h) == Kind::Pair as u8 && checked_field_len(obj, h) == 2 {
-                self.scan_field::<MARKING, FAST>(obj.add(1));
-                self.scan_field::<MARKING, FAST>(obj.add(2));
+            if header_kind(h) == Kind::Pair as u8 && checked_field_len(obj, h) == 2 {
+                self.scan_field::<MARKING>(obj.add(1));
+                self.scan_field::<MARKING>(obj.add(2));
                 return;
             }
             if header_kind(h) == Kind::Ephemerons as u8 {
@@ -1427,7 +1399,7 @@ impl Heap {
             }
             if is_traced(h) {
                 for i in 1..=len_of(obj) {
-                    self.scan_field::<MARKING, FAST>(obj.add(i));
+                    self.scan_field::<MARKING>(obj.add(i));
                 }
             }
         }
@@ -1890,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn field_scanners_preserve_immediate_bits_sharing_cycles_and_identity_hashes() {
+    fn field_scanning_preserves_immediate_bits_sharing_cycles_and_identity_hashes() {
         let immediates = [
             Value::float(0.0),
             Value::float(-0.0),
@@ -1905,8 +1877,6 @@ mod tests {
             Value::TRUE,
             Value::VOID,
         ];
-        // The validation matrix runs this in separate default/reference
-        // processes: no unsafe mutation of process environment in tests.
         let mut vm = crate::vm::Vm::bare();
         let _world = vm.enter_account();
         let list = vm.make_list_raw(&immediates);
@@ -1948,8 +1918,8 @@ mod tests {
         let base = cage.base().cast::<u64>();
         let last = base.wrapping_byte_add(CAGE_MASK + 1 - 8);
         let pair_header = header(Kind::Pair, 2, 0);
-        // No dereference: exercise the exact shared extent check used by
-        // both field-scanner variants, including fixed two-field pairs.
+        // No dereference: exercise the extent check that `len_of` and the
+        // fixed two-field pair path share.
         assert_eq!(checked_field_len(last.wrapping_sub(3), pair_header), 2);
         for obj in [last.wrapping_sub(2), last.wrapping_sub(1), last] {
             assert!(std::panic::catch_unwind(|| checked_field_len(obj, pair_header)).is_err());

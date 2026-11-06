@@ -125,6 +125,29 @@ lifetime/promotion and reversal work, not assume wide-loop unboxing is the
 largest win. No new throughput speedup is claimed. Methods, caveats, exact
 counts, feature-gated tests and reproduction: [HOF.md](HOF.md).
 
+## Less minor-collection work per promoted pair, 2026-11-06
+
+A minor collection now leaves immediate fields unwritten (they cannot move
+or shade) and visits a pair's two fields directly, without the generic
+field loop or closure/ephemeron dispatch. The cage extent check that
+`len_of` applies runs for pairs too. Allocation, promotion and collection
+counts are unchanged: this is less tracing work, not less garbage.
+
+Whole-process cachegrind counts against main `4db749c8`, JIT / interpreter:
+HOF **-4.02% / -1.45%**, callbacks **-0.95% / -0.24%**, hash
+**-0.63% / -0.44%**, bintrees **-0.38% / -0.13%**; every other program within
+±0.11%. Wall time on an Intel N100 (CPU 3, three campaigns of 5-7
+alternating process pairs, ten calls each): HOF **-2.1% to -4.4%**, hash
+-3.4% to +1.1%, qsort, tak and nqueens within ±1% with no consistent sign.
+Executable text grows 10 KiB.
+
+The optional allocation census (`allocation-census` feature) now also counts
+promotion by kind and attributes it to `reverse`'s preparation. In one
+warmed HOF `run`, 2,284,509 pairs (54.8 MB) are promoted, almost all promoted
+bytes; 30.4 MB of them during `reverse` preparing its result, whose
+reservation can collect while the input list is still live. That is the
+larger lever for HOF, not tracing speed.
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror
