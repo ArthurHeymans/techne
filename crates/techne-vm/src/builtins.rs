@@ -1501,7 +1501,11 @@ fn length(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn reverse(vm: &mut Vm, args: usize, _: usize) -> R {
     let len = list_len(arg(vm, args, 0), "reverse")?;
+    #[cfg(feature = "allocation-census")]
+    let before = vm.heap.reverse_checkpoint();
     let mut b = Bulk::list(vm, len)?;
+    #[cfg(feature = "allocation-census")]
+    vm.heap.count_reverse(before);
     let mut acc = Value::NIL;
     let mut l = arg(vm, args, 0);
     while is_kind(l, Kind::Pair) {

@@ -14,6 +14,16 @@ pub(crate) struct Snapshot {
     pub bigint_words: u64,
     pub direct_old_objects: u64,
     pub direct_old_words: u64,
+    pub promoted_objects: u64,
+    pub promoted_words: u64,
+    pub promoted_pairs: u64,
+    pub promoted_pair_words: u64,
+    pub promoted_bigints: u64,
+    pub promoted_bigint_words: u64,
+    pub reverse_calls: u64,
+    pub reverse_minors: u64,
+    pub reverse_promoted_words: u64,
+    pub reverse_promoted_pair_words: u64,
     pub truncated: bool,
 }
 
@@ -27,6 +37,16 @@ impl Snapshot {
         self.bigint_words += other.bigint_words;
         self.direct_old_objects += other.direct_old_objects;
         self.direct_old_words += other.direct_old_words;
+        self.promoted_objects += other.promoted_objects;
+        self.promoted_words += other.promoted_words;
+        self.promoted_pairs += other.promoted_pairs;
+        self.promoted_pair_words += other.promoted_pair_words;
+        self.promoted_bigints += other.promoted_bigints;
+        self.promoted_bigint_words += other.promoted_bigint_words;
+        self.reverse_calls += other.reverse_calls;
+        self.reverse_minors += other.reverse_minors;
+        self.reverse_promoted_words += other.reverse_promoted_words;
+        self.reverse_promoted_pair_words += other.reverse_promoted_pair_words;
         self.truncated |= other.truncated;
     }
 }
@@ -46,6 +66,22 @@ impl Census {
     pub fn old(&mut self, words: usize) {
         self.total.direct_old_objects += 1;
         self.total.direct_old_words += words as u64;
+    }
+
+    pub fn promoted(&mut self, h: u64, words: usize) {
+        self.total.promoted_objects += 1;
+        self.total.promoted_words += words as u64;
+        match header_kind(h) {
+            k if k == Kind::Pair as u8 => {
+                self.total.promoted_pairs += 1;
+                self.total.promoted_pair_words += words as u64;
+            }
+            k if k == Kind::BigInt as u8 => {
+                self.total.promoted_bigints += 1;
+                self.total.promoted_bigint_words += words as u64;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -97,6 +133,22 @@ impl Heap {
         Some(out)
     }
 
+    /// Only cumulative counters: unlike allocation_census, this must not
+    /// scan a bulk reservation whose objects are not initialized yet.
+    pub(crate) fn reverse_checkpoint(&self) -> Option<(u64, u64, u64)> {
+        let total = self.census.as_ref()?.total;
+        Some((self.stats.minor, total.promoted_words, total.promoted_pair_words))
+    }
+
+    pub(crate) fn count_reverse(&mut self, before: Option<(u64, u64, u64)>) {
+        if let (Some(census), Some((minor, words, pair_words))) = (&mut self.census, before) {
+            census.total.reverse_calls += 1;
+            census.total.reverse_minors += self.stats.minor - minor;
+            census.total.reverse_promoted_words += census.total.promoted_words - words;
+            census.total.reverse_promoted_pair_words += census.total.promoted_pair_words - pair_words;
+        }
+    }
+
     pub(super) fn count_nursery(&mut self) {
         if self.census.is_some() {
             let scanned = nursery(self);
@@ -133,6 +185,12 @@ mod tests {
         assert_eq!(first.pairs, second.pairs);
         assert_eq!(first.bigints, second.bigints);
         assert_eq!(first.direct_old_objects, second.direct_old_objects, "promotion is not a direct allocation");
+        assert_eq!(second.promoted_pairs - first.promoted_pairs, 3);
+        assert_eq!(second.promoted_pair_words - first.promoted_pair_words, 9);
+        assert_eq!(second.promoted_bigints - first.promoted_bigints, 1);
+        assert_eq!(second.promoted_bigint_words - first.promoted_bigint_words, 2);
+        vm.full_collect_raw();
+        assert_eq!(second, vm.heap.allocation_census().unwrap(), "old survivors are not promoted twice");
         assert!(is_kind(list.get(), Kind::Pair));
         assert!(is_kind(big.get(), Kind::BigInt));
         let items = vec![Value::NIL; LARGE_WORDS];
@@ -140,6 +198,33 @@ mod tests {
         let old = vm.heap.allocation_census().unwrap();
         assert_eq!(old.direct_old_objects - second.direct_old_objects, 1);
         assert_eq!(old.direct_old_words - second.direct_old_words, 1 + LARGE_WORDS as u64);
+    }
+
+    #[test]
+    fn reverse_preparation_counts_promotion_without_scanning_an_uninitialized_reservation() {
+        let mut vm = crate::vm::Vm::bare();
+        let _world = vm.enter_account();
+        vm.heap.census = Census::new(vm.heap.budget());
+        vm.full_collect_raw();
+        vm.heap.set_nursery_window(8192);
+        let list = vm.make_list_raw(&[Value::NIL; 2000]);
+        let list = vm.root(list);
+        let before = vm.heap.reverse_checkpoint();
+        // Just as Bulk::list does: this collects, then reserves an unfinished
+        // span. Reading a nursery census here would mistake its zero headers
+        // for malformed objects. The reverse checkpoint reads totals only.
+        vm.reserve_nursery(6000);
+        vm.heap.count_reverse(before);
+        for pair in vm.heap.nursery[..6000].as_chunks_mut::<3>().0 {
+            *pair = [header(Kind::Pair, 2, 0), Value::NIL.bits(), Value::NIL.bits()];
+        }
+        let snapshot = vm.heap.allocation_census().unwrap();
+        assert!(!snapshot.truncated);
+        assert_eq!(snapshot.reverse_calls, 1);
+        assert_eq!(snapshot.reverse_minors, 1);
+        assert_eq!(snapshot.reverse_promoted_pair_words, 6000);
+        assert_eq!(snapshot.reverse_promoted_words, 6000);
+        assert!(is_kind(list.get(), Kind::Pair));
     }
 
     #[test]

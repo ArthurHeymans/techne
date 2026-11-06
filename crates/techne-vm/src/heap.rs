@@ -250,6 +250,13 @@ pub fn string_words(len: usize, ascii: bool) -> usize {
     bytevector_words(len) + if ascii || len < STRING_INDEX_STRIDE { 0 } else { 1 + len / STRING_INDEX_STRIDE }
 }
 
+/// Developer ablation, fixed for the process. Read once per minor, never
+/// per field; do not change Heap/Vm layout just to select a scanner.
+fn field_scan_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TECHNE_GC_FIELD_SCAN").as_deref() != Ok("0"))
+}
+
 /// Size classes in words: exact up to 16, then about 12.5% apart.
 struct Classes {
     words: Vec<usize>,
@@ -619,6 +626,8 @@ pub(crate) fn marked(v: Value) -> bool {
 
 impl Heap {
     pub(crate) fn new_in(budget: Budget) -> Heap {
+        // Initialize outside collection: a minor only reads the ready flag.
+        let _ = field_scan_enabled();
         #[cfg(feature = "allocation-census")]
         let census = if std::env::var("TECHNE_ALLOC_CENSUS").as_deref() == Ok("1") { census::Census::new(&budget) } else { None };
         let nursery_max = nursery_words();
@@ -1092,12 +1101,11 @@ impl Heap {
         unsafe {
             roots.visit(&mut |v| *v = self.evacuate(*v));
             roots.visit_unrooted(&mut |v| *v = self.evacuate(*v));
-            if self.marking {
-                self.scan_promoted::<true>()
+            if field_scan_enabled() {
+                self.scan_minor::<true>();
             } else {
-                self.scan_promoted::<false>()
+                self.scan_minor::<false>();
             }
-            self.minor_ephemerons();
         }
         self.sweep_foreign_nursery();
         if self.verify {
@@ -1181,6 +1189,10 @@ impl Heap {
                 corrupt("an object of the nursery runs past it");
             }
             let dst = self.old.alloc(words + hashed as usize);
+            #[cfg(feature = "allocation-census")]
+            if let Some(census) = &mut self.census {
+                census.promoted(h, words + hashed as usize);
+            }
             self.promoted += words + hashed as usize;
             // A corrupt free list may have placed `dst` over `p`: a copy that
             // allows that.
@@ -1207,9 +1219,22 @@ impl Heap {
         }
     }
 
+    /// Select the scanner before walking objects, keeping configuration
+    /// tests out of the field loop. Both variants keep the same visit order.
+    unsafe fn scan_minor<const FAST: bool>(&mut self) {
+        unsafe {
+            if self.marking {
+                self.scan_promoted::<true, FAST>();
+            } else {
+                self.scan_promoted::<false, FAST>();
+            }
+            self.minor_ephemerons::<FAST>();
+        }
+    }
+
     /// Scan remembered and promoted objects: evacuate the nursery objects
     /// they point to and, while marking, shade the old ones.
-    unsafe fn scan_promoted<const MARKING: bool>(&mut self) {
+    unsafe fn scan_promoted<const MARKING: bool, const FAST: bool>(&mut self) {
         unsafe {
             for obj in std::mem::take(&mut self.remembered) {
                 // Remembered objects are old (or freshly allocated old, which
@@ -1218,10 +1243,10 @@ impl Heap {
                 if MARKING {
                     self.shade(obj);
                 }
-                self.scan_object::<MARKING>(obj);
+                self.scan_object::<MARKING, FAST>(obj);
             }
             while let Some(obj) = self.scan.pop() {
-                self.scan_object::<MARKING>(obj);
+                self.scan_object::<MARKING, FAST>(obj);
             }
         }
     }
@@ -1229,7 +1254,7 @@ impl Heap {
     /// After a minor collection's scan: evacuate the values of ephemerons
     /// whose key survived (old, or copied), until no more are found, then
     /// clear the entries whose key stayed behind in the nursery.
-    unsafe fn minor_ephemerons(&mut self) {
+    unsafe fn minor_ephemerons<const FAST: bool>(&mut self) {
         unsafe {
             // Each entry once: its value is kept if its key survived;
             // otherwise it waits for the key to be copied (`evacuate`), as
@@ -1256,7 +1281,7 @@ impl Heap {
                     let v = Value::from_bits(*word(obj, i + 1));
                     *word(obj, i + 1) = self.evacuate(v).bits();
                 } else if let Some(obj) = self.scan.pop() {
-                    if self.marking { self.scan_object::<true>(obj) } else { self.scan_object::<false>(obj) }
+                    if self.marking { self.scan_object::<true, FAST>(obj) } else { self.scan_object::<false, FAST>(obj) }
                 } else {
                     break;
                 }
@@ -1330,9 +1355,32 @@ impl Heap {
     }
 
     #[inline(always)]
-    unsafe fn scan_object<const MARKING: bool>(&mut self, obj: *mut u64) {
+    unsafe fn scan_field<const MARKING: bool, const FAST: bool>(&mut self, slot: *mut u64) {
+        unsafe {
+            let v = Value::from_bits(*slot);
+            // An immediate cannot move or shade anything.
+            if !FAST || v.is_ptr() {
+                let v = self.evacuate(v);
+                *slot = v.bits();
+                if MARKING {
+                    self.shade_value(v);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn scan_object<const MARKING: bool, const FAST: bool>(&mut self, obj: *mut u64) {
         unsafe {
             let h = *obj;
+            // Pairs dominate promotion in list workloads. Their fixed two
+            // fields need neither the dynamic loop nor closure/weak dispatch.
+            // Keep malformed shapes on the original generic path.
+            if FAST && header_kind(h) == Kind::Pair as u8 && checked_field_len(obj, h) == 2 {
+                self.scan_field::<MARKING, FAST>(obj.add(1));
+                self.scan_field::<MARKING, FAST>(obj.add(2));
+                return;
+            }
             if header_kind(h) == Kind::Ephemerons as u8 {
                 // Its entries wait for the rest of the scan.
                 self.weak_minor.push(obj);
@@ -1346,12 +1394,7 @@ impl Heap {
             }
             if is_traced(h) {
                 for i in 1..=len_of(obj) {
-                    let slot = obj.add(i);
-                    let v = self.evacuate(Value::from_bits(*slot));
-                    *slot = v.bits();
-                    if MARKING {
-                        self.shade_value(v);
-                    }
+                    self.scan_field::<MARKING, FAST>(obj.add(i));
                 }
             }
         }
@@ -1448,13 +1491,18 @@ pub(crate) unsafe fn kind_of(obj: *mut u64) -> u8 {
 /// length in bytes is `bytes_len`'s.
 #[inline(always)]
 pub(crate) unsafe fn len_of(obj: *mut u64) -> usize {
-    unsafe {
-        let len = header_len(*obj);
-        if len >= (crate::alloc::CAGE_MASK - (obj.addr() & crate::alloc::CAGE_MASK)) / 8 {
-            corrupt("an object runs past its cage");
-        }
-        len
+    unsafe { checked_field_len(obj, *obj) }
+}
+
+/// The same extent check for an already loaded header. Even a fixed-size
+/// pair must pass it before its raw field addresses are formed.
+#[inline(always)]
+fn checked_field_len(obj: *mut u64, h: u64) -> usize {
+    let len = header_len(h);
+    if len >= (crate::alloc::CAGE_MASK - (obj.addr() & crate::alloc::CAGE_MASK)) / 8 {
+        corrupt("an object runs past its cage");
     }
+    len
 }
 
 /// The length in bytes of string or bytevector `obj` holding its bytes
@@ -1809,6 +1857,54 @@ mod tests {
     }
 
     #[test]
+    fn field_scanners_preserve_immediate_bits_sharing_cycles_and_identity_hashes() {
+        let immediates = [
+            Value::float(0.0),
+            Value::float(-0.0),
+            Value::float(f64::NAN),
+            Value::float(f64::INFINITY),
+            Value::float(f64::NEG_INFINITY),
+            Value::int_unchecked(crate::value::FIXNUM_MIN),
+            Value::int_unchecked(crate::value::FIXNUM_MAX),
+            Value::char('😀'),
+            Value::NIL,
+            Value::FALSE,
+            Value::TRUE,
+            Value::VOID,
+        ];
+        // The validation matrix runs this in separate default/reference
+        // processes: no unsafe mutation of process environment in tests.
+        let mut vm = crate::vm::Vm::bare();
+        let _world = vm.enter_account();
+        let list = vm.make_list_raw(&immediates);
+        let list = vm.root(list);
+        let cycle = vm.make_list_raw(&[list.get()]);
+        let cycle = vm.root(cycle);
+        // The newly allocated pair is young; no old-to-young barrier.
+        unsafe { set_field(cycle.get().as_ptr(), 1, cycle.get()) };
+        let vector = vm.make_vector_raw(&[list.get(), list.get(), cycle.get()]);
+        let vector = vm.root(vector);
+        let hash = vm.heap.identity_hash(list.get().as_ptr());
+        for _ in 0..3 {
+            vm.full_collect_raw();
+            assert_eq!(vm.heap.identity_hash(list.get().as_ptr()), hash);
+            unsafe {
+                assert_eq!(field(vector.get().as_ptr(), 0), list.get());
+                assert_eq!(field(vector.get().as_ptr(), 1), list.get());
+                assert_eq!(field(vector.get().as_ptr(), 2), cycle.get());
+                assert_eq!(field(cycle.get().as_ptr(), 0), list.get());
+                assert_eq!(field(cycle.get().as_ptr(), 1), cycle.get());
+                let mut p = list.get();
+                for value in immediates {
+                    assert_eq!(field(p.as_ptr(), 0).bits(), value.bits());
+                    p = field(p.as_ptr(), 1);
+                }
+                assert_eq!(p, Value::NIL);
+            }
+        }
+    }
+
+    #[test]
     fn what_an_object_reaches_stays_in_its_cage() {
         use crate::alloc::CAGE_MASK;
         assert_eq!(header_len(header(Kind::Vector, 5, 0)), 5);
@@ -1818,6 +1914,13 @@ mod tests {
         let cage = crate::alloc::Cage::new();
         let base = cage.base().cast::<u64>();
         let last = base.wrapping_byte_add(CAGE_MASK + 1 - 8);
+        let pair_header = header(Kind::Pair, 2, 0);
+        // No dereference: exercise the exact shared extent check used by
+        // both field-scanner variants, including fixed two-field pairs.
+        assert_eq!(checked_field_len(last.wrapping_sub(3), pair_header), 2);
+        for obj in [last.wrapping_sub(2), last.wrapping_sub(1), last] {
+            assert!(std::panic::catch_unwind(|| checked_field_len(obj, pair_header)).is_err());
+        }
         assert_eq!(word(last, 1), base);
         assert_eq!(word(base, usize::MAX), last);
         assert_eq!(word(last, (CAGE_MASK + 1) / 8 + 3), base.wrapping_add(2));
