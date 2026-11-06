@@ -10,7 +10,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -24,7 +24,7 @@ use std::{
 use techne_text::{Assoc, Document, Range, Recovery};
 pub use techne_vm::tasks::Progress;
 use techne_vm::{
-    api::{Arg as Val, Foreign, FromValue, IntoValue, Value},
+    api::{Arg as Val, Bytes, Foreign, FromValue, IntoValue, Value},
     vm::{Error, ExecId, Grants, InterruptHandle, Stop, Vm},
 };
 
@@ -128,7 +128,13 @@ pub enum Msg {
     /// A frontend attaches (`Runtime::attach`), its inputs interrupted
     /// with `interrupts`. `state` is its session as it last sent it
     /// (`Output::Session`), brought back after a crash.
-    Attach { client: Client, file: Option<File>, profile: String, state: Option<String>, interrupts: Arc<Interrupts> },
+    Attach {
+        client: Client,
+        file: Option<File>,
+        profile: String,
+        state: Option<String>,
+        interrupts: Arc<Interrupts>,
+    },
     /// An input from an attached frontend, counted in its backlog until
     /// taken.
     Input(Client, Input, Admitted),
@@ -136,7 +142,33 @@ pub enum Msg {
     /// program (`server`): `reply` gets `Opened`, or `Failed`, and with
     /// `wait`, `Done` once the file is done with. It is dropped after
     /// the last. `id` is the request's, unique to the process.
-    Open { id: usize, path: PathBuf, wait: bool, reply: mpsc::Sender<Reply> },
+    Open {
+        id: usize,
+        path: PathBuf,
+        wait: bool,
+        reply: mpsc::Sender<Reply>,
+    },
+    /// Request a screenshot in the selected Scheme session.
+    Capture {
+        path: PathBuf,
+        lease: Arc<crate::capture::Lease>,
+        reply: mpsc::Sender<Reply>,
+    },
+    /// A caller expired or disconnected; retire its jobs even while no
+    /// frontend frame is being drawn.
+    CaptureCancelled,
+    Recording {
+        path: Option<PathBuf>,
+        frames: usize,
+        interval_ms: usize,
+        reply: mpsc::Sender<Reply>,
+    },
+    /// A frontend completed a capture (not interruptible keyboard input).
+    Captured {
+        client: Client,
+        id: usize,
+        result: Result<crate::present::CapturedFrame, String>,
+    },
     /// The program of request `id` stopped waiting (`Open`).
     Gone(usize),
     /// A background task woke. One is queued at a time, however many
@@ -159,6 +191,10 @@ pub struct Runtime {
     /// The programs waiting until a file they opened is done with, by the
     /// id of their request, which Lisp knows them by (`Msg::Open`).
     waiting: HashMap<usize, mpsc::Sender<Reply>>,
+    captures: HashMap<usize, (Arc<crate::capture::Lease>, mpsc::Sender<Reply>)>,
+    /// Issued frame requests, including Scheme's screenshots/recordings.
+    /// Reject late/duplicate pixels before copying them into the VM heap.
+    outstanding_frames: HashSet<(Client, usize)>,
     /// How long a call into Lisp for a part of a snapshot may run
     /// (`call`).
     deadline: Duration,
@@ -390,7 +426,14 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 34] = [
+const PROCS: [&str; 41] = [
+    "editor-cancel-capture!",
+    "editor-cancel-captures!",
+    "editor-record!",
+    "editor-stop-record!",
+    "editor-capture-request!",
+    "editor-take-captures!",
+    "editor-captured!",
     "editor-open!",
     "keep-histories!",
     "editor-take-done!",
@@ -487,6 +530,8 @@ impl Runtime {
             serving: Client::FIRST,
             next_id: 0,
             waiting: HashMap::new(),
+            captures: HashMap::new(),
+            outstanding_frames: HashSet::new(),
             deadline: PART_DEADLINE,
             watch,
             stalled: HashMap::new(),
@@ -546,10 +591,19 @@ impl Runtime {
     pub fn detach(&mut self, client: Client) {
         if self.clients.contains_key(&client) {
             self.serving = client;
+            let cancelled =
+                self.call("editor-cancel-captures!", &[Arg::Session]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
+            for id in cancelled {
+                if let Some((lease, reply)) = self.captures.remove(&id) {
+                    let answer = lease.cancel().unwrap_or_else(|| Reply::Failed("the frontend detached before capture completed".into()));
+                    let _ = reply.send(answer);
+                }
+            }
             if let Err(e) = self.call("editor-detach!", &[Arg::Session]) {
                 eprintln!("techne: editor-detach!: {e}");
             }
             self.clients.remove(&client);
+            self.outstanding_frames.retain(|(owner, _)| *owner != client);
         }
     }
 
@@ -739,7 +793,9 @@ impl Runtime {
             let batch = Instant::now() + BATCH;
             let queued = first.into_iter().chain(std::iter::from_fn(|| (Instant::now() < batch).then(|| inputs.try_recv().ok()).flatten()));
             for msg in queued {
+                self.cancel_captures(&send);
                 match msg {
+                    Msg::CaptureCancelled => {}
                     Msg::Wake => woken.store(false, Ordering::Release),
                     Msg::Stop => return,
                     Msg::Attach { client, file, profile, state, interrupts } => match self.attach(client, file.as_ref(), &profile) {
@@ -754,6 +810,66 @@ impl Runtime {
                         Err(e) => send(client, Output::Refused(e)),
                     },
                     Msg::Open { id, path, wait, reply } => self.open_for(id, &path, wait, reply),
+                    Msg::Capture { path, lease, reply } => {
+                        if !lease.active() {
+                            let _ = reply.send(Reply::Failed("capture cancelled or expired".into()));
+                            continue;
+                        }
+                        let requested = self
+                            .call("editor-capture-request!", &[Arg::Str(path.display().to_string()), Arg::Lease(lease.clone())])
+                            .and_then(|v| self.vm.get::<usize>(&v));
+                        match requested {
+                            Ok(id) => {
+                                self.captures.insert(id, (lease, reply));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Reply::Failed(e.to_string()));
+                            }
+                        }
+                    }
+                    Msg::Recording { path, frames, interval_ms, reply } => {
+                        let result = if let Some(path) = path {
+                            self.call("editor-record!", &[Arg::Str(path.display().to_string()), Arg::Int(frames), Arg::Int(interval_ms)])
+                        } else {
+                            self.call("editor-stop-record!", &[])
+                        };
+                        let answer = match result.and_then(|v| self.vm.get::<String>(&v)) {
+                            Ok(path) => Reply::Recording { path },
+                            Err(e) => Reply::Failed(e.to_string()),
+                        };
+                        let _ = reply.send(answer);
+                    }
+                    Msg::Captured { client, id, result } => {
+                        if !self.outstanding_frames.remove(&(client, id)) || !self.clients.contains_key(&client) {
+                            continue;
+                        }
+                        self.serving = client;
+                        let (snapshot, width, height, png, error) = match result {
+                            Ok(f) => (f.snapshot, f.width, f.height, f.png, String::new()),
+                            Err(e) => (0, 0, 0, Vec::new(), e),
+                        };
+                        let args = [
+                            Arg::Session,
+                            Arg::Int(id),
+                            Arg::Int(snapshot as usize),
+                            Arg::Int(width as usize),
+                            Arg::Int(height as usize),
+                            Arg::Bytes(png),
+                            Arg::Str(error),
+                        ];
+                        let saved =
+                            self.call_within("editor-captured!", &args, OPEN_DEADLINE).and_then(|v| self.vm.get::<Option<String>>(&v));
+                        if let Some((lease, reply)) = self.captures.remove(&id) {
+                            let answer = lease.cancel().unwrap_or_else(|| match saved {
+                                Ok(Some(path)) => Reply::Captured { path, snapshot, width, height },
+                                Ok(None) => Reply::Failed("capture cancelled".into()),
+                                Err(e) => Reply::Failed(e.to_string()),
+                            });
+                            let _ = reply.send(answer);
+                        } else if let Err(e) = saved {
+                            let _ = self.message(&format!("Capture: {e}"));
+                        }
+                    }
                     Msg::Gone(id) => {
                         if self.waiting.remove(&id).is_some() {
                             let _ = self.call("editor-forget!", &[Arg::Int(id)]);
@@ -799,6 +915,25 @@ impl Runtime {
         }
     }
 
+    /// Drop expired external jobs in both Scheme and their frontend. Native
+    /// leases already prevent publication; this also releases all queue slots.
+    fn cancel_captures(&mut self, send: &impl Fn(Client, Output)) {
+        let cancelled: Vec<_> = self.captures.iter().filter_map(|(&id, (lease, _))| (!lease.active()).then_some(id)).collect();
+        for id in cancelled {
+            if let Some((lease, reply)) = self.captures.remove(&id) {
+                for client in self.clients().collect::<Vec<_>>() {
+                    self.outstanding_frames.remove(&(client, id));
+                    self.serving = client;
+                    if self.call("editor-cancel-capture!", &[Arg::Session, Arg::Int(id)]).is_ok_and(|v| v.is_truthy()) {
+                        send(client, Output::CancelCapture { id });
+                        break;
+                    }
+                }
+                let _ = reply.send(lease.cancel().unwrap_or_else(|| Reply::Failed("capture cancelled or expired".into())));
+            }
+        }
+    }
+
     /// Show the file at `path` for another program (`Msg::Open`).
     fn open_for(&mut self, id: usize, path: &Path, wait: bool, reply: mpsc::Sender<Reply>) {
         let id = wait.then_some(id);
@@ -837,7 +972,15 @@ impl Runtime {
             if discarded > 0 {
                 let _ = self.message(&format!("Discarded {discarded} inputs sent while the editor was busy"));
             }
-            send(client, Output::Snapshot(Box::new(self.snapshot())));
+            let snapshot = self.snapshot();
+            let after = snapshot.id;
+            send(client, Output::Snapshot(Box::new(snapshot)));
+            let captures =
+                self.call("editor-take-captures!", &[Arg::Session]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
+            for id in captures {
+                self.outstanding_frames.insert((client, id));
+                send(client, Output::Capture { id, after });
+            }
             if greet.contains(&client) {
                 send(client, Output::Bindings(self.bindings()));
             }
@@ -1396,6 +1539,8 @@ impl Runtime {
                 Arg::Int(n) => (*n).into_value(&mut self.vm)?,
                 Arg::Bool(b) => (*b).into_value(&mut self.vm)?,
                 Arg::Strs(v) => v.clone().into_value(&mut self.vm)?,
+                Arg::Bytes(v) => Bytes(v.clone()).into_value(&mut self.vm)?,
+                Arg::Lease(v) => Foreign::new(v.clone()).into_value(&mut self.vm)?,
                 Arg::View(v) => Foreign(v.clone()).into_value(&mut self.vm)?,
             };
             values.push(v);
@@ -1614,6 +1759,8 @@ enum Arg {
     Int(usize),
     Bool(bool),
     Strs(Vec<String>),
+    Bytes(Vec<u8>),
+    Lease(Arc<crate::capture::Lease>),
 }
 
 #[cfg(all(test, unix))]

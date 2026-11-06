@@ -365,7 +365,7 @@ impl Term {
                 write!(self.replies, "\x1b]52;c;{}\x07", base64(text.as_bytes())).expect("a string");
                 Vec::new()
             }
-            Output::Session(_) | Output::Quit | Output::Refused(_) => Vec::new(),
+            Output::Capture { .. } | Output::CancelCapture { .. } | Output::Session(_) | Output::Quit | Output::Refused(_) => Vec::new(),
         }
     }
 

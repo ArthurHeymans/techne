@@ -24,6 +24,62 @@ buffer, as killing the buffer or =:wq= in the modal profile do. So
 ~EDITOR="techne --wait"~ edits commit messages in the editor you have
 open. With no editor running, the command starts one on the file.
 
+* Screenshots and recordings
+
+In the window frontend, =M-x screenshot= saves the next rendered editor
+frame to a new PNG. It includes panes, gutters, mode lines, popups and
+the minibuffer, not other applications, window decorations or the system
+mouse pointer. No desktop capture permission or external capture tool is
+needed. Visible sensitive text is included: capture only what you intend
+to share.
+
+Agents and other programs can capture an already running editor:
+
+#+begin_src sh
+techne window --screenshot /tmp/editor.png
+techne window --record /tmp/editor-recording --record-frames 30 --record-interval 100
+techne window --stop-recording
+#+end_src
+
+These commands use the editor socket under =$XDG_RUNTIME_DIR= and never
+start another editor. Screenshot completion prints a JSON =Captured=
+reply with =path=, =snapshot=, =width= and =height=, only after drawing and
+saving succeeded. It captures the fresh snapshot answering the request,
+or a newer one; the id identifies the frame actually drawn and is local
+to this runtime. It does not promise that background work has finished.
+An external screenshot does not change the echo area it observes.
+Existing destinations, including symbolic links, are refused; PNGs are
+private files, written whole before becoming visible at their destination.
+GPU completion and PNG encoding run on a bounded worker, not the window
+thread: typing, redraw and closing remain responsive during capture.
+External screenshot requests expire after 25 seconds, or are cancelled if
+the caller disconnects. Cancellation releases pending slots and prevents
+late file publication, even if the editor runtime was busy. If publication
+already won the race, the reply acknowledges that completed screenshot.
+
+=M-x start-recording= records up to 100 frames in a new private directory;
+=M-x stop-recording= finishes early. The CLI permits 1..300 frames and
+50..10000 ms between a completed frame and the next request (defaults:
+100 frames, 100 ms). There is only one recording frame in flight: slow
+rendering lowers the frame rate instead of growing a queue. Recording
+also ends on capture failure or after 256 MiB plus at most one frame.
+An already requested frame may finish after stopping. The =Recording=
+JSON reply acknowledges starting or stopping, not completion of all frames.
+
+A recording is a PNG frame sequence, not an MP4: =recording.scm= is an
+atomically updated Scheme alist with =format= (=techne-frames-v1=),
+=active=, =interval-ms=, =bytes= and =frames=. Each frame records its file,
+snapshot id, dimensions and elapsed milliseconds at completion. It can
+be inspected directly or encoded later with a video tool. Captures are
+limited to 16 megapixels and four pending requests per session. Neither
+pending screenshots nor recordings resume after a runtime restart.
+
+Extensions can import =(techne editor)= and call =(screenshot! s path)=,
+=(recording-start! s directory #:frames 30 #:interval 100)= and
+=(recording-stop! s)=. The first returns a request id, not a completed
+file. Pixel capture on a terminal frontend reports an explicit error:
+the terminal emulator, not Techne, owns those pixels.
+
 * Keys
 
 A profile decides what keys mean. In the Emacs profile chords edit and

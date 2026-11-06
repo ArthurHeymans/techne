@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -32,14 +32,52 @@ const MAX_FRAME: usize = 1 << 20;
 pub enum Request {
     /// Show the file at `path` (absolute) in the session used last; with
     /// `wait`, reply `Done` too when it is done with.
-    Open { path: PathBuf, wait: bool },
+    Open {
+        path: PathBuf,
+        wait: bool,
+    },
+    /// Capture the currently selected editor session; never start an editor.
+    Capture {
+        path: PathBuf,
+        /// May shorten, never extend, the server's 25 second deadline.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    Record {
+        path: PathBuf,
+        frames: usize,
+        interval_ms: usize,
+    },
+    StopRecording,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum Reply {
     Opened,
     Done,
     Failed(String),
+    Captured { path: String, snapshot: u64, width: u32, height: u32 },
+    Recording { path: String },
+}
+
+/// Capture the running editor. The reply is sent only after Scheme saved
+/// the PNG, and identifies the frame actually drawn, not merely requested.
+pub fn capture(socket: &Path, path: &Path) -> Result<Reply, String> {
+    let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+    request(socket, &Request::Capture { path, timeout_ms: None })
+}
+
+/// Send a bounded capture/recording control request to the editor.
+pub fn request(socket: &Path, request: &Request) -> Result<Reply, String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| format!("no running editor: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(REQUEST_WAIT)).map_err(|e| e.to_string())?;
+    write_frame(&mut stream, request).map_err(|e| e.to_string())?;
+    match read_frame::<Reply>(&mut stream).map_err(|e| e.to_string())? {
+        Some(reply @ (Reply::Captured { .. } | Reply::Recording { .. })) => Ok(reply),
+        Some(Reply::Failed(e)) => Err(e),
+        _ => Err("the editor stopped before the capture completed".into()),
+    }
 }
 
 /// The socket a running editor listens on: `techne/editor` in
@@ -76,6 +114,7 @@ pub fn open(socket: &Path, path: &Path, wait: bool) -> Result<(), OpenError> {
             Some(Reply::Opened) => {}
             Some(Reply::Done) => return Ok(()),
             Some(Reply::Failed(e)) => return Err(OpenError::Failed(e)),
+            Some(Reply::Captured { .. } | Reply::Recording { .. }) => return Err(OpenError::Failed("unexpected capture reply".into())),
             None => return Err(OpenError::Failed("the editor stopped before the file was done with".into())),
         }
     }
@@ -178,11 +217,85 @@ impl Drop for Counted {
     }
 }
 
+/// Serve a screenshot with cancellation independent of the runtime's input
+/// queue. The lease blocks publication immediately, even while Lisp is busy;
+/// the wake then releases Scheme and frontend queue slots when it can run.
+fn serve_capture(shared: &Mutex<Shared>, mut stream: UnixStream, path: PathBuf, timeout: Duration) {
+    let lease = Arc::new(crate::capture::Lease::new(timeout));
+    let (tx, replies) = mpsc::channel();
+    let generation = {
+        let s = shared.lock().expect("the host");
+        s.inputs.as_ref().is_some_and(|i| i.send(Msg::Capture { path, lease: lease.clone(), reply: tx }).is_ok()).then_some(s.generation)
+    };
+    let mut disconnected = false;
+    let reply = if let Some(generation) = generation {
+        loop {
+            let left = lease.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Reply::Failed("capture timed out".into());
+            }
+            if gone(&stream) {
+                disconnected = true;
+                break Reply::Failed("capture caller disconnected".into());
+            }
+            let restarted = {
+                let s = shared.lock().expect("the host");
+                s.given_up == Some(generation) || s.generation != generation
+            };
+            if restarted {
+                break Reply::Failed("the editor restarted during capture".into());
+            }
+            match replies.recv_timeout(left.min(Duration::from_millis(50))) {
+                Ok(reply) => break reply,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break Reply::Failed("the editor stopped during capture".into()),
+            }
+        }
+    } else {
+        Reply::Failed("the editor is not running".into())
+    };
+    // Publication and cancellation are serialized at the filesystem boundary.
+    // If publishing already won, report its success instead of a false timeout.
+    let reply = if Instant::now() >= lease.deadline { Reply::Failed("capture timed out".into()) } else { reply };
+    let reply = lease.cancel().unwrap_or(reply);
+    if let Some(tx) = &shared.lock().expect("the host").inputs {
+        let _ = tx.send(Msg::CaptureCancelled);
+    }
+    if !disconnected {
+        let _ = write_frame(&mut stream, &reply);
+    }
+}
+
 /// Handle a connection's request: hand it to the runtime, and pass its
 /// replies on until the last, or until the program asking is gone.
 fn serve(shared: &Mutex<Shared>, mut stream: UnixStream) {
     let _ = stream.set_read_timeout(Some(REQUEST_WAIT));
-    let Ok(Some(Request::Open { path, wait })) = read_frame::<Request>(&mut stream) else { return };
+    let Ok(Some(request)) = read_frame::<Request>(&mut stream) else { return };
+    let _ = stream.set_write_timeout(Some(REQUEST_WAIT));
+    if let Request::Capture { path, timeout_ms } = request {
+        serve_capture(shared, stream, path, Duration::from_millis(timeout_ms.unwrap_or(25_000).clamp(1, 25_000)));
+        return;
+    }
+    if !matches!(request, Request::Open { .. }) {
+        let (tx, replies) = mpsc::channel();
+        let msg = match request {
+            Request::Capture { .. } => unreachable!(),
+            Request::Record { path, frames, interval_ms } => Msg::Recording { path: Some(path), frames, interval_ms, reply: tx },
+            Request::StopRecording => Msg::Recording { path: None, frames: 0, interval_ms: 0, reply: tx },
+            Request::Open { .. } => unreachable!(),
+        };
+        let sent = shared.lock().expect("the host").inputs.as_ref().is_some_and(|i| i.send(msg).is_ok());
+        let reply = if sent {
+            replies
+                .recv_timeout(Duration::from_secs(25))
+                .unwrap_or_else(|_| Reply::Failed("capture timed out or the editor restarted".into()))
+        } else {
+            Reply::Failed("the editor is not running".into())
+        };
+        let _ = write_frame(&mut stream, &reply);
+        return;
+    }
+    let Request::Open { path, wait } = request else { unreachable!() };
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let (tx, replies) = mpsc::channel();

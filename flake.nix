@@ -100,6 +100,9 @@
           window = pkgs.mkShell {
             packages = rust ++ (with pkgs; [ sway grim wtype ]);
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath windowLibs;
+            # Opt in for CI or machines without a GPU; never override the
+            # desktop's driver when running an ordinary editor window.
+            TECHNE_SOFTWARE_VULKAN_DRIVER = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
           };
 
         });

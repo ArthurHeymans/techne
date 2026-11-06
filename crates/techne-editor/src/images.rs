@@ -97,6 +97,22 @@ fn image(width: u32, height: u32, rgba: Vec<u8>) -> Image {
     Image(Arc::new(ImageData { id: NEXT.fetch_add(1, Ordering::Relaxed), width, height, rgba }))
 }
 
+/// Encode GPU readback pixels without moving file or capture policy out
+/// of Scheme. The existing image codec also handles decoding here. A VM
+/// prototype took 27.6 s for just CRC/Adler passes over a 1600x1000 frame;
+/// native bulk encoding is needed even for low-rate recording.
+pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    use image::ImageEncoder;
+    if width == 0 || height == 0 || width as u64 * height as u64 > 16_777_216 || rgba.len() as u64 != width as u64 * height as u64 * 4 {
+        return Err("capture dimensions exceed the 16 megapixel limit or do not match the pixels".into());
+    }
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|e| e.to_string())?;
+    Ok(png)
+}
+
 /// Whether `bytes` (of a file named `name`) are SVG.
 fn is_svg(name: &Path, bytes: &[u8]) -> bool {
     let ext = name.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);

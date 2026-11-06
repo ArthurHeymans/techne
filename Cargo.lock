@@ -4170,6 +4170,7 @@ dependencies = [
  "cosmic-text",
  "glyphon",
  "pollster",
+ "serde_json",
  "smithay-clipboard",
  "techne-editor",
  "techne-term",

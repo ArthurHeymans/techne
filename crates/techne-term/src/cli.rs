@@ -217,6 +217,10 @@ pub fn main(args: Vec<String>) -> ExitCode {
                 Msg::Pause => term.flush(),
                 Msg::Busy => vec![],
                 Msg::Runtime(Event::Output(Output::Quit)) => break 'run,
+                Msg::Runtime(Event::Output(Output::Capture { id, .. })) => {
+                    host.captured(id, Err("pixel capture is only available in the window frontend".into()));
+                    vec![]
+                }
                 Msg::Runtime(Event::Output(o)) => term.output(o),
                 Msg::Runtime(Event::Failed(e)) => {
                     failed = Some(e);

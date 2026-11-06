@@ -21,6 +21,10 @@
 //! key that took 10 ms or more); `--load` keeps a Lisp task busy in the
 //! runtime meanwhile. `headless.scm` runs it in a headless Wayland session.
 
+// Proving wgpu's deeply nested device/buffer handles are Send for readback.
+#![recursion_limit = "256"]
+
+mod capture;
 mod keys;
 mod layout;
 #[cfg(test)]
@@ -70,9 +74,19 @@ struct Args {
     open: bool,
     /// Return once the file opened is done with.
     wait: bool,
+    screenshot: Option<PathBuf>,
+    record: Option<PathBuf>,
+    stop_recording: bool,
+    record_frames: usize,
+    record_interval: usize,
 }
 
-const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [--open] [--wait] [FILE]";
+const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [--open] [--wait] [FILE]\n\
+  techne window --screenshot NEW.png\n\
+  techne window --record NEW-DIR [--record-frames 1..300] [--record-interval 50..10000]\n\
+  techne window --stop-recording\n\
+Capture commands address an already running editor and print a JSON reply.\n\
+Recording saves timestamped PNG frames plus recording.scm (default: 100 frames, 100 ms).";
 
 fn args(args: Vec<String>) -> Result<Args, String> {
     let mut a = Args {
@@ -84,10 +98,20 @@ fn args(args: Vec<String>) -> Result<Args, String> {
         size: 15.0,
         open: false,
         wait: false,
+        screenshot: None,
+        record: None,
+        stop_recording: false,
+        record_frames: 100,
+        record_interval: 100,
     };
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--screenshot" => a.screenshot = Some(PathBuf::from(it.next().ok_or(USAGE)?)),
+            "--record" => a.record = Some(PathBuf::from(it.next().ok_or(USAGE)?)),
+            "--stop-recording" => a.stop_recording = true,
+            "--record-frames" => a.record_frames = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
+            "--record-interval" => a.record_interval = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
             "--modal" => a.profile = "modal".into(),
             "--load" => a.load = true,
             "--open" => a.open = true,
@@ -100,6 +124,15 @@ fn args(args: Vec<String>) -> Result<Args, String> {
             _ => return Err(USAGE.into()),
         }
     }
+    let controls = a.screenshot.is_some() as u8 + a.record.is_some() as u8 + a.stop_recording as u8;
+    if controls > 1
+        || (controls > 0 && (a.path.is_some() || a.open || a.bench.is_some() || a.load))
+        || !(1..=300).contains(&a.record_frames)
+        || !(50..=10000).contains(&a.record_interval)
+        || (a.record.is_none() && (a.record_frames != 100 || a.record_interval != 100))
+    {
+        return Err(USAGE.into());
+    }
     if a.open && a.path.is_none() {
         return Err(USAGE.into());
     }
@@ -107,7 +140,10 @@ fn args(args: Vec<String>) -> Result<Args, String> {
 }
 
 /// Woken when the runtime has output.
-struct Wake;
+enum Wake {
+    Runtime,
+    Captured(capture::Completion),
+}
 
 /// Latencies from input to the frame that showed it, and to the snapshot.
 #[derive(Default)]
@@ -167,6 +203,10 @@ struct App {
     /// The Wayland clipboard: kills go to it; what another program put
     /// there is sent to the runtime when the window gets the focus.
     clipboard: Option<smithay_clipboard::Clipboard>,
+    captures: Vec<(usize, u64)>,
+    capture_worker: capture::Worker,
+    capture_in_flight: bool,
+    capture_epoch: u64,
 }
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
@@ -248,6 +288,8 @@ impl App {
                         self.send(input);
                     }
                 }
+                Event::Output(Output::Capture { id, after }) => self.captures.push((id, after)),
+                Event::Output(Output::CancelCapture { id }) => self.captures.retain(|(pending, _)| *pending != id),
                 // Every key a window gets can be sent.
                 Event::Output(Output::Bindings(_) | Output::Session(_)) => {}
                 Event::Output(Output::Clipboard(text)) => {
@@ -261,7 +303,11 @@ impl App {
                     self.quit(event_loop);
                 }
                 Event::Ended if self.quitting => {}
-                Event::Ended if self.host.restart() => eprintln!("techne: the runtime stopped; a new one has the unsaved edits"),
+                Event::Ended if self.host.restart() => {
+                    self.captures.clear();
+                    self.capture_epoch += 1;
+                    eprintln!("techne: the runtime stopped; a new one has the unsaved edits");
+                }
                 Event::Ended => {
                     eprintln!("techne: the runtime stopped before it had input");
                     self.quit(event_loop);
@@ -723,7 +769,39 @@ impl App {
             })
             .collect();
         let Some(renderer) = &mut self.renderer else { return };
-        if renderer.draw(fonts, frame_bg, &rects, &images, &texts) {
+        let capture = !self.capture_in_flight && self.captures.iter().any(|(_, after)| snap.id >= *after);
+        if renderer.draw(fonts, frame_bg, &rects, &images, &texts, capture) {
+            if capture {
+                let readback = renderer.captured.take().unwrap_or_else(|| Err("the renderer did not produce a capture".into()));
+                let snapshot = snap.id;
+                let mut ids = Vec::new();
+                self.captures.retain(|(id, after)| {
+                    if snapshot >= *after {
+                        ids.push(*id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let job = capture::Job {
+                    epoch: self.capture_epoch,
+                    ids,
+                    finish: Box::new(move || {
+                        readback.and_then(|r| r.finish()).map(|mut frame| {
+                            frame.snapshot = snapshot;
+                            frame
+                        })
+                    }),
+                };
+                match self.capture_worker.submit(job) {
+                    Ok(()) => self.capture_in_flight = true,
+                    Err(job) => {
+                        for id in job.ids {
+                            self.host.captured(id, Err("capture worker unavailable".into()));
+                        }
+                    }
+                }
+            }
             let now = Instant::now();
             self.latency.frame.extend(self.unanswered.drain(..).map(|at| now - at));
         } else {
@@ -782,8 +860,21 @@ impl ApplicationHandler<Wake> for App {
         self.redraw();
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _: Wake) {
-        self.take_outputs(event_loop);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
+        match event {
+            Wake::Runtime => self.take_outputs(event_loop),
+            Wake::Captured(c) => {
+                self.capture_in_flight = false;
+                // A completion from before a restart must never answer a
+                // reused Scheme request id in the new runtime.
+                if c.epoch == self.capture_epoch {
+                    for id in c.ids {
+                        self.host.captured(id, c.result.clone());
+                    }
+                }
+                self.redraw();
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -876,6 +967,35 @@ pub fn main(args: Vec<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let capture = args.screenshot.is_some() || args.record.is_some() || args.stop_recording;
+    if capture {
+        let result = (|| {
+            let socket = server::socket().ok_or("no XDG_RUNTIME_DIR for the editor socket")?;
+            if let Some(path) = &args.screenshot {
+                return server::capture(&socket, path);
+            }
+            let request = if let Some(path) = &args.record {
+                server::Request::Record {
+                    path: std::path::absolute(path).map_err(|e| e.to_string())?,
+                    frames: args.record_frames,
+                    interval_ms: args.record_interval,
+                }
+            } else {
+                server::Request::StopRecording
+            };
+            server::request(&socket, &request)
+        })();
+        return match result {
+            Ok(reply) => {
+                println!("{}", serde_json::to_string(&reply).expect("a capture reply"));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("techne: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(opened) = args.path.as_deref().filter(|_| args.open).and_then(|p| server::open_running(p, args.wait)) {
         if let Err(e) = opened {
             eprintln!("techne: {e}");
@@ -913,9 +1033,13 @@ pub fn main(args: Vec<String>) -> ExitCode {
             }
         }
     };
+    let capture_proxy = proxy.clone();
+    let capture_worker = capture::Worker::new(move |c| {
+        let _ = capture_proxy.send_event(Wake::Captured(c));
+    });
     let host = Host::start(file.clone(), args.profile.clone(), setup, move |e| {
         let _ = tx.send(e);
-        let _ = proxy.send_event(Wake);
+        let _ = proxy.send_event(Wake::Runtime);
     });
     // A benchmark's window opens no files for others.
     let _listener = args.bench.is_none().then(|| server::listen_for(&host)).flatten();
@@ -935,6 +1059,10 @@ pub fn main(args: Vec<String>) -> ExitCode {
         latency: Latency::default(),
         bench,
         clipboard: None,
+        captures: Vec::new(),
+        capture_worker,
+        capture_in_flight: false,
+        capture_epoch: 0,
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, .. } = app;

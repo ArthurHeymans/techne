@@ -435,9 +435,29 @@ pub enum Input {
     Close,
 }
 
+/// Pixels captured from a successfully drawn frame, encoded as sRGB PNG.
+#[derive(Clone, Debug)]
+pub struct CapturedFrame {
+    pub snapshot: u64,
+    pub width: u32,
+    pub height: u32,
+    pub png: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub enum Output {
     Snapshot(Box<Snapshot>),
+    /// Capture a frame showing this snapshot or a newer one. Complete via
+    /// `Host::captured`, including on frontends without pixel capture.
+    Capture {
+        id: usize,
+        after: u64,
+    },
+    /// Forget a cancelled request. A readback already in flight may finish;
+    /// the runtime ignores its result and its lease forbids publishing it.
+    CancelCapture {
+        id: usize,
+    },
     /// The key sequences the session binds in Emacs notation, sent when a
     /// frontend attaches, so that its key normalizer can report those it
     /// cannot send.
