@@ -82,6 +82,10 @@ use crate::{
     vm::{Error, Moves, PlainFn, Vm},
 };
 
+mod fast;
+mod integer;
+mod invariant;
+
 /// `(vm, ctx, registers at bp, bp, entry pc, native depth) -> pc | status << 32`.
 pub type JitFn = unsafe extern "C" fn(*mut Vm, *mut JitCtx, *mut Value, u64, u32, u32) -> u64;
 
@@ -118,6 +122,10 @@ pub struct JitCtx {
     /// a value names from its offset there, as `alloc::caged` does, so
     /// that no value, however it came about, names memory outside it.
     pub cage: *mut u8,
+    /// Owner and outer frame of an active numeric kernel. The owner is
+    /// stable for this native run; only cold materialization uses it.
+    pub vm: *mut Vm,
+    pub fast_root: u64,
 }
 
 /// Native calls nest at most this deep before handing over to the interpreter.
@@ -170,6 +178,10 @@ const GUARD_TICK: u32 = 12;
 pub struct JitSlot {
     /// Loop back-edges taken so far (until compiled).
     pub hot: Cell<u32>,
+    /// A few indirect sites, observed only while interpreting before the
+    /// one compilation. No heap values or addresses: feedback cannot keep
+    /// a closure alive, and a code id is resolved afresh when queued.
+    pub calls: RefCell<CallFeedback>,
     pub entry: Cell<Option<JitFn>>,
     /// `entry` if the function can be entered at pc 0 (by native calls).
     pub call_entry: Cell<Option<JitFn>>,
@@ -199,6 +211,46 @@ impl fmt::Debug for JitSlot {
     }
 }
 
+/// One target per indirect call site; a second target makes it generic.
+/// The fixed budget bounds both profiling memory and specialization work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallTarget {
+    Code(u32),
+    Native(u32),
+    Other,
+}
+
+#[derive(Default)]
+pub struct CallFeedback([(u32, Option<CallTarget>); 4]);
+
+/// Developer ablation: no observation and no indirect specialization.
+#[inline]
+pub fn feedback_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TECHNE_JIT_FEEDBACK").as_deref() != Ok("0"))
+}
+
+impl CallFeedback {
+    pub fn observe(&mut self, pc: u32, target: CallTarget) {
+        for (site, seen) in &mut self.0 {
+            if seen.is_none() {
+                (*site, *seen) = (pc, Some(target));
+                break;
+            }
+            if *site == pc {
+                if *seen != Some(target) {
+                    *seen = Some(CallTarget::Other);
+                }
+                break;
+            }
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u32, CallTarget)> + '_ {
+        self.0.iter().filter_map(|&(pc, target)| target.filter(|t| *t != CallTarget::Other).map(|t| (pc, t)))
+    }
+}
+
 /// Functions compiled into one arena.
 const ARENA_FUNCTIONS: usize = 64;
 
@@ -208,6 +260,8 @@ struct Arena {
     id: u32,
     generation: u32,
     module: JITModule,
+    /// A kernel and its entry/fallback live and fail as one unit.
+    isolated: bool,
     functions: usize,
     /// Functions not released yet.
     live: usize,
@@ -265,6 +319,11 @@ fn kept(ops: usize) -> usize {
 /// pages of its own).
 const PAGE: usize = 4096;
 
+// Reusing the ordinary ~500-instruction buffers saves compilation work.
+// A rare 3,467-instruction loader retained about 3 MiB indefinitely.
+const MAX_CACHED_INSTS: usize = 2048;
+const MAX_CACHED_REGS: usize = 256;
+
 struct Jit {
     isa: cranelift_codegen::isa::OwnedTargetIsa,
     /// The last of a generation's arenas is where its functions go.
@@ -272,6 +331,8 @@ struct Jit {
     arena_ids: u32,
     ctx: Context,
     fctx: FunctionBuilderContext,
+    /// The last job exceeded the working-buffer reuse budget.
+    oversized_buffers: bool,
     usage: std::sync::Arc<Usage>,
     /// The world's, which its machine code and its compiling are charged to.
     budget: crate::alloc::Budget,
@@ -318,6 +379,10 @@ pub struct Job {
     /// Globals called by this code that held plain Rust natives when it was
     /// queued; calls of those natives call them directly.
     pub native_globals: HashMap<u32, KnownNative>,
+    /// Monomorphic indirect sites, by original pc. Code ids were resolved
+    /// and their dependencies retained before this self-contained job.
+    pub closure_calls: HashMap<u32, Known>,
+    pub native_calls: HashMap<u32, KnownNative>,
     /// Calls and tail calls through globals (by pc) of small functions
     /// (`inlinable`) that native code runs inline, the global holding
     /// their closure (`closure_globals`).
@@ -510,12 +575,20 @@ struct Site {
     start: usize,
     code: i64,
     frame: u16,
-    /// Where the closure called is (`Known::closure`): a GC root, so
-    /// current after anything that collects, and the closure running
-    /// (the call's guard compared it), even if the global changed since.
-    closure: i64,
+    /// The actual closure: a global's GC-updated root, or an indirect
+    /// non-tail call's live base register (not a sampled instance).
+    closure: SiteClosure,
     consts: i64,
     const_bits: Vec<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum SiteClosure {
+    /// A global call's expected closure, in a GC-updated root.
+    Root(i64),
+    /// An indirect non-tail call's actual closure. Its base is below all
+    /// callee registers, stays live until return, and moves with the GC.
+    Register(Reg),
 }
 
 /// What a return of a function inlined does: the caller's own return, or a
@@ -596,9 +669,10 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>, Vec<Option<u
         calls.iter().map(|&call| (call as usize, &job.inlined[&call], None)).collect();
     let mut sites: Vec<Site> = Vec::new();
     while let Some((call, inl, parent)) = todo.pop_front() {
-        let (tail, base, args, g) = match ops[call] {
-            Op::CallG { base, n, g } => (false, base, n, g),
-            Op::TailCallG { base, n, g } => (true, base, n, g),
+        let (tail, base, args, closure) = match ops[call] {
+            Op::CallG { base, n, g } => (false, base, n, SiteClosure::Root(job.closure_globals[&g].closure.unwrap() as i64)),
+            Op::TailCallG { base, n, g } => (true, base, n, SiteClosure::Root(job.closure_globals[&g].closure.unwrap() as i64)),
+            Op::Call { base, n } => (false, base, n, SiteClosure::Register(base)),
             op => unreachable!("inlined call: {op:?}"),
         };
         let site = sites.len();
@@ -677,7 +751,7 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>, Vec<Option<u
             start,
             code: inl.code as i64,
             frame: inl.frame_size,
-            closure: job.closure_globals[&g].closure as i64,
+            closure,
             consts: inl.consts_addr as i64,
             const_bits: inl.consts.clone(),
         });
@@ -753,7 +827,7 @@ impl KnownNative {
 
     /// Its inline case, for a call with `n` arguments.
     fn inline(&self, n: u16) -> Option<Inline> {
-        self.inline.filter(|i| i.arity() == n)
+        self.inline.filter(|i| i.arity() == n && (*i != Inline::IntegerAdd || integer::enabled()))
     }
 }
 
@@ -772,11 +846,13 @@ pub enum Inline {
     CharEq,
     /// A field of a record of the type given (record accessors).
     RecordRef,
+    /// Exact integers through i64; allocation/overflow use the native fallback.
+    IntegerAdd,
 }
 
 impl Inline {
     /// Each, and the global holding its native.
-    pub const ALL: [(Inline, &str); 7] = [
+    pub const ALL: [(Inline, &str); 8] = [
         (Inline::StringLength, "string-length"),
         (Inline::StringRef, "string-ref"),
         (Inline::VectorLength, "vector-length"),
@@ -784,12 +860,13 @@ impl Inline {
         (Inline::CharToInteger, "char->integer"),
         (Inline::CharEq, "char=?"),
         (Inline::RecordRef, "%record-ref"),
+        (Inline::IntegerAdd, "+"),
     ];
 
     fn arity(self) -> u16 {
         match self {
             Inline::StringLength | Inline::VectorLength | Inline::CharToInteger => 1,
-            Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq => 2,
+            Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq | Inline::IntegerAdd => 2,
             Inline::RecordRef => 3,
         }
     }
@@ -799,8 +876,11 @@ impl Inline {
 #[derive(Clone, Copy)]
 pub struct Known {
     /// Where the closure the global held is (in `JitSlot::callees`): a call
-    /// of that same closure needs no other check.
-    pub closure: usize,
+    /// of that same closure needs no other check. None for an indirect site.
+    pub closure: Option<usize>,
+    /// For an indirect call, guard the code id, not closure identity:
+    /// different instances of a capturing lambda use the actual instance.
+    pub id: u32,
     pub code: usize,
     pub nparams: u16,
     pub rest: bool,
@@ -871,9 +951,31 @@ impl Compiler {
                             continue;
                         }
                     };
+                    let memory_log = std::env::var_os("TECHNE_JIT_MEMORY").is_some();
+                    let held_before = if memory_log { jit.budget.accounted() } else { 0 };
                     let started = std::time::Instant::now();
                     let cancelled = job.cancelled.load(std::sync::atomic::Ordering::Relaxed);
                     let (entry, arena) = if cancelled { (None, 0) } else { jit.compile(&job) };
+                    let held_after = if memory_log { jit.budget.accounted() } else { 0 };
+                    // Keep small-function buffers warm, not a rare loader's
+                    // multi-megabyte high-water mark. The arenas/executable
+                    // code are independent. 0/1 force drop/keep for ablation.
+                    let cache = std::env::var("TECHNE_JIT_CACHE").ok();
+                    if cache.as_deref() == Some("0") || (cache.as_deref() != Some("1") && jit.oversized_buffers) {
+                        jit.ctx = Context::new();
+                        jit.fctx = FunctionBuilderContext::new();
+                        jit.oversized_buffers = false;
+                    }
+                    if memory_log {
+                        eprintln!(
+                            "jit-memory: {} before={} compiled={} cached={} machine={}",
+                            job.name,
+                            held_before,
+                            held_after,
+                            jit.budget.accounted(),
+                            jit.usage.bytes.load(std::sync::atomic::Ordering::Relaxed)
+                        );
+                    }
                     let done =
                         Done { id: job.id, entry, arena, heads: job.heads, name: job.name, ops: job.ops.len(), time: started.elapsed() };
                     if done_tx.send(done).is_err() {
@@ -1002,7 +1104,10 @@ fn jit_poisoned(vm: *mut Vm) -> Error {
 
 unsafe extern "C" fn jit_step(vm: *mut Vm, bp: usize, op: *const Op) -> u32 {
     unsafe {
-        match catch_jit(vm, |vm| vm.jit_slow_op(bp, *op)) {
+        match catch_jit(vm, |vm| {
+            vm.note_jit_helper(0);
+            vm.jit_slow_op(bp, *op)
+        }) {
             Some(Ok(false)) => 0,
             Some(Ok(true)) => 1,
             Some(Err(e)) => {
@@ -1147,7 +1252,10 @@ unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64,
 /// callee handed over to the interpreter; its result is in `ctx.res`).
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base: u64, n: u64, depth: u64, f: u64) -> u64 {
-    match catch_jit(vm, |_| unsafe { jit_call_slow_inner(vm, ctx, bp, base, n, depth, f) }) {
+    match catch_jit(vm, |vm| {
+        vm.note_jit_helper(1);
+        unsafe { jit_call_slow_inner(vm, ctx, bp, base, n, depth, f) }
+    }) {
         Some(status) => status,
         None => {
             let vm_ref = unsafe { &mut *vm };
@@ -1202,6 +1310,7 @@ unsafe fn jit_call_slow_inner(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base: u64,
 /// register stack or globals moved).
 unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u64) -> u64 {
     let status = catch_jit(vm, |vm| {
+        vm.note_jit_helper(2);
         let (f, bp) = (Value::from_bits(f), bp as usize);
         if f.is_native() && f != vm.apply_native {
             return call_native(vm, f, bp + base as usize, n as usize, bp - 1);
@@ -1215,6 +1324,34 @@ unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u
             native_failed(vm, vm.poison_error())
         }
     }
+}
+
+/// Initialize a kernel's active virtual span before any original slow
+/// instruction can collect. Bounds/depth were checked by the pc-0 entry.
+/// This helper neither collects nor grows the register buffer.
+unsafe extern "C" fn jit_fast_prepare(ctx: *mut JitCtx, bp: u64, frame: u64) -> *mut Value {
+    let (vm, root) = unsafe { ((*ctx).vm, (*ctx).fast_root as usize) };
+    catch_jit(vm, |vm| {
+        let bp = bp as usize;
+        let end = bp.checked_add(frame as usize).expect("kernel frame extent");
+        assert!(root <= bp && end <= vm.regs.len(), "kernel capacity proof");
+        vm.regs[root..end].fill(Value::float(0.0));
+        vm.stack_top = vm.stack_top.max(end);
+        vm.regs.as_mut_ptr().wrapping_add(bp)
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// The child has materialized already. Record this suspended caller and
+/// return a fresh pointer for stores *below* its child's callee slot.
+unsafe extern "C" fn jit_fast_unwind(ctx: *mut JitCtx, bp: u64, code: *const Code, pc: u64) -> *mut Value {
+    let vm = unsafe { (*ctx).vm };
+    catch_jit(vm, |vm| {
+        assert!((bp as usize) < vm.regs.len(), "kernel caller frame");
+        vm.jit_push_frame(code, pc as u32, bp as u32);
+        vm.regs.as_mut_ptr().wrapping_add(bp as usize)
+    })
+    .unwrap_or(std::ptr::null_mut())
 }
 
 /// The register stack has no room for the `needed` registers of a frame
@@ -1281,7 +1418,17 @@ impl Regs {
         Regs(self.0.iter().zip(&o.0).map(|(a, b)| a & !b).collect())
     }
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(w, bits)| (0..64).filter(move |i| bits & (1 << i) != 0).map(move |i| w * 64 + i))
+        self.0.iter().enumerate().flat_map(|(w, &bits)| {
+            let mut bits = bits;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let i = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(w * 64 + i)
+            })
+        })
     }
 }
 
@@ -1380,6 +1527,8 @@ struct Flow {
 
 /// The control flow of the instructions compiled (`combine`).
 struct Shape {
+    /// Computed once, shared by the kind, liveness and dirtiness analyses.
+    effects: Vec<(Vec<Reg>, Vec<Reg>)>,
     /// Each instruction's successors: an inlined call's include the start
     /// of its callee's instructions.
     succs: Vec<Vec<usize>>,
@@ -1408,14 +1557,14 @@ impl Shape {
 fn analyze(
     ops: &[Op],
     n: usize,
-    captures: &HashMap<u32, Vec<Reg>>,
+    _captures: &HashMap<u32, Vec<Reg>>,
     self_jump: bool,
     fix: &[Regs],
     native: impl Fn(usize) -> Option<bool>,
     shape: &Shape,
 ) -> Flow {
     let len = ops.len();
-    let effects: Vec<_> = ops.iter().map(|op| uses_defs(op, captures)).collect();
+    let effects = &shape.effects;
     let succs = &shape.succs;
     let mut live_in = vec![Regs::empty(n); len];
     let mut live_out = vec![Regs::empty(n); len];
@@ -1462,7 +1611,7 @@ fn analyze(
                 // A known native's value stays in a machine register. Its
                 // call writes registers back (unless inline) but for known
                 // fixnums, and keeps them or re-reads them.
-                (Op::CallG { base, .. }, Some(inline)) => {
+                (Op::CallG { base, .. } | Op::Call { base, .. }, Some(inline)) => {
                     let mut d = if inline {
                         dirty_in[pc].clone()
                     } else if shape.inlined[pc] {
@@ -1557,7 +1706,7 @@ fn fixnums(
             Op::Quo { dst, .. } | Op::Rem { dst, .. } | Op::Mod { dst, .. } => Some((dst, true)),
             // An inlined call returns a fixnum if each of its callee's
             // returns does (`Gen::call_op` checks the call's result).
-            Op::CallG { base, .. } => {
+            Op::CallG { base, .. } | Op::Call { base, .. } => {
                 let results = shape.results.get(&pc);
                 Some((base, fixnum_call(pc) || results.is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
             }
@@ -1588,6 +1737,9 @@ fn flonums(
             Op::Mov { dst, src } => Some((dst, has(src))),
             Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) || has(b))),
             Op::AddI { dst, a, .. } => Some((dst, has(a))),
+            Op::Call { base, .. } | Op::CallG { base, .. } => {
+                Some((base, shape.results.get(&pc).is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
+            }
             _ => None,
         }
     };
@@ -1693,6 +1845,21 @@ fn vectors(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usi
     known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
 }
 
+/// Pair kinds cannot change, even across calls or collections. A
+/// successful access proves its operand a pair (unless overwritten).
+fn pairs(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usize], shape: &Shape) -> Vec<Regs> {
+    let step = |pc: usize, known: &[Regs]| match ops[pc] {
+        Op::Cons { dst, .. } => Some((dst, true)),
+        Op::Mov { dst, src } => Some((dst, known[pc].contains(src))),
+        _ => None,
+    };
+    let also = |pc: usize| match ops[pc] {
+        Op::Car { dst, a } | Op::Cdr { dst, a } if dst != a => Some(a),
+        _ => None,
+    };
+    known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
+}
+
 /// The registers whose kind some instruction uses: operands of arithmetic
 /// and comparisons, and vector indices, and what is moved into them.
 fn kind_used(ops: &[Op], n: usize) -> Regs {
@@ -1744,7 +1911,7 @@ fn kind_used(ops: &[Op], n: usize) -> Regs {
 fn known_regs(
     ops: &[Op],
     n: usize,
-    captures: &HashMap<u32, Vec<Reg>>,
+    _captures: &HashMap<u32, Vec<Reg>>,
     heads: &[usize],
     shape: &Shape,
     assumed: &HashMap<usize, Regs>,
@@ -1782,10 +1949,14 @@ fn known_regs(
     // What is known after the instruction at `pc`, on its edge to `s`.
     let out = |known: &[Regs], pc: usize, s: usize| {
         let mut k = known[pc].clone();
-        match step(pc, known) {
-            Some((dst, true)) => k.insert(dst),
-            Some((dst, false)) => k.remove(dst),
-            None => uses_defs(&ops[pc], captures).1.iter().for_each(|&d| k.remove(d)),
+        // Entering an inlinee is before the call's result exists. In
+        // particular an indirect call's base still holds its closure.
+        if shape.fresh(pc, s).is_none() {
+            match step(pc, known) {
+                Some((dst, true)) => k.insert(dst),
+                Some((dst, false)) => k.remove(dst),
+                None => shape.effects[pc].1.iter().for_each(|&d| k.remove(d)),
+            }
         }
         if let Some(r) = also(pc) {
             k.insert(r);
@@ -1841,20 +2012,39 @@ impl Jit {
         flags.set("is_pic", "false").ok()?;
         flags.set("enable_verifier", "false").ok()?;
         let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
-        Some(Jit { isa, arenas: Vec::new(), arena_ids: 0, ctx: Context::new(), fctx: FunctionBuilderContext::new(), usage, budget })
+        Some(Jit {
+            isa,
+            arenas: Vec::new(),
+            arena_ids: 0,
+            ctx: Context::new(),
+            fctx: FunctionBuilderContext::new(),
+            oversized_buffers: false,
+            usage,
+            budget,
+        })
     }
 
     /// The index of the arena to compile `generation`'s code into: its
     /// last, or a new one if that is full.
-    fn arena(&mut self, generation: u32) -> usize {
-        match self.arenas.iter().rposition(|a| a.generation == generation) {
+    fn arena(&mut self, generation: u32, isolated: bool) -> usize {
+        match self.arenas.iter().rposition(|a| !isolated && !a.isolated && a.generation == generation) {
             Some(i) if self.arenas[i].functions < ARENA_FUNCTIONS => i,
             _ => {
                 self.arena_ids += 1;
                 let module = JITModule::new(JITBuilder::with_isa(self.isa.clone(), cranelift_module::default_libcall_names()));
                 // Charged as functions go in (`compile`).
                 let charged = self.budget.reserve(0).expect("nothing reserved");
-                self.arenas.push(Arena { id: self.arena_ids, generation, module, functions: 0, live: 0, bytes: 0, charged, ops: 0 });
+                self.arenas.push(Arena {
+                    id: self.arena_ids,
+                    generation,
+                    module,
+                    isolated,
+                    functions: 0,
+                    live: 0,
+                    bytes: 0,
+                    charged,
+                    ops: 0,
+                });
                 self.usage.arenas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.arenas.len() - 1
             }
@@ -1876,14 +2066,34 @@ impl Jit {
 
     /// The function and the arena it is in.
     fn compile(&mut self, job: &Job) -> (Option<JitFn>, u32) {
-        let i = self.arena(job.generation);
-        // What compiling takes while it runs and what it makes, reserved
-        // before: past the world's ceiling the function is not compiled.
-        let ops = job.ops.len() + job.inlined.values().map(Inlinee::size).sum::<usize>();
-        let reserved = self.budget.charge(working(ops)).and_then(|w| self.budget.reserve(reserve(ops) + kept(ops)).map(|r| (w, r)));
+        self.oversized_buffers = false;
+        let mut kernel = fast::plan(job);
+        // Admit both functions. Under pressure, drop the optional kernel
+        // before giving up compilation of the ordinary implementation.
+        let plain = job.ops.len() + job.inlined.values().map(Inlinee::size).sum::<usize>();
+        // Also recheck the extra working set against the owner's current
+        // accounting, not just the mutator's earlier admission snapshot.
+        // Separate definitions round to separate executable mappings.
+        if kernel.is_some() {
+            let room = self.budget.limit().saturating_sub(self.budget.accounted());
+            if !Compiler::fits(plain + job.ops.len(), room.saturating_sub(2 * PAGE)) {
+                kernel = None;
+            }
+        }
+        let mut ops = plain + kernel.as_ref().map_or(0, |_| job.ops.len());
+        let reserve_work = |ops, extra| {
+            self.budget.charge(working(ops)).and_then(|w| self.budget.reserve(reserve(ops) + kept(ops) + extra).map(|r| (w, r)))
+        };
+        let mut reserved = reserve_work(ops, if kernel.is_some() { 2 * PAGE } else { 0 });
+        if reserved.is_err() && kernel.is_some() {
+            kernel = None;
+            ops = plain;
+            reserved = reserve_work(ops, 0);
+        }
+        let i = self.arena(job.generation, kernel.is_some());
         let (f, made) = match reserved {
             Ok((working, made)) => {
-                let f = self.compile_in(i, job);
+                let f = self.compile_in(i, job, kernel.as_ref());
                 drop(working);
                 (f, Some(made))
             }
@@ -1909,7 +2119,7 @@ impl Jit {
     }
 
     /// The function and the bytes of its pages.
-    fn compile_in(&mut self, arena: usize, job: &Job) -> Option<(JitFn, usize)> {
+    fn compile_in(&mut self, arena: usize, job: &Job, kernel: Option<&fast::Plan>) -> Option<(JitFn, usize)> {
         let module = &mut self.arenas[arena].module;
         let heads = &job.heads[..];
         let frame = job.frame_size as usize;
@@ -1917,6 +2127,10 @@ impl Jit {
         if effects.iter().flat_map(|(u, d)| u.iter().chain(d)).any(|&r| r as usize >= frame) {
             return None;
         }
+        let kernel = match kernel {
+            Some(plan) => Some(fast::compile(module, &mut self.ctx, &mut self.fctx, job, plan)?),
+            None => None,
+        };
         // The function's instructions, then those of the functions inlined,
         // whose registers are above.
         let (ops, origin, sites, returns) = combine(job);
@@ -1924,7 +2138,23 @@ impl Jit {
         let n = sites.iter().map(|s| (s.off + s.frame) as usize).fold(frame, usize::max);
         let own_len = job.ops.len();
         let site_at: HashMap<usize, usize> = sites.iter().enumerate().map(|(i, s)| (s.call, i)).collect();
+        let effects = ops
+            .iter()
+            .enumerate()
+            .map(|(pc, op)| {
+                let (mut uses, defs) = uses_defs(op, &job.captures);
+                if let Some(o) = origin[pc]
+                    && let SiteClosure::Register(r) = sites[root(&sites, o.site)].closure
+                {
+                    // Exits can materialize the actual captured environment
+                    // at any instruction, including inside a nested inlinee.
+                    uses.push(r);
+                }
+                (uses, defs)
+            })
+            .collect();
         let shape = Shape {
+            effects,
             succs: ops
                 .iter()
                 .enumerate()
@@ -2063,6 +2293,7 @@ impl Jit {
             heads,
             |pc| match orig[pc] {
                 Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
+                Op::Call { .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.fixnum),
                 _ => false,
             },
             &shape,
@@ -2080,8 +2311,14 @@ impl Jit {
         let cached = cached_globals(orig, &shape.succs, &sites.iter().map(|s| s.call).collect::<Vec<_>>());
         let vec_globals: Vec<u32> = cached.iter().filter(|c| c.1).map(|c| c.0).collect();
         let vecs = vectors(orig, n, &job.captures, heads, &shape, &vec_globals);
+        let pairs = if std::env::var("TECHNE_JIT_PAIRS").as_deref() == Ok("0") {
+            vec![Regs::empty(n); orig.len()]
+        } else {
+            pairs(orig, n, &job.captures, heads, &shape)
+        };
         let inline = |pc: usize| match orig[pc] {
             Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
+            Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n).is_some()),
             _ => false,
         };
         let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline);
@@ -2095,6 +2332,9 @@ impl Jit {
             fuel,
             fuel_var,
             loops,
+            // Multiple polls per iteration pay for boundary publication.
+            // Pure loops retain the smaller old live ranges/counter path.
+            defer_fuel: loops && !sites.is_empty() && std::env::var("TECHNE_JIT_FUEL").as_deref() != Ok("0"),
             regs_end,
             cage,
             code_table,
@@ -2108,6 +2348,7 @@ impl Jit {
                 &fix,
                 |pc| match orig[pc] {
                     Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
+                    Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).map(|k| k.inline(n).is_some()),
                     _ => None,
                 },
                 &shape,
@@ -2115,6 +2356,7 @@ impl Jit {
             fix,
             flo,
             vecs,
+            pairs,
             ant,
             lens: (0..n).map(|_| (b.declare_var(I64), b.declare_var(I64))).collect(),
             cached: cached
@@ -2126,6 +2368,10 @@ impl Jit {
                 .enumerate()
                 .filter(|(_, s)| matches!(orig[s.call], Op::CallG { g, .. } | Op::TailCallG { g, .. } if cached.iter().any(|c| c.0 == g)))
                 .map(|(i, _)| (i, b.declare_var(I64)))
+                .collect(),
+            cached_calls: if loops { invariant::calls(job, &sites) } else { Vec::new() }
+                .into_iter()
+                .map(|(site, r)| (site, r, b.declare_var(I64)))
                 .collect(),
             guards,
             guard_blocks: HashMap::new(),
@@ -2139,6 +2385,8 @@ impl Jit {
             sigs,
             closure_globals: job.closure_globals.clone(),
             native_globals: job.native_globals.clone(),
+            closure_calls: job.closure_calls.clone(),
+            native_calls: job.native_calls.clone(),
             own,
             consts: job.consts_addr as i64,
             const_bits: job.consts.clone(),
@@ -2148,6 +2396,9 @@ impl Jit {
             sites,
             site_at,
         };
+        if !g.cached_calls.is_empty() && std::env::var_os("TECHNE_JIT_LOG").is_some() {
+            eprintln!("jit-call-cache: {} {} invariant guards", job.name, g.cached_calls.len());
+        }
         // Dead registers start as 0; each entry point loads its live ones.
         let zero = b.ins().iconst(I64, 0);
         g.vars.iter().chain(&g.shifts).for_each(|v| b.def_var(*v, zero));
@@ -2156,7 +2407,12 @@ impl Jit {
             b.def_var(l, zero);
             b.def_var(w, zero);
         });
-        g.cached.iter().map(|c| c.value).chain(g.same.iter().map(|s| s.1)).for_each(|v| b.def_var(v, zero));
+        g.cached
+            .iter()
+            .map(|c| c.value)
+            .chain(g.same.iter().map(|s| s.1))
+            .chain(g.cached_calls.iter().map(|c| c.2))
+            .for_each(|v| b.def_var(v, zero));
         let fzero = b.ins().f64const(0.0);
         g.fvals.iter().for_each(|v| b.def_var(*v, fzero));
         let trap = b.create_block();
@@ -2190,12 +2446,25 @@ impl Jit {
             if n > frame {
                 g.room(&mut b, h, n);
             }
+            if h == 0
+                && let Some(kernel) = &kernel
+            {
+                fast::enter(module, &mut b, &g, kernel, job);
+            }
             g.reload(&mut b, &g.flow.live_in[h].clone());
+            g.reload_calls(&mut b, h);
             g.reload_globals(&mut b, h);
             for r in g.vecs[h].and(&g.flow.live_in[h]).iter() {
                 let x = g.get(&mut b, r as Reg);
                 let lens = g.lens_of(&mut b, x);
                 g.set_lens(&mut b, r as Reg, lens);
+            }
+            // Pair facts hold on compiled paths, not necessarily on an
+            // interpreter/OSR entry (an earlier access may have raised).
+            for r in g.pairs[h].and(&g.flow.live_in[h]).iter() {
+                let x = g.get(&mut b, r as Reg);
+                let interpret = g.exit(&mut b, h, INTERPRET);
+                g.check_kind(&mut b, x, Kind::Pair, interpret);
             }
             // The interpreter may have stored something else where native
             // code knows fixnums or floats.
@@ -2267,6 +2536,9 @@ impl Jit {
                     b.ins().store(flags(), x, g.r, (i * 8) as i32);
                 }
             }
+            // Publish before REDO's refund; publishing after it would
+            // overwrite the increment the interpreter is owed.
+            g.publish_fuel(&mut b);
             // Registers are as the interpreter left them.
             let status = match status {
                 GUARD => INTERPRET,
@@ -2289,9 +2561,11 @@ impl Jit {
         g.finish_inline_exits(&mut b);
         b.seal_all_blocks();
         b.finalize(frontend);
+        let f = &self.ctx.func;
+        let insts: usize = f.layout.blocks().map(|bl| f.layout.block_insts(bl).count()).sum();
+        self.oversized_buffers =
+            insts > MAX_CACHED_INSTS || n > MAX_CACHED_REGS || kernel.as_ref().is_some_and(|k| k.insts > MAX_CACHED_INSTS);
         if std::env::var_os("TECHNE_JIT_IR").is_some() {
-            let f = &self.ctx.func;
-            let insts: usize = f.layout.blocks().map(|bl| f.layout.block_insts(bl).count()).sum();
             eprintln!(
                 "ir: {} {} ops ({} inlined at {} calls, {} tail) -> {} blocks, {insts} insts",
                 job.name,
@@ -2316,7 +2590,7 @@ impl Jit {
         module.clear_context(&mut self.ctx);
         module.finalize_definitions().ok()?;
         let f = module.get_finalized_function(id);
-        Some((unsafe { std::mem::transmute::<*const u8, JitFn>(f) }, bytes))
+        Some((unsafe { std::mem::transmute::<*const u8, JitFn>(f) }, bytes + kernel.as_ref().map_or(0, |k| k.bytes)))
     }
 }
 
@@ -2345,15 +2619,18 @@ struct Gen {
     /// Where the fuel is counted: a counter the native code of one run of
     /// the interpreter's (`JitCtx::fuel`) shares.
     fuel: ir::Value,
-    /// The fuel while this function runs, if it `loops`: counting writes it
-    /// through to `fuel`, so that nothing has to write it back (callees,
-    /// the interpreter), and calls of compiled code read it anew. Then
-    /// counting does not wait for memory.
+    /// The fuel while this function runs, if it `loops`. With inlinees,
+    /// publish at native boundaries; otherwise write through each tick.
+    /// Callees and the interpreter see the same count, and native helpers'
+    /// requests to shorten the slice are loaded back after their calls.
     fuel_var: Variable,
     /// The function loops (a back-edge or a tail call to itself). Else it
     /// counts in memory: reading the fuel when called and after each call
     /// would cost more.
     loops: bool,
+    /// Count at every original poll, but publish only at foreign/native
+    /// boundaries. Inlined work shares this function's SSA counter.
+    defer_fuel: bool,
     regs_end: ir::Value,
     /// `JitCtx::cage`: values name addresses in it (`Gen::ptr`).
     cage: ir::Value,
@@ -2367,6 +2644,8 @@ struct Gen {
     flo: Vec<Regs>,
     /// Registers whose `lens` are kept, by pc (`vectors`).
     vecs: Vec<Regs>,
+    /// Registers known pairs on compiled paths (`pairs`).
+    pairs: Vec<Regs>,
     /// The globals kept native code may read, by pc (`anticipated`).
     ant: Vec<u16>,
     /// By register: the length of the vector it holds if it is one, and
@@ -2380,6 +2659,9 @@ struct Gen {
     /// By call inlined through a global kept: whether the global holds the
     /// closure inlined (non-zero if so; see `enter_inlined`), kept with it.
     same: Vec<(usize, Variable)>,
+    /// By indirect inline site: its immutable argument source and a cached
+    /// code-identity guard. Actual closures/environments are never cached.
+    cached_calls: Vec<(usize, Reg, Variable)>,
     /// The fixnums and floats native code checks on an edge (from, to)
     /// into an entry point that assumes them (`known_regs`).
     guards: HashMap<(usize, usize), (Regs, Regs)>,
@@ -2404,6 +2686,8 @@ struct Gen {
     sigs: Sigs,
     closure_globals: HashMap<u32, Known>,
     native_globals: HashMap<u32, KnownNative>,
+    closure_calls: HashMap<u32, Known>,
+    native_calls: HashMap<u32, KnownNative>,
     /// This function, for direct recursive calls.
     own: ir::FuncRef,
     consts: i64,
@@ -2441,6 +2725,15 @@ fn flags() -> MemFlagsData {
 }
 
 impl Gen {
+    /// Make the exact current count visible before another execution
+    /// mechanism (including a collecting helper) can inspect/change it.
+    fn publish_fuel(&self, b: &mut FunctionBuilder) {
+        if self.defer_fuel {
+            let f = b.use_var(self.fuel_var);
+            b.ins().store(flags(), f, self.fuel, 0);
+        }
+    }
+
     /// Re-read the fuel after a call that may have counted.
     fn load_fuel(&self, b: &mut FunctionBuilder) {
         if !self.loops {
@@ -2565,6 +2858,30 @@ impl Gen {
         }
     }
 
+    /// Refresh identity guards on native/OSR entry and after an implicit
+    /// self-tail parameter rebind. A false guard takes the normal call
+    /// fallback; a non-procedure must not raise before it is actually used.
+    fn reload_calls(&self, b: &mut FunctionBuilder, pc: usize) {
+        for &(site, r, var) in &self.cached_calls {
+            if !self.flow.live_in[pc].contains(r) {
+                continue;
+            }
+            let f = self.get(b, r);
+            let k = self.closure_calls[&(self.sites[site].call as u32)];
+            let bad = b.create_block();
+            let done = b.create_block();
+            self.check_callee(b, f, k, bad);
+            let one = b.ins().iconst(I64, 1);
+            b.def_var(var, one);
+            b.ins().jump(done, &[]);
+            b.switch_to_block(bad);
+            let zero = b.ins().iconst(I64, 0);
+            b.def_var(var, zero);
+            b.ins().jump(done, &[]);
+            b.switch_to_block(done);
+        }
+    }
+
     /// The value of global `g` (unbound or not), kept or read.
     fn global(&self, b: &mut FunctionBuilder, g: u32) -> ir::Value {
         match self.cached.iter().find(|c| c.g == g) {
@@ -2638,8 +2955,13 @@ impl Gen {
     /// The closure the call inlined at `site` called, read anew: what
     /// native code held of it is stale after a collection.
     fn site_closure(&self, b: &mut FunctionBuilder, site: usize) -> ir::Value {
-        let addr = b.ins().iconst(I64, self.sites[site].closure);
-        b.ins().load(I64, flags(), addr, 0)
+        match self.sites[site].closure {
+            SiteClosure::Root(addr) => {
+                let addr = b.ins().iconst(I64, addr);
+                b.ins().load(I64, flags(), addr, 0)
+            }
+            SiteClosure::Register(r) => self.get(b, r),
+        }
     }
 
     /// The closure running instruction `pc`: the frame's, or that of the
@@ -2788,6 +3110,7 @@ impl Gen {
             b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
             let bp = b.ins().iadd_imm_s(self.bp, s.off as i64);
             b.ins().store(flags(), bp, self.ctx, offset_of!(JitCtx, bp) as i32);
+            self.publish_fuel(b);
             b.ins().return_(&[v]);
         }
     }
@@ -2810,6 +3133,7 @@ impl Gen {
         b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
         b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
         let res = b.ins().bor_imm_s(status, h as i64);
+        self.publish_fuel(b);
         b.ins().return_(&[res]);
         b.switch_to_block(ok);
     }
@@ -2906,8 +3230,14 @@ impl Gen {
     }
 
     fn call(&self, b: &mut FunctionBuilder, sig: ir::SigRef, f: *const (), args: &[ir::Value]) -> Option<ir::Value> {
+        self.publish_fuel(b);
         let f = b.ins().iconst(I64, f as i64);
         let inst = b.ins().call_indirect(sig, f, args);
+        // Even a cold storage/collection helper can shorten the slice.
+        // Never publish the stale pre-helper SSA count over its request.
+        if self.defer_fuel {
+            self.load_fuel(b);
+        }
         b.inst_results(inst).first().copied()
     }
 
@@ -2917,7 +3247,9 @@ impl Gen {
         let f = if self.loops { b.use_var(self.fuel_var) } else { b.ins().load(I32, flags(), self.fuel, 0) };
         let f = b.ins().iadd_imm_s(f, -1);
         b.def_var(self.fuel_var, f);
-        b.ins().store(flags(), f, self.fuel, 0);
+        if !self.defer_fuel {
+            b.ins().store(flags(), f, self.fuel, 0);
+        }
         let tick = self.exit(b, resume, if self.guarded(resume) { GUARD_TICK } else { TICK });
         Self::guard(b, f, tick);
     }
@@ -2931,10 +3263,7 @@ impl Gen {
             b.ins().jump(slow, &[]);
             return None;
         }
-        let addr = b.ins().iconst(I64, k.closure as i64);
-        let expected = b.ins().load(I64, flags(), addr, 0);
-        let same = b.ins().icmp(IntCC::Equal, f, expected);
-        Self::guard(b, same, slow);
+        self.check_callee(b, f, k, slow);
         let end = b.ins().iadd_imm_s(frame, k.frame_size as i64 * 8);
         let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, self.regs_end);
         Self::guard(b, fits, slow);
@@ -2947,6 +3276,24 @@ impl Gen {
         let compiled = b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
         Self::guard(b, compiled, slow);
         Some(Target::Entry(entry))
+    }
+
+    /// A global's rooted closure, or an indirect site's observed code.
+    fn check_callee(&self, b: &mut FunctionBuilder, f: ir::Value, k: Known, slow: Block) {
+        let same = match k.closure {
+            Some(addr) => {
+                let addr = b.ins().iconst(I64, addr as i64);
+                let expected = b.ins().load(I64, flags(), addr, 0);
+                b.ins().icmp(IntCC::Equal, f, expected)
+            }
+            None => {
+                let p = self.check_kind(b, f, Kind::Closure, slow);
+                let w = b.ins().load(I64, flags(), p, 8);
+                let id = b.ins().band_imm_s(w, crate::heap::CODE_MASK as i64);
+                b.ins().icmp_imm_s(IntCC::Equal, id, k.id as i64)
+            }
+        };
+        Self::guard(b, same, slow);
     }
 
     /// For a call of `f` with `n` arguments whose frame starts at `frame`:
@@ -2996,6 +3343,15 @@ impl Gen {
     /// Inline nursery allocation of `words` words with `header`; goes to
     /// `slow` when the nursery is full or allocation must go through the VM.
     fn alloc(&self, b: &mut FunctionBuilder, words: i64, header: u64, slow: Block) -> ir::Value {
+        let p = self.alloc_words(b, words, slow);
+        let h = b.ins().iconst(I64, header as i64);
+        b.ins().store(flags(), h, p, 0);
+        p
+    }
+
+    /// Reserve nursery words, without collecting; initialize all fields
+    /// before any boundary can observe the new object.
+    fn alloc_words(&self, b: &mut FunctionBuilder, words: i64, slow: Block) -> ir::Value {
         let top_ptr = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_top) as i32);
         let inline = b.ins().icmp_imm_s(IntCC::NotEqual, top_ptr, 0);
         Self::guard(b, inline, slow);
@@ -3006,8 +3362,6 @@ impl Gen {
         let room = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new, end);
         Self::guard(b, room, slow);
         b.ins().store(flags(), new, top_ptr, 0);
-        let h = b.ins().iconst(I64, header as i64);
-        b.ins().store(flags(), h, top, 0);
         top
     }
 
@@ -3398,13 +3752,14 @@ impl Gen {
         b.append_block_param(bail, I64);
         let returned = b.create_block();
         b.append_block_param(returned, I64);
-        // Calls through globals that hold no closure skip the inline path.
-        let known = global.and_then(|g| self.closure_globals.get(&g).copied());
-        let native = global.and_then(|g| self.native_globals.get(&g).copied());
+        // Globals and observed monomorphic indirect calls share the paths.
+        let known = global.map_or_else(|| self.closure_calls.get(&(pc as u32)), |g| self.closure_globals.get(&g)).copied();
+        let native = global.map_or_else(|| self.native_calls.get(&(pc as u32)), |g| self.native_globals.get(&g)).copied();
         let fixnum = native.is_some_and(|k| k.fixnum);
         // What native code knows a fixnum after the call, whatever path
         // the call took.
         let checked = self.fix.get(next).is_some_and(|f| f.contains(base));
+        let checked_float = self.flo.get(next).is_some_and(|f| f.contains(base));
         if let Some(k) = native {
             self.known_native(b, pc, base, n, f, k, slow, returned, false, |g, b, v| {
                 if fixnum {
@@ -3454,6 +3809,7 @@ impl Gen {
         let code = b.ins().iconst(I64, self.code_ptr);
         let ret_pc = b.ins().iconst(I64, next as i64);
         self.call(b, self.sigs.unwind, jit_unwind_push as *const (), &[self.vm, code, ret_pc, self.bp]);
+        self.publish_fuel(b);
         b.ins().return_(&[res]);
 
         b.switch_to_block(done);
@@ -3469,6 +3825,13 @@ impl Gen {
             Self::guard(b, int, other);
             let s = Self::shifted(b, x);
             b.def_var(self.shifts[base as usize], s);
+        } else if checked_float {
+            let x = self.get(b, base);
+            let float = Self::is_float(b, x);
+            let other = self.exit(b, next, RESUME);
+            Self::guard(b, float, other);
+            let f = b.ins().bitcast(F64, MemFlagsData::new(), x);
+            b.def_var(self.fvals[base as usize], f);
         }
         self.jump(b, next);
     }
@@ -3476,14 +3839,23 @@ impl Gen {
     /// Run the callee of call `pc` inline (`sites[site]`) if `f` is the
     /// closure it expects, else go to `slow`.
     fn enter_inlined(&mut self, b: &mut FunctionBuilder, pc: usize, f: ir::Value, site: usize, slow: Block) {
-        let same = match self.same.iter().find(|s| s.0 == site) {
-            Some(&(_, same)) => b.use_var(same),
-            None => {
-                let expected = self.site_closure(b, site);
-                b.ins().icmp(IntCC::Equal, f, expected)
+        if let Some(&k) = self.closure_calls.get(&(pc as u32)) {
+            if let Some(&(_, _, var)) = self.cached_calls.iter().find(|c| c.0 == site) {
+                let same = b.use_var(var);
+                Self::guard(b, same, slow);
+            } else {
+                self.check_callee(b, f, k, slow);
             }
-        };
-        Self::guard(b, same, slow);
+        } else {
+            let same = match self.same.iter().find(|s| s.0 == site) {
+                Some(&(_, same)) => b.use_var(same),
+                None => {
+                    let expected = self.site_closure(b, site);
+                    b.ins().icmp(IntCC::Equal, f, expected)
+                }
+            };
+            Self::guard(b, same, slow);
+        }
         // Counted as a call.
         self.tick(b, pc);
         let zero = b.ins().iconst(I64, 0);
@@ -3577,6 +3949,7 @@ impl Gen {
         let depth32 = b.ins().ireduce(I32, depth);
         let zero = b.ins().iconst(I32, 0);
         let args = [self.vm, self.ctx, frame, callee_bp, zero, depth32];
+        self.publish_fuel(b);
         let inst = match target {
             Target::Own => b.ins().call(self.own, &args),
             Target::Entry(entry) => b.ins().call_indirect(self.sigs.jit, entry, &args),
@@ -3612,13 +3985,14 @@ impl Gen {
         let slow = b.create_block();
         let returned = b.create_block();
         b.append_block_param(returned, I64);
-        let known = global.and_then(|g| self.closure_globals.get(&g).copied());
-        let native = global.and_then(|g| self.native_globals.get(&g).copied());
+        let known = global.map_or_else(|| self.closure_calls.get(&(pc as u32)), |g| self.closure_globals.get(&g)).copied();
+        let native = global.map_or_else(|| self.native_calls.get(&(pc as u32)), |g| self.native_globals.get(&g)).copied();
         if let Some(k) = native {
             // Its value is returned from the callee slot.
             self.known_native(b, pc, base, n, f, k, slow, returned, true, |g, b, v| {
                 b.ins().store(flags(), v, g.r, -8);
                 let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
+                g.publish_fuel(b);
                 b.ins().return_(&[res]);
             });
         } else if let Some(&site) = self.site_at.get(&pc) {
@@ -3689,6 +4063,7 @@ impl Gen {
         let args = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
         let n = b.ins().iconst(I64, n as i64);
         let f = b.ins().iconst(I64, k.f as usize as i64);
+        self.publish_fuel(b);
         let inst = b.ins().call_indirect(self.sigs.native, f, &[self.vm, args, n]);
         let (v, error) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
         // A stop the native made (out of memory, say) ends the slice.
@@ -3707,8 +4082,12 @@ impl Gen {
         let base_v = b.ins().iconst(I64, base as i64);
         let native = b.ins().iconst(I64, k.value as i64);
         let helper = b.ins().iconst(I64, jit_native_unusual as *const () as i64);
+        self.publish_fuel(b);
         let inst = b.ins().call_indirect(self.sigs.unusual, helper, &[self.vm, v, error, self.bp, base_v, native]);
         let (status, frame) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
+        if self.defer_fuel {
+            self.load_fuel(b);
+        }
         // Where the frame is now: the register stack may have moved.
         self.spill_to(b, pc, &deferred, frame);
         b.ins().jump(returned, &[BlockArg::Value(status)]);
@@ -3754,6 +4133,7 @@ impl Gen {
             for (i, v) in self.vars.clone().into_iter().enumerate() {
                 b.def_var(v, args.get(i).copied().unwrap_or(zero));
             }
+            self.reload_calls(b, 0);
             // What the start assumes of the arguments (`Job::observed`),
             // checked as on edges into other entry points (`Gen::target`).
             let live = &self.flow.live_in[0];
@@ -3783,6 +4163,7 @@ impl Gen {
         b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
         b.ins().store(flags(), entry, self.ctx, offset_of!(JitCtx, tail) as i32);
         let res = b.ins().iconst(I64, (TAILCALL as i64) << 32);
+        self.publish_fuel(b);
         b.ins().return_(&[res]);
     }
 
@@ -3813,6 +4194,7 @@ impl Gen {
             b.ins().icmp_imm_s(IntCC::Equal, t, TAG_CHAR)
         };
         match i {
+            Inline::IntegerAdd => self.integer_add(b, args[0], args[1], call),
             Inline::StringLength => {
                 let (_, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
                 tag(b, len, TAG_INT)
@@ -3890,6 +4272,7 @@ impl Gen {
         b.ins().br_table(k, jt);
         b.switch_to_block(returned);
         let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
+        self.publish_fuel(b);
         b.ins().return_(&[res]);
     }
 
@@ -4026,6 +4409,7 @@ impl Gen {
                 let v = self.get(b, r);
                 b.ins().store(flags(), v, self.r, -8);
                 let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
+                self.publish_fuel(b);
                 b.ins().return_(&[res]);
             }
             Op::Call { .. } | Op::CallG { .. } => self.call_op(b, pc, op),
@@ -4090,6 +4474,10 @@ impl Gen {
                 self.branch(b, eq, next, t as usize);
             }
             Op::JNPair { a, t } => {
+                if self.pairs[pc].contains(a) {
+                    self.jump(b, next);
+                    return;
+                }
                 let x = self.get(b, a);
                 let no = self.target(b, t as usize);
                 self.check_kind(b, x, Kind::Pair, no);
@@ -4158,7 +4546,7 @@ impl Gen {
             Op::Car { dst, a } | Op::Cdr { dst, a } => {
                 let slow = self.step(b, pc);
                 let x = self.get(b, a);
-                let p = self.check_kind(b, x, Kind::Pair, slow);
+                let p = if self.pairs[pc].contains(a) { self.ptr(b, x) } else { self.check_kind(b, x, Kind::Pair, slow) };
                 let offset = if matches!(op, Op::Car { .. }) { 8 } else { 16 };
                 let v = b.ins().load(I64, flags(), p, offset);
                 self.set(b, dst, v);
@@ -4180,6 +4568,12 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::PairP { dst, a } => {
+                if self.pairs[pc].contains(a) {
+                    let t = Self::imm(b, Value::TRUE);
+                    self.set(b, dst, t);
+                    self.jump(b, next);
+                    return;
+                }
                 let x = self.get(b, a);
                 let no = b.create_block();
                 self.check_kind(b, x, Kind::Pair, no);
@@ -4248,6 +4642,16 @@ impl Gen {
         }
     }
 }
+
+#[cfg(test)]
+fn code_for_test<'a>(vm: &'a mut Vm, name: &str) -> &'a Code {
+    let f = vm.eval_source_raw(name).unwrap();
+    unsafe { &*vm.closure_code(f) }
+}
+
+#[cfg(test)]
+#[path = "jit/tests.rs"]
+mod feedback_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4425,7 +4829,7 @@ mod tests {
                         start: 1,
                         code: 0,
                         frame: 8,
-                        closure: 0,
+                        closure: SiteClosure::Root(0),
                         consts: 0,
                         const_bits: vec![],
                     };
@@ -4558,6 +4962,8 @@ mod tests {
             res: 0,
             moves: vm.moves,
             cage: vm.heap.cage_base(),
+            vm: &mut vm,
+            fast_root: 0,
         };
         let result = unsafe { jit_after_call(&mut vm, &mut ctx, (TAILCALL as u64) << 32, 1, 0) };
         assert_eq!(result, (RETURNED as u64) << 32);

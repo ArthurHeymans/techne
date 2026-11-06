@@ -37,6 +37,7 @@ pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), cr
         }
     };
     vm.flush();
+    vm.report_jit_stats();
     if std::env::var_os("TECHNE_GC_STATS").is_some() {
         eprintln!("{:?}", vm.heap().stats);
     }

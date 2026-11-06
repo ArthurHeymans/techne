@@ -205,6 +205,7 @@ impl Vm {
             jit_callers: _,
             young_consts: _,
             jit_error: _,
+            jit_stats: _,
             poisoned: _,
             jit_unwind: _,
             interrupt: _,

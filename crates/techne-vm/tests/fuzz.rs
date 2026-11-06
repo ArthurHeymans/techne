@@ -569,6 +569,7 @@ fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Optio
         .arg(file)
         .env_remove("TECHNE_IR")
         .env_remove("TECHNE_JIT")
+        .env_remove("TECHNE_JIT_SYNC")
         .env_remove("TECHNE_GC_STRESS")
         .env_remove("TECHNE_JIT_INLINE")
         .env("TECHNE_GC_VERIFY", "1")

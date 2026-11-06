@@ -130,6 +130,20 @@ fn a_break_reaches_a_loop_of_calls_promptly() {
     }
 }
 
+/// Numeric native recursion must hand over its exact frames at fuel
+/// exhaustion too, not merely poll when it calls a Rust/native builtin.
+#[test]
+fn numeric_recursion_polls_breaks_and_kills() {
+    for (mode, mut vm) in vms() {
+        eval(&mut vm, "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 24)");
+        let caught = eval_stopped(&mut vm, "(guard (e (#t 'caught)) (ready) (fib 45))", &[Stop::Break]);
+        assert_eq!(caught.unwrap(), "caught", "{mode}");
+        let killed = eval_stopped(&mut vm, "(ready) (fib 45)", &[Stop::Kill]).unwrap_err();
+        assert!(killed.is_kill(), "{mode}: {killed}");
+        assert_eq!(eval(&mut vm, "(collect-garbage 'full) (fib 10)"), "55", "{mode}");
+    }
+}
+
 /// A child task (`spawn #:child`) is killed with what spawned it, a
 /// top-level execution or a task, and theirs with it; other tasks go on.
 #[test]

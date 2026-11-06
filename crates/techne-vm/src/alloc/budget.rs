@@ -75,6 +75,12 @@ impl Budget {
         self.0.held.load(Relaxed)
     }
 
+    /// Diagnostic owner total, including globally intercepted allocations.
+    /// Reading flushes this thread's delta, not other threads' pending ones.
+    pub(crate) fn accounted(&self) -> usize {
+        self.0.account.map_or_else(|| self.held(), AccountRef::held)
+    }
+
     pub fn limit(&self) -> usize {
         self.0.limit.load(Relaxed)
     }

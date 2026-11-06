@@ -4,6 +4,78 @@ The tables are the record. A run's raw output lands in `results/`
 (gitignored, like `http/results/`): rerun `run.sh` to reproduce a
 table, and see gh-pages for CI's instruction-count history.
 
+## Bounded runtime improvements, 2026-11-05
+
+Against `eda95c01`, on an EPYC 3151: indirect-call control **28.9 → 8.6 ms**,
+HOF **575 → 342 ms**, and HOF peak RSS over ten calls **738 → 97 MiB**.
+The default nursery stays 8 MiB. Most other existing workloads remain
+essentially flat. Native compilation remains close to baseline; no general
+optimizing tier or recompilation was added.
+
+See [HILLCLIMB.md](HILLCLIMB.md) for the full table, instruction-count
+ablations, compilation costs, rejected allocation policy and reproduction
+with the Scheme [compare.scm](compare.scm) harness. These are before/after
+Techne measurements, not a new V8-parity claim.
+
+The [follow-up investigation](INVESTIGATION.md) finds normal compiled-call
+pressure rather than frequent deoptimization in fib/tak, rejects a numeric
+register-retention experiment, and fixes the retained compiler-workspace test
+without loosening it. The final runtime timings stay essentially unchanged.
+
+## Bounded numeric recursive calls, 2026-11-05
+
+A subsequent [numeric kernel](FAST-CALLS.md), keeping the ordinary JIT as
+fallback: fib **155.8 -> 100.5 ms** (-35.5%), tak **231.4 -> 125.2 ms**
+(-45.9%). Five alternating process pairs / ten calls; whole-process counted
+instructions fall 38.0% / 45.6%. Other workloads admit no kernel.
+
+Fresh matching Node 24.21 controls are 74.2 / 117.3 ms: these two Techne
+workloads are now **1.35x / 1.07x** warmed Node, not a general parity claim.
+The tradeoff is explicit: selected native compilations cost 5.0 -> 8.3 ms
+and 8.5 -> 14.1 ms, code mappings 4 -> 8 and 8 -> 16 KiB. Admission, precise
+GC/error/preemption exits, depth bounds, measurements and reproduction are
+in [FAST-CALLS.md](FAST-CALLS.md). `TECHNE_JIT_FAST=0` is the same-binary control.
+
+## Callback and scalar-loop follow-up, 2026-11-06
+
+Against the numeric-kernel baseline, unchanged workloads: direct control
+**6.03 -> 4.35 ms**, indirect **8.56 -> 6.04 ms**, HOF **338.5 -> 302.5 ms**,
+qsort **178.0 -> 160.0 ms**. Three alternating pairs / eight calls; whole
+process instructions fall 8.2%, 23.1%, 14.9%, 4.0% respectively. Fib/tak stay
+flat. New scalar controls improve **72.7 -> 25.5 ms** (wide exact sum) and
+**35.6 -> 15.8 ms** (inexact sum), not application-speedup claims.
+
+The retained changes publish fuel only at boundaries of bounded inlined
+loops, cache invariant callback code guards without caching captures, and
+inline exact i64/fixnum/ordinary float addition through the original `+`
+procedure. All fallback/GC/preemption/error contracts remain. Costs include
+HOF native compilation **18.8 -> 22.5 ms**, peak RSS **99,248 -> 100,512 KiB**;
+nqueens is about 2% slower by wall time despite flat instructions. No
+parsing/vector-bound improvement is claimed. Wider regressing policies were
+rejected. Full data, ablations, 117-unit/378-conformance validation, caveats
+and reproduction: [LOOPS.md](LOOPS.md).
+
+## Review: interpreter HOF cost, 2026-11-06
+
+The full-nursery list policy has an interpreter-only cost as well as the
+compiled HOF/RSS gains above. With `TECHNE_JIT=0`, HOF performs more minor
+collections and promotion copying when its temporary lists occupy the
+nursery. This is a real tradeoff, not timing noise or a universal speedup.
+
+Review also found avoidable feedback-helper calls with JIT disabled or a
+function's compilation already settled. Gating those calls in the dispatch
+loop reduces the interpreter HOF count from **3,661,225,584** to
+**3,588,194,406** instructions. Against main `1356a30`'s CI reference of
+**3,388,697,697**, the remaining cost is **5.9%**. The review rebuild's
+compiled HOF count is **963,016,976**. These are whole-process cachegrind
+counts on the unchanged `programs/hof.scm`, via `PROGS=hof` and
+`TECHNE_VM=... techne run runtime/bench/icount.scm` in `nix develop`.
+
+Retain the list policy for its compiled HOF throughput and peak-RSS gains
+rather than reverting it to hide this interpreter cost. PR #334 accepts
+this specific regression using the repository's `accepted-regression`
+mechanism; the 5% benchmark threshold remains unchanged.
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror

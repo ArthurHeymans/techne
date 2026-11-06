@@ -19,7 +19,10 @@ fully hygienic.
   - Nursery: 256 KiB until the world's first collection, then 8 MiB
     (`TECHNE_NURSERY_KB`) if its memory limit has room; bump-allocated
     (also inline in JIT code), copied out en masse by each minor
-    collection. A world that never collects holds little.
+    collection. A world that never collects holds little. Bulk lists may
+    use the entire existing nursery: a list of small pairs is not one
+    large object. Other bulk allocations retain their half-nursery cutoff;
+    no larger default nursery or new large-object policy is needed.
   - Old generation: non-moving. Small objects live in blocks of one size
     class each (32 KiB for a class's first, doubling up to 256 KiB; exact
     up to 16 words, then about 12.5% apart), allocated
@@ -124,7 +127,11 @@ fully hygienic.
   background thread compiles it from a self-contained job, and the VM
   installs the result when it next counts calls. Its entry points (pc 0,
   loop heads, the instruction after each call) become `EnterJit`
-  instructions, where the interpreter enters native code.
+  instructions, where the interpreter enters native code. The compiler
+  reuses its small-function working buffers; after a job exceeds 2,048
+  pre-optimization IR instructions or 256 registers it discards those
+  buffers, not executable code or arena declarations. A rare large loader
+  therefore does not set the world's permanent compiler-workspace size.
   - Native code runs straight-line instructions, branches, loops, closure
     creation, calls to Rust natives, and calls to other compiled functions,
     including rest-argument ones. Calls go on the native stack without
@@ -133,8 +140,8 @@ fully hygienic.
     jump, and a tail call to a Rust native returns its value directly.
   - Call sites through a global are specialised for the procedure the
     global held when the function was queued. For a closure, one comparison
-    of its code pointer replaces the arity and frame checks, and recursion
-    is a direct call. For a Rust native, one comparison of the global's
+    of its identity replaces tag and arity checks; frame capacity is still
+    checked. Recursion is a direct call. For a Rust native, one comparison of the global's
     value; the arity is checked when compiling, and native code calls the
     native's function itself: `natives!` defines each with the C calling
     convention, returning its value and its error, if any, in two machine
@@ -144,6 +151,18 @@ fully hygienic.
     grow) tells the common case. Known fixnums are stored to memory only
     if native code is left after the call. A redefinition only makes the
     guard fail.
+  - Indirect calls record one target at each of at most four sites per
+    function before its one compilation. A second target makes the site
+    generic permanently. Feedback holds only code ids or native indices,
+    not closures; live ids are resolved and code dependencies retained
+    when queued. Closure sites guard the code id, so distinct instances
+    of the same lambda use their own captured environment. Non-tail
+    indirect calls can run small callees inline under the same size and
+    depth limits as globals. Their actual closure stays in the call's
+    base register, live through nested inlinees and GC. Indirect tail
+    calls use the guarded compiled-call path, not frame-replacing
+    inlining. Native targets reuse the direct native-call paths. A failed
+    guard uses the generic call; no extra versions or recompilation.
   - Small functions run inline at call sites specialised for their
     closure: at most 20 instructions, no loops, handlers, closures made or
     calls but of Rust natives (at most one without an inline case) and of
@@ -220,25 +239,61 @@ fully hygienic.
     they do not, as do self tail calls. So loop counters that start from
     the function's parameters are known fixnums: qsort takes 22% fewer
     instructions, mandel 28%; with arguments assumed, nqueens 8% fewer.
-  - A function that loops counts the calls and back-edges for preemption
-    and stops in a machine register, writing it through to memory (which
-    callees and the interpreter count in): the count does not wait for
-    memory.
+  - Kind facts also reuse successful pair accesses and `cons` results:
+    `car`, `cdr` and predicates need not repeat a proven pair check. OSR
+    loaders validate those facts independently. Argument kinds flow into
+    indirect inlinees too; fixnum and float return kinds flow back out,
+    with checks on the generic fallback's result. Use/definition metadata
+    is computed once for the analyses, and register sets iterate only
+    their set bits, not all 64 positions per word.
+  - Small fixed-arity (1–3 arguments), self-recursive integer functions
+    can also use a bounded numeric call kernel: native arguments/results,
+    one numeric SSA form and no per-recursion VM-register traffic. It checks
+    actual closure identity, tags, fuel and capacity/depth; exact slow exits
+    materialize initialized frames before anything can collect. The original
+    entry/OSR path stays compiled for other inputs. Kernel and fallback code
+    are budgeted/reclaimed together; no recompilation. The extra compilation
+    costs milliseconds, not zero; see [FAST-CALLS.md](bench/FAST-CALLS.md).
+  - Loops count calls/back-edges in a machine register. With bounded
+    Scheme inlinees, publish the exact count at native calls/exits instead
+    of every tick; reload after helpers so pressure/stop notifications win.
+    Pure loops retain write-through counting. Polls and resume pcs do not
+    move. Repeated indirect inline sites can also cache a boolean code guard
+    for immutable formal arguments, refreshed at OSR/native entry and
+    self-tail rebinding; actual closures/captures are never cached.
   - Inline: fixnum and float arithmetic (including mixed), comparisons,
     `quotient`/`remainder`/`modulo`, pair and vector access, globals,
     boxes, and nursery allocation for `cons` and boxes. At call sites
     specialised for them, the common case of a few natives:
     `string-length` and `string-ref` of ASCII strings, `vector-length`,
     `bytevector-u8-ref`, `char->integer`, `char=?` of two characters,
-    `%record-ref` (record accessors) (anything else calls the native).
+    `%record-ref` (record accessors), and two-argument first-class `+` on
+    fixnums/one-limb signed-i64 integers or ordinary fixnum/float inputs.
+    Integer results normalize to the original representation; overflow,
+    other kinds and allocation fallback call the native. The procedure's
+    initial zero addition (including signed-zero semantics) is retained.
+    See [LOOPS.md](bench/LOOPS.md) for measured tradeoffs and exclusions.
   - Environment: `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the
     threshold (`1` compiles everything synchronously, for testing),
     `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_INLINE=0`
-    runs no function inline, `TECHNE_JIT_LOG=1`
+    runs no function inline, `TECHNE_JIT_FEEDBACK=0` disables indirect-call
+    feedback/specialization, `TECHNE_JIT_PAIRS=0` disables pair facts,
+    `TECHNE_JIT_FAST=0` disables numeric recursive kernels,
+    `TECHNE_JIT_FUEL=0` restores per-tick publication,
+    `TECHNE_JIT_CALL_CACHE=0` disables invariant argument guard caching,
+    `TECHNE_JIT_WIDE_ADD=0` disables first-class scalar addition (read once
+    per process); these are developer ablations, `TECHNE_JIT_LOG=1`
     reports compiled functions and compile times (and entry points handed
     back to the interpreter), `TECHNE_JIT_IR=1` reports
     IR sizes (`=name` prints that function's IR), `TECHNE_JIT_ASM=name`
-    prints that function's machine code. From Rust: `vm.set_jit`.
+    prints that function's machine code. `TECHNE_JIT_STATS=1` collects
+    bounded interpreter/JIT-boundary counters and STEP operand classes
+    (no generated-code instrumentation), printed by the CLI on exit.
+    `TECHNE_JIT_MEMORY=1` logs owner bytes before/after compilation and
+    buffer trimming; use synchronous compilation for attribution.
+    `TECHNE_JIT_CACHE=0` discards all working buffers, `=1` retains all;
+    absent, the size-bounded reuse policy applies. These are developer
+    ablations, not extra compiler tiers. From Rust: `vm.set_jit`.
 - **Macros** (`expand.rs`): `syntax-rules` with nested/middle ellipses, literals,
   `_`, vector and improper patterns, custom ellipsis, `(... ...)`. Hygiene by
   Clinger–Rees renaming: template identifiers become aliases that are fresh when
