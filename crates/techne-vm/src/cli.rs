@@ -41,6 +41,10 @@ pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), cr
     if std::env::var_os("TECHNE_GC_STATS").is_some() {
         eprintln!("{:?}", vm.heap().stats);
     }
+    #[cfg(feature = "allocation-census")]
+    if let Some(census) = vm.heap().allocation_census() {
+        eprintln!("allocation-census: {census:?}");
+    }
     // The process ends here: freeing the world object by object (its
     // symbols, codes, heap blocks) would only delay the exit.
     std::mem::forget(vm);

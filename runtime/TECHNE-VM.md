@@ -62,6 +62,13 @@ fully hygienic.
     progress and 64-word slices; `=full` completes a whole cycle on every
     allocation. `TECHNE_GC_STATS=1` prints counts, times, the longest pause,
     minor collection and slice, and the most words marked in one pause.
+    Developer builds with Cargo feature `allocation-census` can also set
+    `TECHNE_ALLOC_CENSUS=1`: `gc-stats` and CLI exit then report cumulative
+    nursery pair/integer counts and separately unclassified direct-old
+    requests. It samples before GC forwarding, includes the current nursery
+    tail, and does not count promotion again. It retains no guest roots, and is
+    compiled out of normal builds. See [HOF.md](bench/HOF.md) and the Scheme
+    [allocation runner](bench/allocations.scm); do not time census-enabled runs.
   - Code is collected too. Each `Code` (bytecode, constants, spans) has a
     handle on the heap holding its constants and the handles of the codes
     it makes closures of; the closures its machine code expects to call

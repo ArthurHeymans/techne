@@ -1912,6 +1912,15 @@ fn gc_stats(vm: &mut Vm, _: usize, _: usize) -> R {
     // The statistics hold how long collections took.
     vm.need(crate::vm::Capability::Clock, "gc-stats")?;
     let s = format!("{:?}\n", vm.heap.stats);
+    #[cfg(feature = "allocation-census")]
+    let s = {
+        use std::fmt::Write as _;
+        let mut s = s;
+        if let Some(census) = vm.heap.allocation_census() {
+            writeln!(&mut s, "allocation-census: {census:?}").expect("writing a string");
+        }
+        s
+    };
     crate::ports::admit_standard(vm, &s)?;
     vm.out.write_error(&s);
     Ok(Value::VOID)

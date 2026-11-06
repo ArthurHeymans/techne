@@ -102,6 +102,29 @@ Full paired data, fresh Node table, compilation/RSS, independent ablations,
 118-library/378-conformance/13-hostile validation and reproduction:
 [STRINGS.md](STRINGS.md).
 
+## Adversarial correction and HOF allocation census, 2026-11-06
+
+The PR #337 review reproduced stale native identity after a compiled mutator
+and implicit self-tail jump. Global anticipation now includes the possible
+pc-0 edge, so the existing call-return reload points refresh needed globals.
+The regression was observed failing before and passing after the fix, with
+both functions compiled and the mutator not inlined. See [STRINGS.md](STRINGS.md)
+for the correctness fix and the paired qsort wall-time caveat.
+
+A separate, compile-time-optional nursery census profiles the unchanged warmed
+HOF source: one ten-round `run` requests **5,200,000 pairs / 124,800,000 bytes**
+and **320,061 wide integers / 5,120,976 bytes**. These are **96.058% / 3.942%**
+of guest allocation bytes; other objects total 400 bytes, and direct-old
+allocation requests are zero. Three processes and one/three warmups agree.
+
+The calibration test distinguishes actual inline allocation from native
+fallback under nursery exhaustion. Normal builds contain no census machinery.
+A fresh non-census Callgrind profile still emphasizes minor GC and reverse
+(overlapping inclusive costs). The next investigation should focus on pair
+lifetime/promotion and reversal work, not assume wide-loop unboxing is the
+largest win. No new throughput speedup is claimed. Methods, caveats, exact
+counts, feature-gated tests and reproduction: [HOF.md](HOF.md).
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror

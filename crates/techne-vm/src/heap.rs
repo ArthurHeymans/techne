@@ -44,6 +44,8 @@ use crate::{
     value::Value,
 };
 
+#[cfg(feature = "allocation-census")]
+mod census;
 mod verify;
 
 /// Keep GC storage as vectors, not boxes: raw object pointers remain usable
@@ -584,6 +586,9 @@ pub struct Heap {
     /// collection (`verify`).
     pub verify: bool,
     pub stats: GcStats,
+    /// Developer-only census; no guest roots or per-allocation JIT probes.
+    #[cfg(feature = "allocation-census")]
+    census: Option<Box<census::Census>>,
 }
 
 /// Visitor over root slots, supplied by the VM.
@@ -614,6 +619,8 @@ pub(crate) fn marked(v: Value) -> bool {
 
 impl Heap {
     pub(crate) fn new_in(budget: Budget) -> Heap {
+        #[cfg(feature = "allocation-census")]
+        let census = if std::env::var("TECHNE_ALLOC_CENSUS").as_deref() == Ok("1") { census::Census::new(&budget) } else { None };
         let nursery_max = nursery_words();
         let words = NURSERY_START.min(nursery_max);
         // A cage of its own: no value of another world names its memory.
@@ -655,6 +662,8 @@ impl Heap {
             stress_full: std::env::var("TECHNE_GC_STRESS").is_ok_and(|v| v == "full"),
             verify: std::env::var_os("TECHNE_GC_VERIFY").is_some(),
             stats: GcStats::default(),
+            #[cfg(feature = "allocation-census")]
+            census,
         }
     }
 
@@ -720,6 +729,10 @@ impl Heap {
     /// scans it.
     pub(crate) fn alloc_old(&mut self, words: usize) -> *mut u64 {
         let p = self.old.alloc(words);
+        #[cfg(feature = "allocation-census")]
+        if let Some(census) = &mut self.census {
+            census.old(words);
+        }
         self.remembered.push(p);
         p
     }
@@ -741,6 +754,15 @@ impl Heap {
             // Marked when the next minor collection scans it.
             return self.alloc_old(words);
         }
+        #[cfg(feature = "allocation-census")]
+        {
+            let p = self.old.alloc(words);
+            if let Some(census) = &mut self.census {
+                census.old(words);
+            }
+            p
+        }
+        #[cfg(not(feature = "allocation-census"))]
         self.old.alloc(words)
     }
 
@@ -1064,6 +1086,8 @@ impl Heap {
     /// Copy live nursery objects into the old generation; returns the words
     /// promoted.
     fn minor(&mut self, roots: &mut dyn Roots) -> usize {
+        #[cfg(feature = "allocation-census")]
+        self.count_nursery();
         self.promoted = 0;
         unsafe {
             roots.visit(&mut |v| *v = self.evacuate(*v));
