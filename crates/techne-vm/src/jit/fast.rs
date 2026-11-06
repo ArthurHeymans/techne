@@ -84,10 +84,10 @@ pub(super) fn plan(job: &Job) -> Option<Plan> {
         if flow.live_in[pc].iter().any(|r| !fix[pc].contains(r as Reg)) {
             return None;
         }
-        if let Op::CallG { base, .. } = *op {
-            if flow.live_out[pc].iter().any(|r| r > base as usize) {
-                return None;
-            }
+        if let Op::CallG { base, .. } = *op
+            && flow.live_out[pc].iter().any(|r| r > base as usize)
+        {
+            return None;
         }
     }
     Some(Plan { flow, advance })

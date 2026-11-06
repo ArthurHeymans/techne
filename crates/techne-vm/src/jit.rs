@@ -2143,12 +2143,12 @@ impl Jit {
             .enumerate()
             .map(|(pc, op)| {
                 let (mut uses, defs) = uses_defs(op, &job.captures);
-                if let Some(o) = origin[pc] {
-                    if let SiteClosure::Register(r) = sites[root(&sites, o.site)].closure {
-                        // Exits can materialize the actual captured environment
-                        // at any instruction, including inside a nested inlinee.
-                        uses.push(r);
-                    }
+                if let Some(o) = origin[pc]
+                    && let SiteClosure::Register(r) = sites[root(&sites, o.site)].closure
+                {
+                    // Exits can materialize the actual captured environment
+                    // at any instruction, including inside a nested inlinee.
+                    uses.push(r);
                 }
                 (uses, defs)
             })
@@ -2446,10 +2446,10 @@ impl Jit {
             if n > frame {
                 g.room(&mut b, h, n);
             }
-            if h == 0 {
-                if let Some(kernel) = &kernel {
-                    fast::enter(module, &mut b, &g, kernel, job);
-                }
+            if h == 0
+                && let Some(kernel) = &kernel
+            {
+                fast::enter(module, &mut b, &g, kernel, job);
             }
             g.reload(&mut b, &g.flow.live_in[h].clone());
             g.reload_calls(&mut b, h);

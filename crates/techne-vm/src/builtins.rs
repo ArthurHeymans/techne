@@ -64,7 +64,9 @@ impl Bulk {
     /// old space above the general bulk allocator's half-nursery cutoff.
     pub fn list(vm: &mut Vm, count: usize) -> Result<Bulk, Error> {
         let words = 3 * count;
-        if words > vm.heap.nursery_capacity() {
+        // Preserve bulk admission even when these pairs now fit the
+        // nursery: their eventual promotion still consumes old space.
+        if words >= vm.heap.nursery_capacity() / 2 {
             vm.admit_items(words, 8, 0)?;
         }
         Ok(Bulk::reserve_list(vm, words))
@@ -2522,6 +2524,16 @@ pub(crate) fn install(vm: &mut Vm) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nursery_bulk_lists_still_require_memory_admission() {
+        let mut vm = Vm::bare();
+        let _world = vm.enter_account();
+        vm.full_collect_raw();
+        vm.set_memory_limit(vm.held().total());
+        let count = vm.heap.nursery_capacity() / 4;
+        assert!(Bulk::list(&mut vm, count).is_err());
+    }
 
     #[test]
     fn bulk_lists_use_all_of_the_existing_nursery_and_survive_collection() {
