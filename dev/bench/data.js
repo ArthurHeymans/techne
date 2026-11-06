@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793957955182,
+  "lastUpdate": 1793957957856,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -49424,6 +49424,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642333529,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106059,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8dad6b8bb858dc0dc19aea93e635ae6e6a0ada38",
+          "message": "Merge pull request #336 from ArthurHeymans/debugger/bounded-procedure-tracing\n\ndebugger: add bounded task-aware procedure tracing",
+          "timestamp": "2026-11-06T10:20:08+01:00",
+          "tree_id": "114e0950aba72d8ade13cdab16dba8e4757d19fc",
+          "url": "https://github.com/ArthurHeymans/techne/commit/8dad6b8bb858dc0dc19aea93e635ae6e6a0ada38"
+        },
+        "date": 1793957957788,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690378003,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642688373,
             "unit": "instructions"
           },
           {
