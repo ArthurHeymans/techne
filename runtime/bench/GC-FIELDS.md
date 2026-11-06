@@ -1,12 +1,17 @@
-# Experimental minor-GC field scanning — not promoted to PR #337
+# Checked minor-GC field scanning — quiet-machine follow-up
 
-Status: preserve this experiment separately; **do not treat it as a retained
-throughput improvement**. Instruction counts are promising, but wall-time
-results are mixed, later samples were contended by unrelated compiler jobs,
-and the shared `target/` directory (including the Techne measurement binary)
-was removed externally before the final measurement/validation matrix finished.
-No unrelated jobs were stopped and no replacement build was started into that
-activity. PR #337 remains at the prior published checkpoint `d0e723d7`.
+Status: the quiet-machine recheck and remaining integrations are complete.
+HOF/hash improve reproducibly, but tak/nqueens have a small cross-binary cost
+that is absent in scanner ablation. **Keep this as a separate checkpoint pending
+that tradeoff's resolution or approval**, not an unconditional no-regression
+win. PR #337 merged at `d0e723d7` during this work; it was not modified.
+
+The initial experiment was interrupted by unrelated compiler load and external
+removal of `target/`. After the machine became quiet, the Techne harness was
+rebuilt, source hashes checked, and the rebuilt VM verified byte-for-byte equal
+to the saved candidate. No unrelated jobs were stopped. The resumed timing
+comparisons each had a once-per-second competing-build audit; all three audit
+logs are empty. Fresh pre/post samples also showed 99% CPU idle.
 
 ## Attribution
 
@@ -30,8 +35,8 @@ phase. This attributes the collection site, not every copied pair to a source
 variable. Nursery phase and preceding probes matter; it is not a universal
 promotion ratio. Almost all promoted bytes are pairs. The original/default
 scanner's allocation, promotion, reverse counters and answers matched exactly
-in the fully checked, per-heap-selector trial (`checked-promotion-*.json`).
-The final process-selector trial still needs that repeat.
+for all four probes in the final process-selector recheck
+(`resume/promotion-{reference,fast}.json`).
 
 ## Candidate mechanism
 
@@ -55,7 +60,50 @@ fast/reference variants each support marking/non-marking and ephemeron
 continuation. Rust is necessary for the collector's memory-safety mechanism;
 measurement orchestration and reporting stay Scheme.
 
-## Final process-selector evidence
+## Quiet-machine recheck
+
+CPU 4, synchronous JIT threshold 1000, alternating process pairs. Seven fresh
+process pairs per application, twelve unchanged `run` calls per process,
+median of the final six calls, then median across processes:
+
+| Application | Baseline ms | Candidate ms | Change |
+|---|---:|---:|---:|
+| HOF | 316.621 | 306.2685 | -3.27% |
+| Hash | 321.891 | 308.685 | -4.10% |
+| Qsort | 161.891 | 161.2295 | -0.41% |
+
+Seven-pair same-binary original/default scanner ablation:
+
+| Application | Original scanner ms | Default ms | Change |
+|---|---:|---:|---:|
+| HOF | 316.229 | 306.199 | -3.17% |
+| Hash | 319.7185 | 308.1975 | -3.60% |
+| Qsort | 162.446 | 160.413 | -1.25% |
+
+A separate five-pair, ten-call broad pass gave HOF **310.178 -> 303.389 ms
+(-2.19%)**, hash **322.008 -> 306.838 ms (-4.71%)**, and qsort -1.03%.
+Report a modest **2–3% HOF / roughly 4% hash** warmed improvement, not startup
+wins or a new Node parity claim. Qsort shows no regression in these repeats;
+no qsort gain is claimed.
+
+The other eight controls have no claimed gain. Broad-pass tak was +1.07%
+and nqueens +0.76%; targeted seven-pair repeats gave **+1.18% / +1.16%**.
+Their same-binary scanner ablations are **+0.06% / -0.14%**, essentially flat.
+This separates the scanner mechanism from cross-binary layout effects, but
+**does not erase the observed cross-binary costs** or establish zero regression.
+The remaining broad controls range from -0.62% to +0.23%.
+
+Native compilation is effectively flat in the broad logs: HOF **22.38 / 22.20
+ms**, hash **17.73 / 17.64 ms**. Ordinary benchmark GC counts/promoted words
+match (HOF 160 minors / 8 full / 67,193,004 words; hash 19 / 0 / 5,304,378).
+The gain is less tracing work, not fewer allocations or promotions.
+
+Static Rust executable text grows **27,244 bytes** (11,145,375 -> 11,172,619),
+about 0.24%. Three-process median HOF peak RSS is **100,084 -> 100,624 KiB**,
+an observed **540 KiB increase**, not a memory reduction. No larger nursery,
+budget ceiling, memory ratchet or JIT admission bound was introduced.
+
+## Instruction counts and earlier process-selector evidence
 
 Normal release/counting-allocator binary, synchronous JIT threshold 1000,
 unchanged source. Same-binary Cachegrind, two calls including boot and
@@ -89,9 +137,8 @@ of the extent check and must not support a performance claim.
 The candidate reduces work, **not** allocation or promotion. It does not
 change the nursery/window, roots, admission, promotion policy, collection
 triggers, list semantics or arithmetic. There is no automatic callback fusion,
-destructive reversal or new JIT tier. Compiling both Rust scanner variants has
-an executable-text cost; final RSS and text-size comparison remain to be
-completed. Do not infer a memory or compilation improvement.
+destructive reversal or new JIT tier. The executable-text/RSS costs are reported
+above. Do not infer a memory or compilation improvement.
 
 ## Validation and next decision
 
@@ -107,16 +154,17 @@ On the final process-selector source:
   environment mutation inside parallel tests.
 - Strict Clippy in normal/diagnostic configurations, no-default-features checks
   with/without the census, and formatting pass. LSP is inconclusive.
-- All regular integrations passed on the preceding checked per-Heap variant;
-  their final process-selector rerun was blocked when `target/` disappeared.
+- **All regular counting-allocator integrations now pass on the final
+  process-selector source**, along with the 121 library tests. The first
+  rebuild/test invocation hit its outer time budget after compilation;
+  the cached complete rerun passed. No failed or partial run is counted as
+  complete validation.
 
-Resume by rebuilding a Techne harness and final binary after shared build
-activity is resolved. Repeat complete, CPU-pinned alternating process pairs
-against the frozen baseline and original/default ablation, including qsort;
-verify counters, text size, RSS and all integrations on that exact head. Retain
-only reproducible gains without regressions. Otherwise discard the scanner and
-keep the attribution instrumentation. Do not widen existing safety/memory
-ratchets or rewrite workloads to obtain a win.
+Next decision: resolve or explicitly approve the small cross-binary
+recursive/vector-control costs before promoting the checkpoint. Do not widen
+existing safety/memory ratchets, dismiss layout costs as nonexistent, or
+rewrite workloads to obtain a win. Otherwise keep only the attribution
+instrumentation.
 
 The Scheme runner is `runtime/bench/allocations.scm`; `PROBES` selects phases.
 Use a current `allocation-census` binary for the added promotion/reverse fields.
@@ -134,7 +182,12 @@ All paths below are under `/tmp/techne-pairs/`:
   `fabe99e7e21a6eee8b4b040ccc6831c58b4abeb0fbbfe7ff159cf60d375622d9`.
 - Diagnostic `layout-census`, SHA-256
   `9679b43dad738ec6b3fde0a5839377feb868140acc152b717c56dead7bd2924c`.
-- `layout-{runtime,ablation,counts}.json`, `layout-*.log`.
+- Final quiet runs: `resume/{runtime,ablation,broad,control-runtime,control-ablation}.json`.
+- Audit logs: `resume/{competing-builds,broad-competing-builds,control-competing-builds}.log`.
+- `resume/promotion-{reference,fast}.json`, `resume/rss-{before,candidate}-{0,1,2}.txt`.
+- Complete validation: `resume/all-integrations-complete.log`; rebuilt candidate
+  `resume/candidate` has the exact `layout-final` hash above.
+- `layout-{runtime,ablation,counts}.json`, `layout-*.log` retain earlier evidence.
 - `promotion.json`, `checked-promotion-{reference,fast}.json`.
 - Historical/superseded prototypes and interrupted runs are explicitly not
   final throughput evidence; no benchmark child remains running.
