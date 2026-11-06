@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793988379812,
+  "lastUpdate": 1793988381385,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -50120,6 +50120,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642687487,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106059,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4db749c8ed95ca81f7789219bda227f489a2347f",
+          "message": "Merge pull request #337 from ArthurHeymans/perf/vm-native-followup\n\nvm: reduce string and scalar-native overhead",
+          "timestamp": "2026-11-06T18:37:36+01:00",
+          "tree_id": "9b73e4acfd1d6b0e0f1418aad7c24b889a3a4dde",
+          "url": "https://github.com/ArthurHeymans/techne/commit/4db749c8ed95ca81f7789219bda227f489a2347f"
+        },
+        "date": 1793988381313,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690521111,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642689849,
             "unit": "instructions"
           },
           {
