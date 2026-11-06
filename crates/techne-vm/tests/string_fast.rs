@@ -27,7 +27,7 @@ fn run(path: &std::path::Path, jit: &str, enabled: Option<bool>, stress: bool, l
         c.env("TECHNE_GC_STRESS", "full");
     }
     if log {
-        c.env("TECHNE_JIT_LOG", "1");
+        c.env("TECHNE_JIT_LOG", "1").env("TECHNE_JIT_IR", "1");
     }
     c.output().expect("run VM")
 }
@@ -145,6 +145,55 @@ fn native_guard_cache_refreshes_after_calls_and_rejects_local_writes() {
         let out = run(&path, "20", Some(true), false, true);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(String::from_utf8_lossy(&out.stderr).contains("jit-native-cache: drive"));
+    }
+}
+
+#[test]
+fn native_guard_cache_refreshes_on_implicit_self_tail_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("self-tail-native.scm");
+    // A collecting/interpreted mutator reenters a native loader and masks
+    // stale state. Keep this callee compiled but above the inline budget.
+    let writes = "(set! counter (+ counter 1))\n".repeat(8);
+    for (replacement, expected) in [
+        ("(lambda (s i) #\\z)", Some("#\\z")),
+        ("substring", Some("\"a\"")),
+        ("42", None),
+        ("(lambda (s i) (collect-garbage) #\\z)", Some("#\\z")),
+    ] {
+        let source = format!(
+            r#"
+(define read-char string-ref)
+(define counter 0)
+(define (mutate n)
+  {writes}
+  (when (= n 1) (set! read-char {replacement})))
+(define (drive n)
+  (let ((c (let loop ((i 0) (c #\?))
+             (if (= i 3) c (loop (+ i 1) (read-char "a" 0))))))
+    (mutate n)
+    (if (= n 0) c (drive (- n 1)))))
+(write (drive 2000))
+"#
+        );
+        fs::write(&path, source).unwrap();
+        let reference = run(&path, "0", Some(false), false, false);
+        assert_eq!(reference.status.success(), expected.is_some(), "{}", String::from_utf8_lossy(&reference.stderr));
+        if let Some(expected) = expected {
+            assert_eq!(reference.stdout, expected.as_bytes());
+        }
+        let probe = run(&path, "20", Some(true), false, true);
+        let log = String::from_utf8_lossy(&probe.stderr);
+        assert!(log.contains("jit: drive compiled") && log.contains("jit: mutate compiled"), "{log}");
+        assert!(log.contains("jit-native-cache: drive 1 guards"), "{log}");
+        let drive = log.lines().find(|l| l.starts_with("ir: drive ")).expect("drive IR log");
+        assert!(drive.contains("(0 inlined at 0 calls, 0 tail)"), "mutator must not inline: {drive}");
+        for (enabled, stress) in [(Some(false), false), (Some(true), false), (None, false), (Some(true), true)] {
+            let actual = run(&path, "20", enabled, stress, false);
+            assert_eq!(actual.status, reference.status, "{replacement}");
+            assert_eq!(actual.stdout, reference.stdout, "{replacement}, {enabled:?}, stress={stress}");
+            assert_eq!(actual.stderr, reference.stderr, "{replacement}");
+        }
     }
 }
 

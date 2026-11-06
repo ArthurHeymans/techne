@@ -1825,7 +1825,7 @@ fn cached_globals(ops: &[Op], succs: &[Vec<usize>], inlined: &[usize]) -> Vec<(u
 /// (`Gen::reload_globals`): where it does, it reads only these. Calls
 /// read them anew on their way to the next instruction, but for natives
 /// running inline (`inline`).
-fn anticipated(ops: &[Op], cached: &[u32], succs: &[Vec<usize>], inline: impl Fn(usize) -> bool) -> Vec<u16> {
+fn anticipated(ops: &[Op], cached: &[u32], succs: &[Vec<usize>], inline: impl Fn(usize) -> bool, entry0: bool) -> Vec<u16> {
     let bit = |g: u32| cached.iter().position(|&c| c == g).map_or(0, |i| 1 << i);
     let uses: Vec<u16> = ops
         .iter()
@@ -1846,7 +1846,13 @@ fn anticipated(ops: &[Op], cached: &[u32], succs: &[Vec<usize>], inline: impl Fn
     loop {
         let mut changed = false;
         for pc in (0..ops.len()).rev() {
-            let a = succs[pc].iter().filter(|&&s| !reloads(pc, s)).fold(uses[pc], |a, &s| a | ant[s]);
+            let mut a = succs[pc].iter().filter(|&&s| !reloads(pc, s)).fold(uses[pc], |a, &s| a | ant[s]);
+            // A same-code tail call can jump to pc 0 without a native
+            // loader. Conservatively include that edge for global uses
+            // only: local liveness/kind analyses require argument rebinding.
+            if entry0 && matches!(ops[pc], Op::TailCall { .. } | Op::TailCallG { .. }) {
+                a |= ant[0];
+            }
             changed |= a != ant[pc];
             ant[pc] = a;
         }
@@ -2371,7 +2377,7 @@ impl Jit {
             Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n).is_some()),
             _ => false,
         };
-        let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline);
+        let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline, heads.contains(&0));
         let mut g = Gen {
             vm: p[0],
             ctx: p[1],

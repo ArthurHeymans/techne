@@ -356,6 +356,40 @@ Build `/tmp/techne-scan/postmerge`, SHA-256
 The performance tables remain measurements of the explicitly frozen reviewed
 pair above, not newly invented timings for this final rebase.
 
+### Adversarial review: self-tail cache invalidation
+
+GPT-6.1 Sol's independent review found a confirmed wrong-result regression.
+A non-inlineable **compiled** callee changed a cached `string-ref` global after
+its final visible read; an implicit self-tail jump then reused the old native.
+The interpreter and cache-off run returned `#\z`, while cache-on returned
+`#\a`. Collecting/interpreted mutators masked this by reentering a loader.
+
+The fix adds the possible pc-0 self-tail edge to **global anticipation only**.
+Existing invalidating-call return paths now refresh global values, vector
+lengths and native/Scheme identity facts needed on the next tail iteration.
+It does not add that edge to local kind/liveness analyses, where argument
+rebinding needs separate treatment, or blindly reload globals on every tail.
+
+The regression asserts both functions really compile and the mutator is not
+inlined. Native-to-closure, native-to-native, non-procedure and collecting
+replacement cases compare results/full errors against the interpreter with
+cache off/on/default and GC stress. A unit test covers direct and indirect
+implicit tail edges, and the absence of a pc-0 entry. The new fixture was
+observed failing before the fix and passing after it; compilation markers
+alone are not the execution evidence.
+
+Paired fixed-binary recheck: HOF 303.225 -> 303.158 ms, parsing 62.637 ->
+62.693 ms, Mandelbrot 38.413 -> 38.548 ms, effectively flat. Qsort wall time is
+160.454 -> 164.221 ms (+2.3%) despite identical per-function IR counts and
+1,252,891,324 -> 1,252,945,126 whole-process instructions (+0.0043%). Report
+this binary/layout-sensitive wall caveat, not a speedup or a reason to retain
+incorrect semantics. No regressing vector-bound optimization was reintroduced.
+The fixed default passes 120 library tests, all regular integration targets,
+378 conformance trials, 13 hostile tests, strict Clippy, formatting and the
+no-default-feature check. No tests or bounds were relaxed.
+Raw records: `/tmp/techne-hof/{self-tail-red,edge-unit,edge-green}.log`,
+`edge-runtime.json`, `edge-qsort-counts.json` and the frozen before/fixed binaries.
+
 Next targets remain HOF list intermediates/GC and wide-accumulator boxing,
 callback overhead, and vector loops. The regressing local-proof prototype is
 not evidence that every bounds strategy must fail, nor permission to weaken
