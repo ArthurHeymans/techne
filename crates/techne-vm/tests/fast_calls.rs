@@ -5,13 +5,16 @@ use std::{fs, process::Command};
 
 const DENSE: &str = "(define (dense n) (if (= n 0) 0 (let ((a (+ n 1)) (b (+ n 2)) (c (+ n 3)) (d (+ n 4)) (e (+ n 5)) (g (+ n 6)) (h (+ n 7)) (i (+ n 8))) (+ a (+ b (+ c (+ d (+ e (+ g (+ h (+ i (dense (- n 1)))))))))))))";
 
+const LOOP: &str =
+    "(define (with-loop n) (if (= n 0) 0 (+ (let loop ((i 0) (s 0)) (if (= i 10) s (loop (+ i 1) (+ s i)))) (with-loop (- n 1)))))";
+
 #[test]
 fn numeric_kernel_is_compiled_and_can_be_ablated() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("kernel.scm");
     fs::write(
         &file,
-        format!("{DENSE} (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (list (fib 20) (dense 4000)))"),
+        format!("{DENSE} {LOOP} (define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (display (list (fib 20) (dense 4000) (with-loop 300)))"),
     )
     .unwrap();
     for fast in [Some("0"), Some("1"), None] {
@@ -23,8 +26,8 @@ fn numeric_kernel_is_compiled_and_can_be_ablated() {
         let out = command.output().unwrap();
         let log = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{log}");
-        assert_eq!(out.stdout, b"(6765 64160000)");
-        for name in ["fib", "dense"] {
+        assert_eq!(out.stdout, b"(6765 64160000 13500)");
+        for name in ["fib", "dense", "with-loop"] {
             assert!(log.contains(&format!("jit: {name} compiled")), "{log}");
             assert_eq!(log.contains(&format!("fast-jit: {name}")), fast != Some("0"), "{log}");
         }
@@ -50,6 +53,7 @@ fn recursive_fast_calls_preserve_values_exits_and_source_frames() {
     ];
     let mut cases: Vec<String> = cases.into_iter().map(str::to_owned).collect();
     cases.push(format!("{DENSE} (display (dense 4000))"));
+    cases.push(format!("{LOOP} (display (with-loop 300))"));
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("fast-calls.scm");
     for source in cases {

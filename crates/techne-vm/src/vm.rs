@@ -5096,7 +5096,11 @@ impl Vm {
                         }
                         Op::Call { base, n } | Op::TailCall { base, n } => {
                             let f = reg!(base);
-                            self.observe_call(code, pc - 1, f);
+                            // Keep the disabled/settled cases in the dispatch
+                            // loop: even a helper call costs at every callback.
+                            if self.jit_threshold != u32::MAX && !(*code).jit.failed.get() && (*code).jit.entry.get().is_none() {
+                                self.observe_call(code, pc - 1, f);
+                            }
                             let tail = matches!(op, Op::TailCall { .. });
                             if is_kind(f, Kind::Closure) {
                                 call_closure!(f, base, n, tail);
@@ -5223,7 +5227,7 @@ impl Vm {
     #[inline]
     fn observe_call(&self, code: *const Code, pc: usize, f: Value) {
         let jit = unsafe { &(*code).jit };
-        if jit.failed.get() || self.jit_threshold == u32::MAX || !crate::jit::feedback_enabled() {
+        if !crate::jit::feedback_enabled() {
             return;
         }
         let target = if f.is_native() {

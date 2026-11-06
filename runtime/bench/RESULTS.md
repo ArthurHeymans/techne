@@ -55,6 +55,27 @@ parsing/vector-bound improvement is claimed. Wider regressing policies were
 rejected. Full data, ablations, 117-unit/378-conformance validation, caveats
 and reproduction: [LOOPS.md](LOOPS.md).
 
+## Review: interpreter HOF cost, 2026-11-06
+
+The full-nursery list policy has an interpreter-only cost as well as the
+compiled HOF/RSS gains above. With `TECHNE_JIT=0`, HOF performs more minor
+collections and promotion copying when its temporary lists occupy the
+nursery. This is a real tradeoff, not timing noise or a universal speedup.
+
+Review also found avoidable feedback-helper calls with JIT disabled or a
+function's compilation already settled. Gating those calls in the dispatch
+loop reduces the interpreter HOF count from **3,661,225,584** to
+**3,588,194,406** instructions. Against main `1356a30`'s CI reference of
+**3,388,697,697**, the remaining cost is **5.9%**. The review rebuild's
+compiled HOF count is **963,016,976**. These are whole-process cachegrind
+counts on the unchanged `programs/hof.scm`, via `PROGS=hof` and
+`TECHNE_VM=... techne run runtime/bench/icount.scm` in `nix develop`.
+
+Retain the list policy for its compiled HOF throughput and peak-RSS gains
+rather than reverting it to hide this interpreter cost. PR #334 accepts
+this specific regression using the repository's `accepted-regression`
+mechanism; the 5% benchmark threshold remains unchanged.
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror
