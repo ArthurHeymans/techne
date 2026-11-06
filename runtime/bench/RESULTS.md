@@ -36,6 +36,25 @@ and 8.5 -> 14.1 ms, code mappings 4 -> 8 and 8 -> 16 KiB. Admission, precise
 GC/error/preemption exits, depth bounds, measurements and reproduction are
 in [FAST-CALLS.md](FAST-CALLS.md). `TECHNE_JIT_FAST=0` is the same-binary control.
 
+## Callback and scalar-loop follow-up, 2026-11-06
+
+Against the numeric-kernel baseline, unchanged workloads: direct control
+**6.03 -> 4.35 ms**, indirect **8.56 -> 6.04 ms**, HOF **338.5 -> 302.5 ms**,
+qsort **178.0 -> 160.0 ms**. Three alternating pairs / eight calls; whole
+process instructions fall 8.2%, 23.1%, 14.9%, 4.0% respectively. Fib/tak stay
+flat. New scalar controls improve **72.7 -> 25.5 ms** (wide exact sum) and
+**35.6 -> 15.8 ms** (inexact sum), not application-speedup claims.
+
+The retained changes publish fuel only at boundaries of bounded inlined
+loops, cache invariant callback code guards without caching captures, and
+inline exact i64/fixnum/ordinary float addition through the original `+`
+procedure. All fallback/GC/preemption/error contracts remain. Costs include
+HOF native compilation **18.8 -> 22.5 ms**, peak RSS **99,248 -> 100,512 KiB**;
+nqueens is about 2% slower by wall time despite flat instructions. No
+parsing/vector-bound improvement is claimed. Wider regressing policies were
+rejected. Full data, ablations, 117-unit/378-conformance validation, caveats
+and reproduction: [LOOPS.md](LOOPS.md).
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror

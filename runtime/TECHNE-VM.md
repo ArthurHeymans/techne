@@ -254,24 +254,35 @@ fully hygienic.
     entry/OSR path stays compiled for other inputs. Kernel and fallback code
     are budgeted/reclaimed together; no recompilation. The extra compilation
     costs milliseconds, not zero; see [FAST-CALLS.md](bench/FAST-CALLS.md).
-  - A function that loops counts the calls and back-edges for preemption
-    and stops in a machine register, writing it through to memory (which
-    callees and the interpreter count in): the count does not wait for
-    memory.
+  - Loops count calls/back-edges in a machine register. With bounded
+    Scheme inlinees, publish the exact count at native calls/exits instead
+    of every tick; reload after helpers so pressure/stop notifications win.
+    Pure loops retain write-through counting. Polls and resume pcs do not
+    move. Repeated indirect inline sites can also cache a boolean code guard
+    for immutable formal arguments, refreshed at OSR/native entry and
+    self-tail rebinding; actual closures/captures are never cached.
   - Inline: fixnum and float arithmetic (including mixed), comparisons,
     `quotient`/`remainder`/`modulo`, pair and vector access, globals,
     boxes, and nursery allocation for `cons` and boxes. At call sites
     specialised for them, the common case of a few natives:
     `string-length` and `string-ref` of ASCII strings, `vector-length`,
     `bytevector-u8-ref`, `char->integer`, `char=?` of two characters,
-    `%record-ref` (record accessors) (anything else calls the native).
+    `%record-ref` (record accessors), and two-argument first-class `+` on
+    fixnums/one-limb signed-i64 integers or ordinary fixnum/float inputs.
+    Integer results normalize to the original representation; overflow,
+    other kinds and allocation fallback call the native. The procedure's
+    initial zero addition (including signed-zero semantics) is retained.
+    See [LOOPS.md](bench/LOOPS.md) for measured tradeoffs and exclusions.
   - Environment: `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the
     threshold (`1` compiles everything synchronously, for testing),
     `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_INLINE=0`
     runs no function inline, `TECHNE_JIT_FEEDBACK=0` disables indirect-call
     feedback/specialization, `TECHNE_JIT_PAIRS=0` disables pair facts,
-    `TECHNE_JIT_FAST=0` disables numeric recursive kernels
-    (developer ablations), `TECHNE_JIT_LOG=1`
+    `TECHNE_JIT_FAST=0` disables numeric recursive kernels,
+    `TECHNE_JIT_FUEL=0` restores per-tick publication,
+    `TECHNE_JIT_CALL_CACHE=0` disables invariant argument guard caching,
+    `TECHNE_JIT_WIDE_ADD=0` disables first-class scalar addition (read once
+    per process); these are developer ablations, `TECHNE_JIT_LOG=1`
     reports compiled functions and compile times (and entry points handed
     back to the interpreter), `TECHNE_JIT_IR=1` reports
     IR sizes (`=name` prints that function's IR), `TECHNE_JIT_ASM=name`

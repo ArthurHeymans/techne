@@ -8,7 +8,7 @@ fn run(path: &std::path::Path, jit: &str, wide: &str, stress: bool, log: bool) -
     c.arg(path)
         .env("TECHNE_JIT", jit)
         .env("TECHNE_JIT_SYNC", "1")
-        .env("TECHNE_JIT_WIDE_ADD", wide)
+        .env_remove("TECHNE_JIT_WIDE_ADD")
         .env("TECHNE_GC_VERIFY", "1")
         .env_remove("TECHNE_GC_STRESS")
         .env_remove("TECHNE_GC_STATS")
@@ -17,6 +17,9 @@ fn run(path: &std::path::Path, jit: &str, wide: &str, stress: bool, log: bool) -
         .env_remove("TECHNE_JIT_ASM")
         .env_remove("TECHNE_JIT_STATS")
         .env_remove("TECHNE_JIT_MEMORY");
+    if wide != "default" {
+        c.env("TECHNE_JIT_WIDE_ADD", wide);
+    }
     if stress {
         c.env("TECHNE_GC_STRESS", "full");
     }
@@ -57,16 +60,16 @@ fn indirect_integer_add_is_exact_across_fixnum_i64_and_bigint_edges() {
         }
     }
     fs::write(&path, source).unwrap();
-    for (jit, wide, stress) in [("0", "0", false), ("20", "0", false), ("20", "1", false), ("20", "1", true)] {
+    for (jit, wide, stress) in [("0", "0", false), ("20", "0", false), ("20", "1", false), ("20", "1", true), ("20", "default", false)] {
         let out = run(&path, jit, wide, stress, false);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(out.stdout, expected.as_bytes(), "{jit}/{wide}/{stress}");
         assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
     }
-    for wide in ["0", "1"] {
+    for wide in ["0", "1", "default"] {
         let out = run(&path, "20", wide, false, true);
         assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stderr).contains("jit-wide-add:"), wide == "1");
+        assert_eq!(String::from_utf8_lossy(&out.stderr).contains("jit-wide-add:"), wide != "0");
     }
 }
 

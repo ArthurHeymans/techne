@@ -16,7 +16,7 @@ fn run(file: &std::path::Path, jit: &str, cache: &str, log: bool, stress: bool) 
         .arg(file)
         .env("TECHNE_JIT", jit)
         .env("TECHNE_JIT_SYNC", "1")
-        .env("TECHNE_JIT_CALL_CACHE", cache)
+        .env_remove("TECHNE_JIT_CALL_CACHE")
         .env("TECHNE_JIT_FUEL", "1")
         .env("TECHNE_GC_VERIFY", "1")
         .env_remove("TECHNE_JIT_LOG")
@@ -28,6 +28,9 @@ fn run(file: &std::path::Path, jit: &str, cache: &str, log: bool, stress: bool) 
         .env_remove("TECHNE_GC_STRESS")
         .env_remove("TECHNE_JIT_INLINE")
         .env_remove("TECHNE_JIT_FEEDBACK");
+    if cache != "default" {
+        command.env("TECHNE_JIT_CALL_CACHE", cache);
+    }
     if log {
         command.env("TECHNE_JIT_LOG", "1");
     }
@@ -42,12 +45,12 @@ fn stable_argument_guard_is_cached_and_ablated() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("call-cache.scm");
     fs::write(&file, format!("{DRIVE} (display (drive (make-adder 7) 3000))")).unwrap();
-    for cache in ["0", "1"] {
+    for cache in ["0", "1", "default"] {
         let out = run(&file, "20", cache, true, false);
         let log = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{log}");
         assert_eq!(out.stdout, b"4519500");
-        assert_eq!(log.contains("jit-call-cache: drive"), cache == "1", "{log}");
+        assert_eq!(log.contains("jit-call-cache: drive"), cache != "0", "{log}");
     }
 }
 

@@ -2334,7 +2334,7 @@ impl Jit {
             loops,
             // Multiple polls per iteration pay for boundary publication.
             // Pure loops retain the smaller old live ranges/counter path.
-            defer_fuel: loops && !sites.is_empty() && std::env::var("TECHNE_JIT_FUEL").as_deref() == Ok("1"),
+            defer_fuel: loops && !sites.is_empty() && std::env::var("TECHNE_JIT_FUEL").as_deref() != Ok("0"),
             regs_end,
             cage,
             code_table,
@@ -2619,10 +2619,10 @@ struct Gen {
     /// Where the fuel is counted: a counter the native code of one run of
     /// the interpreter's (`JitCtx::fuel`) shares.
     fuel: ir::Value,
-    /// The fuel while this function runs, if it `loops`: counting writes it
-    /// through to `fuel`, so that nothing has to write it back (callees,
-    /// the interpreter), and calls of compiled code read it anew. Then
-    /// counting does not wait for memory.
+    /// The fuel while this function runs, if it `loops`. With inlinees,
+    /// publish at native boundaries; otherwise write through each tick.
+    /// Callees and the interpreter see the same count, and native helpers'
+    /// requests to shorten the slice are loaded back after their calls.
     fuel_var: Variable,
     /// The function loops (a back-edge or a tail call to itself). Else it
     /// counts in memory: reading the fuel when called and after each call
@@ -4085,7 +4085,9 @@ impl Gen {
         self.publish_fuel(b);
         let inst = b.ins().call_indirect(self.sigs.unusual, helper, &[self.vm, v, error, self.bp, base_v, native]);
         let (status, frame) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
-        self.load_fuel(b);
+        if self.defer_fuel {
+            self.load_fuel(b);
+        }
         // Where the frame is now: the register stack may have moved.
         self.spill_to(b, pc, &deferred, frame);
         b.ins().jump(returned, &[BlockArg::Value(status)]);

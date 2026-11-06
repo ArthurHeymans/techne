@@ -5,7 +5,7 @@ use super::*;
 
 pub(super) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("TECHNE_JIT_WIDE_ADD").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| std::env::var("TECHNE_JIT_WIDE_ADD").as_deref() != Ok("0"))
 }
 
 impl Gen {

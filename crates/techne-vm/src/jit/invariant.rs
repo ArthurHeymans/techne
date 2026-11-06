@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn calls(job: &Job, sites: &[Site]) -> Vec<(usize, Reg)> {
-    if job.closure_calls.is_empty() || sites.is_empty() || std::env::var("TECHNE_JIT_CALL_CACHE").as_deref() != Ok("1") {
+    if job.closure_calls.is_empty() || sites.is_empty() || std::env::var("TECHNE_JIT_CALL_CACHE").as_deref() == Ok("0") {
         return Vec::new();
     }
     let ops = &job.ops;
