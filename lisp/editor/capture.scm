@@ -12,7 +12,7 @@
 (import (techne crypto))
 
 (provide screenshot! recording-start! recording-stop!
-         editor-capture-request! editor-take-captures! editor-captured! editor-cancel-captures!
+         editor-capture-request! editor-take-captures! editor-captured! editor-cancel-capture! editor-cancel-captures!
          editor-record! editor-stop-record!)
 
 (define %capture-next 0)
@@ -20,15 +20,15 @@
 (define recording-max-frames 300)
 (define recording-max-bytes (* 256 1024 1024))
 
-;; An outstanding job: id, absolute path, success callback, failure callback.
-(define (capture! s path done failed)
+;; A job: id, absolute path, success callback, failure callback, publication lease.
+(define (capture! s path done failed #:lease [lease #f])
   (unless s (error "No frontend is attached"))
   (when (remote-path? path) (error "Captures need a local path"))
   (let ((path (absolute-path path)) (jobs (or (sget s 'capture-jobs) '())))
     (when (>= (length jobs) capture-max-pending) (error "Too many pending captures"))
     (when (file-attributes path) (error "Capture destination already exists" path))
     (set! %capture-next (+ %capture-next 1))
-    (sset! s 'capture-jobs (cons (vector %capture-next path done failed) jobs))
+    (sset! s 'capture-jobs (cons (vector %capture-next path done failed lease) jobs))
     (sset! s 'capture-queue (append (or (sget s 'capture-queue) '()) (list %capture-next)))
     %capture-next))
 
@@ -40,10 +40,10 @@ The frontend may draw a newer snapshot; completion identifies that frame."
             (lambda (snapshot width height bytes) (message! s (string-append "Screenshot: " (absolute-path path))))
             (lambda () #f)))
 
-(define (editor-capture-request! path)
-  "Request a screenshot at PATH in the selected session for a caller."
+(define (editor-capture-request! path lease)
+  "Request a screenshot at PATH in the selected session, guarded by LEASE."
   ;; An agent looking must not itself change the echo area being observed.
-  (capture! (current-session) path (lambda (snapshot width height bytes) #f) (lambda () #f)))
+  (capture! (current-session) path (lambda (snapshot width height bytes) #f) (lambda () #f) #:lease lease))
 
 (define (editor-take-captures! s)
   "Take the capture request ids queued in S since last asked."
@@ -51,9 +51,10 @@ The frontend may draw a newer snapshot; completion identifies that frame."
     (sset! s 'capture-queue '())
     ids))
 
-;; Private temporary directory, then a no-replace rename: neither a failed
-;; write nor a race at the destination truncates somebody else's file.
-(define (save-capture! path png)
+;; Write privately, then publish complete bytes without replacing a name.
+;; The OS boundary checks the caller's lease atomically with publication,
+;; so cancelling during file I/O cannot leave a late screenshot behind.
+(define (save-capture! path png lease snapshot width height)
   (let ((tmp (string-append path ".capture-" (hex-encode (random-bytes 8)))))
     (create-directory tmp #o700)
     (dynamic-wind
@@ -62,7 +63,7 @@ The frontend may draw a newer snapshot; completion identifies that frame."
         (let ((file (string-append tmp "/frame.png")))
           (call-with-port (open-binary-output-file file) (lambda (p) (write-bytevector png p)))
           (set-file-mode! file #o600)
-          (rename-file file path)))
+          (%capture-publish! lease file path snapshot width height)))
       (lambda () (delete-path tmp #t)))))
 
 (define (editor-captured! s id snapshot width height png failure)
@@ -71,15 +72,18 @@ PNG holds the encoded bytes; nonempty FAILURE reports a frontend error.
 Return its path or raise. Remove the job even on failure; recordings stop."
   (let* ((jobs (or (sget s 'capture-jobs) '()))
          (job (find (lambda (j) (= id (vector-ref j 0))) jobs)))
-    (unless job (error "Unknown capture request" id))
-    (sset! s 'capture-jobs (remove (lambda (j) (eq? job j)) jobs))
-    (guard (e (#t ((vector-ref job 3)) (raise e)))
-      (unless (string=? failure "") (error failure))
-      (unless (and (> snapshot 0) (> width 0) (> height 0) (> (bytevector-length png) 0))
-        (error "Invalid captured frame"))
-      (save-capture! (vector-ref job 1) png)
-      ((vector-ref job 2) snapshot width height (bytevector-length png))
-      (vector-ref job 1))))
+    ;; A worker may finish after cancellation. Ignore it, without recreating
+    ;; the job, touching disk or changing the echo area.
+    (and job
+      (begin
+        (sset! s 'capture-jobs (remove (lambda (j) (eq? job j)) jobs))
+        (guard (e (#t ((vector-ref job 3)) (raise e)))
+          (unless (string=? failure "") (error failure))
+          (unless (and (> snapshot 0) (> width 0) (> height 0) (> (bytevector-length png) 0))
+            (error "Invalid captured frame"))
+          (save-capture! (vector-ref job 1) png (vector-ref job 4) snapshot width height)
+          ((vector-ref job 2) snapshot width height (bytevector-length png))
+          (vector-ref job 1))))))
 
 (define-record-type <recording>
   (make-recording directory limit interval started frames bytes active)
@@ -157,6 +161,17 @@ frame sequence, not constant-rate video. A failed capture ends recording."
     (unless r (error "Not recording"))
     (recording-end! s r)
     (recording-directory r)))
+
+(define (editor-cancel-capture! s id)
+  "Cancel S's capture ID, releasing its queue slot; return #t if found."
+  (let* ((jobs (or (sget s 'capture-jobs) '()))
+         (job (find (lambda (j) (= id (vector-ref j 0))) jobs)))
+    (and job
+      (begin
+        (sset! s 'capture-jobs (remove (lambda (j) (eq? job j)) jobs))
+        (sset! s 'capture-queue (remove (lambda (n) (= n id)) (or (sget s 'capture-queue) '())))
+        ((vector-ref job 3))
+        #t))))
 
 (define (editor-cancel-captures! s)
   "Cancel S's captures and recording on detach, returning the request ids."

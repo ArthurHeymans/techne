@@ -43,9 +43,11 @@ fn screenshots_and_bounded_recording_in_a_real_window() {
     assert_eq!(native.size(), compositor.size());
     assert!(native.0.rgba == compositor.0.rgba, "native and compositor pixels differ");
     assert_eq!(image(&dir, "resized.png").size(), (1003, 701));
-    assert_eq!(image(&dir, "interactive.png").size(), native.size());
+    let interactive = image(&dir, "interactive.png");
+    assert_eq!(interactive.size(), native.size());
     let popup = image(&dir, "popup.png");
     assert!(native.0.rgba != popup.0.rgba, "the minibuffer popup must be present");
+    assert!(interactive.0.rgba != popup.0.rgba, "M-x must replace the screenshot file reader, not leave a stale minibuffer");
     for n in 0..3 {
         assert_eq!(image(&dir, &format!("recording/{n:06}.png")).size(), native.size());
     }

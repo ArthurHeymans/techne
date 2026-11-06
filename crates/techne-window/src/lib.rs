@@ -21,6 +21,10 @@
 //! key that took 10 ms or more); `--load` keeps a Lisp task busy in the
 //! runtime meanwhile. `headless.scm` runs it in a headless Wayland session.
 
+// Proving wgpu's deeply nested device/buffer handles are Send for readback.
+#![recursion_limit = "256"]
+
+mod capture;
 mod keys;
 mod layout;
 #[cfg(test)]
@@ -136,7 +140,10 @@ fn args(args: Vec<String>) -> Result<Args, String> {
 }
 
 /// Woken when the runtime has output.
-struct Wake;
+enum Wake {
+    Runtime,
+    Captured(capture::Completion),
+}
 
 /// Latencies from input to the frame that showed it, and to the snapshot.
 #[derive(Default)]
@@ -197,6 +204,9 @@ struct App {
     /// there is sent to the runtime when the window gets the focus.
     clipboard: Option<smithay_clipboard::Clipboard>,
     captures: Vec<(usize, u64)>,
+    capture_worker: capture::Worker,
+    capture_in_flight: bool,
+    capture_epoch: u64,
 }
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
@@ -279,6 +289,7 @@ impl App {
                     }
                 }
                 Event::Output(Output::Capture { id, after }) => self.captures.push((id, after)),
+                Event::Output(Output::CancelCapture { id }) => self.captures.retain(|(pending, _)| *pending != id),
                 // Every key a window gets can be sent.
                 Event::Output(Output::Bindings(_) | Output::Session(_)) => {}
                 Event::Output(Output::Clipboard(text)) => {
@@ -294,6 +305,7 @@ impl App {
                 Event::Ended if self.quitting => {}
                 Event::Ended if self.host.restart() => {
                     self.captures.clear();
+                    self.capture_epoch += 1;
                     eprintln!("techne: the runtime stopped; a new one has the unsaved edits");
                 }
                 Event::Ended => {
@@ -757,23 +769,38 @@ impl App {
             })
             .collect();
         let Some(renderer) = &mut self.renderer else { return };
-        let capture = self.captures.iter().any(|(_, after)| snap.id >= *after);
+        let capture = !self.capture_in_flight && self.captures.iter().any(|(_, after)| snap.id >= *after);
         if renderer.draw(fonts, frame_bg, &rects, &images, &texts, capture) {
             if capture {
-                let result =
-                    renderer.captured.take().unwrap_or_else(|| Err("the renderer did not produce a capture".into())).map(|mut f| {
-                        f.snapshot = snap.id;
-                        f
-                    });
-                let mut pending = Vec::new();
-                for (id, after) in self.captures.drain(..) {
-                    if snap.id >= after {
-                        self.host.captured(id, result.clone());
+                let readback = renderer.captured.take().unwrap_or_else(|| Err("the renderer did not produce a capture".into()));
+                let snapshot = snap.id;
+                let mut ids = Vec::new();
+                self.captures.retain(|(id, after)| {
+                    if snapshot >= *after {
+                        ids.push(*id);
+                        false
                     } else {
-                        pending.push((id, after));
+                        true
+                    }
+                });
+                let job = capture::Job {
+                    epoch: self.capture_epoch,
+                    ids,
+                    finish: Box::new(move || {
+                        readback.and_then(|r| r.finish()).map(|mut frame| {
+                            frame.snapshot = snapshot;
+                            frame
+                        })
+                    }),
+                };
+                match self.capture_worker.submit(job) {
+                    Ok(()) => self.capture_in_flight = true,
+                    Err(job) => {
+                        for id in job.ids {
+                            self.host.captured(id, Err("capture worker unavailable".into()));
+                        }
                     }
                 }
-                self.captures = pending;
             }
             let now = Instant::now();
             self.latency.frame.extend(self.unanswered.drain(..).map(|at| now - at));
@@ -833,8 +860,21 @@ impl ApplicationHandler<Wake> for App {
         self.redraw();
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _: Wake) {
-        self.take_outputs(event_loop);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
+        match event {
+            Wake::Runtime => self.take_outputs(event_loop),
+            Wake::Captured(c) => {
+                self.capture_in_flight = false;
+                // A completion from before a restart must never answer a
+                // reused Scheme request id in the new runtime.
+                if c.epoch == self.capture_epoch {
+                    for id in c.ids {
+                        self.host.captured(id, c.result.clone());
+                    }
+                }
+                self.redraw();
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -993,9 +1033,13 @@ pub fn main(args: Vec<String>) -> ExitCode {
             }
         }
     };
+    let capture_proxy = proxy.clone();
+    let capture_worker = capture::Worker::new(move |c| {
+        let _ = capture_proxy.send_event(Wake::Captured(c));
+    });
     let host = Host::start(file.clone(), args.profile.clone(), setup, move |e| {
         let _ = tx.send(e);
-        let _ = proxy.send_event(Wake);
+        let _ = proxy.send_event(Wake::Runtime);
     });
     // A benchmark's window opens no files for others.
     let _listener = args.bench.is_none().then(|| server::listen_for(&host)).flatten();
@@ -1016,6 +1060,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
         bench,
         clipboard: None,
         captures: Vec::new(),
+        capture_worker,
+        capture_in_flight: false,
+        capture_epoch: 0,
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, .. } = app;

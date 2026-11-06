@@ -199,3 +199,100 @@ fn detaching_fails_a_waiting_capture_promptly() {
     host.close();
     assert!(client.join().unwrap().unwrap_err().contains("detached"));
 }
+
+fn wait_output(rx: &mpsc::Receiver<Event>, wanted: impl Fn(&Output) -> bool) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
+            Event::Output(o) if wanted(&o) => return o,
+            Event::Failed(e) => panic!("{e}"),
+            _ => {}
+        }
+    }
+}
+
+fn frame(snapshot: u64) -> CapturedFrame {
+    CapturedFrame { snapshot, width: 1, height: 1, png: encode_png(1, 1, &[255, 0, 0, 255]).unwrap() }
+}
+
+#[test]
+fn timed_out_captures_release_all_slots_and_ignore_late_worker_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("editor");
+    let (tx, rx) = mpsc::channel();
+    let host = Host::start(
+        None,
+        "emacs".into(),
+        |_| {},
+        move |e| {
+            let _ = tx.send(e);
+        },
+    );
+    let _listener = host.listen(&socket).unwrap().unwrap();
+    wait_output(&rx, |o| matches!(o, Output::Snapshot(_)));
+    let clients: Vec<_> = (0..4)
+        .map(|n| {
+            let (socket, path) = (socket.clone(), dir.path().join(format!("abandoned-{n}.png")));
+            std::thread::spawn(move || server::request(&socket, &server::Request::Capture { path, timeout_ms: Some(1000) }))
+        })
+        .collect();
+    let mut pending = Vec::new();
+    for _ in 0..4 {
+        if let Output::Capture { id, after } = wait_output(&rx, |o| matches!(o, Output::Capture { .. })) {
+            pending.push((id, after));
+        }
+    }
+    for client in clients {
+        let error = client.join().unwrap().unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+    }
+    for _ in 0..4 {
+        wait_output(&rx, |o| matches!(o, Output::CancelCapture { .. }));
+    }
+    let (s, path) = (socket.clone(), dir.path().join("fresh.png"));
+    let client = std::thread::spawn(move || server::capture(&s, &path));
+    let Output::Capture { id, after } = wait_output(&rx, |o| matches!(o, Output::Capture { .. })) else { unreachable!() };
+    assert!(pending.iter().all(|(old, _)| id > *old));
+    for (old, snapshot) in pending {
+        host.captured(old, Ok(frame(snapshot)));
+    }
+    host.captured(id, Ok(frame(after)));
+    assert!(matches!(client.join().unwrap().unwrap(), Reply::Captured { .. }));
+    assert!(dir.path().join("fresh.png").exists());
+    for n in 0..4 {
+        assert!(!dir.path().join(format!("abandoned-{n}.png")).exists());
+    }
+    host.close();
+}
+
+#[test]
+fn a_disconnected_caller_is_cancelled_before_rendering_completes() {
+    use std::{io::Write, os::unix::net::UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("editor");
+    let path = dir.path().join("abandoned.png");
+    let (tx, rx) = mpsc::channel();
+    let host = Host::start(
+        None,
+        "emacs".into(),
+        |_| {},
+        move |e| {
+            let _ = tx.send(e);
+        },
+    );
+    let _listener = host.listen(&socket).unwrap().unwrap();
+    wait_output(&rx, |o| matches!(o, Output::Snapshot(_)));
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let request = rmp_serde::to_vec_named(&server::Request::Capture { path: path.clone(), timeout_ms: None }).unwrap();
+    stream.write_all(&(request.len() as u32).to_be_bytes()).unwrap();
+    stream.write_all(&request).unwrap();
+    let Output::Capture { id, after } = wait_output(&rx, |o| matches!(o, Output::Capture { .. })) else { unreachable!() };
+    drop(stream);
+    wait_output(&rx, |o| matches!(o, Output::CancelCapture { id: cancelled } if *cancelled == id));
+    host.captured(id, Ok(frame(after)));
+    // A following snapshot is the barrier proving the late completion was
+    // processed, not just that it has not written the file yet.
+    wait_output(&rx, |o| matches!(o, Output::Snapshot(_)));
+    host.close();
+    assert!(!path.exists());
+}

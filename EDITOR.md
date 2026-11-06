@@ -432,10 +432,17 @@ callbacks, even when frontend and runtime share a process.
   its fresh snapshot with that snapshot's id as a lower bound. A window
   captures the same scene it draws, using an offscreen GPU attachment,
   and answers with the actual snapshot id, dimensions and PNG bytes.
-  A terminal refuses pixel capture explicitly. Scheme saves files and owns
-  recording cadence, metadata and limits; native code only reads GPU
-  pixels and performs bulk PNG encoding (a Scheme prototype's CRC/Adler
-  passes alone took 27.6 seconds per 1600x1000 RGBA frame). Captures
+  GPU completion and encoding run on a single bounded worker, outside the
+  window's event loop; a runtime epoch prevents old completions answering
+  request ids reused after a restart. A terminal refuses pixel capture.
+  Scheme saves files and owns recording cadence, metadata and limits.
+  Native code reads GPU pixels, performs bulk PNG encoding (a Scheme
+  prototype's CRC/Adler passes alone took 27.6 seconds per 1600x1000 RGBA
+  frame), and serializes cancellation with atomic filesystem publication.
+  External requests carry a native expiry lease: caller timeout or EOF
+  forbids late publication even before the runtime consumes cancellation;
+  Scheme and frontend queue slots are then retired. A publication that
+  already won is acknowledged as success, never as a false timeout. Captures
   observe the editor, not the compositor or other windows; independent
   desktop capture remains useful for end-to-end comparison.
 - **Lazy rows:** the frontend requests rows around an anchor, lays them out,

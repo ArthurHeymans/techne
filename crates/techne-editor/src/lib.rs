@@ -19,6 +19,7 @@
 //! frontends share to scroll by anchor.
 
 mod access;
+pub mod capture;
 mod deadline;
 pub mod edits;
 pub mod faces;
@@ -550,6 +551,7 @@ pub fn install(vm: &mut Vm) {
 pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Shared) {
     syntax::install(vm, trees);
     images::install(vm);
+    capture::install(vm);
     rpc::install(vm);
     vm.name_foreign_type::<RefCell<Document>>("document");
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");

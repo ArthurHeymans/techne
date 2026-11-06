@@ -82,6 +82,31 @@ jobs:
       # would give it reaches nothing of another's.
       - run: cargo test --release -p techne-vm --features hostile,counting-allocator --test hostile
 
+  # Exercise the real render/readback path on a CPU Vulkan driver, without
+  # a desktop or physical GPU. The independent compositor capture must agree.
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: nix develop .#window --command bash -e {0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          shell: window
+      - run: |
+          export VK_DRIVER_FILES="$TECHNE_SOFTWARE_VULKAN_DRIVER"
+          export WGPU_BACKEND=vulkan WLR_RENDERER=pixman
+          export TECHNE_CAPTURE_ARTIFACTS="$RUNNER_TEMP/techne-capture"
+          cargo test --release -p techne-cli --test capture -- \
+            --ignored --nocapture
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: capture-failure
+          path: ${{ runner.temp }}/techne-capture
+
   # The Scheme suites (own, R7RS, r7rs-benchmarks) in the other modes, which
   # must give the same results as the default one.
   suites:

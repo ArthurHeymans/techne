@@ -99,7 +99,7 @@ pub struct Renderer {
     textures: HashMap<u64, (wgpu::BindGroup, u64, usize)>,
     texture_bytes: usize,
     frames: u64,
-    pub captured: Option<Result<CapturedFrame, String>>,
+    pub captured: Option<Result<Readback, String>>,
     // Dropped last: the surface refers to it.
     pub window: Arc<Window>,
 }
@@ -559,39 +559,61 @@ impl Renderer {
             );
             buffer
         });
-        self.queue.submit(Some(encoder.finish()));
+        let submission = self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
         if let Some(buffer) = readback {
-            self.captured = Some(self.read_capture(&buffer, padded));
+            self.captured = Some(Ok(Readback {
+                device: self.device.clone(),
+                buffer,
+                submission,
+                padded,
+                width: self.config.width,
+                height: self.config.height,
+                bgra: matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb),
+            }));
         }
         self.atlas.trim();
         true
     }
+}
 
-    fn read_capture(&self, buffer: &wgpu::Buffer, padded: u32) -> Result<CapturedFrame, String> {
+/// A submitted copy, independent of the live surface and layout. Finishing it
+/// waits for the GPU and encodes pixels, so only the capture worker does it.
+pub struct Readback {
+    device: wgpu::Device,
+    buffer: wgpu::Buffer,
+    submission: wgpu::SubmissionIndex,
+    padded: u32,
+    width: u32,
+    height: u32,
+    bgra: bool,
+}
+
+impl Readback {
+    pub fn finish(self) -> Result<CapturedFrame, String> {
+        let buffer = &self.buffer;
         let (tx, rx) = std::sync::mpsc::channel();
         buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
         self.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(5)) })
+            .poll(wgpu::PollType::Wait { submission_index: Some(self.submission), timeout: Some(std::time::Duration::from_secs(5)) })
             .map_err(|e| e.to_string())?;
         rx.recv_timeout(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
         let bytes = buffer.slice(..).get_mapped_range().map_err(|e| e.to_string())?;
-        let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
-        let mut rgba = Vec::with_capacity((self.config.width as usize * self.config.height as usize) * 4);
-        for row in bytes.chunks_exact(padded as usize) {
-            rgba.extend_from_slice(&row[..self.config.width as usize * 4]);
+        let mut rgba = Vec::with_capacity((self.width as usize * self.height as usize) * 4);
+        for row in bytes.chunks_exact(self.padded as usize) {
+            rgba.extend_from_slice(&row[..self.width as usize * 4]);
         }
         drop(bytes);
         buffer.unmap();
-        if bgra {
+        if self.bgra {
             for pixel in rgba.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
         }
-        let png = encode_png(self.config.width, self.config.height, &rgba)?;
-        Ok(CapturedFrame { snapshot: 0, width: self.config.width, height: self.config.height, png })
+        let png = encode_png(self.width, self.height, &rgba)?;
+        Ok(CapturedFrame { snapshot: 0, width: self.width, height: self.height, png })
     }
 }
 

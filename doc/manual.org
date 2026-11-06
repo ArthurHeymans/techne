@@ -50,6 +50,12 @@ to this runtime. It does not promise that background work has finished.
 An external screenshot does not change the echo area it observes.
 Existing destinations, including symbolic links, are refused; PNGs are
 private files, written whole before becoming visible at their destination.
+GPU completion and PNG encoding run on a bounded worker, not the window
+thread: typing, redraw and closing remain responsive during capture.
+External screenshot requests expire after 25 seconds, or are cancelled if
+the caller disconnects. Cancellation releases pending slots and prevents
+late file publication, even if the editor runtime was busy. If publication
+already won the race, the reply acknowledges that completed screenshot.
 
 =M-x start-recording= records up to 100 frames in a new private directory;
 =M-x stop-recording= finishes early. The CLI permits 1..300 frames and

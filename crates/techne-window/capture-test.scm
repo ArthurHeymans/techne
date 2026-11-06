@@ -11,7 +11,10 @@
 (define (run program args log)
   (call-with-process program args process-wait #:stdin 'null #:stdout (at log) #:stderr (at "commands.err")))
 (define (ok program args log) (check (equal? 0 (run program args log)) (string-append "command failed: " program " " log)))
-(define (keys . args) (ok "wtype" (append '("-k" "Shift_L" "-s" "300") args) "keys.log"))
+;; wtype finishing means Wayland accepted the events, not that the editor
+;; has consumed the last key. Let both the window and compositor settle
+;; before comparing independent captures (worker tests use explicit gates).
+(define (keys . args) (ok "wtype" (append '("-k" "Shift_L" "-s" "300") args '("-s" "300")) "keys.log"))
 (define last-snapshot 0)
 (define (capture name)
   (let ((log (string-append name ".json")))
@@ -61,6 +64,10 @@
     (capture "after-error.png")
     ;; Bounded recording finishes by itself and produces timestamped metadata.
     (ok binary (list "window" "--record" (at "recording") "--record-frames" "3" "--record-interval" "50") "record.json")
+    ;; Input and saving continue while readback/encoding run on the worker.
+    (keys "-M" "ctrl" "-k" "e" "-m" "ctrl" " ; typed during capture"
+          "-M" "ctrl" "-k" "x" "-k" "s" "-m" "ctrl")
+    (wait-for (lambda () (string-contains (file->string (at "example.scm")) "; typed during capture")) "editing during recording")
     (wait-for (lambda () (not (field (manifest "recording") 'active))) "bounded recording")
     (let ((frames (cdr (assq 'frames (manifest "recording")))))
       (check (= 3 (length frames)) "wrong frame count")

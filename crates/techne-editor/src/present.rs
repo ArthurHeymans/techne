@@ -453,6 +453,11 @@ pub enum Output {
         id: usize,
         after: u64,
     },
+    /// Forget a cancelled request. A readback already in flight may finish;
+    /// the runtime ignores its result and its lease forbids publishing it.
+    CancelCapture {
+        id: usize,
+    },
     /// The key sequences the session binds in Emacs notation, sent when a
     /// frontend attaches, so that its key normalizer can report those it
     /// cannot send.
