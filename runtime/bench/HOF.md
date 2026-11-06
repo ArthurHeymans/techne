@@ -148,16 +148,4 @@ tests. The diagnostic build passes **122 library tests**, both calibration
 integration tests, and feature-enabled memory/budget/reclamation/string checks.
 Strict Clippy passes both configurations, as do no-default-features library
 checks with and without the census feature. Formatting/diff checks pass.
-
-Frozen diagnostic binary `/tmp/techne-hof/census-feature-final`, SHA-256
-`e29ce0ea87479e5dbdb0cbb07df0c4f98fbb1349a740475f9241723b249fd253`.
-Non-census CPU-profile binary `/tmp/techne-hof/fixed-edge`, SHA-256
-`81b697958cf89c2755a9cff6f98248b851c86e7321e6105c19180ab68ba48668`.
-The final normal binary has no census symbols; its frozen copy is
-`/tmp/techne-hof/final`, SHA-256
-`b1cdfa7e165d719e502ddee4134ca0e12106a5c3d7ce643957e2df195f72a585`.
-Raw records: `/tmp/techne-hof/final-allocations-{0,1,2,warm1,wide-off}.json`,
-`census-control.json`, `final-{default-tests,census-unit,conformance,hostile}.log`,
-`fixed-hof.callgrind`, `fixed-hof-{inclusive,exclusive}.txt` and
-`normal-census-off.json`. Earlier census binaries and `allocations*.json`
-precede final validation and are superseded.
+The final normal binary has no census symbols.
