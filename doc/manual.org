@@ -390,8 +390,10 @@ procedure-first adapter is private to that library.
 
 ** Tools for callers
 
-~techne tool --help~ gives the workflow, runnable examples and limits;
+~techne tool --help~ gives a short orientation and signatures;
 ~techne tool ROOT~ gives the same help in a persistent project session.
+Request ~(tool-help 'recipes)~ for runnable examples or ~(tool-help 'guide)~
+for detailed contracts and limits; neither is dumped by default.
 ~techne tool ROOT FORM [SESSION]~ evaluates one Scheme form with ~project~
 bound. The library is ~(techne tools)~, also usable in scripts and nREPL.
 
@@ -403,6 +405,84 @@ bound. The library is ~(techne tools)~, also usable in scripts and nREPL.
 
 Help comes from live bindings, not a separate manual or command catalog.
 The tools operate on disk files, not unsaved editor buffers.
+
+~techne tool --text ROOT FORM [SESSION]~ displays strings directly and
+automatically renders disk-source read/expand replies with their original
+line numbers, including flat result lists containing such replies. Other
+values stay written as Scheme data; arbitrary ~path~/~text~ records and
+process-output labels are not treated as files. Omit ~--text~ for structured
+results, or use ~tool-show~ explicitly to format other kinds of replies.
+
+~tool-show~ numbers source views by default: one header gives the filename,
+full revision and ~file-lines~, then ~LINE: TEXT~ lines retain original source
+coordinates. The header scopes the whole block, including search context and
+snapshot expansion; full paths are not repeated on every source line. Separate
+blocks, even in batches, keep their own header. Wrapped display lines must not
+be mistaken for source coordinates. Use ~#:numbered #f~ for the old plain-text view.
+A read's handle identifies only its selected region, not the entire file.
+~region-complete~ says that region was returned fully; ~file-eof~ says
+that the returned text reaches file EOF. If ~next~ is present, expand
+that character offset first. Otherwise ~next-line~, when present, is the
+next source line to pass to ~tool-read~. Do not count newlines yourself:
+character clipping may end inside a line. ~file-lines~ is the file's real
+line count (an empty file still has line 1). File-specific metadata and
+~next-line~ are false for kept process output: its label is not a disk
+path, and expansion finishes a region, not necessarily a running stream.
+
+Search replies provide exact source lines and ~total~ matching lines.
+Use ~#:before~ and ~#:after~ (0 to 8 each) for numbered context from the
+same immutable snapshot, without a second disk read. The original hit
+handle still covers one line; ~context-handle~ covers the requested
+context. ~#:chars~ bounds context characters across the whole reply
+(1 to 16000), not per hit. Check ~context-truncated~; when context was
+requested, a ~#f~ context means the budget ran out. Its ~context-handle~
+can still be expanded.
+
+Search automatically attaches the innermost named definition for recognized
+code at each hit's actual character position. ~#:enclosing #f~ opts out;
+~#:enclosing #t~ also requests diagnostics for unsupported languages. Its ~enclosing~ record has a name, scope,
+span and handle: expand that handle to read the whole definition without
+rediscovering it by name. The definition uses the same immutable source
+and parser as ~tool-symbols~. ~enclosing-complete~ and ~enclosing-status~
+distinguish known absence from unavailable/partial syntax; a partial
+owner is only a candidate. Ownership is syntactic, not semantic reference
+resolution. One form defining multiple names uses the first enumerated
+name for its shared span. Counts grouped by path cannot request owners.
+
+~(tool-search project "literal" #:group-by 'path)~ instead returns
+~path~/~revision~/~count~ items for matching files. ~total~ still counts
+matching lines, not occurrences; ~files~ counts matching files and
+~next~ pages files. Grouped queries do not cache source handles. Counts
+cover the scan, not just the page: always check ~complete~, ~skipped~ and
+~problems~ before treating them as full-repository totals. Context and
+grouping cannot be combined. ~tool-show~ renders both modes directly.
+Zero-hit rendering echoes the literal query, prefix and scanned text-file
+count, and explains that regex operators are not interpreted. Alternatives
+can be issued as separate literal queries in one Scheme batch. Structured
+replies identify ~match-mode~ as ~literal~; ~query~ and ~prefix~ echoes are
+bounded to 240 characters, with explicit truncation flags. A zero count in
+an incomplete scan is still not proof that the full scope has no matches.
+
+~(tool-cite project "FILE" #:from 10 #:to 20)~ validates an inclusive
+source range and returns ~valid~, ~file-lines~, a canonical ~citation~
+string and the revision checked. An optional ~#:revision~ rejects stale
+reads. Past-end and stale-revision results are data, not CLI errors:
+check ~valid~. Invalid arguments, missing files and binary files are errors.
+Checks do not populate the source cache. A valid bound does NOT establish
+that a claim is supported by those lines or that the disk stays unchanged.
+
+For a known small file, prefer ~tool-read~ directly; defaults now fill its
+bounded 200-line, 16000-character read. For a known definition, use
+~tool-read-symbol~ directly. Use ~tool-symbols~ to discover names, not as a
+mandatory preliminary read: pages default to an 8000-character rendered-label
+budget with a 50-item ceiling. ~#:chars~ (1 to 16000) and ~#:limit~ (1 to 50)
+can narrow these; ~next~ remains an item offset, not a character offset. A first
+oversized item is returned alone so the cursor advances, marked ~budget-exceeded~.
+~characters~ counts rendered labels plus their joining newlines; full structured
+metadata and pagination notes are not part of that budget.
+
+Prefer these queries to writing a source scanner. Small session helpers can reuse them;
+~tool-help~ finds available bindings before you reimplement one.
 
 * Help
 

@@ -1,8 +1,28 @@
 (define (tool-help [topic #f])
-  "Explain how to use Techne tools, without a manual or a separate catalog.
-With no TOPIC, return a bounded onboarding answer and runnable examples.
-A symbol describes that live binding; a string discovers live bindings
-matching its words. Use tool-describe to page a long docstring."
+  "Return short tool help, or detailed help selected by TOPIC.
+'guide returns contracts and limits, 'recipes returns runnable examples.
+Other symbols describe live bindings; strings discover matching bindings.
+Use tool-describe to page a long docstring. Help needs no file/process grants."
+  (cond ((eq? topic 'guide) (%tool-help-guide))
+        ((eq? topic 'recipes) (tool-ref (%tool-help-guide) 'recipes))
+        ((symbol? topic) (tool-describe topic))
+        ((string? topic) (tool-discover topic))
+        (topic (error "tool-help: topic must be a binding symbol or search string"))
+        (else
+          '((kind help)
+            (purpose "Bounded tools, not an autonomous agent. CLI forms retain definitions; project is already bound.")
+            (signatures ((tool-read project PATH #:from 1 #:lines 200 #:chars 16000)
+                         (tool-search project LITERAL #:prefix "DIR/")
+                         (tool-read-symbol project PATH NAME)
+                         (tool-symbols project PATH #:chars 8000 #:offset 0)
+                         (tool-expand project HANDLE #:offset 0)
+                         (tool-cite project PATH #:from LINE #:to END)))
+            (workflow "Known small file: tool-read directly; known definition: tool-read-symbol. Use symbols only to discover names. Batch independent replies with (tool-show (list QUERY-A QUERY-B)).")
+            (evidence "One filename/revision header scopes numbered source lines. Cite PATH:LINE from those coordinates. next expands characters inside a region; next-line starts another file read. Follow continuation, never guess EOF. tool-cite checks bounds/revision, not claim support.")
+            (details "(tool-help 'tool-read) for live docs; (tool-help \"words\") for discovery; (tool-help 'recipes) for examples; (tool-help 'guide) for contracts/limits. Repository queries require project first; process success is returned status, not CLI exit.")))))
+
+(define (%tool-help-guide [topic #f])
+  "Detailed tool guide, requested explicitly with (tool-help 'guide)."
   (cond ((symbol? topic) (tool-describe topic))
         ((string? topic) (tool-discover topic))
         (topic (error "tool-help: topic must be a binding symbol or search string"))
@@ -13,10 +33,14 @@ matching its words. Use tool-describe to page a long docstring."
             (start (tool-help "read symbol"))
             (recipes (
               ((task "Find files") (form (tool-files project #:prefix "crates/" #:limit 10)))
-              ((task "Read a region") (form (tool-read project "FILE" #:from 20 #:lines 30)))
+              ((task "Find a hit's owning definition, then expand its handle") (form (tool-show (tool-search project "literal" #:prefix "crates/" #:enclosing #t))))
+              ((task "Search with numbered source context") (form (tool-show (tool-search project "literal" #:prefix "lisp/" #:before 1 #:after 2))))
+              ((task "Read numbered source and snapshot line count") (form (tool-show (tool-read project "FILE" #:from 20 #:lines 100))))
+              ((task "Validate citation bounds, not claim support") (form (tool-show (tool-cite project "FILE" #:from 10 #:to 20))))
               ((task "Find definitions") (form (tool-symbols project "FILE")))
               ((task "Read a definition") (form (tool-read-symbol project "FILE" "NAME")))
-              ((task "Search text") (form (tool-search project "literal" #:prefix "lisp/")))
+              ((task "Count matching lines per file and in total") (form (tool-show (tool-search project "literal" #:prefix "lisp/" #:group-by (quote path) #:limit 50))))
+              ((task "Count matching lines, without printing hits") (form (tool-ref (tool-search project "literal" #:prefix "lisp/" #:limit 1) (quote total))))
               ((task "Expand an answer") (form (tool-expand project "HANDLE" #:offset 8000)))
               ((task "Edit checked text") (form (tool-edit! project "FILE" "REVISION" (quote (("old" "new"))))))
               ((task "Edit or create files from search/replace blocks on stdin, unescaped") (form (tool-apply! project input)))
@@ -30,9 +54,12 @@ matching its words. Use tool-describe to page a long docstring."
               ((task "Inspect a binding") (form (tool-help (quote tool-read))))
               ((task "Batch independent queries") (form (tool-batch (list (lambda () (tool-files project))))))
               ((task "Run and wait") (form (tool-process-result (tool-run project "PROGRAM" (quote ("ARG"))))))))
-            (answers "Proper association lists: (tool-ref reply (quote text)), not the cdr of an entry. Inspect complete, truncated and next. Process success is the returned status, not the CLI exit status.")
+            (answers "Pass project as the first argument to repository queries. Replies are proper association lists: (tool-ref reply (quote text)), not the cdr of an entry. Use total for matching-line counts and items for result lists. Inspect complete, truncated and next. Process success is the returned status, not the CLI exit status.")
+            (reading "A read handle covers only its selected region. next is a character offset to expand that region, NOT a file continuation. When region-complete, next-line starts another tool-read; file-eof alone means file EOF. tool-show gives each source block one filename/revision/file-lines header and original line numbers; #:numbered #f opts out. Copy actual coordinates, never estimate or count displayed lines. tool-cite checks bounds/revision, not whether a claim is supported.")
+            (workflow "Prefer existing queries and metadata to writing parsers or file readers. Read known small files directly; use tool-read-symbol for a known definition, and budgeted tool-symbols only to discover names. tool-search offers bounded before/after context and group-by 'path counts to avoid follow-up reads and counting glue. Discover existing Scheme functions with tool-help before reimplementing them. Keep any necessary helpers small, indented and tested on one case before reuse.")
             (snapshots "Handles identify immutable text in this session, surviving disk edits. Expired/foreign handles require a new query. Expansion offsets count Unicode characters; list offsets count items.")
-            (limits ((items 50) (read-lines 200) (read-characters 16000) (file-bytes 1048576)
+            (limits ((items 50) (read-lines 200) (read-characters 16000) (context-lines-each-side 8)
+                     (context-characters-per-reply 16000) (file-bytes 1048576)
                      (cached-source-bytes-per-project 16777216) (snapshots-per-project 128)
                      (session-projects 8) (search-bytes 67108864) (batch-queries 20)))
             (scope "Disk-backed files only, not unsaved editor buffers or semantic references. Not a filesystem sandbox, and checked writes are not cross-file transactions.")

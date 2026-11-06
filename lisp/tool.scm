@@ -3,7 +3,8 @@
 (define args (cdr (command-line)))
 (define executable (car args))
 ;; The flags may come anywhere but in FORM, which is one argument of its
-;; own: --text displays a string answer as it is, not written; --stdin
+;; own: --text displays strings as they are and source views with their
+;; original line numbers; other values stay written as Scheme data. --stdin
 ;; binds `input` in FORM to the text read from stdin, so text needs no
 ;; escaping (patches for `tool-apply!`, say); --help asks for help. Where
 ;; they stood used to matter, and a --text after FORM was quietly taken
@@ -59,6 +60,19 @@
              (sleep 200)
              (loop (+ tries 1)))))))
 (define (written value) (call-with-output-string (lambda (p) (write value p))))
+;; Source replies carry disk-snapshot metadata. Do not infer a file from
+;; any old (path, text) pair, or from a kept process stream's label.
+(define (source-view? value)
+  (and (pair? value) (list? value)
+       (every (lambda (e) (and (pair? e) (symbol? (car e))
+                              (pair? (cdr e)) (null? (cddr e)))) value)
+       (string? (tool-ref value 'path)) (string? (tool-ref value 'handle))
+       (string? (tool-ref value 'text))
+       (exact-integer? (tool-ref value 'file-lines))
+       (> (tool-ref value 'file-lines) 0)))
+(define (source-result? value)
+  (or (source-view? value)
+      (and (list? value) (any source-view? value))))
 ;; Without a SESSION, this program's own: one per techne binary (its
 ;; path, as current_exe gives it) and the Lisp it loads, so that two
 ;; checkouts, a debug and a release build, or one binary given other
@@ -101,5 +115,6 @@
                                                (written form)))))
                   (cond ((eq? value (if #f #f)))
                         ((and text? (string? value)) (display value) (newline))
+                        ((and text? (source-result? value)) (display (tool-show value)) (newline))
                         (else (write value) (newline)))))
               (lambda () (node-close node)))))))

@@ -86,13 +86,20 @@ fn text_prints_strings_as_they_are_and_stdin_needs_no_escaping() {
     assert!(String::from_utf8(out.stdout).unwrap().starts_with("made: created, revision "));
     assert_eq!(std::fs::read_to_string(dir.path().join("made")).unwrap(), "says \"quoted\" \\ back\n");
     let text = Command::new(env!("CARGO_BIN_EXE_techne"))
-        .args(["tool", "--text", dir.path().to_str().unwrap(), "(tool-show (tool-read project \"made\"))", &session.name])
+        .args(["tool", "--text", dir.path().to_str().unwrap(), "(tool-show (tool-read project \"made\") #:numbered #f)", &session.name])
         .env("TECHNE_NODE_DIR", &session.node_dir)
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(text.stdout).unwrap(), "says \"quoted\" \\ back\n");
     // Without --text a string is written, so a handle can be pasted back.
     assert_eq!(session.query(dir.path(), "(tool-ref (tool-read project \"made\") 'path)"), r#""made""#);
+}
+
+#[test]
+fn scheme_source_rendering_tests() {
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/tests/tools/cli.scm");
+    let out = Command::new(env!("CARGO_BIN_EXE_techne")).arg("run").arg(suite).arg(env!("CARGO_BIN_EXE_techne")).output().unwrap();
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 }
 
 /// Copy the directory FROM to TO, recursively.
