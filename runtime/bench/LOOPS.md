@@ -1,8 +1,6 @@
 # Loop/callback hillclimb
 
-Baseline is `17fb4311`, including the numeric recursive kernel. Frozen binary
-`/tmp/techne-loops/before`, SHA-256
-`cd027dd56791f3d062d8224bb1bf167db5593db0ae57ac3456475c12ebfd523a`.
+Baseline is `17fb4311`, including the numeric recursive kernel.
 Workloads and arguments stay unchanged. CPU 4, release/counting-allocator,
 paired alternating processes, synchronous compilation at threshold 1000.
 
@@ -59,9 +57,6 @@ One Cachegrind pair / two calls, **whole process**, including compilation:
 | mandel | 288,653,445 | 288,641,181 |
 | nqueens | 1,801,161,864 | 1,801,165,552 |
 
-Raw records `/tmp/techne-loops/fuel-{wall,ablation,bounded-wall,bounded-counts}.json`;
-the unrestricted policy's counts are `fuel-counts.json`.
-
 Initially opt-in with `TECHNE_JIT_FUEL=1`. The unit test in
 `src/vm/fuel_tests.rs` observes the exact count from a native every iteration
 (one inlined call plus one back-edge) and requests allocation-pressure hurry.
@@ -97,8 +92,7 @@ interpreter exit status/stdout/full source traces. It also verifies which
 cases actually select/reject caching: distinct captures of one code, a new
 target, unused/bad callbacks, self-tail rebinding, boxed assignment, CFG joins,
 and a native collection inside an inlined callback with a captured pair.
-Both ordinary and full-GC-stress variants pass. Raw measurements:
-`/tmp/techne-loops/cache-{wall,ablation,counts}.json`.
+Both ordinary and full-GC-stress variants pass.
 
 ## 3. Exact scalar addition through first-class `+`
 
@@ -136,8 +130,7 @@ Three same-binary pairs / eight calls with the earlier changes held enabled:
 The integer-only trial improved HOF but mildly regressed inexact sums; the
 retained floating fallback avoids that regression. Its original HOF counts
 fell 2,155,899,372 -> 1,922,429,247 (whole process, two calls); final combined
-counts are measured separately. Raw records: `wide-{wall,counts,controls}.json`
-and `scalar-wall.json` in `/tmp/techne-loops/`.
+counts are measured separately.
 
 This remains Rust because native number representation, allocation boundaries
 and exact fallback/root publication belong to the VM mechanism. Workloads and
@@ -198,8 +191,7 @@ changes, and reverses the sign of nqueens' small cross-binary difference:
 | nqueens | 262.640 | 258.437 |
 
 These small unaffected-control differences are not evidence of an
-optimization benefit or a reproducible policy regression. Raw control:
-`/tmp/techne-loops/final-ablation.json`.
+optimization benefit or a reproducible policy regression.
 
 Final Cachegrind, one pair / two calls, whole process including compilation:
 
@@ -261,18 +253,9 @@ nix develop --command cargo test --release -p techne-vm \
   --features counting-allocator --test suites -- --skip bench/
 ```
 
-Raw local data: `/tmp/techne-loops/final-runtime.json`,
-`final-instructions.json`, `pure-loop-recheck.json`, `final-tests.log`,
-`final-conformance.log` and `rss-{before,final}-*.txt`. The earlier
-`final-wall.json`/`after` binary precede the pure-loop reload correction and
-are superseded. Frozen final binary `/tmp/techne-loops/final`, SHA-256
-`a58d853271955ecf6dab7d58f2a729a7644f8990d17412a87076ff68012c8665`.
-
-Tooling caveat: a hard outer timeout killed one comparison driver without
-cleaning up its bounded Cachegrind child. It was checked/finished before
-later wall measurements; no benchmark child remains. Run wall and counted
-campaigns separately with sufficient outer timeout. Scheme process-scope
-cleanup cannot execute after a hard process kill.
+Run wall and counted campaigns separately, with a sufficient outer timeout:
+Scheme process-scope cleanup cannot run after a hard process kill, so a
+killed driver can leave its Cachegrind child behind.
 
 ### Still open
 

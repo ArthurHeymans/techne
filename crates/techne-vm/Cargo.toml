@@ -89,6 +89,10 @@ name = "hostile"
 required-features = ["hostile"]
 
 [[test]]
+name = "emission"
+required-features = ["counting-allocator"]
+
+[[test]]
 name = "language"
 required-features = ["counting-allocator"]
 

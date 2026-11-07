@@ -7,11 +7,6 @@ Baseline: `eda95c0132c0c5d90ce345556f147ccb342a5aae`, release build with
 `counting-allocator`. Same source programs, arguments and expected outputs
 in both binaries. No hand-rewritten workload supplies an optimization win.
 
-Measured binary SHA-256:
-
-- Before: `8d4b2df65c2a19954d12785402d073f578feb574253c6eaa92a19b713a9cd3f3`
-- After: `3674d820d429ea1b1a6f31639022395a7b32e86f8a409ba6d5aa426c909a23df`
-
 ## What was kept
 
 1. **List-specific nursery bulk allocation.** `list`, `reverse`, `append`

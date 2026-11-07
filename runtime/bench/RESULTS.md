@@ -148,6 +148,34 @@ bytes; 30.4 MB of them during `reverse` preparing its result, whose
 reservation can collect while the input list is still live. That is the
 larger lever for HOF, not tracing speed.
 
+## Native identity cache only in reload-free loops, 2026-11-06
+
+PR #337's native identity cache also applied to loops that call another
+procedure between uses, such as `numstr`'s `(string-length (number->string
+...))`. Each such call reloads kept globals, so the guard was recomputed every
+iteration for a single use: about 4 instructions per iteration, linear in
+work (+1.07M / +4.07M / +8.07M instructions at 250 / 1000 / 2000 repeats).
+Caching is now restricted to loops that can return to the call without a
+reload. Whole-process cachegrind counts against main `4db749c8`: numstr (JIT)
+**250,561,585 -> 246,491,803** (-1.62%, recovering the regression) and the HTTP `/work` request
+**232,819 -> 228,807** instructions (-1.72%); orgparse
+**345,825,732 -> 345,793,961**, keeping the cache's gain; every other
+program within ±0.2%. The per-call-site JIT switches are now read once per
+process instead of once per site.
+
+## Native emission in a fixed order, 2026-11-06
+
+The JIT writes some of a function's blocks (entry loaders, guard and exit
+blocks, the numeric kernel's exits) in hash-map iteration order. `HashMap`
+seeds SipHash per process, so two runs of one binary compiled the same
+function differently: six runs of the steady Mandelbrot gave six IR block
+orders, and qsort's `partition` two machine-code layouts. The JIT's maps now
+use SipHash with fixed keys (`hash::Map`), so a given job compiles the same
+way in every process; `tests/emission.rs` compares `partition`'s disassembly
+across eight processes. This removes one source of run-to-run variance in
+wall-time comparisons. It makes no throughput claim, and machine code still
+depends on runtime state (sampled register kinds, call feedback, globals).
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror
