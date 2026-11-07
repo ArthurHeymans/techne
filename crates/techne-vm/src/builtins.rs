@@ -1499,9 +1499,16 @@ fn length(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(Value::int_unchecked(list_len(arg(vm, args, 0), "length")? as i64))
 }
 
+/// Copy a validated proper list into fresh pairs, without mutating its input.
+/// Admit and reserve the output before construction, then reread the rooted
+/// argument after any collection. Census checkpoints cover preparation only.
 fn reverse(vm: &mut Vm, args: usize, _: usize) -> R {
     let len = list_len(arg(vm, args, 0), "reverse")?;
+    #[cfg(feature = "allocation-census")]
+    let before = vm.heap.reverse_checkpoint();
     let mut b = Bulk::list(vm, len)?;
+    #[cfg(feature = "allocation-census")]
+    vm.heap.count_reverse(before);
     let mut acc = Value::NIL;
     let mut l = arg(vm, args, 0);
     while is_kind(l, Kind::Pair) {
@@ -2009,8 +2016,7 @@ fn fold_char(c: char) -> char {
     single(&mut caseless::Caseless::default_case_fold(std::iter::once(c))).or_else(|| single(&mut c.to_lowercase())).unwrap_or(c)
 }
 
-/// Unicode full case folding.
-/// The c[ad]r combinations of three and four letters, but `caddr` and
+/// Install the `c[ad]r` combinations of three and four letters, except `caddr` and
 /// `cdddr`: natives cost nothing at startup, unlike prelude definitions.
 /// (Those two, and the shorter ones, are in the prelude, where the compiler
 /// inlines `car` and `cdr`.)
