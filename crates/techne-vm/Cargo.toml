@@ -93,6 +93,10 @@ name = "emission"
 required-features = ["counting-allocator"]
 
 [[test]]
+name = "nursery_adapt"
+required-features = ["counting-allocator"]
+
+[[test]]
 name = "language"
 required-features = ["counting-allocator"]
 

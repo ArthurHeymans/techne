@@ -90,9 +90,68 @@ pub const NURSERY_WORDS: usize = 1 << 20; // 8 MiB
 /// gets the largest. Above `LARGE_WORDS`, so that every small object fits.
 const NURSERY_START: usize = 1 << 15; // 256 KiB
 
+/// Largest nursery the policy will consider, in words (256 MiB). A cage and
+/// the world's budget bound it far below this in practice; the bound keeps a
+/// mistyped environment value from wrapping or overflowing.
+const NURSERY_WORDS_MAX: usize = 1 << 25;
+
+/// `kb` in words, checked, and at most `NURSERY_WORDS_MAX`.
+fn kb_words(kb: usize) -> Option<usize> {
+    kb.checked_mul(128).map(|words| words.min(NURSERY_WORDS_MAX))
+}
+
 /// Largest nursery size in words: `TECHNE_NURSERY_KB` or `NURSERY_WORDS`.
+/// A parsed value is clamped to `NURSERY_WORDS_MAX`; one that does not parse,
+/// or that overflows when converted, falls back to `NURSERY_WORDS`.
 fn nursery_words() -> usize {
-    std::env::var("TECHNE_NURSERY_KB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(NURSERY_WORDS, |kb| (kb * 128).max(1 << 12))
+    std::env::var("TECHNE_NURSERY_KB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(kb_words)
+        .map_or(NURSERY_WORDS, |words| words.max(1 << 12))
+}
+
+/// The survivor-sized nursery aims a window at this many times the words
+/// one collection copied, i.e. at about 1/8 survival.
+const SURVIVOR_TARGET: usize = 8;
+
+/// The share of recent time collections must take before the nursery grows
+/// past its base. Below it a larger nursery costs more than it saves: a
+/// workload that collects rarely runs faster with a nursery that stays in
+/// cache.
+const GROW_SHARE: f64 = 0.3;
+/// How much of the time measured so far each collection keeps: about the
+/// last eight weigh.
+const SHARE_DECAY: f64 = 0.875;
+/// Below this share a grown nursery halves back towards its base.
+const SHRINK_SHARE: f64 = 0.1;
+/// Growth must cut the share of the window surviving to at most this much
+/// of what it was, or below `MOSTLY_SURVIVING`; otherwise it only
+/// lengthened the pauses (the young data survives however long it is
+/// given) and is undone, and growth waits for `GROWTH_COOLDOWN` more
+/// collections that ran out of window.
+const GROWTH_HELPED: f64 = 0.75;
+const MOSTLY_SURVIVING: f64 = 0.5;
+const GROWTH_COOLDOWN: u32 = 16;
+
+/// `(base, ceiling)` in words for the survivor-sized nursery window.
+///
+/// On unless `TECHNE_NURSERY_ADAPT=0`; an explicit `TECHNE_NURSERY_KB` pins
+/// the capacity as before. The ceiling is `TECHNE_NURSERY_ADAPT_KB` (4x
+/// the base, 32 MiB, by default) and is only a cap: the capacity actually
+/// reserved is still admitted by the world's budget.
+fn nursery_policy(base: usize) -> (usize, usize) {
+    let adapt = std::env::var("TECHNE_NURSERY_ADAPT").as_deref() != Ok("0") && std::env::var_os("TECHNE_NURSERY_KB").is_none();
+    if !adapt {
+        return (base, base);
+    }
+    let ceiling = std::env::var("TECHNE_NURSERY_ADAPT_KB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(kb_words)
+        .map_or(base.saturating_mul(4).min(NURSERY_WORDS_MAX), |words| words.max(base));
+    let base = base.min(ceiling);
+    (base, ceiling)
 }
 
 /// Objects at least this large are allocated directly in the old generation.
@@ -513,12 +572,51 @@ pub struct GcStats {
     pub ephemeron_entries: u64,
     /// Most such entries examined in one collection (minor and old-generation work).
     pub max_ephemeron_entries: u64,
+    /// Nursery capacity now, and the capacity the survivor-sized policy asks
+    /// for (equal when it is off): what the last resize settled on.
+    pub nursery_words: usize,
+    pub nursery_target_words: usize,
 }
 
 pub struct Heap {
     nursery: Vec<u64, Caged>,
-    /// The size the nursery grows to, in words (`nursery_words`).
+    /// The size the nursery resizes to after a collection, in words: the
+    /// base (`nursery_words`) unless a survivor-sized window asks for more.
     nursery_max: usize,
+    /// The bound the survivor-sized target is clamped to, and the base it is
+    /// clamped from. Equal when adaptation is off.
+    nursery_base: usize,
+    nursery_ceiling: usize,
+    /// Set when an allocation ran out of window and is about to collect:
+    /// only then is the nursery a bottleneck the policy may react to. Boot,
+    /// `collect-garbage`, `request_collection`, GC stress and a bulk
+    /// reservation's own collection leave it clear, so none of them changes
+    /// the capacity.
+    window_exhausted: bool,
+    /// What the last minor collection saw: whether its window ran out, the
+    /// words allocated and the words copied (`adapt_nursery`'s inputs,
+    /// taken by `adapt_after_collection`).
+    last_minor: (bool, usize, usize),
+    /// When the last collection ended (`note_collection_end`): the mutator
+    /// ran since.
+    collected_at: Instant,
+    /// Seconds spent collecting, and in all, decayed by `SHARE_DECAY` at
+    /// each collection: their ratio is the recent share of time collections
+    /// take, weighted by time, not by count.
+    gc_time: (f64, f64),
+    /// The share of the window that survived before the last growth, until
+    /// the next collection shows whether growing helped.
+    grown_from: Option<f64>,
+    /// Collections to wait before growing again after a growth was undone.
+    growth_cooldown: u32,
+    /// A collection was asked for (`request_collection`): the next one is
+    /// not a window exhaustion, whatever `limit` says.
+    requested: bool,
+    /// Words a bulk reservation has checked against the current capacity and
+    /// not yet taken: no resize may leave the nursery smaller than this. A
+    /// pending shrink target can otherwise be applied by the very collection
+    /// that makes the reservation's span.
+    reserve_floor: usize,
     /// The window asked for (`set_nursery_window`), in words.
     window: usize,
     nursery_start: *mut u64,
@@ -621,7 +719,9 @@ impl Heap {
     pub(crate) fn new_in(budget: Budget) -> Heap {
         #[cfg(feature = "allocation-census")]
         let census = if std::env::var("TECHNE_ALLOC_CENSUS").as_deref() == Ok("1") { census::Census::new(&budget) } else { None };
-        let nursery_max = nursery_words();
+        let base = nursery_words();
+        let (nursery_base, nursery_ceiling) = nursery_policy(base);
+        let nursery_max = nursery_base;
         let words = NURSERY_START.min(nursery_max);
         // A cage of its own: no value of another world names its memory.
         let alloc = Caged::new(budget, crate::alloc::Cage::new());
@@ -635,6 +735,16 @@ impl Heap {
             limit: unsafe { start.add(words) },
             nursery,
             nursery_max,
+            nursery_base,
+            nursery_ceiling,
+            window_exhausted: false,
+            last_minor: (false, 0, 0),
+            collected_at: Instant::now(),
+            gc_time: (0.0, 0.0),
+            grown_from: None,
+            growth_cooldown: 0,
+            requested: false,
+            reserve_floor: 0,
             window: usize::MAX,
             old: OldSpace::new(alloc),
             remembered: Vec::new(),
@@ -661,7 +771,7 @@ impl Heap {
             stress,
             stress_full: std::env::var("TECHNE_GC_STRESS").is_ok_and(|v| v == "full"),
             verify: std::env::var_os("TECHNE_GC_VERIFY").is_some(),
-            stats: GcStats::default(),
+            stats: GcStats { nursery_words: words, nursery_target_words: nursery_max, ..GcStats::default() },
             #[cfg(feature = "allocation-census")]
             census,
         }
@@ -702,6 +812,25 @@ impl Heap {
     /// too (`Vm::collect`): for what the heap's size does not show.
     pub(crate) fn request_collection(&mut self) {
         self.limit = self.top;
+        self.requested = true;
+    }
+
+    /// A bulk reservation of `words` has been checked against the capacity
+    /// and is about to collect to make its span: the nursery must not shrink
+    /// below it until `release_reserve`.
+    pub(crate) fn hold_reserve(&mut self, words: usize) {
+        self.reserve_floor = words.max(self.reserve_floor);
+    }
+
+    pub(crate) fn release_reserve(&mut self) {
+        self.reserve_floor = 0;
+    }
+
+    /// True when the next collection is forced rather than caused by a full
+    /// window (GC stress, or one asked for): the survivor-sized nursery
+    /// policy must not read a survival rate from those.
+    pub(crate) fn forced_collection(&self) -> bool {
+        self.stress || self.requested
     }
 
     /// The addresses of the bump pointer and of the allocation limit, for
@@ -1093,7 +1222,10 @@ impl Heap {
     fn minor(&mut self, roots: &mut dyn Roots) -> usize {
         #[cfg(feature = "allocation-census")]
         self.count_nursery();
+        let allocated = self.nursery_used() / 8; // words, like `promoted`
         self.promoted = 0;
+        // The request is consumed by this collection.
+        self.requested = false;
         unsafe {
             roots.visit(&mut |v| *v = self.evacuate(*v));
             roots.visit_unrooted(&mut |v| *v = self.evacuate(*v));
@@ -1113,7 +1245,101 @@ impl Heap {
         self.limit = unsafe { self.nursery_start.add(self.window.min(self.nursery_capacity())) };
         let promoted = self.promoted;
         self.stats.max_copied_words = self.stats.max_copied_words.max(promoted);
+        self.last_minor = (std::mem::take(&mut self.window_exhausted), allocated, promoted);
         promoted
+    }
+
+    /// Aim the next window at `SURVIVOR_TARGET` times what this collection
+    /// copied, clamped to the policy's bounds, for a collection caused by
+    /// running out of window (`exhausted`) only.
+    ///
+    /// Growth needs collections to take at least `GROW_SHARE` of the recent
+    /// time (`pause` against `mutator`, the run before it, time-weighted
+    /// over the last collections): a larger nursery saves collection work but costs cache
+    /// misses on every allocation, a loss for a workload that rarely
+    /// collects. It doubles at most, towards the target, and must then pay
+    /// off: if the next collection still finds most of its window alive, and
+    /// about as large a share as before (`GROWTH_HELPED`), the young data was
+    /// not dying given
+    /// more time, the larger nursery only lengthens pauses, and the growth is
+    /// undone for a while (`GROWTH_COOLDOWN`). The nursery halves, towards
+    /// its base, once collections take less than `SHRINK_SHARE`, or once the
+    /// estimate is at most half the current target; a workload hovering near
+    /// either band does not relocate its nursery every collection.
+    ///
+    /// The copied volume is not exactly the live set: it is what the window
+    /// happened to hold when the collection ran, the best estimate here.
+    fn adapt_nursery(&mut self, exhausted: bool, allocated: usize, promoted: usize, pause: f64, mutator: f64) {
+        // Every collection's time counts, a bulk reservation's or one asked
+        // for too; only one that ran out of window decides.
+        let (gc, all) = self.gc_time;
+        self.gc_time = (gc * SHARE_DECAY + pause, all * SHARE_DECAY + pause + mutator);
+        if !exhausted || self.nursery_ceiling == self.nursery_base || allocated == 0 {
+            return;
+        }
+        let share = self.gc_time.0 / self.gc_time.1.max(f64::MIN_POSITIVE);
+        let survived = promoted as f64 / allocated as f64;
+        if let Some(before) = self.grown_from.take()
+            && survived > before * GROWTH_HELPED
+            && survived > MOSTLY_SURVIVING
+        {
+            self.nursery_max = (self.nursery_max / 2).max(self.nursery_base);
+            self.growth_cooldown = GROWTH_COOLDOWN;
+            return;
+        }
+        self.growth_cooldown = self.growth_cooldown.saturating_sub(1);
+        let target = promoted.saturating_mul(SURVIVOR_TARGET).clamp(self.nursery_base, self.nursery_ceiling);
+        // A window narrower than the nursery (`set_nursery_window`, the
+        // editor's, bounding pauses) already decides how much is allocated
+        // between collections: a larger nursery would not widen it.
+        let widens = self.window > self.nursery_max;
+        if widens && target > self.nursery_max && share >= GROW_SHARE && self.growth_cooldown == 0 {
+            self.nursery_max = self.nursery_max.saturating_mul(2).min(target);
+            self.grown_from = Some(survived);
+        } else if share < SHRINK_SHARE || target.saturating_mul(2) <= self.nursery_max {
+            self.nursery_max = (self.nursery_max / 2).max(self.nursery_base);
+        }
+    }
+
+    /// After a collection the VM began at `started`, its own work around the
+    /// heap's included: let the policy see it, before the nursery resizes.
+    pub(crate) fn adapt_after_collection(&mut self, started: Instant) {
+        let pause = started.elapsed();
+        let mutator = started.saturating_duration_since(self.collected_at);
+        let (exhausted, allocated, copied) = std::mem::take(&mut self.last_minor);
+        self.adapt_nursery(exhausted, allocated, copied, pause.as_secs_f64(), mutator.as_secs_f64());
+    }
+
+    /// The collection is over: the mutator runs from now.
+    pub(crate) fn note_collection_end(&mut self) {
+        self.collected_at = Instant::now();
+    }
+
+    /// The next collection was caused by an allocation that ran out of
+    /// window: the one case the survivor-sized policy reacts to.
+    pub(crate) fn note_window_exhausted(&mut self) {
+        self.window_exhausted = true;
+    }
+
+    /// The nursery capacity the policy asks for, in words (tests and
+    /// diagnostics).
+    #[cfg(test)]
+    pub(crate) fn nursery_target(&self) -> usize {
+        self.nursery_max
+    }
+
+    /// Set the survivor-sized policy directly (`(base, base)` disables it):
+    /// the same bounds the environment asks for. Tests drive it this way
+    /// because the environment is process-global.
+    #[cfg(test)]
+    pub(crate) fn set_nursery_policy(&mut self, base: usize, ceiling: usize) {
+        let base = base.max(1 << 12);
+        self.nursery_base = base;
+        self.nursery_ceiling = ceiling.max(base);
+        self.nursery_max = base;
+        self.gc_time = (0.0, 0.0);
+        self.grown_from = None;
+        self.growth_cooldown = 0;
     }
 
     /// Allocate at most `words` in the nursery between minor collections
@@ -1125,25 +1351,33 @@ impl Heap {
         self.limit = unsafe { self.nursery_start.add(self.window.min(self.nursery_capacity())) };
     }
 
-    /// The bytes `grow_nursery` would add: none at its largest.
+    /// Bytes `resize_nursery` would newly commit: none when it shrinks or
+    /// already matches the target.
     pub(crate) fn nursery_growth(&self) -> usize {
         let words = self.nursery_capacity();
-        (self.nursery_max - words.min(self.nursery_max)) * 8
+        self.nursery_max.saturating_sub(words) * 8
     }
 
-    /// After a collection, the nursery empty: make it its largest (the VM
-    /// admits it, `Vm::collect_with`). A world that never fills its first
-    /// one keeps it small (its cage's room and its memory account are what
-    /// it reserves). Growing by steps instead costs a busy world more
+    /// After a collection, the nursery empty: make it the target capacity (the
+    /// VM admits growth, `Vm::collect_with`). A world that never fills its
+    /// first one keeps it small (its cage's room and its memory account are
+    /// what it reserves). Growing by steps instead costs a busy world more
     /// collections, each rescanning the large old objects it remembers
     /// (hash's tables: 7% more instructions doubling from 256 KiB).
-    pub(crate) fn grow_nursery(&mut self) {
+    ///
+    /// A smaller target shrinks the reservation here too, so a workload whose
+    /// live young data shrank releases it. The new region is allocated before
+    /// the old is dropped; if that is refused the current one serves on.
+    pub(crate) fn resize_nursery(&mut self) {
         debug_assert_eq!(self.top, self.nursery_start, "the nursery is empty");
         let words = self.nursery_capacity();
-        if words >= self.nursery_max {
+        if words == self.nursery_max.max(self.reserve_floor) {
             return;
         }
-        let words = self.nursery_max;
+        // Never below a reservation that was checked against the current
+        // capacity: a pending shrink may only be applied by a collection
+        // that no reservation is waiting on.
+        let words = self.nursery_max.max(self.reserve_floor);
         let _charged = self.old.alloc.budget().enter();
         // Without room, the small nursery serves on.
         let Some(nursery) = try_zeroed_words(words, self.old.alloc.clone()) else { return };
@@ -1156,6 +1390,15 @@ impl Heap {
             self.limit = start.add(words.min(self.window));
         }
         self.top = start;
+        self.note_nursery_stats();
+    }
+
+    /// Record the current nursery capacity and target with the statistics.
+    /// `Vm::boot` resets the rest of them after the prelude, so it calls this
+    /// again.
+    pub(crate) fn note_nursery_stats(&mut self) {
+        self.stats.nursery_words = self.nursery_capacity();
+        self.stats.nursery_target_words = self.nursery_max;
     }
 
     pub fn nursery_window(&self) -> usize {
@@ -1864,6 +2107,183 @@ mod tests {
                 assert_eq!(str_ref(obj, count), None);
             }
         }
+    }
+
+    /// Collections taking all the time, an eighth of a large window
+    /// surviving each, until the target reaches `ceiling`.
+    fn grow_to(heap: &mut Heap, ceiling: usize) {
+        while heap.nursery_target() < ceiling {
+            heap.adapt_nursery(true, ceiling * SURVIVOR_TARGET, ceiling, 1.0, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_survivor_sized_window_grows_to_the_ceiling_and_shrinks_back() {
+        let mut vm = crate::vm::Vm::new();
+        let _world = vm.enter_account();
+        let (base, ceiling) = (1 << 14, 1 << 18); // 128 KiB and 2 MiB
+        vm.heap.set_nursery_policy(base, ceiling);
+        assert_eq!(vm.heap.nursery_target(), base);
+
+        // However much survives, collections that take little of the time
+        // leave it at the base: a larger nursery would only miss in cache.
+        for _ in 0..4 {
+            vm.heap.adapt_nursery(true, base, base, 0.05, 0.95);
+        }
+        assert_eq!(vm.heap.nursery_target(), base);
+        vm.heap.set_nursery_policy(base, ceiling);
+
+        // Collections taking most of the time, with much surviving: it
+        // doubles, collection by collection, while growing pays off.
+        vm.heap.adapt_nursery(true, base, base, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), 2 * base);
+        grow_to(&mut vm.heap, ceiling);
+        assert_eq!(vm.heap.nursery_target(), ceiling);
+        vm.heap.resize_nursery();
+        assert_eq!(vm.heap.nursery_capacity(), ceiling);
+
+        // A collection not caused by running out of window (boot,
+        // `collect-garbage`, a bulk reservation's own collection) changes
+        // nothing, however much it copies.
+        vm.heap.adapt_nursery(false, ceiling, ceiling, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), ceiling);
+
+        // Collections that come to take little of the time halve it, even
+        // with as much surviving, once the recent share falls below the
+        // band: not at the first, the share is weighted over several.
+        let mut collections = 0;
+        while vm.heap.nursery_target() == ceiling {
+            vm.heap.adapt_nursery(true, ceiling * SURVIVOR_TARGET, ceiling, 0.0, 1.0);
+            collections += 1;
+            assert!(collections < 64);
+        }
+        assert!(collections > 1, "{collections}");
+        assert_eq!(vm.heap.nursery_target(), ceiling / 2);
+
+        // Almost nothing surviving halves it, collection by collection, but
+        // never below the base ...
+        vm.heap.set_nursery_policy(base, ceiling);
+        grow_to(&mut vm.heap, ceiling);
+        vm.heap.adapt_nursery(true, ceiling, 1, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), ceiling / 2);
+        for _ in 0..8 {
+            vm.heap.adapt_nursery(true, ceiling / 2, 1, 1.0, 0.0);
+        }
+        assert_eq!(vm.heap.nursery_target(), base);
+        vm.heap.resize_nursery();
+        assert_eq!(vm.heap.nursery_capacity(), base);
+
+        // A window narrower than the nursery bounds what is allocated
+        // between collections: growing would not widen it.
+        vm.heap.set_nursery_policy(base, ceiling);
+        vm.heap.set_nursery_window(base / 2);
+        vm.heap.adapt_nursery(true, base, base, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), base);
+        vm.heap.set_nursery_window(usize::MAX);
+
+        // ... and a policy with no room to grow changes nothing.
+        vm.heap.set_nursery_policy(base, base);
+        vm.heap.adapt_nursery(true, base, base, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), base);
+        assert_eq!(vm.heap.nursery_capacity(), base);
+    }
+
+    #[test]
+    fn growth_that_does_not_let_the_young_data_die_is_undone() {
+        let mut vm = crate::vm::Vm::new();
+        let _world = vm.enter_account();
+        let (base, ceiling) = (1 << 14, 1 << 18);
+        vm.heap.set_nursery_policy(base, ceiling);
+        // Everything in the window survives: it doubles to find out whether
+        // more time lets the young data die ...
+        vm.heap.adapt_nursery(true, base, base, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), 2 * base);
+        // ... it does not: back to the base, and no growth for a while.
+        vm.heap.adapt_nursery(true, 2 * base, 2 * base, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), base);
+        for _ in 0..GROWTH_COOLDOWN - 1 {
+            vm.heap.adapt_nursery(true, base, base, 1.0, 0.0);
+            assert_eq!(vm.heap.nursery_target(), base);
+        }
+        vm.heap.adapt_nursery(true, base, base, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), 2 * base);
+        // Growth that cuts the surviving share is kept, and continues.
+        vm.heap.adapt_nursery(true, 2 * base, base / 2, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), 4 * base);
+    }
+
+    #[test]
+    fn a_reservation_holds_the_capacity_across_a_pending_shrink() {
+        let mut vm = crate::vm::Vm::new();
+        let _world = vm.enter_account();
+        let (base, ceiling) = (1 << 14, 1 << 18); // 128 KiB and 2 MiB
+        vm.heap.set_nursery_policy(base, ceiling);
+        grow_to(&mut vm.heap, ceiling);
+        vm.heap.resize_nursery();
+        assert_eq!(vm.heap.nursery_capacity(), ceiling);
+
+        // A shrink target is set, but the resize is refused or delayed: the
+        // target stays pending, as a refused resize leaves it.
+        vm.heap.adapt_nursery(true, ceiling, 1, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), ceiling / 2);
+
+        // A bulk reservation was checked against the current capacity: the
+        // collection it makes its span must not apply that pending shrink.
+        vm.heap.hold_reserve(ceiling);
+        vm.heap.resize_nursery();
+        assert_eq!(vm.heap.nursery_capacity(), ceiling);
+
+        // Once released, the next collection applies it (down to the base
+        // over further collections).
+        vm.heap.release_reserve();
+        vm.heap.resize_nursery();
+        assert_eq!(vm.heap.nursery_capacity(), ceiling / 2);
+    }
+
+    #[test]
+    fn a_bulk_reservation_holds_the_capacity_across_its_collection() {
+        let mut vm = crate::vm::Vm::new();
+        let _world = vm.enter_account();
+        let (base, ceiling) = (1 << 12, 1 << 16); // 32 KiB and 512 KiB
+        vm.heap.set_nursery_policy(base, ceiling);
+        grow_to(&mut vm.heap, ceiling);
+        vm.heap.resize_nursery();
+        assert_eq!(vm.heap.nursery_capacity(), ceiling);
+
+        // A shrink target left pending, as a refused resize leaves it, and
+        // smaller than the span the reservation will ask for.
+        for _ in 0..3 {
+            vm.heap.adapt_nursery(true, ceiling, 1, 1.0, 0.0);
+        }
+        assert_eq!(vm.heap.nursery_target(), ceiling / 8);
+
+        // Fill the window with valid, unrooted pairs, then reserve through
+        // the VM's own path: the collection it makes must not apply that
+        // pending shrink below the span the caller was promised.
+        let span = 3 * 16384;
+        vm.with_heap(|mut heap| {
+            let nil = heap.immediate(Value::NIL).unwrap();
+            while heap.try_cons(nil, nil).is_some() {}
+        })
+        .unwrap();
+        let start = vm.reserve_nursery(span);
+        assert!(!start.is_null());
+        assert_eq!(vm.heap.nursery_capacity(), span, "the reservation held the capacity it was promised");
+        assert!(unsafe { start.add(span) } <= vm.heap.nursery_end, "the span the reservation was promised");
+
+        // Fill the span as a Bulk user would, so the nursery is scannable.
+        unsafe {
+            for i in 0..(span / 3) {
+                let p = start.add(i * 3);
+                *p = header(Kind::Pair, 2, 0);
+                *p.add(1) = Value::NIL.bits();
+                *p.add(2) = Value::NIL.bits();
+            }
+        }
+        // The floor was released: the pending shrink applies on the next
+        // collection, down to the base over further ones.
+        vm.collect_raw();
+        assert_eq!(vm.heap.nursery_capacity(), ceiling / 8);
     }
 
     #[test]

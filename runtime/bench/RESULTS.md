@@ -195,6 +195,40 @@ across eight processes. This removes one source of run-to-run variance in
 wall-time comparisons. It makes no throughput claim, and machine code still
 depends on runtime state (sampled register kinds, call feedback, globals).
 
+## A nursery that grows while collection dominates, 2026-11-07
+
+Collector counters at the default 8 MiB nursery (warm calls, EPYC 3151): hof
+spends 59.9% of its time collecting, hash 19.9%, bintrees 10.7%, orgparse
+1.8%, nqueens 0.1%, and fib, tak, qsort and mandel nothing. A fixed larger
+nursery helps hof (316 -> 157 ms per call at 32 MiB) but is no general
+answer: on an Intel N100 it made orgparse 13% slower, because a nursery
+larger than needed misses in cache on every allocation, which instruction
+counts do not show. Sizing it by survival alone grew orgparse's too.
+
+The nursery now doubles, towards 8x what a collection copied and up to 4x
+its base (`TECHNE_NURSERY_ADAPT_KB`), only while collections take at least
+30% of the recent time (every collection's pause against the run before it,
+time-weighted over about the last eight). The next collection must show
+more of the young data dying; if most of the window still survives, the
+growth only lengthened pauses and is undone for sixteen collections. It
+halves back once collections take under 10% of the time or little survives.
+Only collections caused by running out of window decide; a bulk reservation
+holds the capacity across its own collection. `TECHNE_NURSERY_ADAPT=0` or an
+explicit `TECHNE_NURSERY_KB` keeps it fixed.
+
+Intel N100, CPU 3, alternating process pairs of ten calls, same binary with
+`TECHNE_NURSERY_ADAPT=0` as control (environment size held equal: a longer
+environment alone moved hash 3.5%): hof **-48%** per call (138.7 -> 72.1
+ms), bintrees **-6%**; hash, orgparse and nqueens within 1%. Against main
+`4db749c8`: hof -48% / -49%, bintrees -7.8% / -7.3% in two campaigns. Ten
+warm calls: hof minor collections 160 -> 43, peak RSS **96 -> 120 MiB**;
+bintrees peak RSS 96 -> 105 MiB. Largest pauses are unchanged, including
+the incremental-marking test's (about 26 ms), where everything young
+survives and growth is undone.
+
+The policy reads time, so `icount.scm` runs with it off to keep counts
+independent of the machine's speed; wall time measures it.
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror

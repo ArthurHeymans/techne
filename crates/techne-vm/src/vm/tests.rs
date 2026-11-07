@@ -446,3 +446,17 @@ fn native_task_entry_unwinds_on_its_task_stack_and_keeps_the_raise_trace() {
     }
     assert_eq!(reraised, vec![(None, (1, false), "(1 #f)".into()), (Some(1), (1, false), "(1 #f)".into())]);
 }
+
+#[test]
+fn only_an_exhausted_window_is_a_survivor_sized_nursery_signal() {
+    let mut vm = Vm::bare();
+    let _world = vm.enter_account();
+    assert!(!vm.heap.forced_collection(), "an empty world is not forced");
+    vm.heap.request_collection();
+    assert!(vm.heap.forced_collection(), "an asked-for collection is forced");
+    vm.collect();
+    assert!(!vm.heap.forced_collection(), "the request is consumed");
+    vm.heap.stress = true;
+    assert!(vm.heap.forced_collection(), "GC stress is forced");
+    vm.heap.stress = false;
+}
