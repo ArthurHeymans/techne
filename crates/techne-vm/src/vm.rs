@@ -3079,6 +3079,7 @@ impl Vm {
     }
 
     fn collect_with(&mut self, collect: fn(&mut Heap, &mut dyn Roots)) {
+        let started = std::time::Instant::now();
         let _charged = self.account.enter();
         let _cage = crate::alloc::enter_cage(self.heap.cage(), &self.symbols);
         let cycles = self.heap.stats.full;
@@ -3177,6 +3178,7 @@ impl Vm {
         self.heap.release_empty();
         // The nursery, empty, resizes to what the policy asks: growth needs
         // the world's room, a smaller reservation only replaces it.
+        self.heap.adapt_after_collection(started);
         let growth = self.heap.nursery_growth();
         if growth == 0 || growth <= self.room() {
             self.heap.resize_nursery();
@@ -3184,6 +3186,7 @@ impl Vm {
         // Reported even when a resize was refused or skipped: the target is
         // what the policy asked for, the capacity what it settled on.
         self.heap.note_nursery_stats();
+        self.heap.note_collection_end();
     }
 
     /// The codes running or about to: frames and handlers of every stack,

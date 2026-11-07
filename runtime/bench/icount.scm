@@ -45,7 +45,9 @@
 ;; What PROGRAM with ARGS writes, (stdout stderr), once it has ended;
 ;; ENVIRONMENT is set besides what this has. A program that fails is an
 ;; error: valgrind counts a program that failed as well as one that did
-;; its work.
+;; its work. The nursery stays fixed: its policy reads the time collections
+;; take, which would make counts depend on the machine's speed; wall-time
+;; comparisons (compare.scm) measure that policy.
 (define (run program args #:environment [environment '()] #:stdout [stdout #f])
   (call-with-process program args
     (lambda (p)
@@ -57,7 +59,7 @@
           (display err (current-error-port))
           (error "icount: failed:" (cons program args) status))
         (list out err)))
-    #:directory here #:environment environment #:stdout stdout))
+    #:directory here #:environment (cons '("TECHNE_NURSERY_ADAPT" . "0") environment) #:stdout stdout))
 
 (define (lines text) (filter (lambda (l) (not (string=? l ""))) (string-split text #\newline)))
 (define (words text) (regexp-extract '(+ (~ space)) text))

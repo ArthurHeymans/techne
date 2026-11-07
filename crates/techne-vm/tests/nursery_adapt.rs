@@ -1,8 +1,8 @@
-//! The opt-in survivor-sized nursery (`TECHNE_NURSERY_ADAPT`): the
+//! The survivor-sized nursery (`TECHNE_NURSERY_ADAPT`): the
 //! collection-path behaviour that a unit test of `adapt_nursery` cannot see.
 //!
 //! A separate process per case, because the policy is read from the
-//! environment when a heap is made. See runtime/bench/ADAPTIVE-NURSERY.md.
+//! environment when a heap is made.
 #![cfg(feature = "counting-allocator")]
 use std::{fs, process::Command};
 
@@ -79,10 +79,25 @@ fn an_oversized_ceiling_is_ignored() {
     assert!(text.starts_with("199990000\n"), "{text}");
 }
 
-/// Off by default: a fresh world's nursery is the base even after the
-/// prelude's forced collection, which is not a window exhaustion.
+/// A fresh world's nursery is the base even after the prelude's forced
+/// collection, which is not a window exhaustion.
 #[test]
-fn the_default_nursery_stays_at_the_base() {
+fn a_fresh_nursery_stays_at_the_base() {
     let text = run("(gc-stats)", &[]);
+    assert!(text.contains("nursery_words: 1048576, nursery_target_words: 1048576"), "{text}");
+}
+
+/// By default, a program whose collections copy a large young set and take
+/// most of its time (building and reversing long lists) grows the nursery;
+/// `TECHNE_NURSERY_ADAPT=0` keeps it at the base.
+const LIST_HEAVY: &str = "(define (build n) (let loop ((i 0) (acc '())) (if (= i n) (reverse acc) (loop (+ i 1) (cons i acc)))))
+     (let loop ((k 0)) (when (< k 20) (build 400000) (loop (+ k 1))))
+     (gc-stats)";
+
+#[test]
+fn collection_heavy_lists_grow_the_nursery_by_default() {
+    let text = run(LIST_HEAVY, &[]);
+    assert!(!text.contains("nursery_words: 1048576,"), "{text}");
+    let text = run(LIST_HEAVY, &[("TECHNE_NURSERY_ADAPT", "0")]);
     assert!(text.contains("nursery_words: 1048576, nursery_target_words: 1048576"), "{text}");
 }

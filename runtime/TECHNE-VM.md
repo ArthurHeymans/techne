@@ -17,10 +17,14 @@ fully hygienic.
   zero-filled register is a safe non-pointer for the GC.
 - **Heap** (`heap.rs`): generational, with the structure of OCaml's heap.
   - Nursery: 256 KiB until the world's first collection, then 8 MiB
-    (`TECHNE_NURSERY_KB`) if its memory limit has room; bump-allocated
-    (`TECHNE_NURSERY_ADAPT=1` opts into a survivor-sized capacity instead,
-    still budget-admitted and off by default: see
-    [bench/ADAPTIVE-NURSERY.md](bench/ADAPTIVE-NURSERY.md)); bump-allocated
+    (`TECHNE_NURSERY_KB`) if its memory limit has room. While collections
+    take at least 30% of the recent time and more than an eighth of the
+    window survives, it doubles, up to 4x (`TECHNE_NURSERY_ADAPT_KB`),
+    budget-admitted; growth that does not let more of the young data die
+    is undone. It halves back once collections take under 10% of the time
+    or little survives. `TECHNE_NURSERY_ADAPT=0` or an explicit
+    `TECHNE_NURSERY_KB` keeps it fixed. A nursery larger than needed costs
+    cache misses on every allocation, hence the time gate; bump-allocated
     (also inline in JIT code), copied out en masse by each minor
     collection. A world that never collects holds little. Bulk lists may
     use the entire existing nursery: a list of small pairs is not one
