@@ -21,8 +21,12 @@ fully hygienic.
     (also inline in JIT code), copied out en masse by each minor
     collection. A world that never collects holds little. Bulk lists may
     use the entire existing nursery: a list of small pairs is not one
-    large object. Other bulk allocations retain their half-nursery cutoff;
-    no larger default nursery or new large-object policy is needed.
+    large object. One of at least half the nursery that does not fit what
+    is left of it goes to the old generation, while no cycle runs, rather
+    than collecting: that collection would promote the list `reverse` or
+    `append` was given, which dies once the new list is made. Other bulk
+    allocations retain their half-nursery cutoff; no larger default nursery
+    or new large-object policy is needed.
   - Old generation: non-moving. Small objects live in blocks of one size
     class each (32 KiB for a class's first, doubling up to 256 KiB; exact
     up to 16 words, then about 12.5% apart), allocated

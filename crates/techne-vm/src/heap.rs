@@ -816,6 +816,11 @@ impl Heap {
         self.foreign = live;
     }
 
+    /// Whether no old-generation cycle is in progress.
+    pub(crate) fn old_idle(&self) -> bool {
+        self.phase == Phase::Idle
+    }
+
     pub fn nursery_capacity(&self) -> usize {
         (self.nursery_end as usize - self.nursery_start as usize) / 8
     }

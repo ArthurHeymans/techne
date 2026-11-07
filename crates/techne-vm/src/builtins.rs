@@ -73,8 +73,17 @@ impl Bulk {
     }
 
     /// `list` without admitting: its pair words have already been admitted.
+    ///
+    /// A large list the nursery has no room left for goes to the old
+    /// generation instead of collecting first: a collection here would
+    /// promote what the caller still holds (for `reverse` or `append`, a list
+    /// as large as this one) only for it to die once the new list is made.
+    /// Only while no old-generation cycle runs: during one, the new pairs
+    /// would survive it, and the old generation would grow past its pace.
     pub fn reserve_list(vm: &mut Vm, words: usize) -> Bulk {
-        if words <= vm.heap.nursery_capacity() {
+        let capacity = vm.heap.nursery_capacity();
+        let instead_of_collecting = words >= capacity / 2 && !vm.heap.stress && !vm.heap.has_room(words) && vm.heap.old_idle();
+        if words <= capacity && !instead_of_collecting {
             Bulk { p: vm.reserve_nursery(words), old: false }
         } else {
             Bulk { p: std::ptr::null_mut(), old: true }
@@ -2630,6 +2639,35 @@ mod tests {
             assert_eq!(items.first().unwrap().as_int(), count as i64 - 1);
             assert_eq!(items.last().unwrap().as_int(), 0);
         }
+    }
+
+    #[test]
+    fn a_large_list_without_room_goes_old_rather_than_promoting_what_is_held() {
+        let mut vm = Vm::bare();
+        let _world = vm.enter_account();
+        vm.full_collect_raw();
+        let count = vm.heap.nursery_capacity() / 6 + 1;
+        // Over half the nursery, held as `reverse` holds its argument.
+        let held = vm.make_list_raw(&vec![Value::int_unchecked(7); count]);
+        let held = vm.root(held);
+        let (minors, promoted) = (vm.heap.stats.minor, vm.heap.stats.promoted_words);
+        let mut bulk = Bulk::list(&mut vm, count).unwrap();
+        assert!(bulk.old);
+        assert_eq!((vm.heap.stats.minor, vm.heap.stats.promoted_words), (minors, promoted), "nothing collected");
+        let mut list = Value::NIL;
+        for i in 0..count {
+            list = bulk.pair(&mut vm, Value::int_unchecked(i as i64), list);
+        }
+        let list = vm.root(list);
+        // A small list still collects to make room.
+        let filler = vm.make_list_raw(&vec![Value::NIL; count - 10]);
+        let _filler = vm.root(filler);
+        assert_eq!(vm.heap.stats.minor, minors);
+        Bulk::list(&mut vm, 100).unwrap();
+        assert!(vm.heap.stats.minor > minors);
+        vm.full_collect_raw();
+        assert_eq!(list_values(list.get()).unwrap().len(), count);
+        assert_eq!(list_values(held.get()).unwrap().len(), count);
     }
 
     /// Printing stops at its limit for every kind of value, escapes, symbols
