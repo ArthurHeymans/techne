@@ -45,6 +45,19 @@ fn global_anticipation_includes_implicit_self_tail_edges() {
 }
 
 #[test]
+fn native_identity_is_kept_only_in_loops_without_a_reload() {
+    // pc 0 runs inline; pc 1, when not inline, reloads the kept globals.
+    let ops = [Op::CallG { base: 0, n: 1, g: 7 }, Op::CallG { base: 0, n: 1, g: 8 }, Op::Jmp { t: 0 }];
+    let succs: Vec<_> = ops.iter().enumerate().map(|(pc, op)| successors(op, pc, ops.len())).collect();
+    assert!(!reload_free_loop(&ops, &succs, 0, |pc| pc == 0));
+    assert!(reload_free_loop(&ops, &succs, 0, |pc| pc < 2));
+    // Not in a loop at all.
+    let ops = [Op::CallG { base: 0, n: 1, g: 7 }, Op::Ret { r: 0 }];
+    let succs: Vec<_> = ops.iter().enumerate().map(|(pc, op)| successors(op, pc, ops.len())).collect();
+    assert!(!reload_free_loop(&ops, &succs, 0, |_| true));
+}
+
+#[test]
 fn feedback_is_monomorphic_bounded_and_does_not_respecialize() {
     let mut feedback = CallFeedback::default();
     feedback.observe(12, CallTarget::Code(7));

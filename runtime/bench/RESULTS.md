@@ -125,6 +125,21 @@ lifetime/promotion and reversal work, not assume wide-loop unboxing is the
 largest win. No new throughput speedup is claimed. Methods, caveats, exact
 counts, feature-gated tests and reproduction: [HOF.md](HOF.md).
 
+## Native identity cache only in reload-free loops, 2026-11-06
+
+PR #337's native identity cache also applied to loops that call another
+procedure between uses, such as `numstr`'s `(string-length (number->string
+...))`. Each such call reloads kept globals, so the guard was recomputed every
+iteration for a single use: about 4 instructions per iteration, linear in
+work (+1.07M / +4.07M / +8.07M instructions at 250 / 1000 / 2000 repeats).
+Caching is now restricted to loops that can return to the call without a
+reload. Whole-process cachegrind counts against main `4db749c8`: numstr (JIT)
+**250,561,585 -> 246,491,803** (-1.62%, recovering the regression) and the HTTP `/work` request
+**232,819 -> 228,807** instructions (-1.72%); orgparse
+**345,825,732 -> 345,793,961**, keeping the cache's gain; every other
+program within ±0.2%. The per-call-site JIT switches are now read once per
+process instead of once per site.
+
 ## Native emission in a fixed order, 2026-11-06
 
 The JIT writes some of a function's blocks (entry loaders, guard and exit

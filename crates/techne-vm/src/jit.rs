@@ -224,6 +224,19 @@ pub enum CallTarget {
     Other,
 }
 
+/// A developer switch, read once per process: whether environment variable
+/// `$name` is not `$off`. Compilation consults these per call site, where
+/// reading the environment each time would cost a lock and an allocation.
+macro_rules! switch {
+    ($name:literal) => {
+        switch!($name, "0")
+    };
+    ($name:literal, $off:literal) => {{
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var($name).as_deref() != Ok($off))
+    }};
+}
+
 #[derive(Default)]
 pub struct CallFeedback([(u32, Option<CallTarget>); 4]);
 
@@ -467,8 +480,8 @@ pub fn inlinable(
                         // Bounded byte loops are larger than a scalar native case.
                         // Count them against the existing complex-native budget;
                         // =1 restores bytecode-only admission for measurement.
-                        let heavy = std::env::var("TECHNE_JIT_STRING_INLINE").as_deref() != Ok("1")
-                            && matches!(inline, Some(Inline::Substring | Inline::StringEq));
+                        let heavy =
+                            switch!("TECHNE_JIT_STRING_INLINE", "1") && matches!(inline, Some(Inline::Substring | Inline::StringEq));
                         calls += (inline.is_none() || heavy) as usize;
                     })
                     .is_some(),
@@ -844,10 +857,10 @@ impl KnownNative {
         self.inline.filter(|i| {
             i.arity() == n
                 && (*i != Inline::IntegerAdd || integer::enabled())
-                && (*i != Inline::Substring || strings::enabled("TECHNE_JIT_SUBSTRING"))
-                && (*i != Inline::StringEq || strings::enabled("TECHNE_JIT_STRING_EQ"))
-                && (*i != Inline::Inexact || std::env::var("TECHNE_JIT_INEXACT").as_deref() != Ok("0"))
-                && (*i != Inline::FloatDiv || std::env::var("TECHNE_JIT_FLOAT_DIV").as_deref() != Ok("0"))
+                && (*i != Inline::Substring || switch!("TECHNE_JIT_SUBSTRING"))
+                && (*i != Inline::StringEq || switch!("TECHNE_JIT_STRING_EQ"))
+                && (*i != Inline::Inexact || switch!("TECHNE_JIT_INEXACT"))
+                && (*i != Inline::FloatDiv || switch!("TECHNE_JIT_FLOAT_DIV"))
         })
     }
 }
@@ -1822,6 +1835,32 @@ fn cached_globals(ops: &[Op], succs: &[Vec<usize>], inlined: &[usize]) -> Vec<(u
     cached
 }
 
+/// Whether native code reads the kept globals anew after `pc`, on its way
+/// to the next instruction (`Gen::reload_globals`).
+fn reloads_globals(ops: &[Op], pc: usize, inline: &impl Fn(usize) -> bool) -> bool {
+    match ops[pc] {
+        Op::Closure { .. } | Op::PopHandler | Op::Call { .. } => true,
+        Op::CallG { .. } => !inline(pc),
+        _ => false,
+    }
+}
+
+/// Whether instruction `pc` can follow itself along `succs` without
+/// passing an instruction that reloads the kept globals.
+fn reload_free_loop(ops: &[Op], succs: &[Vec<usize>], pc: usize, inline: impl Fn(usize) -> bool) -> bool {
+    let mut seen = vec![false; ops.len()];
+    let mut todo = succs[pc].clone();
+    while let Some(s) = todo.pop() {
+        if s == pc {
+            return true;
+        }
+        if !std::mem::replace(&mut seen[s], true) && !reloads_globals(ops, s, &inline) {
+            todo.extend(&succs[s]);
+        }
+    }
+    false
+}
+
 /// By instruction, the globals kept (`cached`, a bit each) that native
 /// code may read from there before it reads those kept anew
 /// (`Gen::reload_globals`): where it does, it reads only these. Calls
@@ -1836,14 +1875,7 @@ fn anticipated(ops: &[Op], cached: &[u32], succs: &[Vec<usize>], inline: impl Fn
             _ => 0,
         })
         .collect();
-    let reloads = |pc: usize, s: usize| {
-        s == pc + 1
-            && match ops[pc] {
-                Op::Closure { .. } | Op::PopHandler | Op::Call { .. } => true,
-                Op::CallG { .. } => !inline(pc),
-                _ => false,
-            }
-    };
+    let reloads = |pc: usize, s: usize| s == pc + 1 && reloads_globals(ops, pc, &inline);
     let mut ant = uses.clone();
     loop {
         let mut changed = false;
@@ -2348,8 +2380,16 @@ impl Jit {
             guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).1.union(m);
         }
         let (fix, flo) = (fix.regs, flo.regs);
+        let inline = |pc: usize| match orig[pc] {
+            Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
+            Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n).is_some()),
+            _ => false,
+        };
         let mut cached_sites: Vec<_> = sites.iter().map(|s| s.call).collect();
-        if strings::enabled("TECHNE_JIT_NATIVE_CACHE") {
+        if switch!("TECHNE_JIT_NATIVE_CACHE") {
+            // A scalar native's identity, kept only where a loop can come
+            // back to its call without a reload: past a reload it would be
+            // checked anew each iteration, for a single use.
             cached_sites.extend(orig.iter().enumerate().filter_map(|(pc, op)| match *op {
                 Op::CallG { g, n, .. }
                     if job.native_globals.get(&g).is_some_and(|k| {
@@ -2359,7 +2399,7 @@ impl Jit {
                                 Inline::StringRef | Inline::StringLength | Inline::CharEq | Inline::CharToInteger | Inline::BytevectorU8Ref
                             )
                         )
-                    }) =>
+                    }) && reload_free_loop(orig, &shape.succs, pc, inline) =>
                 {
                     Some(pc)
                 }
@@ -2373,11 +2413,6 @@ impl Jit {
             vec![Regs::empty(n); orig.len()]
         } else {
             pairs(orig, n, &job.captures, heads, &shape)
-        };
-        let inline = |pc: usize| match orig[pc] {
-            Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
-            Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n).is_some()),
-            _ => false,
         };
         let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline, heads.contains(&0));
         let mut g = Gen {
@@ -2424,10 +2459,7 @@ impl Jit {
             native_same: cached
                 .iter()
                 .filter_map(|&(g, _)| {
-                    job.native_globals
-                        .get(&g)
-                        .filter(|_| strings::enabled("TECHNE_JIT_NATIVE_CACHE"))
-                        .map(|k| (g, k.value, b.declare_var(I64)))
+                    job.native_globals.get(&g).filter(|_| switch!("TECHNE_JIT_NATIVE_CACHE")).map(|k| (g, k.value, b.declare_var(I64)))
                 })
                 .collect(),
             same: sites
@@ -4275,7 +4307,7 @@ impl Gen {
         // The byte at fixnum index `args[1]` of the bytes of `x`.
         let byte = |b: &mut FunctionBuilder, len: ir::Value| {
             let idx;
-            if self.fix[pc].contains(base + 2) && std::env::var("TECHNE_JIT_INDEX").as_deref() != Ok("0") {
+            if self.fix[pc].contains(base + 2) && switch!("TECHNE_JIT_INDEX") {
                 let s = b.use_var(self.shifts[(base + 2) as usize]);
                 idx = b.ins().sshr_imm_s(s, 16);
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
