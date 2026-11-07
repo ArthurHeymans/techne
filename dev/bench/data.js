@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794061297545,
+  "lastUpdate": 1794061299345,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -50816,6 +50816,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642687860,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106059,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "06c694741d97f348a436f4a756831947613095d9",
+          "message": "Merge pull request #341 from ArthurHeymans/perf/vm-gc-field-experiment\n\nvm: less collector work for list-heavy programs",
+          "timestamp": "2026-11-07T15:03:53+01:00",
+          "tree_id": "7a53cd8568ab453423f36c24de647b6b5af18fda",
+          "url": "https://github.com/ArthurHeymans/techne/commit/06c694741d97f348a436f4a756831947613095d9"
+        },
+        "date": 1794061299274,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690511136,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642741765,
             "unit": "instructions"
           },
           {
