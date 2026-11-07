@@ -105,8 +105,19 @@ fn kind(v: Value) -> &'static str {
 
 impl Vm {
     /// Called only after registers have been published/rederived, before
-    /// executing a slow instruction or resuming the interpreter.
+    /// executing a slow instruction or resuming the interpreter. Without
+    /// `TECHNE_JIT_STATS` this is one test, inline: every return from native
+    /// code passes here.
+    #[inline(always)]
     pub(super) fn note_jit_exit(&mut self, code: *const Code, pc: usize, bp: usize, status: u32) {
+        if self.jit_stats.is_some() {
+            self.record_jit_exit(code, pc, bp, status);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_jit_exit(&mut self, code: *const Code, pc: usize, bp: usize, status: u32) {
         let Some(stats) = &mut self.jit_stats else { return };
         let code = unsafe { &*code };
         let at = if matches!(status, jit::ERROR | jit::WAIT | jit::RESUME | jit::RET_MOVED) { pc.saturating_sub(1) } else { pc };
