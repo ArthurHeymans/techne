@@ -76,13 +76,13 @@ fn feedback_is_monomorphic_bounded_and_does_not_respecialize() {
 fn pair_facts_do_not_survive_overwriting_the_operand() {
     let ops =
         [Op::Cons { dst: 0, a: 1, b: 2 }, Op::Car { dst: 3, a: 0 }, Op::Cdr { dst: 0, a: 0 }, Op::Car { dst: 4, a: 0 }, Op::Ret { r: 4 }];
-    let captures = HashMap::new();
+    let captures = HashMap::default();
     let shape = Shape {
         effects: ops.iter().map(|op| uses_defs(op, &captures)).collect(),
         succs: ops.iter().enumerate().map(|(pc, op)| successors(op, pc, ops.len())).collect(),
-        entries: HashMap::new(),
+        entries: HashMap::default(),
         inlined: vec![false; ops.len()],
-        results: HashMap::new(),
+        results: HashMap::default(),
     };
     let facts = pairs(&ops, 5, &captures, &[0], &shape);
     assert!(!facts[0].contains(0));

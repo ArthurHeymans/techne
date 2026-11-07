@@ -55,10 +55,12 @@
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
-    collections::HashMap,
     fmt,
     mem::offset_of,
 };
+
+/// Fixed-seed: native block order is emitted in iteration order.
+use crate::hash::Map as HashMap;
 
 use cranelift_codegen::{
     Context,
@@ -803,7 +805,7 @@ fn redo_points(ops: &[Op], origin: &[Option<Inlined>], sites: &[Site], succs: &[
             let args = s.base + 1..=s.base + s.args;
             let call = matches!(ops[pc], CallG { .. } | TailCallG { .. });
             call || matches!(ops[pc], SetG { .. } | SetCB { .. } | SetBox { .. } | VSet { .. } | PopHandler)
-                || uses_defs(&ops[pc], &HashMap::new()).1.iter().any(|d| args.contains(d))
+                || uses_defs(&ops[pc], &HashMap::default()).1.iter().any(|d| args.contains(d))
         })
         .collect();
     // Calls inlined in inlined code jump back to their caller's
@@ -1705,7 +1707,7 @@ fn analyze(
 /// which must not overwrite the result once the call has stored it.
 fn deferred(op: &Op, dirty: &Regs, live: &Regs, known: &Regs) -> Regs {
     let mut regs = dirty.and(live).and(known);
-    let (uses, defs) = uses_defs(op, &HashMap::new());
+    let (uses, defs) = uses_defs(op, &HashMap::default());
     uses.iter().chain(&defs).for_each(|&r| regs.remove(r));
     regs
 }
@@ -1912,7 +1914,7 @@ fn vectors(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usi
         Op::VRef { dst, v, .. } => (dst != v).then_some(v),
         _ => None,
     };
-    known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
+    known_regs(ops, n, captures, heads, shape, &HashMap::default(), step, also).regs
 }
 
 /// Pair kinds cannot change, even across calls or collections. A
@@ -1927,7 +1929,7 @@ fn pairs(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usize
         Op::Car { dst, a } | Op::Cdr { dst, a } if dst != a => Some(a),
         _ => None,
     };
-    known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
+    known_regs(ops, n, captures, heads, shape, &HashMap::default(), step, also).regs
 }
 
 /// The registers whose kind some instruction uses: operands of arithmetic
@@ -2052,7 +2054,7 @@ fn known_regs(
             break;
         }
     }
-    let mut missing = HashMap::new();
+    let mut missing = HashMap::default();
     for pc in (0..len).filter(|&pc| reached[pc]) {
         for &s in &edges[pc] {
             if let Some(a) = assumed.get(&s) {
@@ -2370,7 +2372,7 @@ impl Jit {
             &assumed(&|o| &o.fixnums),
         );
         // The edges native code checks assumptions on.
-        let mut guards: HashMap<(usize, usize), (Regs, Regs)> = HashMap::new();
+        let mut guards: HashMap<(usize, usize), (Regs, Regs)> = HashMap::default();
         for (&edge, m) in &fix.missing {
             guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).0.union(m);
         }
@@ -2471,14 +2473,14 @@ impl Jit {
                 .map(|(site, r)| (site, r, b.declare_var(I64)))
                 .collect(),
             guards,
-            guard_blocks: HashMap::new(),
+            guard_blocks: HashMap::default(),
             at: 0,
             vars,
             shifts,
             fvals,
             ops: orig.to_vec(),
             blocks: orig.iter().map(|op| compiled(op).then(|| b.create_block())).collect(),
-            exits: HashMap::new(),
+            exits: HashMap::default(),
             sigs,
             closure_globals: job.closure_globals.clone(),
             native_globals: job.native_globals.clone(),
@@ -2487,7 +2489,7 @@ impl Jit {
             own,
             consts: job.consts_addr as i64,
             const_bits: job.consts.clone(),
-            inline_exits: HashMap::new(),
+            inline_exits: HashMap::default(),
             redo: redo_points(orig, &origin, &sites, &shape.succs),
             origin,
             sites,
@@ -2910,7 +2912,7 @@ impl Gen {
         let live = &self.flow.live_out[pc];
         self.reload(b, live);
         let mut known = self.fix[pc].and(live);
-        uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
+        uses_defs(&self.ops[pc], &HashMap::default()).1.iter().for_each(|&d| known.remove(d));
         for r in known.iter() {
             let x = b.use_var(self.vars[r]);
             let s = Self::shifted(b, x);
@@ -2928,7 +2930,7 @@ impl Gen {
             live.remove(r);
         }
         let mut known = self.fix[pc].clone();
-        uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
+        uses_defs(&self.ops[pc], &HashMap::default()).1.iter().for_each(|&d| known.remove(d));
         known.iter().for_each(|r| live.remove(r as Reg));
         self.reload(b, &live);
         self.reload_globals(b, pc + 1);
