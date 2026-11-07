@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794062298495,
+  "lastUpdate": 1794062299989,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -51164,6 +51164,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642741765,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106059,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5fc2f8896e10eb4c4fd566d86a7f9702e58aebbd",
+          "message": "Merge pull request #345 from ArthurHeymans/perf/vm-survivor-nursery\n\nvm: grow the nursery while collections dominate",
+          "timestamp": "2026-11-07T15:29:25+01:00",
+          "tree_id": "0f00a578862a9d3ceb91b0ae1cf7bd4989b04155",
+          "url": "https://github.com/ArthurHeymans/techne/commit/5fc2f8896e10eb4c4fd566d86a7f9702e58aebbd"
+        },
+        "date": 1794062299937,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690413847,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642639881,
             "unit": "instructions"
           },
           {
