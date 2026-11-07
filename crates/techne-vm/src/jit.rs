@@ -55,10 +55,12 @@
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
-    collections::HashMap,
     fmt,
     mem::offset_of,
 };
+
+/// Fixed-seed: native block order is emitted in iteration order.
+use crate::hash::Map as HashMap;
 
 use cranelift_codegen::{
     Context,
@@ -220,6 +222,19 @@ pub enum CallTarget {
     Code(u32),
     Native(u32),
     Other,
+}
+
+/// A developer switch, read once per process: whether environment variable
+/// `$name` is not `$off`. Compilation consults these per call site, where
+/// reading the environment each time would cost a lock and an allocation.
+macro_rules! switch {
+    ($name:literal) => {
+        switch!($name, "0")
+    };
+    ($name:literal, $off:literal) => {{
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var($name).as_deref() != Ok($off))
+    }};
 }
 
 #[derive(Default)]
@@ -465,8 +480,8 @@ pub fn inlinable(
                         // Bounded byte loops are larger than a scalar native case.
                         // Count them against the existing complex-native budget;
                         // =1 restores bytecode-only admission for measurement.
-                        let heavy = std::env::var("TECHNE_JIT_STRING_INLINE").as_deref() != Ok("1")
-                            && matches!(inline, Some(Inline::Substring | Inline::StringEq));
+                        let heavy =
+                            switch!("TECHNE_JIT_STRING_INLINE", "1") && matches!(inline, Some(Inline::Substring | Inline::StringEq));
                         calls += (inline.is_none() || heavy) as usize;
                     })
                     .is_some(),
@@ -790,7 +805,7 @@ fn redo_points(ops: &[Op], origin: &[Option<Inlined>], sites: &[Site], succs: &[
             let args = s.base + 1..=s.base + s.args;
             let call = matches!(ops[pc], CallG { .. } | TailCallG { .. });
             call || matches!(ops[pc], SetG { .. } | SetCB { .. } | SetBox { .. } | VSet { .. } | PopHandler)
-                || uses_defs(&ops[pc], &HashMap::new()).1.iter().any(|d| args.contains(d))
+                || uses_defs(&ops[pc], &HashMap::default()).1.iter().any(|d| args.contains(d))
         })
         .collect();
     // Calls inlined in inlined code jump back to their caller's
@@ -842,10 +857,10 @@ impl KnownNative {
         self.inline.filter(|i| {
             i.arity() == n
                 && (*i != Inline::IntegerAdd || integer::enabled())
-                && (*i != Inline::Substring || strings::enabled("TECHNE_JIT_SUBSTRING"))
-                && (*i != Inline::StringEq || strings::enabled("TECHNE_JIT_STRING_EQ"))
-                && (*i != Inline::Inexact || std::env::var("TECHNE_JIT_INEXACT").as_deref() != Ok("0"))
-                && (*i != Inline::FloatDiv || std::env::var("TECHNE_JIT_FLOAT_DIV").as_deref() != Ok("0"))
+                && (*i != Inline::Substring || switch!("TECHNE_JIT_SUBSTRING"))
+                && (*i != Inline::StringEq || switch!("TECHNE_JIT_STRING_EQ"))
+                && (*i != Inline::Inexact || switch!("TECHNE_JIT_INEXACT"))
+                && (*i != Inline::FloatDiv || switch!("TECHNE_JIT_FLOAT_DIV"))
         })
     }
 }
@@ -1692,7 +1707,7 @@ fn analyze(
 /// which must not overwrite the result once the call has stored it.
 fn deferred(op: &Op, dirty: &Regs, live: &Regs, known: &Regs) -> Regs {
     let mut regs = dirty.and(live).and(known);
-    let (uses, defs) = uses_defs(op, &HashMap::new());
+    let (uses, defs) = uses_defs(op, &HashMap::default());
     uses.iter().chain(&defs).for_each(|&r| regs.remove(r));
     regs
 }
@@ -1820,6 +1835,32 @@ fn cached_globals(ops: &[Op], succs: &[Vec<usize>], inlined: &[usize]) -> Vec<(u
     cached
 }
 
+/// Whether native code reads the kept globals anew after `pc`, on its way
+/// to the next instruction (`Gen::reload_globals`).
+fn reloads_globals(ops: &[Op], pc: usize, inline: &impl Fn(usize) -> bool) -> bool {
+    match ops[pc] {
+        Op::Closure { .. } | Op::PopHandler | Op::Call { .. } => true,
+        Op::CallG { .. } => !inline(pc),
+        _ => false,
+    }
+}
+
+/// Whether instruction `pc` can follow itself along `succs` without
+/// passing an instruction that reloads the kept globals.
+fn reload_free_loop(ops: &[Op], succs: &[Vec<usize>], pc: usize, inline: impl Fn(usize) -> bool) -> bool {
+    let mut seen = vec![false; ops.len()];
+    let mut todo = succs[pc].clone();
+    while let Some(s) = todo.pop() {
+        if s == pc {
+            return true;
+        }
+        if !std::mem::replace(&mut seen[s], true) && !reloads_globals(ops, s, &inline) {
+            todo.extend(&succs[s]);
+        }
+    }
+    false
+}
+
 /// By instruction, the globals kept (`cached`, a bit each) that native
 /// code may read from there before it reads those kept anew
 /// (`Gen::reload_globals`): where it does, it reads only these. Calls
@@ -1834,14 +1875,7 @@ fn anticipated(ops: &[Op], cached: &[u32], succs: &[Vec<usize>], inline: impl Fn
             _ => 0,
         })
         .collect();
-    let reloads = |pc: usize, s: usize| {
-        s == pc + 1
-            && match ops[pc] {
-                Op::Closure { .. } | Op::PopHandler | Op::Call { .. } => true,
-                Op::CallG { .. } => !inline(pc),
-                _ => false,
-            }
-    };
+    let reloads = |pc: usize, s: usize| s == pc + 1 && reloads_globals(ops, pc, &inline);
     let mut ant = uses.clone();
     loop {
         let mut changed = false;
@@ -1880,7 +1914,7 @@ fn vectors(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usi
         Op::VRef { dst, v, .. } => (dst != v).then_some(v),
         _ => None,
     };
-    known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
+    known_regs(ops, n, captures, heads, shape, &HashMap::default(), step, also).regs
 }
 
 /// Pair kinds cannot change, even across calls or collections. A
@@ -1895,7 +1929,7 @@ fn pairs(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usize
         Op::Car { dst, a } | Op::Cdr { dst, a } if dst != a => Some(a),
         _ => None,
     };
-    known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
+    known_regs(ops, n, captures, heads, shape, &HashMap::default(), step, also).regs
 }
 
 /// The registers whose kind some instruction uses: operands of arithmetic
@@ -2020,7 +2054,7 @@ fn known_regs(
             break;
         }
     }
-    let mut missing = HashMap::new();
+    let mut missing = HashMap::default();
     for pc in (0..len).filter(|&pc| reached[pc]) {
         for &s in &edges[pc] {
             if let Some(a) = assumed.get(&s) {
@@ -2338,7 +2372,7 @@ impl Jit {
             &assumed(&|o| &o.fixnums),
         );
         // The edges native code checks assumptions on.
-        let mut guards: HashMap<(usize, usize), (Regs, Regs)> = HashMap::new();
+        let mut guards: HashMap<(usize, usize), (Regs, Regs)> = HashMap::default();
         for (&edge, m) in &fix.missing {
             guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).0.union(m);
         }
@@ -2346,8 +2380,16 @@ impl Jit {
             guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).1.union(m);
         }
         let (fix, flo) = (fix.regs, flo.regs);
+        let inline = |pc: usize| match orig[pc] {
+            Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
+            Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n).is_some()),
+            _ => false,
+        };
         let mut cached_sites: Vec<_> = sites.iter().map(|s| s.call).collect();
-        if strings::enabled("TECHNE_JIT_NATIVE_CACHE") {
+        if switch!("TECHNE_JIT_NATIVE_CACHE") {
+            // A scalar native's identity, kept only where a loop can come
+            // back to its call without a reload: past a reload it would be
+            // checked anew each iteration, for a single use.
             cached_sites.extend(orig.iter().enumerate().filter_map(|(pc, op)| match *op {
                 Op::CallG { g, n, .. }
                     if job.native_globals.get(&g).is_some_and(|k| {
@@ -2357,7 +2399,7 @@ impl Jit {
                                 Inline::StringRef | Inline::StringLength | Inline::CharEq | Inline::CharToInteger | Inline::BytevectorU8Ref
                             )
                         )
-                    }) =>
+                    }) && reload_free_loop(orig, &shape.succs, pc, inline) =>
                 {
                     Some(pc)
                 }
@@ -2371,11 +2413,6 @@ impl Jit {
             vec![Regs::empty(n); orig.len()]
         } else {
             pairs(orig, n, &job.captures, heads, &shape)
-        };
-        let inline = |pc: usize| match orig[pc] {
-            Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
-            Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n).is_some()),
-            _ => false,
         };
         let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline, heads.contains(&0));
         let mut g = Gen {
@@ -2422,10 +2459,7 @@ impl Jit {
             native_same: cached
                 .iter()
                 .filter_map(|&(g, _)| {
-                    job.native_globals
-                        .get(&g)
-                        .filter(|_| strings::enabled("TECHNE_JIT_NATIVE_CACHE"))
-                        .map(|k| (g, k.value, b.declare_var(I64)))
+                    job.native_globals.get(&g).filter(|_| switch!("TECHNE_JIT_NATIVE_CACHE")).map(|k| (g, k.value, b.declare_var(I64)))
                 })
                 .collect(),
             same: sites
@@ -2439,14 +2473,14 @@ impl Jit {
                 .map(|(site, r)| (site, r, b.declare_var(I64)))
                 .collect(),
             guards,
-            guard_blocks: HashMap::new(),
+            guard_blocks: HashMap::default(),
             at: 0,
             vars,
             shifts,
             fvals,
             ops: orig.to_vec(),
             blocks: orig.iter().map(|op| compiled(op).then(|| b.create_block())).collect(),
-            exits: HashMap::new(),
+            exits: HashMap::default(),
             sigs,
             closure_globals: job.closure_globals.clone(),
             native_globals: job.native_globals.clone(),
@@ -2455,7 +2489,7 @@ impl Jit {
             own,
             consts: job.consts_addr as i64,
             const_bits: job.consts.clone(),
-            inline_exits: HashMap::new(),
+            inline_exits: HashMap::default(),
             redo: redo_points(orig, &origin, &sites, &shape.succs),
             origin,
             sites,
@@ -2878,7 +2912,7 @@ impl Gen {
         let live = &self.flow.live_out[pc];
         self.reload(b, live);
         let mut known = self.fix[pc].and(live);
-        uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
+        uses_defs(&self.ops[pc], &HashMap::default()).1.iter().for_each(|&d| known.remove(d));
         for r in known.iter() {
             let x = b.use_var(self.vars[r]);
             let s = Self::shifted(b, x);
@@ -2896,7 +2930,7 @@ impl Gen {
             live.remove(r);
         }
         let mut known = self.fix[pc].clone();
-        uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
+        uses_defs(&self.ops[pc], &HashMap::default()).1.iter().for_each(|&d| known.remove(d));
         known.iter().for_each(|r| live.remove(r as Reg));
         self.reload(b, &live);
         self.reload_globals(b, pc + 1);
@@ -4273,7 +4307,7 @@ impl Gen {
         // The byte at fixnum index `args[1]` of the bytes of `x`.
         let byte = |b: &mut FunctionBuilder, len: ir::Value| {
             let idx;
-            if self.fix[pc].contains(base + 2) && std::env::var("TECHNE_JIT_INDEX").as_deref() != Ok("0") {
+            if self.fix[pc].contains(base + 2) && switch!("TECHNE_JIT_INDEX") {
                 let s = b.use_var(self.shifts[(base + 2) as usize]);
                 idx = b.ins().sshr_imm_s(s, 16);
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);

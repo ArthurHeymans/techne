@@ -41,14 +41,17 @@
         (list out err)))
     #:directory here
     #:environment '(("TECHNE_ALLOC_CENSUS" . "1") ("TECHNE_JIT" . "1000") ("TECHNE_JIT_SYNC" . "1"))))
-(define fields '(nursery_objects nursery_words pairs pair_words bigints bigint_words direct_old_objects direct_old_words))
+(define fields
+  '(nursery_objects nursery_words pairs pair_words bigints bigint_words direct_old_objects direct_old_words
+    promoted_objects promoted_words promoted_pairs promoted_pair_words promoted_bigints promoted_bigint_words
+    reverse_calls reverse_minors reverse_promoted_words reverse_promoted_pair_words))
 (define (snapshot line)
   (unless (regexp-search "truncated: false" line) (error "incomplete nursery census" line))
   (apply dict
     (append-map
      (lambda (field)
        (let* ((key (symbol->string field))
-              (m (regexp-search `(: ,key ": " ($ (+ digit))) line)))
+              (m (regexp-search `(: (or bos #\space) ,key ": " ($ (+ digit))) line)))
          (unless m (error "missing census field" field line))
          (list key (string->number (regexp-match-submatch m 1))))) fields)))
 (define snapshots
@@ -72,7 +75,10 @@
        (write (list form 'result result 'pairs (dict-ref delta "pairs")
                     'pair-bytes (* 8 (dict-ref delta "pair_words"))
                     'bigints (dict-ref delta "bigints") 'bigint-bytes (* 8 (dict-ref delta "bigint_words"))
-                    'direct-old-bytes (* 8 (dict-ref delta "direct_old_words")))) (newline)
+                    'direct-old-bytes (* 8 (dict-ref delta "direct_old_words"))
+                    'promoted-pair-bytes (* 8 (dict-ref delta "promoted_pair_words"))
+                    'reverse-minors (dict-ref delta "reverse_minors")
+                    'reverse-promoted-pair-bytes (* 8 (dict-ref delta "reverse_promoted_pair_words")))) (newline)
        (when (positive? (dict-ref delta "direct_old_words"))
          (display "warning: direct old allocations have no kind classification\n" (current-error-port)))
        (dict "probe" (written form) "result" result "counts" delta

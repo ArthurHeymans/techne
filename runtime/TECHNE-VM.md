@@ -28,8 +28,12 @@ fully hygienic.
     (also inline in JIT code), copied out en masse by each minor
     collection. A world that never collects holds little. Bulk lists may
     use the entire existing nursery: a list of small pairs is not one
-    large object. Other bulk allocations retain their half-nursery cutoff;
-    no larger default nursery or new large-object policy is needed.
+    large object. One of at least half the nursery that does not fit what
+    is left of it goes to the old generation, while no cycle runs, rather
+    than collecting: that collection would promote the list `reverse` or
+    `append` was given, which dies once the new list is made. Other bulk
+    allocations retain their half-nursery cutoff; no larger default nursery
+    or new large-object policy is needed.
   - Old generation: non-moving. Small objects live in blocks of one size
     class each (32 KiB for a class's first, doubling up to 256 KiB; exact
     up to 16 words, then about 12.5% apart), allocated
@@ -291,9 +295,11 @@ fully hygienic.
     of at most 64 bytes into fresh mutable nursery strings, and compare bounded
     flat UTF-8 strings. Unsupported representations, ranges and allocations use
     the original native. Byte loops count against the existing complex-native
-    inline budget. Repeated character/string-read globals can cache native
-    identity guards with the existing 16-global entry/call reload discipline;
-    no string pointer, ASCII flag or length is cached across mutation.
+    inline budget. Character/string-read globals called in a loop that can
+    come back without reloading kept globals (no call in between) cache
+    native identity guards with the existing 16-global entry/call reload
+    discipline; past a reload the guard would be recomputed for a single use.
+    No string pointer, ASCII flag or length is cached across mutation.
   - Explicit `inexact`/`exact->inexact` conversion handles fixnums and already-
     inexact values inline. Two-argument `/` handles scalar fixnum/float inputs
     only when at least one is already inexact. Exact division stays exact;
@@ -313,7 +319,8 @@ fully hygienic.
     `TECHNE_JIT_STRING_EQ=0`, `TECHNE_JIT_NATIVE_CACHE=0`,
     `TECHNE_JIT_INEXACT=0` and `TECHNE_JIT_FLOAT_DIV=0` independently disable
     the latest native cases; `TECHNE_JIT_STRING_INLINE=1` restores aggressive
-    bytecode-only admission for string callees. These are developer ablations,
+    bytecode-only admission for string callees (all read once per process).
+    These are developer ablations,
     `TECHNE_JIT_LOG=1`
     reports compiled functions and compile times (and entry points handed
     back to the interpreter), `TECHNE_JIT_IR=1` reports

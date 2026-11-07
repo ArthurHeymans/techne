@@ -185,9 +185,4 @@ nix develop --command cargo test --release -p techne-vm \
   --features counting-allocator --test fast_calls --test stop --test reclaim
 ```
 
-Raw local records: `/tmp/techne-fast/{final-wall,final-counts,ablation-wall,
-nqueens-ablation}.json`, generated assembly and synchronous memory logs.
-Frozen binaries `/tmp/techne-fast/{before,after}`, SHA-256 respectively:
-`7cd76e7ee4944e3672d139e952e705f10f5ee83a2faa019fa0876ab7cc9a3991` and
-`cd027dd56791f3d062d8224bb1bf167db5593db0ae57ac3456475c12ebfd523a`.
 Never build another source checkout into the same Cargo target directory.

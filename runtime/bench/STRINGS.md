@@ -1,7 +1,6 @@
 # Bounded string and real-native hillclimb
 
-Baseline: PR #334 tip (`739462e6`), frozen as `/tmp/techne-scan/before`,
-SHA-256 `a58d853271955ecf6dab7d58f2a729a7644f8990d17412a87076ff68012c8665`.
+Baseline: PR #334 tip (`739462e6`).
 Workloads/arguments unchanged; no comparison against an older VM baseline.
 A concurrent review commit, `fc4a2f34`, restored list admission and fixed CI
 lints. It is preserved beneath the series; final campaigns below were rerun
@@ -92,10 +91,6 @@ PROGS=orgparse RUNS=5 ITERS=10 \
 # Run COUNTS=1 RUNS=1 ITERS=2 separately inside nix develop.
 ```
 
-Raw local records in `/tmp/techne-scan/`: `org.callgrind`, `org-exclusive.txt`,
-`{index-wall,strings-wall,sub-vs-both-wall,native-cache-wall,strings-counts}.json`,
-plus `prototype-tests.log`.
-
 ## Default admission and rejected experiments
 
 The four mechanisms are enabled by default; independently set
@@ -185,15 +180,9 @@ default-on, while retaining both independent zero-valued ablations.
 The final combined series preserves concurrent review commit `fc4a2f34`:
 original list admission and its new low-memory test, plus CI lint fixes.
 
-- Reviewed baseline `/tmp/techne-scan/before-reviewed`, SHA-256
-  `b9c57a8e867d2f297d5d588fa694b8e89dc4d2c4d4236faac74002b848073f6f`.
-- Final `/tmp/techne-scan/final-reviewed`, SHA-256
-  `965248be98c3d633d82f555c00635912a6765828cdf37dfa2d1fa928a47c2756`.
-
 Three alternating pairs / eight calls, medians of the last four and then
 across processes. Same EPYC 3151 / CPU 4 / release counting-allocator build.
-The pre-review final binary (`/tmp/techne-scan/final`, SHA-256 `8ecce4e1…`)
-and its campaigns are historical, not the reviewed tip.
+Campaigns of the pre-review binary are historical, not the reviewed tip.
 
 | Workload | PR tip ms | Final ms |
 |---|---:|---:|
@@ -300,15 +289,6 @@ complete. No heavyweight optimization tier or recompilation was introduced.
 confirm the >5,000-line core file; the small-file probes are inconclusive, not
 proof of clean analysis. Compilation and active tests provide validation.
 
-Final reviewed records in `/tmp/techne-scan/`: `reviewed-runtime.json`,
-`reviewed-instructions.json`, `reviewed-node-vs-vm.json`,
-`rss-{orgparse,mandel,hof}-{before-reviewed,final-reviewed}-*.{txt,log,out}`,
-`reviewed-{tests,conformance,hostile,check,build,clippy}.log`. Earlier independent
-ablations/fuzzing: `final-ablation.json`, `final-instructions.json`,
-`validated-fuzz.log`. Historical `final-runtime.json`, `node-vs-vm.json`,
-`strings-{runtime,ablation}.json` and `aggressive-*.json` are superseded by the
-reviewed combined campaign, not silently substituted.
-
 ```sh
 # Same final binary; original mechanisms versus final defaults.
 PROGS='orgparse mandel exact-div' RUNS=5 ITERS=10 \
@@ -335,11 +315,8 @@ string/real native lowering measured above.
 The final combined source was rebuilt and revalidated after that second rebase:
 118 library tests, all regular integration targets (including the new loop
 fixture and fuzz campaigns), 378 conformance trials, 13 hostile tests, strict
-Clippy, no-default-feature check and formatting pass. Logs are
-`/tmp/techne-scan/latest-{tests,conformance,hostile,clippy,check,build}.log`.
-Built binary `/tmp/techne-scan/latest`, SHA-256
-`8670c3ff16bd5a2d3a78823e23bd5d931be051e5337ebfac6af81fa8fc111297`.
-The measured reviewed hashes/table above remain explicitly the frozen
+Clippy, no-default-feature check and formatting pass.
+The measured reviewed table above remain explicitly the frozen
 `fc4a2f34` comparison, not measurements relabeled as this later build.
 
 ### Publication after #334 merged
@@ -349,16 +326,13 @@ was running. The follow-up is rebased onto `main` at `8dad6b8b`; both review
 fixes and unrelated merged work are preserved. The post-merge source passes
 **119 library tests**, all regular counting-allocator integration targets,
 **378 conformance trials**, **13 hostile tests**, strict Clippy, formatting and
-the no-default-feature check. Logs are
-`/tmp/techne-scan/postmerge-{tests,conformance,hostile,clippy,check,build}.log`.
-Build `/tmp/techne-scan/postmerge`, SHA-256
-`937feaa18f21458b5969d1c574cff68b7b08531b5512ec3c33cb89d22a765674`.
+the no-default-feature check.
 The performance tables remain measurements of the explicitly frozen reviewed
 pair above, not newly invented timings for this final rebase.
 
 ### Adversarial review: self-tail cache invalidation
 
-GPT-6.1 Sol's independent review found a confirmed wrong-result regression.
+An independent review found a confirmed wrong-result regression.
 A non-inlineable **compiled** callee changed a cached `string-ref` global after
 its final visible read; an implicit self-tail jump then reused the old native.
 The interpreter and cache-off run returned `#\z`, while cache-on returned
@@ -387,10 +361,16 @@ incorrect semantics. No regressing vector-bound optimization was reintroduced.
 The fixed default passes 120 library tests, all regular integration targets,
 378 conformance trials, 13 hostile tests, strict Clippy, formatting and the
 no-default-feature check. No tests or bounds were relaxed.
-Raw records: `/tmp/techne-hof/{self-tail-red,edge-unit,edge-green}.log`,
-`edge-runtime.json`, `edge-qsort-counts.json` and the frozen before/fixed binaries.
 
 Next targets remain HOF list intermediates/GC and wide-accumulator boxing,
 callback overhead, and vector loops. The regressing local-proof prototype is
 not evidence that every bounds strategy must fail, nor permission to weaken
 immutability or exact arithmetic.
+
+### Follow-up: native identity cache after reloads
+
+The native identity cache regressed `numstr` and the HTTP `/work` request
+by about 1.6%, visible in CI's counts but not recorded above: past a
+non-inline call, kept globals reload, so the cached guard was recomputed
+each iteration for one use. It is now kept only in loops that can come back
+to the call without a reload; see `RESULTS.md`.

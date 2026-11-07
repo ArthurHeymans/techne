@@ -5324,8 +5324,8 @@ impl Vm {
             Some(crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline, fixnum })
         };
         let known_native = |g: u32| known_native_value(self.globals[g as usize]);
-        let mut closure_calls = std::collections::HashMap::new();
-        let mut native_calls = std::collections::HashMap::new();
+        let mut closure_calls = crate::hash::Map::default();
+        let mut native_calls = crate::hash::Map::default();
         for (pc, target) in c.jit.calls.borrow().iter() {
             match target {
                 crate::jit::CallTarget::Code(id) if self.code_live(id) => {
@@ -5357,7 +5357,7 @@ impl Vm {
         // frame, unless a `guard` landing in this function could read its
         // registers.
         let handlers = orig.iter().any(|op| matches!(op, Op::PushHandler { .. } | Op::PushEscape { .. }));
-        let mut inlined = std::collections::HashMap::new();
+        let mut inlined = crate::hash::Map::default();
         for (pc, op) in orig.iter().enumerate().filter(|_| jit_inlines()) {
             let inlinee = match *op {
                 Op::CallG { n, g, .. } | Op::TailCallG { n, g, .. } => {
@@ -5526,7 +5526,7 @@ impl Vm {
         if ops.len() > crate::jit::INLINE_MAX || callee.rest || callee.nparams != n {
             return None;
         }
-        let mut nested = std::collections::HashMap::new();
+        let mut nested = crate::hash::Map::default();
         if depth < crate::jit::INLINE_DEPTH {
             outer.push(callee);
             for (pc, op) in ops.iter().enumerate() {
