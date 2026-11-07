@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794060229302,
+  "lastUpdate": 1794060230814,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -50468,6 +50468,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642689849,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106059,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c5c1b49093cdfd2f6c0f2d5e1c7466e9cb5d6c8d",
+          "message": "Merge pull request #346 from ArthurHeymans/perf/fixed-emission-order\n\nvm: compile a function the same way in every run",
+          "timestamp": "2026-11-07T14:56:02+01:00",
+          "tree_id": "23bb84bb10721df64cd5c94554ec0efa0db2cb0d",
+          "url": "https://github.com/ArthurHeymans/techne/commit/c5c1b49093cdfd2f6c0f2d5e1c7466e9cb5d6c8d"
+        },
+        "date": 1794060230767,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690472912,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642687860,
             "unit": "instructions"
           },
           {
