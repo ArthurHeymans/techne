@@ -1284,7 +1284,11 @@ impl Heap {
         }
         self.growth_cooldown = self.growth_cooldown.saturating_sub(1);
         let target = promoted.saturating_mul(SURVIVOR_TARGET).clamp(self.nursery_base, self.nursery_ceiling);
-        if target > self.nursery_max && share >= GROW_SHARE && self.growth_cooldown == 0 {
+        // A window narrower than the nursery (`set_nursery_window`, the
+        // editor's, bounding pauses) already decides how much is allocated
+        // between collections: a larger nursery would not widen it.
+        let widens = self.window > self.nursery_max;
+        if widens && target > self.nursery_max && share >= GROW_SHARE && self.growth_cooldown == 0 {
             self.nursery_max = self.nursery_max.saturating_mul(2).min(target);
             self.grown_from = Some(survived);
         } else if share < SHRINK_SHARE || target.saturating_mul(2) <= self.nursery_max {
@@ -2110,6 +2114,14 @@ mod tests {
         assert_eq!(vm.heap.nursery_target(), base);
         vm.heap.resize_nursery();
         assert_eq!(vm.heap.nursery_capacity(), base);
+
+        // A window narrower than the nursery bounds what is allocated
+        // between collections: growing would not widen it.
+        vm.heap.set_nursery_policy(base, ceiling);
+        vm.heap.set_nursery_window(base / 2);
+        vm.heap.adapt_nursery(true, base, base, 1.0, 0.0);
+        assert_eq!(vm.heap.nursery_target(), base);
+        vm.heap.set_nursery_window(usize::MAX);
 
         // ... and a policy with no room to grow changes nothing.
         vm.heap.set_nursery_policy(base, base);
