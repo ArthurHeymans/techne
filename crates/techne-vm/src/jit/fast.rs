@@ -71,10 +71,10 @@ pub(super) fn plan(job: &Job) -> Option<Plan> {
     if succs.iter().flatten().any(|&s| s >= ops.len()) {
         return None;
     }
-    let shape = Shape { effects, succs, entries: HashMap::new(), inlined: vec![false; ops.len()], results: HashMap::new() };
+    let shape = Shape { effects, succs, entries: HashMap::default(), inlined: vec![false; ops.len()], results: HashMap::default() };
     let mut args = Regs::empty(n);
     (0..job.nparams).for_each(|r| args.insert(r));
-    let assumed = HashMap::from([(0, args)]);
+    let assumed = [(0usize, args)].into_iter().collect();
     let fix = fixnums(ops, n, |_, k| Value::from_bits(job.consts[k as usize]), &job.captures, &[0], |_| true, &shape, &assumed).regs;
     let flow = analyze(ops, n, &job.captures, false, &fix, |_| None, &shape);
     // The self-return hypothesis is valid by induction over normally
@@ -137,7 +137,7 @@ pub(super) fn compile(
     }
     let blocks: Vec<_> = job.ops.iter().map(|_| b.create_block()).collect();
     let mut g =
-        Kernel { ctx: p[0], bp: p[1], left: *p.last().unwrap(), vars, blocks, exits: HashMap::new(), own, prepare, unwind, job, plan };
+        Kernel { ctx: p[0], bp: p[1], left: *p.last().unwrap(), vars, blocks, exits: HashMap::default(), own, prepare, unwind, job, plan };
     b.ins().jump(g.blocks[0], &[]);
     for (pc, op) in job.ops.iter().enumerate() {
         b.switch_to_block(g.blocks[pc]);

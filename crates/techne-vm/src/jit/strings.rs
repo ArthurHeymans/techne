@@ -5,10 +5,6 @@ use crate::heap::{ASCII, INDIRECT};
 
 const MAX_BYTES: i64 = 64;
 
-pub(super) fn enabled(name: &str) -> bool {
-    std::env::var(name).as_deref() != Ok("0")
-}
-
 impl Gen {
     fn flat_string_len(&self, b: &mut FunctionBuilder, x: ir::Value, ascii: bool, slow: Block) -> ir::Value {
         let mask = INDIRECT | if ascii { ASCII } else { 0 };
