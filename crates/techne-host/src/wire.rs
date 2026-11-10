@@ -49,13 +49,15 @@ pub enum ToWorker {
         wall_ms: u64,
         dev: bool,
     },
-    /// Serve `request` with the deployment published as `name`; its body
-    /// streams, in `Body` messages, if `streams`.
+    /// Serve `request` with the deployment published as `name`, with its
+    /// debug instance if `debug` and it has one; its body streams, in
+    /// `Body` messages, if `streams`.
     Request {
         rid: u64,
         name: String,
         request: Data,
         streams: bool,
+        debug: bool,
     },
     /// A chunk of request `rid`'s body; its end, failed if with `error`;
     /// a credit for a chunk of its response's body.
@@ -182,9 +184,14 @@ impl ToWorker {
                 int(*wall_ms),
                 Data::Bool(*dev),
             ]),
-            ToWorker::Request { rid, name, request, streams } => {
-                Data::List(vec![sym("request"), int(*rid), Data::String(name.clone()), request.clone(), Data::Bool(*streams)])
-            }
+            ToWorker::Request { rid, name, request, streams, debug } => Data::List(vec![
+                sym("request"),
+                int(*rid),
+                Data::String(name.clone()),
+                request.clone(),
+                Data::Bool(*streams),
+                Data::Bool(*debug),
+            ]),
             ToWorker::Body { rid, bytes } => Data::List(vec![sym("body"), int(*rid), Data::Bytes(bytes.clone())]),
             ToWorker::BodyEnd { rid, error } => Data::List(vec![sym("body-end"), int(*rid), failure(error)]),
             ToWorker::Credit { rid } => Data::List(vec![sym("credit"), int(*rid)]),
@@ -214,7 +221,7 @@ impl ToWorker {
                     .collect::<io::Result<_>>()?;
                 ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()?, dev: p.flag()? }
             }
-            "request" => ToWorker::Request { rid: p.uint()?, name: p.string()?, request: p.any()?, streams: p.flag()? },
+            "request" => ToWorker::Request { rid: p.uint()?, name: p.string()?, request: p.any()?, streams: p.flag()?, debug: p.flag()? },
             "body" => ToWorker::Body { rid: p.uint()?, bytes: p.chunk()? },
             "body-end" => ToWorker::BodyEnd { rid: p.uint()?, error: p.failure()? },
             "credit" => ToWorker::Credit { rid: p.uint()? },

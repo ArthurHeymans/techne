@@ -5,7 +5,9 @@ Status: in progress. Parts of milestones 1 and 2 exist:
 snapshot, each request under a lifetime, and dev worlds a REPL drives;
 its supervisor serves them from a worker process sandboxed by
 `crates/techne-sandbox`, bodies streaming both ways; `techne cloud dev`
-runs both locally, with the nREPL server and its debugger in the worker
+runs both locally, with the nREPL server and its debugger in the worker,
+in a dev world or, with `--debug`, in a debug instance beside a
+deployment served as in production
 ("Runtime work" says what of each is done). The broker, storage and the
 hosted service are not started. Where the design relies on something that exists, it says
 where; everything else is new work, and the milestones say which parts
@@ -316,8 +318,23 @@ Not all of this runs today: an exception handler can wait in its task,
 with the live restarts (runtime/TECHNE-VM.md, "Restarts"), and the
 nREPL server's evaluations do, each in a task of its own, several
 waiting at once while others run. Bounded procedure tracing is available
-through `(techne debug)` and streams to the calling evaluation's output;
-debug instances and routing are still to do (runtime work 7).
+through `(techne debug)` and streams to the calling evaluation's output.
+Debug instances exist in the host (`Host::attach_debug`,
+`Host::fetch_routed`): one for a deployment, serving the requests routed
+to it one at a time (so a request waiting in the debugger holds back the
+others routed there, not yet each with a debugger of its own), kept
+across them, dropped when detached, poisoned or at a deploy, a request
+on it then failing with 504; a routed request has a minute more of wall
+time. Routing is by a credential in the `techne-debug-route` header,
+decided by the front in Lisp (`lisp/http/debug-route.scm`), which marks
+the responses; `techne cloud dev --nrepl PORT --debug` runs it locally,
+its credential made at the start and printed. Still to do: sessions that
+issue and expire credentials, a share of real traffic and filters, the
+audit log, and the paused state (a request's deadline is fixed when it
+is admitted, not when it pauses). A request routed to a debug instance
+that goes before serving it is served as any other, within the wall time
+any other has; those waiting for a debug instance are bounded apart from
+the deployment's own.
 
 Dev worlds remain the place for experiments with preview storage; a
 debug instance is for the problem that only shows in production.
@@ -690,7 +707,10 @@ is the storage layout and that the supervisor can start any worker locally.
   the supervisor, which relays the connection: a definition sent from the
   file changes the next request, and the connection follows the
   deployment to its next dev world when it is deployed again; it ends
-  with its worker.
+  with its worker. With `--debug` too, the deployment is served by
+  instances as in production and the nREPL server is in its debug
+  instance, reached by requests carrying the credential printed
+  ("Debugging in production").
 - **Emacs** (`editors/emacs/techne.el`): connect with a token over TLS;
   choose a dev world or attach a debug instance, shown in the mode line;
   route one's own requests to it, set break on error, trace; deploy the
@@ -871,7 +891,10 @@ What techne-vm and techne-node need that they do not have:
    whose debugger waits on a channel for the client's choice, several at
    once (`nrepl.rs`). Procedure tracing is built in `(techne debug)`:
    bounded, task-labelled call/result/condition snapshots, streamed through
-   ordinary nREPL output. Needed: a routing hook in the host.
+   ordinary nREPL output. The host routes requests to a deployment's
+   debug instance (`Host::attach_debug`, `Host::fetch_routed`), one at a
+   time. Needed: several requests on it at once, each with its debugger;
+   sessions and their credentials.
 8. **Conditions as data.** A bounded export of a condition by Rust: its
    kind, message, irritants written briefly, source sites and frames, and
    a stable code for each kind of failure, without calling Scheme (nREPL

@@ -63,6 +63,17 @@
 //! attached to it ([`Attached`]: an nREPL server, through which a REPL
 //! redefines its code) runs. A redefinition changes the next request:
 //! every request looks `fetch` up anew, in instances and dev worlds alike.
+//!
+//! A deployment in production may have a debug instance beside its
+//! instances ([`Host::attach_debug`]): a world started from the same
+//! snapshot, kept as a dev world is and with what is attached to it, that
+//! serves only the requests routed to it ([`Host::fetch_routed`]; who
+//! routes them is the caller's to decide), one at a time, each allowed
+//! `Limits::debug_pause` more of wall time, to wait in a debugger. The
+//! others are served by the deployment's instances as before, from its
+//! code as deployed. It never joins them: detached
+//! ([`Host::detach_debug`]), poisoned, or its deployment replaced, it is
+//! dropped, and the requests routed to it then are served as any other.
 
 pub mod body;
 pub mod egress;
@@ -89,6 +100,10 @@ use techne_vm::{
     vm::{Capability, Error, Grants, Output, ROOT_MODULE, Snapshot, Vm},
 };
 use tokio::sync::{Notify, oneshot};
+
+/// How much longer than its deployment's wall time a request routed to a
+/// debug instance may take, waiting in a debugger.
+pub const DEBUG_PAUSE: Duration = Duration::from_secs(60);
 
 /// The most bytes of a request copied out of the front world: the front
 /// bounds what it reads to less (`lisp/http`: a megabyte of body).
@@ -125,6 +140,8 @@ pub struct Limits {
     pub output: usize,
     /// Fetches of a request (`fetch-url`).
     pub fetches: usize,
+    /// Wall time a request routed to a debug instance has beyond `wall`.
+    pub debug_pause: Duration,
 }
 
 impl Default for Limits {
@@ -141,6 +158,7 @@ impl Default for Limits {
             load: Duration::from_secs(10),
             output: 64 << 10,
             fetches: 50,
+            debug_pause: DEBUG_PAUSE,
         }
     }
 }
@@ -194,8 +212,9 @@ impl Deployment {
     }
 }
 
-/// What a dev world runs beside the requests it serves, an nREPL server
-/// say ([`Host::publish_dev`]). The host calls `poll` before each slice of
+/// What a dev world or a debug instance runs beside the requests it
+/// serves, an nREPL server say ([`Host::publish_dev`],
+/// [`Host::attach_debug`]). The host calls `poll` before each slice of
 /// the world's tasks, and `reap` after.
 pub trait Attached {
     /// Handle what waits (which may give the world tasks to run); whether
@@ -210,20 +229,33 @@ struct Instance {
     vm: Vm,
     /// The deployment's generation it was started from.
     generation: u64,
-    /// What it runs beside its requests, if it is a dev world.
+    /// What it runs beside its requests, if it is a dev world or a debug
+    /// instance.
     attached: Option<Box<dyn Attached>>,
-    /// What a dev world's requests are started with (`DEV_SERVE`).
+    /// What a dev world's requests, and a debug instance's, are started
+    /// with (`DEV_SERVE`).
     serve: Option<Value>,
+    /// Which debug instance it is, if it is one.
+    debug: Option<u64>,
+}
+
+/// A deployment's debug instance: its number, and the world while no
+/// request runs on it.
+struct Debug {
+    id: u64,
+    idle: Option<Instance>,
 }
 
 /// A deployment published under a name: its generation, which a new
-/// publication bumps, and its instances waiting for requests (its dev
-/// world, while no request runs, if it is published for development).
+/// publication bumps, its instances waiting for requests (its dev
+/// world, while no request runs, if it is published for development),
+/// and its debug instance, if one is attached.
 struct Published {
     deployment: Deployment,
     generation: u64,
     idle: Vec<Instance>,
     dev: bool,
+    debug: Option<Debug>,
 }
 
 /// A request the front world asked for.
@@ -237,6 +269,11 @@ struct Job {
     /// dispatched.
     deadline: Option<Instant>,
     exchange: Rc<Exchange>,
+    /// Routed to the deployment's debug instance, if it has one.
+    debug: bool,
+    /// How much of its deadline is the allowance of a request so routed:
+    /// taken back if it is served as any other after all.
+    pause: Duration,
 }
 
 /// A request being served.
@@ -245,6 +282,8 @@ struct Running {
     id: u64,
     limits: Limits,
     instance: Instance,
+    /// Its debug instance was detached: it ends now.
+    retired: bool,
     lifetime: LifetimeId,
     task: TaskId,
     deadline: Instant,
@@ -273,10 +312,12 @@ pub struct Printed {
 
 struct State {
     published: HashMap<String, Published>,
-    /// Requests being served, by deployment.
+    /// Requests being served by instances, by deployment: not those on a
+    /// debug instance, which take no instance's place.
     busy: HashMap<String, usize>,
     running: Vec<Running>,
     next_id: u64,
+    next_debug: u64,
     broker: Option<outbound::Broker>,
     on_failure: Box<dyn FnMut(&Failure)>,
     on_output: Box<dyn FnMut(&Printed)>,
@@ -304,6 +345,7 @@ impl Host {
                 busy: HashMap::new(),
                 running: Vec::new(),
                 next_id: 0,
+                next_debug: 0,
                 broker: None,
                 on_failure: Box::new(|f| eprintln!("techne-host: {} #{}: {} {}", f.deployment, f.request, f.status, f.message)),
                 on_output: Box::new(|p| {
@@ -341,9 +383,61 @@ impl Host {
     pub fn publish(&self, name: &str, deployment: Deployment) {
         let mut s = self.state.borrow_mut();
         let generation = s.published.get(name).map_or(0, |p| p.generation + 1);
-        s.published.insert(name.to_string(), Published { deployment, generation, idle: Vec::new(), dev: false });
+        // The debug instance of the one before goes with it.
+        s.retire_debug(name);
+        s.published.insert(name.to_string(), Published { deployment, generation, idle: Vec::new(), dev: false, debug: None });
         drop(s);
         self.wake.notify_one();
+    }
+
+    /// Give the deployment published under `name` a debug instance, in
+    /// place of the one it has (a request running on that one is answered
+    /// 504): a world started from its snapshot, kept
+    /// across the requests routed to it ([`Host::fetch_routed`]), those
+    /// that fail too, which it serves one at a time as a dev world serves
+    /// its own (`%host-debugger`, `retry`, `use-value`); the deployment's
+    /// other requests are served by its instances as before. `attach` is
+    /// given the world, as [`Host::publish_dev`]'s is, and the host drives
+    /// it and what is attached also while no request runs on it. It lasts
+    /// until detached, poisoned, or another deployment is published under
+    /// `name`, which answers a request running on it 504. As many
+    /// requests may wait for it as the deployment's `Limits::queue` and
+    /// one; more are refused with 503, whatever its instances serve. Its
+    /// number, for [`Host::detach_debug`].
+    pub fn attach_debug(&self, name: &str, attach: impl FnOnce(&mut Vm) -> Result<Box<dyn Attached>, Error>) -> Result<u64, Error> {
+        let mut s = self.state.borrow_mut();
+        s.next_debug += 1;
+        let id = s.next_debug;
+        let p = s.published.get(name).ok_or_else(|| Error::new("no such deployment"))?;
+        if p.dev {
+            return Err(Error::new("the deployment is served from its dev world"));
+        }
+        let mut world = new_instance(&p.deployment, p.generation, &self.wake)?;
+        world.debug = Some(id);
+        world.serve = Some(install_dev(&mut world.vm)?);
+        world.attached = Some(attach(&mut world.vm)?);
+        s.retire_debug(name);
+        if let Some(p) = s.published.get_mut(name) {
+            p.debug = Some(Debug { id, idle: Some(world) });
+        }
+        drop(s);
+        self.wake.notify_one();
+        Ok(id)
+    }
+
+    /// Drop debug instance `id` of the deployment published under `name`
+    /// (any, with no `id`), if it has it still: a request running on it is
+    /// answered 504, and those routed to it from now on are served as any
+    /// other. Whether there was one.
+    pub fn detach_debug(&self, name: &str, id: Option<u64>) -> bool {
+        let mut s = self.state.borrow_mut();
+        let attached = s.published.get(name).and_then(|p| p.debug.as_ref()).is_some_and(|d| id.is_none_or(|id| id == d.id));
+        if attached {
+            s.retire_debug(name);
+            drop(s);
+            self.wake.notify_one();
+        }
+        attached
     }
 
     /// Serve `deployment` under `name` for development, in place of the one
@@ -368,7 +462,8 @@ impl Host {
         let mut world = new_instance(&deployment, generation, &self.wake)?;
         world.serve = Some(install_dev(&mut world.vm)?);
         world.attached = Some(attach(&mut world.vm)?);
-        s.published.insert(name.to_string(), Published { deployment, generation, idle: vec![world], dev: true });
+        s.retire_debug(name);
+        s.published.insert(name.to_string(), Published { deployment, generation, idle: vec![world], dev: true, debug: None });
         drop(s);
         self.wake.notify_one();
         Ok(())
@@ -388,18 +483,19 @@ impl Host {
         move || wake.notify_one()
     }
 
-    /// Define `(host-fetch deployment request)` in the front world: the
-    /// response of the deployment published as DEPLOYMENT (a string) to
-    /// REQUEST, as `lisp/http` has them, or a response the host made for
-    /// its failure. A request's body may stream, and a response's
-    /// (procedures, as `lisp/http` has them). Call it before the front
-    /// world's tasks start waiting: it sets the world's wake notifier to
-    /// the host's.
+    /// Define `(host-fetch deployment request #:debug #f)` in the front
+    /// world: the response of the deployment published as DEPLOYMENT (a
+    /// string) to REQUEST, as `lisp/http` has them, or a response the host
+    /// made for its failure; with DEBUG, from the deployment's debug
+    /// instance, if it has one ([`Host::fetch_routed`]). A request's body
+    /// may stream, and a response's (procedures, as `lisp/http` has
+    /// them). Call it before the front world's tasks start waiting: it
+    /// sets the world's wake notifier to the host's.
     pub fn install(&self, front: &mut Vm) {
         let wake = self.wake.clone();
         front.set_wake_notifier(move || wake.notify_one());
         let host = self.clone();
-        body::install_front(front, move |deployment, request, body| host.fetch(deployment, request, body));
+        body::install_front(front, move |deployment, request, body, debug| host.fetch_routed(0, deployment, request, body, debug));
     }
 
     /// Ask the deployment published as `deployment` to answer `request`,
@@ -416,6 +512,24 @@ impl Host {
     /// place within the deployment's concurrency and queue limits, and
     /// starts its wall deadline. Overload is answered 503, reported.
     pub fn fetch_as(&self, tag: u64, deployment: &str, request: Data, body: Option<Reader>) -> oneshot::Receiver<Response> {
+        self.fetch_routed(tag, deployment, request, body, false)
+    }
+
+    /// [`Host::fetch_as`], the request served by the deployment's debug
+    /// instance if `debug` and it has one ([`Host::attach_debug`]), after
+    /// those routed to it before, within `Limits::debug_pause` more of
+    /// wall time. A deployment without one serves it as any other, within
+    /// its own wall time, also if the debug instance goes while the
+    /// request waits for it: what routes requests need not know whether a
+    /// debug instance lasts.
+    pub fn fetch_routed(
+        &self,
+        tag: u64,
+        deployment: &str,
+        request: Data,
+        body: Option<Reader>,
+        debug: bool,
+    ) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
         let exchange = Exchange::default();
         *exchange.reply.borrow_mut() = Some(tx);
@@ -423,7 +537,16 @@ impl Host {
         let now = Instant::now();
         let mut queue = self.queue.borrow_mut();
         let Ok(mut s) = self.state.try_borrow_mut() else {
-            queue.push_back(Job { deployment: deployment.into(), tag, request, deadline: None, exchange: Rc::new(exchange) });
+            let job = Job {
+                deployment: deployment.into(),
+                tag,
+                request,
+                deadline: None,
+                exchange: Rc::new(exchange),
+                debug,
+                pause: Duration::ZERO,
+            };
+            queue.push_back(job);
             self.wake.notify_one();
             return rx;
         };
@@ -442,14 +565,14 @@ impl Host {
             s.fail(deployment.into(), 0, &exchange, 404, "no such deployment".into());
             return rx;
         };
-        let limits = &p.deployment.limits;
-        let admitted = queue.iter().filter(|j| j.deployment == deployment).count() + s.busy.get(deployment).copied().unwrap_or(0);
-        if admitted >= limits.concurrency.saturating_add(limits.queue) {
+        let debug = debug && p.debug.is_some();
+        let (wall, pause) = (p.deployment.limits.wall, if debug { p.deployment.limits.debug_pause } else { Duration::ZERO });
+        if s.full(deployment, debug, queue.iter()) {
             s.fail(deployment.into(), 0, &exchange, 503, "the request queue is full".into());
             return rx;
         }
-        let deadline = Some(now + limits.wall);
-        queue.push_back(Job { deployment: deployment.into(), tag, request, deadline, exchange: Rc::new(exchange) });
+        let deadline = Some(now + wall + pause);
+        queue.push_back(Job { deployment: deployment.into(), tag, request, deadline, exchange: Rc::new(exchange), debug, pause });
         self.wake.notify_one();
         rx
     }
@@ -478,7 +601,10 @@ impl Host {
             }
             let next = {
                 let s = self.state.borrow();
-                let dev = s.published.values().filter(|p| p.dev).flat_map(|p| p.idle.iter().map(|i| i.vm.next_timer()));
+                let dev = s.published.values().flat_map(|p| {
+                    let worlds = p.idle.iter().filter(|_| p.dev).chain(p.debug.iter().flat_map(|d| &d.idle));
+                    worlds.map(|i| i.vm.next_timer())
+                });
                 s.running
                     .iter()
                     .flat_map(|r| [r.instance.vm.next_timer(), Some(r.deadline)])
@@ -513,13 +639,22 @@ impl Host {
                     s.fail(job.deployment, 0, &job.exchange, 404, "no such deployment".into());
                     continue;
                 };
+                job.debug &= p.debug.is_some();
                 let limits = &p.deployment.limits;
-                let queued = waiting.iter().chain(&*self.queue.borrow()).filter(|j: &&Job| j.deployment == job.deployment).count();
-                if queued + s.busy.get(&job.deployment).copied().unwrap_or(0) >= limits.concurrency.saturating_add(limits.queue) {
+                job.pause = if job.debug { limits.debug_pause } else { Duration::ZERO };
+                let wall = limits.wall;
+                if s.full(&job.deployment, job.debug, waiting.iter().chain(&*self.queue.borrow())) {
                     s.fail(job.deployment, 0, &job.exchange, 503, "the request queue is full".into());
                     continue;
                 }
-                job.deadline = Some(Instant::now() + limits.wall);
+                job.deadline = Some(Instant::now() + wall + job.pause);
+            }
+            // Its debug instance gone meanwhile: served as any other,
+            // within the time any other has.
+            if job.debug && !s.published.get(&job.deployment).is_some_and(|p| p.debug.is_some()) {
+                job.debug = false;
+                job.deadline = job.deadline.map(|d| d.checked_sub(job.pause).unwrap_or(d));
+                job.pause = Duration::ZERO;
             }
             let deadline = job.deadline.expect("admitted");
             if deadline <= Instant::now() {
@@ -531,18 +666,27 @@ impl Host {
                 s.fail(job.deployment, 0, &job.exchange, 404, "no such deployment".into());
                 continue;
             };
-            if busy >= p.deployment.limits.concurrency {
-                waiting.push_back(job);
-                continue;
-            }
-            let limits = p.deployment.limits.clone();
-            let instance = match p.idle.pop() {
-                Some(i) => Ok(i),
-                // A dev world gone (poisoned): nothing to serve with.
-                None if p.dev => Err(Error::new("the dev world is gone; deploy again")),
-                None => new_instance(&p.deployment, p.generation, &self.wake),
+            let instance = match &mut p.debug {
+                // After the request it serves now.
+                Some(d) if job.debug => match d.idle.take() {
+                    Some(i) => Ok(i),
+                    None => {
+                        waiting.push_back(job);
+                        continue;
+                    }
+                },
+                _ if busy >= p.deployment.limits.concurrency => {
+                    waiting.push_back(job);
+                    continue;
+                }
+                _ => match p.idle.pop() {
+                    Some(i) => Ok(i),
+                    // A dev world gone (poisoned): nothing to serve with.
+                    None if p.dev => Err(Error::new("the dev world is gone; deploy again")),
+                    None => new_instance(&p.deployment, p.generation, &self.wake),
+                },
             };
-            let dev = p.dev;
+            let limits = p.deployment.limits.clone();
             s.next_id += 1;
             let id = s.next_id;
             let context = Rc::new(outbound::Context {
@@ -561,26 +705,25 @@ impl Host {
             };
             match started {
                 Ok((instance, lifetime, task)) => {
-                    *s.busy.entry(job.deployment.clone()).or_default() += 1;
+                    if instance.debug.is_none() {
+                        *s.busy.entry(job.deployment.clone()).or_default() += 1;
+                    }
                     s.running.push(Running {
                         deployment: job.deployment,
                         id,
                         deadline,
                         limits,
                         instance,
+                        retired: false,
                         lifetime,
                         task,
                         exchange: job.exchange,
                     });
                 }
                 Err((instance, e)) => {
-                    // A dev world is kept, as after a request that failed.
-                    if let Some(i) = instance.filter(|i| dev && i.vm.poisoned().is_none())
-                        && let Some(p) = s.published.get_mut(&job.deployment)
-                        && p.generation == i.generation
-                    {
-                        p.idle.push(i);
-                    }
+                    // A dev world is kept, as after a request that failed,
+                    // and a debug instance.
+                    s.keep(&job.deployment, instance.filter(|i| i.attached.is_some() && i.vm.poisoned().is_none()));
                     s.fail(job.deployment, id, &job.exchange, 500, e.msg.clone())
                 }
             }
@@ -591,21 +734,34 @@ impl Host {
         *queue = waiting;
     }
 
-    /// Run the dev worlds no request runs on for a slice, with what is
-    /// attached to them. Whether one has more to run at once. One poisoned
-    /// meanwhile is dropped, what is attached having seen it: nothing runs
-    /// in it any more, nor do its timers.
+    /// Run the dev worlds and debug instances no request runs on for a
+    /// slice, with what is attached to them. Whether one has more to run
+    /// at once. One poisoned meanwhile is dropped, what is attached having
+    /// seen it: nothing runs in it any more, nor do its timers.
     fn drive_dev_worlds(&self) -> bool {
         let mut busy = false;
         let mut s = self.state.borrow_mut();
-        for p in s.published.values_mut().filter(|p| p.dev) {
-            p.idle.retain_mut(|world| match slice(world) {
-                Ok(more) => {
+        for p in s.published.values_mut() {
+            if p.dev {
+                p.idle.retain_mut(|world| match slice(world) {
+                    Ok(more) => {
+                        busy |= more;
+                        true
+                    }
+                    Err(_) => false,
+                });
+            }
+            let gone = match p.debug.as_mut().and_then(|d| d.idle.as_mut()).map(slice) {
+                Some(Ok(more)) => {
                     busy |= more;
-                    true
+                    false
                 }
-                Err(_) => false,
-            });
+                Some(Err(_)) => true,
+                None => false,
+            };
+            if gone {
+                p.debug = None;
+            }
         }
         busy
     }
@@ -618,7 +774,8 @@ impl Host {
         let mut i = 0;
         while i < s.running.len() {
             let r = &mut s.running[i];
-            let slice_error = if Instant::now() < r.deadline && !r.exchange.abandoned() {
+            // One whose debug instance was detached runs no more.
+            let slice_error = if Instant::now() < r.deadline && !r.exchange.abandoned() && !r.retired {
                 match slice(&mut r.instance) {
                     Ok(more) => {
                         busy |= more;
@@ -640,6 +797,8 @@ impl Host {
                 Some((500, format!("the world is poisoned: {why}")))
             } else if let Some(error) = slice_error {
                 Some((500, error.to_string()))
+            } else if r.retired {
+                Some((504, "its debug instance was detached".to_string()))
             } else if Instant::now() >= r.deadline {
                 Some((504, "past its deadline".to_string()))
             } else {
@@ -688,8 +847,9 @@ impl Host {
             r.exchange.writer.borrow_mut().take();
             // A dev world is kept whatever, unless poisoned: it holds what
             // a REPL made of it.
-            let keep = clean || (r.instance.attached.is_some() && r.instance.vm.poisoned().is_none());
-            s.release(&r.deployment, keep.then_some(r.instance));
+            let keep = (clean || r.instance.attached.is_some()) && r.instance.vm.poisoned().is_none() && !r.retired;
+            let debug = r.instance.debug;
+            s.release(&r.deployment, keep.then_some(r.instance), debug);
             // One waiting for a place may start now.
             self.wake.notify_one();
         }
@@ -698,18 +858,66 @@ impl Host {
 }
 
 impl State {
-    /// A request of `deployment` is done: keep `instance` for the next if
-    /// it may be.
-    fn release(&mut self, deployment: &str, instance: Option<Instance>) {
-        if let Some(n) = self.busy.get_mut(deployment) {
-            *n = n.saturating_sub(1);
+    /// A request of `deployment` is done, served by debug instance `debug`
+    /// if by one: keep `instance` for the next if it may be. A debug
+    /// instance not kept (poisoned) is the deployment's no longer.
+    fn release(&mut self, deployment: &str, instance: Option<Instance>, debug: Option<u64>) {
+        match debug {
+            Some(id) if instance.is_none() => {
+                if let Some(p) = self.published.get_mut(deployment)
+                    && p.debug.as_ref().is_some_and(|d| d.id == id)
+                {
+                    p.debug = None;
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let Some(n) = self.busy.get_mut(deployment) {
+                    *n = n.saturating_sub(1);
+                }
+            }
         }
-        if let Some(p) = self.published.get_mut(deployment)
-            && let Some(i) = instance
-            && i.generation == p.generation
-            && (p.dev || p.idle.len() < p.deployment.limits.idle)
-        {
-            p.idle.push(i);
+        self.keep(deployment, instance);
+    }
+
+    /// Keep `instance` for `deployment`'s next request, if it is still of
+    /// the deployment published: a debug instance where it was attached,
+    /// if it still is; a dev world; another while few enough wait.
+    fn keep(&mut self, deployment: &str, instance: Option<Instance>) {
+        let (Some(p), Some(i)) = (self.published.get_mut(deployment), instance) else { return };
+        if i.generation != p.generation {
+            return;
+        }
+        match (i.debug, &mut p.debug) {
+            (Some(id), Some(d)) if d.id == id && d.idle.is_none() => d.idle = Some(i),
+            (Some(_), _) => {}
+            (None, _) if p.dev || p.idle.len() < p.deployment.limits.idle => p.idle.push(i),
+            (None, _) => {}
+        }
+    }
+
+    /// Whether `deployment`, published, can admit no more requests beside
+    /// those `queued`: of those for its debug instance if `debug`, as many
+    /// as its queue holds and the one served; else of the others, as many
+    /// as its queue holds and its instances serve. Neither takes the
+    /// other's places.
+    fn full<'a>(&self, deployment: &str, debug: bool, queued: impl Iterator<Item = &'a Job>) -> bool {
+        let Some(limits) = self.published.get(deployment).map(|p| &p.deployment.limits) else { return true };
+        let queued = queued.filter(|j| j.deployment == deployment && j.debug == debug).count();
+        if debug {
+            let running = self.running.iter().filter(|r| r.deployment == deployment && r.instance.debug.is_some()).count();
+            queued + running > limits.queue
+        } else {
+            queued + self.busy.get(deployment).copied().unwrap_or(0) >= limits.concurrency.saturating_add(limits.queue)
+        }
+    }
+
+    /// `deployment` has its debug instance no longer: the request running
+    /// on it ends.
+    fn retire_debug(&mut self, deployment: &str) {
+        let Some(d) = self.published.get_mut(deployment).and_then(|p| p.debug.take()) else { return };
+        for r in self.running.iter_mut().filter(|r| r.deployment == deployment && r.instance.debug == Some(d.id)) {
+            r.retired = true;
         }
     }
 
@@ -857,7 +1065,7 @@ fn new_instance(deployment: &Deployment, generation: u64, wake: &Arc<Notify>) ->
     vm.capture_output(deployment.limits.output);
     let notify = wake.clone();
     vm.set_wake_notifier(move || notify.notify_one());
-    Ok(Instance { vm, generation, attached: None, serve: None })
+    Ok(Instance { vm, generation, attached: None, serve: None, debug: None })
 }
 
 /// How a world serves a request: `(fetch request env ctx)`, FETCH the

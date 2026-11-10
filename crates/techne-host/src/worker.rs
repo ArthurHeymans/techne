@@ -59,7 +59,9 @@ pub const UNSANDBOXED: u8 = 77;
 /// dev`, with its nREPL server), as this crate knows no REPL.
 pub trait Dev {
     /// Publish `deployment`, whose entry module is at `entry`, as `name`
-    /// on `host` for development (`Host::publish_dev`), its REPL attached.
+    /// on `host` with its REPL attached: for development
+    /// (`Host::publish_dev`), or served as in production with a debug
+    /// instance (`Host::attach_debug`).
     fn publish(&mut self, host: &Host, name: &str, entry: &Path, deployment: Deployment) -> Result<(), techne_vm::vm::Error>;
     /// Serve a REPL client on `stream`, which the supervisor relays.
     fn connect(&mut self, stream: tokio::io::DuplexStream);
@@ -194,7 +196,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     let _ = tx.send(message);
                 });
             }
-            ToWorker::Request { rid, name, request, streams } => {
+            ToWorker::Request { rid, name, request, streams, debug } => {
                 // Its body written to the host as it arrives, each chunk
                 // credited once taken.
                 let (queue, reader) = match streams {
@@ -209,7 +211,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     }
                     false => (None, None),
                 };
-                let reply = host.fetch_as(rid, &name, request, reader);
+                let reply = host.fetch_routed(rid, &name, request, reader, debug);
                 let credits = Rc::new(Semaphore::new(WINDOW));
                 let (tx, running_, credits_) = (tx.clone(), running.clone(), credits.clone());
                 let task = tokio::task::spawn_local(async move {

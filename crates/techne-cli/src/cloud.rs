@@ -36,6 +36,19 @@
 //! given; abort answers it 500. Other requests wait meanwhile (the dev
 //! world serves one at a time), up to its deadline, a minute
 //! (`DEV_WALL`) rather than 30 seconds.
+//!
+//! With `--debug` too, the deployment is served as in production, by
+//! instances started from its snapshot, and the nREPL server is in a
+//! debug instance beside them (`Host::attach_debug`): a world from the
+//! same snapshot that serves only the requests routed to it, those
+//! carrying the header `techne-debug-route` with the credential printed at
+//! the start (`lisp/http/debug-route.scm`, in the front). What a client
+//! evaluates changes the debug instance alone; a routed request that
+//! fails breaks into the debugger as above, while the others are served
+//! from the code as deployed, within the usual 30 seconds. A response
+//! from the debug instance says so (`techne-debug`). Deployed again on
+//! save, the deployment has a new debug instance, and the server moves to
+//! it.
 
 use std::{
     path::{Path, PathBuf},
@@ -49,12 +62,15 @@ use techne_host::{Attached, Deployment, Host, Limits};
 use techne_node::nrepl::Server;
 use techne_vm::vm::{Error, ROOT_MODULE, Vm};
 
-const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--nrepl PORT]
+const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--nrepl PORT [--debug]]
 
 Serve the deployment whose entry module is FILE on 127.0.0.1:PORT (8787
 by default; 0 picks one), deploying again whenever a Lisp file under
 FILE's directory changes. With --nrepl, serve it from a world kept across
-requests, with an nREPL server into it on that port.";
+requests, with an nREPL server into it on that port. With --debug too,
+serve it as in production, and put the nREPL server in a debug instance
+beside, which serves the requests carrying the header techne-debug-route
+with the credential printed.";
 
 /// How long a request may take in the dev world, paused in a debugger
 /// say.
@@ -73,7 +89,8 @@ pub fn main(args: Vec<String>) -> ExitCode {
             let fd = rest.iter().position(|a| a == "--fd").and_then(|i| rest.get(i + 1)).and_then(|f| f.parse().ok());
             match fd {
                 Some(fd) => {
-                    techne_host::worker::main_with(fd, !rest.iter().any(|a| a == "--unsandboxed"), Some(Box::<DevWorker>::default()))
+                    let dev = DevWorker { debug: rest.iter().any(|a| a == "--debug"), ..DevWorker::default() };
+                    techne_host::worker::main_with(fd, !rest.iter().any(|a| a == "--unsandboxed"), Some(Box::new(dev)))
                 }
                 None => usage(),
             }
@@ -102,22 +119,31 @@ struct Options {
     file: PathBuf,
     port: u16,
     nrepl: Option<u16>,
+    /// The nREPL server in a debug instance, the deployment served as in
+    /// production.
+    debug: bool,
 }
 
-/// The options, from `FILE [--port PORT] [--nrepl PORT]` in any order.
+/// The options, from `FILE [--port PORT] [--nrepl PORT [--debug]]` in any
+/// order.
 fn parse(args: &[String]) -> Option<Options> {
-    let mut options = Options { file: PathBuf::new(), port: 8787, nrepl: None };
+    let mut options = Options { file: PathBuf::new(), port: 8787, nrepl: None, debug: false };
     let mut file = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--port" => options.port = args.next()?.parse().ok()?,
             "--nrepl" => options.nrepl = Some(args.next()?.parse().ok()?),
+            "--debug" => options.debug = true,
             _ if file.is_none() && !arg.starts_with("--") => file = Some(PathBuf::from(arg)),
             _ => return None,
         }
     }
     options.file = file?;
+    // A debug instance is reached through its REPL alone.
+    if options.debug && options.nrepl.is_none() {
+        return None;
+    }
     Some(options)
 }
 
@@ -131,7 +157,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
     let program = std::env::current_exe().map_err(|e| Error::new(e.to_string()))?;
     let worker = WorkerOptions {
         program,
-        args: vec!["cloud".into(), "worker".into()],
+        args: ["cloud", "worker"].into_iter().chain(options.debug.then_some("--debug")).map(Into::into).collect(),
         env: Vec::new(),
         sandboxing: Sandboxing::IfAvailable,
         resources: ResourceConfinement::IfAvailable,
@@ -156,7 +182,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
         let mut front = Vm::new();
         techne_net::install_on(&mut front, tokio::runtime::Handle::current())?;
         supervisor.install(&mut front);
-        serve_front(&mut front, port, &entry)?;
+        serve_front(&mut front, port, &entry, options.debug)?;
         let redeploying = supervisor.clone();
         tokio::task::spawn_local(watch_files(dir, seen, move || {
             let (supervisor, entry) = (redeploying.clone(), entry.clone());
@@ -174,18 +200,30 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
 }
 
 /// Start `lisp/http`'s server in `front` on `port`, handing requests to
-/// `host-fetch`, saying where; bodies stream, both ways.
-fn serve_front(front: &mut Vm, port: u16, entry: &Path) -> Result<(), Error> {
+/// `host-fetch`, saying where; bodies stream, both ways. With `debug`,
+/// requests carrying a credential made here, and said, are routed to the
+/// deployment's debug instance (`lisp/http/debug-route.scm`).
+fn serve_front(front: &mut Vm, port: u16, entry: &Path, debug: bool) -> Result<(), Error> {
     let http = techne_vm::library::lisp_dir().join("http");
     front.eval_source(&format!(
-        r#"(require {:?} {:?})
-           (let ((listener (tcp-listen {port})))
+        r#"(require {:?} {:?} {:?})
+           (let* ((listener (tcp-listen {port}))
+                  (credential (and {} (make-debug-credential)))
+                  (serve (lambda (request debug) (host-fetch {NAME:?} request #:debug debug)))
+                  (handler (if credential
+                               (debug-routing serve credential)
+                               (lambda (request) (serve request #f)))))
              (display (string-append "Serving " {:?} " on http://127.0.0.1:"
                                      (number->string (cadr (tcp-local-address listener))) "\n"))
+             (when credential
+               (display (string-append "Debug instance: it serves requests with the header "
+                                       debug-route-header ": " credential "\n")))
              (flush-output-port)
-             (spawn (lambda () (http-serve listener (lambda (request) (host-fetch {NAME:?} request)) #:stream-bodies #t))))"#,
+             (spawn (lambda () (http-serve listener handler #:stream-bodies #t))))"#,
         http.join("http.scm").display().to_string(),
         http.join("server.scm").display().to_string(),
+        http.join("debug-route.scm").display().to_string(),
+        if debug { "#t" } else { "#f" },
         entry.display().to_string(),
     ))?;
     Ok(())
@@ -205,11 +243,12 @@ async fn watch_files<F: std::future::Future<Output = ()>>(dir: PathBuf, mut seen
     }
 }
 
-/// The deployment's limits: a dev world's requests may wait in a debugger.
+/// The deployment's limits: a dev world's requests may wait in a debugger
+/// (a debug instance's have their own allowance, `Limits::debug_pause`).
 fn limits(options: &Options) -> Limits {
     match options.nrepl {
-        Some(_) => Limits { wall: DEV_WALL, ..Limits::default() },
-        None => Limits::default(),
+        Some(_) if !options.debug => Limits { wall: DEV_WALL, ..Limits::default() },
+        _ => Limits::default(),
     }
 }
 
@@ -251,13 +290,17 @@ fn lisp_files(dir: &Path) -> Vec<(PathBuf, Option<u64>)> {
 /// What a worker of `techne cloud dev --nrepl` does for development: each
 /// deployment served from a dev world (`Host::publish_dev`) with an nREPL
 /// server in it, which moves to the next dev world on a deployment anew;
-/// clients relayed by the supervisor.
+/// clients relayed by the supervisor. With `debug`, each deployment is
+/// served as in production instead, and the server is in its debug
+/// instance (`Host::attach_debug`).
 #[derive(Default)]
 pub struct DevWorker {
-    /// The server, in the dev world of the deployment it is numbered with.
+    /// The server, in the dev world (or debug instance) of the deployment
+    /// it is numbered with.
     slot: Rc<RefCell<Option<(u64, Server)>>>,
     /// How many deployments were published.
     deployed: u64,
+    debug: bool,
 }
 
 impl techne_host::worker::Dev for DevWorker {
@@ -265,7 +308,7 @@ impl techne_host::worker::Dev for DevWorker {
         self.deployed += 1;
         let (generation, slot, waker) = (self.deployed, self.slot.clone(), host.waker());
         let entry = entry.display().to_string();
-        host.publish_dev(name, deployment, move |vm| {
+        let attach = move |vm: &mut Vm| -> Result<Box<dyn Attached>, Error> {
             let taken = slot.borrow_mut().take();
             let server = match taken {
                 Some((before, server)) => match server.replace(vm, "the deployment was deployed again") {
@@ -285,7 +328,14 @@ impl techne_host::worker::Dev for DevWorker {
             vm.eval_in(ROOT_MODULE, "<techne cloud>", "(set! %host-debugger %nrepl-debug-request)")?;
             *slot.borrow_mut() = Some((generation, server));
             Ok(Box::new(DevRepl { slot, generation }))
-        })
+        };
+        if self.debug {
+            // Served by its instances whether or not a REPL reaches it.
+            host.publish(name, deployment);
+            host.attach_debug(name, attach).map(drop)
+        } else {
+            host.publish_dev(name, deployment, attach)
+        }
     }
 
     fn connect(&mut self, stream: tokio::io::DuplexStream) {

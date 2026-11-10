@@ -255,6 +255,72 @@ fn a_failing_request_breaks_into_the_debugger() {
     assert_eq!(choose("retry", "", &fix), "fixed");
 }
 
+/// The head and body of the response to GET `path` on `port`, sent with
+/// the routing credential `credential`.
+fn get_routed(port: u16, path: &str, credential: &str) -> (String, String) {
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(c, "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\ntechne-debug-route: {credential}\r\n\r\n").unwrap();
+    let mut answer = String::new();
+    c.read_to_string(&mut answer).unwrap();
+    let (head, body) = answer.split_once("\r\n\r\n").unwrap_or_else(|| panic!("{answer}"));
+    (head.to_string(), body.to_string())
+}
+
+/// With `--nrepl` and `--debug`, the deployment is served as in
+/// production and the REPL is into a debug instance beside: what it
+/// evaluates changes what requests carrying the credential are answered,
+/// marked as the debug instance's, and nothing of what the others are.
+#[test]
+fn a_repl_into_a_debug_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app.scm");
+    std::fs::write(&app, GREETER.replace("GREETING", "hello")).unwrap();
+    let mut child = Killed(
+        Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["cloud", "dev", app.to_str().unwrap(), "--port", "0", "--nrepl", "0", "--debug"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let out = lines(child.0.stdout.take().unwrap());
+    let err = lines(child.0.stderr.take().unwrap());
+    let (mut port, mut nrepl, mut credential) = (None, None, None);
+    while port.is_none() || nrepl.is_none() || credential.is_none() {
+        let line = out.recv_timeout(PATIENCE).expect("the ports and the credential");
+        if line.starts_with("Serving") {
+            port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+        } else if line.starts_with("nREPL server started on port") {
+            nrepl = line.split_whitespace().nth(5).and_then(|p| p.parse::<u16>().ok());
+        } else if line.starts_with("Debug instance") {
+            credential = line.rsplit(' ').next().map(str::to_string);
+        }
+    }
+    let (port, nrepl, credential) = (port.unwrap(), nrepl.unwrap(), credential.unwrap());
+    let mut c = TcpStream::connect(("127.0.0.1", nrepl)).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    nrepl_eval(&mut c, "(define (greeting) \"hi\")");
+    // Redefined in the debug instance alone.
+    assert_eq!(get(port, "/"), "hello");
+    let (head, body) = get_routed(port, "/", &credential);
+    assert_eq!(body, "hi");
+    assert!(head.contains("\r\ntechne-debug: ") && head.contains("\r\ncache-control: private, no-store"), "{head}");
+    // Another credential routes nothing, and marks nothing.
+    let (head, body) = get_routed(port, "/", "0123456789abcdef0123456789abcdef");
+    assert_eq!(body, "hello");
+    assert!(!head.contains("techne-debug"), "{head}");
+    // Deployed again: a new debug instance, which the same connection
+    // reaches, of the new deployment.
+    std::fs::write(&app, GREETER.replace("GREETING", "bonjour")).unwrap();
+    line_with(&err, "techne cloud: deployed", PATIENCE);
+    assert_eq!(get(port, "/"), "bonjour");
+    assert_eq!(get_routed(port, "/", &credential).1, "bonjour");
+    nrepl_eval(&mut c, "(define (greeting) \"salut\")");
+    assert_eq!(get_routed(port, "/", &credential).1, "salut");
+    assert_eq!(get(port, "/"), "bonjour");
+}
+
 const ECHO: &str = r#"(import (techne http))
 (provide fetch)
 (define (fetch request env ctx)

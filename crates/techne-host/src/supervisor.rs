@@ -752,6 +752,13 @@ impl Supervisor {
     /// Ask the deployment published as `name` to answer `request`, as
     /// [`crate::Host::fetch`] does.
     pub fn fetch(&self, name: &str, request: Data, body: Option<Reader>) -> oneshot::Receiver<Response> {
+        self.fetch_routed(name, request, body, false)
+    }
+
+    /// [`Supervisor::fetch`], the request routed to the deployment's
+    /// debug instance if `debug`, as [`crate::Host::fetch_routed`] does:
+    /// the worker is waited for [`crate::DEBUG_PAUSE`] longer.
+    pub fn fetch_routed(&self, name: &str, request: Data, body: Option<Reader>, debug: bool) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
         let mut s = self.state.borrow_mut();
         let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else {
@@ -761,9 +768,10 @@ impl Supervisor {
         };
         s.next_rid += 1;
         let rid = s.next_rid;
-        let deadline = Instant::now() + self.options.wall + GRACE;
+        let pause = if debug { crate::DEBUG_PAUSE } else { Duration::ZERO };
+        let deadline = Instant::now() + self.options.wall + pause + GRACE;
         let credits = body.as_ref().map(|_| Rc::new(Semaphore::new(WINDOW)));
-        let _ = send.send(ToWorker::Request { rid, name: name.into(), request, streams: body.is_some() });
+        let _ = send.send(ToWorker::Request { rid, name: name.into(), request, streams: body.is_some(), debug });
         let pump = body.zip(credits.clone()).map(|(reader, credits)| {
             let send = send.clone();
             let pumping = tokio::task::spawn_local(body::pump(reader, credits, move |piece| {
@@ -870,13 +878,13 @@ impl Supervisor {
         self.state.borrow_mut().repls.insert(cid, Repl { queue, reader });
     }
 
-    /// Define `(host-fetch deployment request)` in the front world, as
-    /// [`crate::Host::install`] does.
+    /// Define `(host-fetch deployment request #:debug #f)` in the front
+    /// world, as [`crate::Host::install`] does.
     pub fn install(&self, front: &mut Vm) {
         let wake = self.wake.clone();
         front.set_wake_notifier(move || wake.notify_one());
         let me = self.clone();
-        body::install_front(front, move |deployment, request, body| me.fetch(deployment, request, body));
+        body::install_front(front, move |deployment, request, body, debug| me.fetch_routed(deployment, request, body, debug));
     }
 
     /// Drive `front` (installed) until its tasks have all finished.

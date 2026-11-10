@@ -52,18 +52,34 @@ const APP: &str = r#"
 /// path), at once; the responses, written as (status body), in their
 /// order.
 fn ask(host: &mut Host, requests: &[(&str, &str)]) -> Vec<String> {
+    let routed: Vec<_> = requests.iter().map(|(d, p)| (*d, *p, false)).collect();
+    ask_routed(host, &routed)
+}
+
+/// `ask`, each request routed to its deployment's debug instance if its
+/// third part says so.
+fn ask_routed(host: &mut Host, requests: &[(&str, &str, bool)]) -> Vec<String> {
+    let mut front = asking(host, requests);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(host.run(Some(&mut front))).unwrap();
+    answers(&mut front)
+}
+
+/// A front world of `host` with a task asking for each of `requests`.
+fn asking(host: &Host, requests: &[(&str, &str, bool)]) -> Vm {
     let mut front = Vm::new();
     host.install(&mut front);
     front
         .eval_source(
-            "(define (ask name path)
+            "(define (ask name path debug)
                (spawn (lambda ()
                         ;; /echo is sent a body that streams.
                         (let* ((n 0)
                                (body (lambda ()
                                        (set! n (+ n 1))
                                        (if (> n 3) (eof-object) (string->utf8 \"ab\"))))
-                               (r (host-fetch name (dict 'method \"GET\" 'path path 'body (if (string=? path \"/echo\") body #u8())))))
+                               (r (host-fetch name (dict 'method \"GET\" 'path path 'body (if (string=? path \"/echo\") body #u8()))
+                                              #:debug debug)))
                           (if (string? r)
                               (list 200 r)
                               (list (dict-ref r 'status 200) (read-body (dict-ref r 'body))))))))
@@ -78,10 +94,13 @@ fn ask(host: &mut Host, requests: &[(&str, &str)]) -> Vec<String> {
                    body))",
         )
         .unwrap();
-    let list: String = requests.iter().map(|(d, p)| format!("(ask {d:?} {p:?}) ")).collect();
+    let list: String = requests.iter().map(|(d, p, debug)| format!("(ask {d:?} {p:?} {}) ", if *debug { "#t" } else { "#f" })).collect();
     front.eval_source(&format!("(define tasks (list {list}))")).unwrap();
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(host.run(Some(&mut front))).unwrap();
+    front
+}
+
+/// What the tasks of a front world (`asking`), run, were answered.
+fn answers(front: &mut Vm) -> Vec<String> {
     let v = front.eval_source("(map task-join tasks)").unwrap();
     let items = front.eval_source("(lambda (l) (map (lambda (x) (call-with-output-string (lambda (p) (write x p)))) l))").unwrap();
     let written = front.call(&items, &[v]).unwrap();
@@ -444,6 +463,206 @@ fn a_dev_world_debugger_chooses_a_restart() {
     // Retried with the new `fetch`, which failed too, then answered.
     assert_eq!(ask(&mut host, &[("app", "/fail")]), ["(200 \"used\")"]);
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(500 \"Internal Server Error\")"]);
+}
+
+/// How a debug instance's `fetch` is redefined here: it says so, counts
+/// as the deployment's does, and fails where that does.
+const DEBUGGED: &str = "(define (fetch request env ctx)
+  (set! served (+ served 1))
+  (if (string=? (dict-ref request 'path) \"/fail\")
+      (error \"it broke\")
+      (string-append \"debug \" (number->string served))))";
+
+/// A deployment's debug instance serves the requests routed to it, one at
+/// a time, kept after one that fails, from the code as redefined there;
+/// the others are served by the deployment's instances, from its code as
+/// deployed. Detached, it serves no more.
+#[test]
+fn a_debug_instance_serves_what_is_routed_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, failures) = host_with_failures();
+    let sources = Rc::new(RefCell::new(Vec::new()));
+    let repl = Repl { sources: sources.clone(), polls: Rc::default() };
+    host.publish("app", deployment(dir.path(), "app", APP, Limits::default()).unwrap());
+    // Routed with no debug instance: served as any other.
+    assert_eq!(ask_routed(&mut host, &[("app", "/", true)]), ["(200 \"1\")"]);
+    let id = host.attach_debug("app", move |_| Ok(Box::new(repl))).unwrap();
+    let module = dir.path().join("app.scm").canonicalize().unwrap().display().to_string();
+    sources.borrow_mut().push((module, DEBUGGED.into()));
+    // A world of its own, from the snapshot: it has served none yet.
+    assert_eq!(ask_routed(&mut host, &[("app", "/", true)]), ["(200 \"debug 1\")"]);
+    // Not routed: the deployment's code, on the instance kept.
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"2\")"]);
+    // Failed, and kept: its count goes on.
+    assert_eq!(ask_routed(&mut host, &[("app", "/fail", true)]), ["(500 \"Internal Server Error\")"]);
+    assert_eq!(failures.borrow().len(), 1);
+    // One at a time there, in order, beside the instances.
+    assert_eq!(
+        ask_routed(&mut host, &[("app", "/", true), ("app", "/", true), ("app", "/", false)]),
+        ["(200 \"debug 3\")", "(200 \"debug 4\")", "(200 \"3\")"]
+    );
+    assert!(host.detach_debug("app", Some(id + 1)).eq(&false));
+    assert!(host.detach_debug("app", Some(id)));
+    assert!(!host.detach_debug("app", None));
+    assert_eq!(ask_routed(&mut host, &[("app", "/", true)]), ["(200 \"4\")"]);
+    assert_eq!(failures.borrow().len(), 1);
+}
+
+/// A request routed to a debug instance may wait longer than the
+/// deployment's wall time (in a debugger, say); one not routed may not.
+#[test]
+fn a_request_on_a_debug_instance_may_wait_longer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, _) = host_with_failures();
+    let limits = Limits { wall: Duration::from_millis(30), debug_pause: Duration::from_secs(10), ..Limits::default() };
+    host.publish("app", deployment(dir.path(), "app", APP, limits).unwrap());
+    host.attach_debug("app", |_| Ok(Box::new(Repl { sources: Rc::default(), polls: Rc::default() }))).unwrap();
+    assert_eq!(ask_routed(&mut host, &[("app", "/slow", true), ("app", "/slow", false)]), ["(200 \"1\")", "(504 \"Gateway Timeout\")"]);
+}
+
+/// A debug instance ends with its session or its deployment: a request
+/// waiting in its debugger when it is detached is answered 504; after
+/// another deployment is published, routed requests are served by that.
+/// Only a deployment in production has one.
+#[test]
+fn a_debug_instance_ends_with_its_session_or_its_deployment() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, failures) = host_with_failures();
+    let repl = || Repl { sources: Rc::default(), polls: Rc::default() };
+    assert!(host.attach_debug("app", |_| Ok(Box::new(repl()))).is_err());
+    host.publish("app", deployment(dir.path(), "app", APP, Limits::default()).unwrap());
+    host.attach_debug("app", |vm| {
+        // A debugger no one answers.
+        vm.eval_in(0, "<test>", "(set! %host-debugger (lambda (c) (sleep 100000) #f))").unwrap();
+        Ok(Box::new(repl()))
+    })
+    .unwrap();
+    let mut front = asking(&host, &[("app", "/fail", true), ("app", "/", false)]);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let detaching = host.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(detaching.detach_debug("app", None));
+        });
+        host.run(Some(&mut front)).await.unwrap();
+    });
+    assert_eq!(answers(&mut front), ["(504 \"Gateway Timeout\")", "(200 \"1\")"]);
+    assert_eq!(failures.borrow().iter().map(|f| f.message.clone()).collect::<Vec<_>>(), ["its debug instance was detached"]);
+    // Attached again, then deployed again: gone with the deployment before.
+    let sources = Rc::new(RefCell::new(Vec::new()));
+    let attached = Repl { sources: sources.clone(), polls: Rc::default() };
+    host.attach_debug("app", move |_| Ok(Box::new(attached))).unwrap();
+    let module = dir.path().join("app.scm").canonicalize().unwrap().display().to_string();
+    sources.borrow_mut().push((module, DEBUGGED.into()));
+    assert_eq!(ask_routed(&mut host, &[("app", "/", true)]), ["(200 \"debug 1\")"]);
+    host.publish("app", deployment(dir.path(), "app", APP, Limits::default()).unwrap());
+    assert_eq!(ask_routed(&mut host, &[("app", "/", true)]), ["(200 \"1\")"]);
+    assert!(!host.detach_debug("app", None));
+    // A dev world is its own debug instance.
+    host.publish_dev("app", deployment(dir.path(), "app", APP, Limits::default()).unwrap(), |_| Ok(Box::new(repl()))).unwrap();
+    assert!(host.attach_debug("app", |_| Ok(Box::new(repl()))).is_err());
+}
+
+/// A deployment published again takes the debug instance of the one
+/// before with it: a request waiting in its debugger is answered 504.
+#[test]
+fn a_deploy_ends_the_request_waiting_on_a_debug_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, failures) = host_with_failures();
+    host.publish("app", deployment(dir.path(), "app", APP, Limits::default()).unwrap());
+    host.attach_debug("app", |vm| {
+        vm.eval_in(0, "<test>", "(set! %host-debugger (lambda (c) (sleep 100000) #f))").unwrap();
+        Ok(Box::new(Repl { sources: Rc::default(), polls: Rc::default() }))
+    })
+    .unwrap();
+    let next = deployment(dir.path(), "app", APP, Limits::default()).unwrap();
+    let mut front = asking(&host, &[("app", "/fail", true)]);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let deploying = host.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            deploying.publish("app", next);
+        });
+        host.run(Some(&mut front)).await.unwrap();
+    });
+    assert_eq!(answers(&mut front), ["(504 \"Gateway Timeout\")"]);
+    assert_eq!(failures.borrow().len(), 1);
+}
+
+/// A request waiting for a debug instance that goes is served as any
+/// other, within the wall time any other has, which it may be past.
+#[test]
+fn a_request_falling_back_has_its_own_wall_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, _) = host_with_failures();
+    let limits = Limits { wall: Duration::from_millis(60), debug_pause: Duration::from_secs(10), ..Limits::default() };
+    host.publish("app", deployment(dir.path(), "app", APP, limits).unwrap());
+    host.attach_debug("app", |vm| {
+        vm.eval_in(0, "<test>", "(set! %host-debugger (lambda (c) (sleep 100000) #f))").unwrap();
+        Ok(Box::new(Repl { sources: Rc::default(), polls: Rc::default() }))
+    })
+    .unwrap();
+    // The second waits behind the first, in its debugger, until the
+    // instance is detached: by then past the deployment's wall time.
+    let mut front = asking(&host, &[("app", "/fail", true), ("app", "/", true)]);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let detaching = host.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(detaching.detach_debug("app", None));
+        });
+        host.run(Some(&mut front)).await.unwrap();
+    });
+    assert_eq!(answers(&mut front), ["(504 \"Gateway Timeout\")", "(504 \"Gateway Timeout\")"]);
+}
+
+/// Requests for a debug instance and the others take none of each
+/// other's places: one waiting for either refuses none of the other.
+#[test]
+fn a_debug_instance_has_places_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, _) = host_with_failures();
+    let limits = Limits { concurrency: 1, queue: 0, idle: 1, ..Limits::default() };
+    host.publish("app", deployment(dir.path(), "app", APP, limits).unwrap());
+    host.attach_debug("app", |_| Ok(Box::new(Repl { sources: Rc::default(), polls: Rc::default() }))).unwrap();
+    assert_eq!(ask_routed(&mut host, &[("app", "/slow", true), ("app", "/slow", false)]), ["(200 \"1\")", "(200 \"1\")"]);
+    // Each full on its own: the second of either is refused.
+    assert_eq!(
+        ask_routed(&mut host, &[("app", "/slow", false), ("app", "/slow", false), ("app", "/slow", true), ("app", "/slow", true)]),
+        ["(200 \"2\")", "(503 \"Service Unavailable\")", "(200 \"2\")", "(503 \"Service Unavailable\")"]
+    );
+}
+
+/// A debug instance poisoned (a native panicked) is the deployment's no
+/// longer: the requests routed to it from then on are served as any other.
+#[test]
+fn a_poisoned_debug_instance_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, _) = host_with_failures();
+    let sources = Rc::new(RefCell::new(Vec::new()));
+    let repl = Repl { sources: sources.clone(), polls: Rc::default() };
+    host.publish("app", deployment(dir.path(), "app", APP, Limits::default()).unwrap());
+    host.attach_debug("app", move |vm| {
+        vm.register_fn("boom", |x: i64| -> i64 {
+            if x < 0 {
+                panic!("boom");
+            }
+            x
+        });
+        Ok(Box::new(repl))
+    })
+    .unwrap();
+    let module = dir.path().join("app.scm").canonicalize().unwrap().display().to_string();
+    sources.borrow_mut().push((module, "(define (fetch request env ctx) (boom -1))".into()));
+    assert_eq!(ask_routed(&mut host, &[("app", "/", true)]), ["(500 \"Internal Server Error\")"]);
+    assert_eq!(ask_routed(&mut host, &[("app", "/", true)]), ["(200 \"1\")"]);
+    assert!(!host.detach_debug("app", None));
 }
 
 #[test]

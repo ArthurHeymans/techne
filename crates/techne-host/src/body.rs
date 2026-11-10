@@ -213,12 +213,13 @@ impl techne_vm::api::IntoValue for DataValue {
 /// whose body is a procedure (`lisp/http`'s, read as it is called) has it
 /// read by a task of its own and written to the exchange, as far as the
 /// deployment reads it; a response whose body streams is given a
-/// procedure writing it.
+/// procedure writing it. With DEBUG, the request is routed to the
+/// deployment's debug instance.
 const FRONT: &str = r#"
-(define (host-fetch deployment request)
+(define (host-fetch deployment request #:debug [debug #f])
   (let* ((body (dict-ref request 'body #f))
          (streams (procedure? body))
-         (x (%host-exchange deployment (if streams (dict-set request 'body (bytevector)) request) streams)))
+         (x (%host-exchange deployment (if streams (dict-set request 'body (bytevector)) request) streams (and debug #t))))
     (when streams
       (spawn (lambda ()
                (guard (e (#t (%host-body-end x "the request's body could not be read")))
@@ -238,11 +239,11 @@ const FRONT: &str = r#"
 
 /// Define `host-fetch` in `front` ([`crate::Host::install`]), asking
 /// `fetch` for each response.
-pub(crate) fn install_front(front: &mut Vm, fetch: impl Fn(&str, Data, Option<Reader>) -> oneshot::Receiver<Response> + 'static) {
+pub(crate) fn install_front(front: &mut Vm, fetch: impl Fn(&str, Data, Option<Reader>, bool) -> oneshot::Receiver<Response> + 'static) {
     install(front);
     front.register_fn_vm(
         "%host-exchange",
-        move |vm: &mut Vm, deployment: String, request: Value, streams: bool| -> Result<Foreign<Exchange>, Error> {
+        move |vm: &mut Vm, deployment: String, request: Value, streams: bool, debug: bool| -> Result<Foreign<Exchange>, Error> {
             let request = vm.to_data(&request, crate::REQUEST_BYTES)?;
             let x = Exchange::default();
             let body = streams.then(|| {
@@ -250,7 +251,7 @@ pub(crate) fn install_front(front: &mut Vm, fetch: impl Fn(&str, Data, Option<Re
                 *x.writer.borrow_mut() = Some(writer);
                 reader
             });
-            *x.response.borrow_mut() = Some(fetch(&deployment, request, body));
+            *x.response.borrow_mut() = Some(fetch(&deployment, request, body, debug));
             Ok(Foreign::new(x))
         },
     );
