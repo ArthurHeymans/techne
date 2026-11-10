@@ -7,9 +7,10 @@ its supervisor serves them from a worker process sandboxed by
 `crates/techne-sandbox`, bodies streaming both ways; `techne cloud dev`
 runs both locally, with the nREPL server and its debugger in the worker,
 in a dev world or, with `--debug`, in a debug instance beside a
-deployment served as in production
-("Runtime work" says what of each is done). The broker, storage and the
-hosted service are not started. Where the design relies on something that exists, it says
+deployment served as in production; a deployment's manifest binds
+secrets, texts and KV namespaces, which the supervisor keeps
+("Runtime work" says what of each is done). SQL storage, accounts and
+the hosted service are not started. Where the design relies on something that exists, it says
 where; everything else is new work, and the milestones say which parts
 are probes before they are commitments.
 
@@ -110,6 +111,22 @@ provides its handler:
   its standard output and error is captured, bounded, and handed to the
   host with the request, not to the worker's own streams, where only the
   runtime's diagnostics go (`Vm::capture_output`; `crates/techne-host`).
+  Today (`crates/techne-host`, `lisp/cloud/manifest.scm`): `env` is a
+  dict by the names the manifest gives its bindings (`manifest.scm`
+  beside the entry module, data, never evaluated): `(dict-ref env
+  'cache)`. A secret (its value from `.secrets.scm`, which is no part of
+  the bundle) or a text is its string; a KV namespace is a handle for
+  `kv-get`, `kv-put!` (with `#:ttl`), `kv-delete!` and `kv-list`, whose
+  values are data. The handle names the binding, not the namespace: the
+  supervisor looks the namespace up among the bindings of the deployment
+  the request was sent for, so a handle of a world's own making reaches
+  nothing. Loading sees no `env`, and hidden files are no part of a
+  bundle: a snapshot holds no secret, and a worker only those bound. A
+  request keeps the bindings of the deployment that was acknowledged
+  when it was sent, whatever is deployed after. (One sent while a
+  deployment is being acknowledged may be served by the new code with
+  the bindings of the one before: requests are not yet pinned to a
+  deployment by the supervisor.)
 - `ctx`: the request's id, its deadline, and `wait-until` (below).
 - Concurrency inside an instance is techne's tasks. A request runs as a
   task; waits on fetch, KV and timers suspend only it. Every task a request
@@ -678,6 +695,20 @@ admission as requests.
 - **Control plane**: accounts, tokens, projects, deployments, routes, in
   one SQLite database; bundles as files named by hash, read by the
   supervisor and passed to workers over their socket.
+- **KV, today**: kept by the supervisor as logical operations (get, put,
+  delete, list), by a store written in Lisp (`lisp/cloud/kv.scm`) that a
+  task of the front world runs; the supervisor's Rust checks the request
+  and the binding, counts (1000 operations a request, with fetches a
+  bounded number at once, as many waiting for the store, more refused)
+  and hands it the namespace and the operation, a value encoded as
+  bytes: the store's world, which lasts, is given a tenant's strings and
+  bytes, never data of its making to read
+  (`Supervisor::install_store`). A namespace is a file, written whole
+  and replaced at each change, so never half written; not forced to the
+  disk, and costing its size at each write, which a log would not: good
+  for a cache and small state, to be replaced by the engine below when
+  that exists. Keys are at most 512 bytes, values a mebibyte, a
+  namespace 64 MiB. `techne cloud dev` keeps them under `.techne/kv`.
 - **Storage**: a database per binding, in SQLite's file format, run by
   Turso (PLAN.md, Stage 1, workstream C, step 5), in the supervisor or
   the worker ("The supervisor as broker"). Backups are copies the

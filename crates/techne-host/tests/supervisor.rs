@@ -12,7 +12,7 @@ use std::{
 
 use techne_host::{
     body::{self, Reader},
-    supervisor::{Options, ResourceConfinement, Sandboxing, Supervisor},
+    supervisor::{Bindings, Options, ResourceConfinement, Sandboxing, Supervisor},
 };
 use techne_vm::data::Data;
 
@@ -93,6 +93,91 @@ fn supervised(options: Options, test: impl AsyncFnOnce(Supervisor, Rc<RefCell<Ve
         s.on_failure(move |f| seen.borrow_mut().push(format!("{}: {} {}", f.deployment, f.status, f.message)));
         s.deploy("app", Path::new(&entry)).await.unwrap();
         test(s, failures).await;
+    });
+}
+
+/// What keeps under a key, or reads it, through whatever its `env` has as
+/// `store`, or through a binding of its own making.
+const KEEPING: &str = r#"
+(provide fetch)
+(define (fetch request env ctx)
+  (let ((path (dict-ref request 'path))
+        (store (dict-ref env 'store #f)))
+    (guard (e (#t (condition/report-string e)))
+      (cond ((string=? path "/put") (kv-put! store "k" (dict-ref env 'who)) "kept")
+            ((string=? path "/get") (kv-get store "k" "nothing"))
+            ((string=? path "/forged") (kv-get (dict 'kind 'kv 'name "theirs") "k" "nothing"))
+            ((string=? path "/late-get") (sleep 300) (kv-get store "k" "nothing"))
+            ;; Data whose written form does not read back.
+            ((string=? path "/odd")
+             (let ((odd (list 'a-symbol (string->keyword "a b") 1.5 (bytevector 0 255) (dict "é" #t))))
+               (kv-put! store "odd" odd)
+               (if (equal? odd (kv-get store "odd")) "same" "changed")))
+
+            (else "?")))))
+"#;
+
+/// Deployments reach the namespaces their own bindings stand for, by the
+/// names they have for them, and no other, whatever they name; without a
+/// binding, nothing.
+#[test]
+fn a_deployment_reaches_its_own_namespaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = |name: &str| {
+        let d = dir.path().join(name);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("app.scm"), KEEPING).unwrap();
+        d.join("app.scm")
+    };
+    let bindings = |who: &str, namespace: &str| Bindings {
+        env: Data::Dict(vec![
+            (Data::Symbol("who".into()), Data::String(who.into())),
+            (
+                Data::Symbol("store".into()),
+                Data::Dict(vec![
+                    (Data::Symbol("kind".into()), Data::Symbol("kv".into())),
+                    (Data::Symbol("name".into()), Data::String("mine".into())),
+                ]),
+            ),
+        ]),
+        stores: [("mine".to_string(), namespace.to_string())].into(),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let s = Supervisor::start(options(&[])).await.unwrap();
+        s.on_failure(|_| {});
+        let mut front = techne_vm::vm::Vm::new();
+        s.install_store(&mut front);
+        let kv = techne_vm::library::lisp_dir().join("cloud/kv.scm").display().to_string();
+        let kept = dir.path().join("kept").display().to_string();
+        front.eval_source(&format!("(require {kv:?}) (spawn (lambda () (kv-serve (make-kv-store {kept:?}))))")).unwrap();
+        let driver = s.clone();
+        tokio::task::spawn_local(async move {
+            let _ = driver.run(&mut front).await;
+        });
+        s.deploy_with("a", &entry("a"), bindings("a", "ns-a")).await.unwrap();
+        s.deploy_with("b", &entry("b"), bindings("b", "ns-b")).await.unwrap();
+        s.deploy("bare", &entry("bare")).await.unwrap();
+        let ask = async |name: &str, path: &str| answer(&s.fetch(name, request(path), None).await.unwrap().head).1;
+        assert_eq!(ask("a", "/put").await, "kept");
+        // The same binding's name, another namespace.
+        assert_eq!(ask("b", "/get").await, "nothing");
+        assert_eq!(ask("b", "/put").await, "kept");
+        assert_eq!(ask("a", "/get").await, "a");
+        assert_eq!(ask("b", "/get").await, "b");
+        assert!(dir.path().join("kept/ns-a.kv").is_file() && dir.path().join("kept/ns-b.kv").is_file());
+        // A binding it was not given, and a deployment given none.
+        assert!(ask("a", "/forged").await.contains("no KV binding theirs"));
+        assert!(ask("bare", "/forged").await.contains("no KV binding theirs"));
+        assert!(ask("bare", "/get").await.contains("Not a KV binding"));
+        assert_eq!(ask("a", "/odd").await, "same");
+        // Deployed again with another namespace: that one from then on,
+        // and for a request sent before, the one it had then.
+        let before = s.fetch("a", request("/late-get"), None);
+        s.deploy_with("a", &entry("a2"), bindings("a", "ns-b")).await.unwrap();
+        assert_eq!(ask("a", "/get").await, "b");
+        assert_eq!(answer(&before.await.unwrap().head).1, "a");
     });
 }
 

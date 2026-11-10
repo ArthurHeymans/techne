@@ -17,6 +17,15 @@
 //! serving, also while the new one loads. Failures and what requests print
 //! go to standard error, marked with the request.
 //!
+//! The deployment's bindings are those its manifest names
+//! (`manifest.scm` beside FILE, read as `lisp/cloud/manifest.scm` reads
+//! it, with the secrets of `.secrets.scm`), given to its requests as
+//! their `env`. Its KV namespaces are kept by the supervisor, in files
+//! under `.techne/kv` beside FILE, by a task of the front world
+//! (`lisp/cloud/kv.scm`): they outlive the worker and this process. The
+//! manifest is read again at each deployment; a secret changed is seen
+//! at the next.
+//!
 //! With `--nrepl PORT`, the deployment is served instead by one world
 //! kept across requests, its dev world (`Host::publish_dev`) in the
 //! worker, with an nREPL server in it ([`DevWorker`]), whose clients the
@@ -58,9 +67,12 @@ use std::{
 
 use std::{cell::RefCell, rc::Rc};
 
-use techne_host::{Attached, Deployment, Host, Limits};
+use techne_host::{Attached, Deployment, Host, Limits, supervisor::Bindings};
 use techne_node::nrepl::Server;
-use techne_vm::vm::{Error, ROOT_MODULE, Vm};
+use techne_vm::{
+    data::Data,
+    vm::{Error, ROOT_MODULE, Vm},
+};
 
 const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--nrepl PORT [--debug]]
 
@@ -171,7 +183,9 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         let supervisor = Supervisor::start(worker).await.map_err(|e| Error::new(format!("no worker: {e}")))?;
-        supervisor.deploy(NAME, &entry).await.map_err(Error::new)?;
+        let manifests = Rc::new(RefCell::new(Manifests::new()?));
+        let bound = manifests.borrow_mut().bindings(&dir)?;
+        supervisor.deploy_with(NAME, &entry, bound).await.map_err(Error::new)?;
         if let Some(port) = options.nrepl {
             let bound =
                 supervisor.serve_repl(&format!("127.0.0.1:{port}")).await.map_err(|e| Error::new(format!("nREPL on port {port}: {e}")))?;
@@ -182,13 +196,20 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
         let mut front = Vm::new();
         techne_net::install_on(&mut front, tokio::runtime::Handle::current())?;
         supervisor.install(&mut front);
+        supervisor.install_store(&mut front);
         serve_front(&mut front, port, &entry, options.debug)?;
         let redeploying = supervisor.clone();
-        tokio::task::spawn_local(watch_files(dir, seen, move || {
+        let watched = dir.clone();
+        tokio::task::spawn_local(watch_files(watched, seen, move || {
             let (supervisor, entry) = (redeploying.clone(), entry.clone());
+            let bound = manifests.borrow_mut().bindings(&dir);
             async move {
                 eprintln!("techne cloud: loading {}", entry.display());
-                match supervisor.deploy(NAME, &entry).await {
+                let deployed = match bound {
+                    Ok(bound) => supervisor.deploy_with(NAME, &entry, bound).await,
+                    Err(e) => Err(e.msg.clone()),
+                };
+                match deployed {
                     Ok(_) => eprintln!("techne cloud: deployed {}", entry.display()),
                     Err(e) => eprintln!("techne cloud: not deployed, the last deployment keeps serving: {e}"),
                 }
@@ -199,12 +220,55 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
     })
 }
 
+/// A world reading deployments' manifests (`lisp/cloud/manifest.scm`).
+struct Manifests(Vm);
+
+impl Manifests {
+    fn new() -> Result<Manifests, Error> {
+        let mut vm = Vm::new();
+        let manifest = techne_vm::library::lisp_dir().join("cloud/manifest.scm");
+        vm.eval_source(&format!("(require {:?})", manifest.display().to_string()))?;
+        Ok(Manifests(vm))
+    }
+
+    /// The bindings of the deployment in `dir`, as its manifest has them
+    /// now.
+    fn bindings(&mut self, dir: &Path) -> Result<Bindings, Error> {
+        let vm = &mut self.0;
+        let read = vm.eval_source("read-bindings")?;
+        let dir = vm.from_data(&Data::String(dir.display().to_string()))?;
+        let found = vm.call(&read, &[dir]).map_err(|e| Error::new(format!("the manifest: {}", e.msg)))?;
+        let Data::Dict(parts) = vm.to_data(&found, 4 << 20)? else { return Err(Error::new("the manifest's bindings are no dict")) };
+        let part = |name: &str| parts.iter().find(|(k, _)| matches!(k, Data::Symbol(s) if s == name)).map(|(_, v)| v.clone());
+        let stores = match part("stores") {
+            Some(Data::Dict(stores)) => stores
+                .into_iter()
+                .filter_map(|(k, v)| match (k, v) {
+                    (Data::String(binding), Data::String(namespace)) => Some((binding, namespace)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Default::default(),
+        };
+        Ok(Bindings { env: part("env").unwrap_or(Data::Dict(Vec::new())), stores })
+    }
+}
+
 /// Start `lisp/http`'s server in `front` on `port`, handing requests to
 /// `host-fetch`, saying where; bodies stream, both ways. With `debug`,
 /// requests carrying a credential made here, and said, are routed to the
-/// deployment's debug instance (`lisp/http/debug-route.scm`).
+/// deployment's debug instance (`lisp/http/debug-route.scm`). A task
+/// keeps the deployment's KV namespaces under `.techne/kv` beside its
+/// entry (`lisp/cloud/kv.scm`).
 fn serve_front(front: &mut Vm, port: u16, entry: &Path, debug: bool) -> Result<(), Error> {
     let http = techne_vm::library::lisp_dir().join("http");
+    let kv = entry.parent().unwrap_or(Path::new("/")).join(".techne/kv");
+    front.eval_source(&format!(
+        r#"(require {:?})
+           (spawn (lambda () (kv-serve (make-kv-store {:?}))))"#,
+        techne_vm::library::lisp_dir().join("cloud/kv.scm").display().to_string(),
+        kv.display().to_string(),
+    ))?;
     front.eval_source(&format!(
         r#"(require {:?} {:?} {:?})
            (let* ((listener (tcp-listen {port}))

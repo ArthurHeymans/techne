@@ -26,6 +26,17 @@
 //! (`FETCHES`), a bounded number at once (`FETCHING`); the worker's own
 //! counts are not trusted.
 //!
+//! What a worker's requests keep in their deployment's KV namespaces is
+//! kept by the supervisor too, for a store it is given
+//! ([`Supervisor::install_store`]: a task of the front world's, in Lisp).
+//! A deployment is deployed with its bindings ([`Bindings`]): what its
+//! requests are given, and which namespace each of its KV bindings stands
+//! for. A worker names a binding as its deployment does, never a
+//! namespace: the supervisor looks it up among those of the deployment
+//! the request it sent was for, and the store is asked for that
+//! namespace. So a worker reaches the namespaces of the deployments it
+//! serves requests of, and no other, whatever it says.
+//!
 //! For development (`Options::dev`), the worker serves each deployment
 //! from its dev world, with a REPL server in it ([`crate::worker::Dev`]),
 //! whose clients connect to the supervisor ([`Supervisor::serve_repl`]),
@@ -48,7 +59,12 @@ use std::{
 };
 
 use techne_sandbox::cgroup::{self, Cgroups};
-use techne_vm::{data::Data, tasks::Progress, vm::Vm};
+use techne_vm::{
+    api::Value,
+    data::Data,
+    tasks::Progress,
+    vm::{Error, Vm},
+};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
@@ -57,7 +73,8 @@ use tokio::{
 
 use crate::{
     Failure, Printed, Response,
-    body::{self, Piece, Reader},
+    body::{self, DataValue, Piece, Reader},
+    outbound::Service,
     wire::{BUNDLE_BYTES, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, encode, read_frame, write_encoded},
     worker,
 };
@@ -156,9 +173,96 @@ impl Link {
 /// URL and headers.
 const FETCH_BYTES: usize = (1 << 20) + (64 << 10);
 
-/// Fetches of a request, and of a worker's requests at once.
+/// Fetches of a request, and of a worker's requests at once (with what
+/// they ask of the store).
 const FETCHES: usize = 50;
 const FETCHING: usize = 64;
+
+/// Operations of a request on its bindings' storage.
+const STORE_OPS: usize = 1000;
+
+/// How long the store may take to answer.
+const STORE: Duration = Duration::from_secs(10);
+
+/// What a deployment is deployed with.
+#[derive(Clone, Debug)]
+pub struct Bindings {
+    /// What its requests are given as `env`: a dict, by the names the
+    /// deployment has for its bindings.
+    pub env: Data,
+    /// The KV namespace each of its KV bindings stands for, by the
+    /// binding's name.
+    pub stores: HashMap<String, String>,
+}
+
+impl Default for Bindings {
+    fn default() -> Bindings {
+        Bindings { env: Data::Dict(Vec::new()), stores: HashMap::new() }
+    }
+}
+
+/// What the store is asked: an operation on a namespace, as
+/// `kv_operation` makes it, and who waits for its answer.
+struct StoreAsk {
+    namespace: String,
+    request: Data,
+    reply: oneshot::Sender<Result<Data, String>>,
+}
+
+/// What a worker asked of a KV binding (`outbound::Service::Kv`), as the
+/// store is handed it: the binding named, the operation, and whether it
+/// is a `get`. Only what an operation has is kept of it, and a value to
+/// keep is encoded (`wire::encode`): the store's world, which lasts and
+/// is not the tenant's, is given a tenant's strings and bytes and never
+/// its symbols, which it would intern for good.
+fn kv_operation(request: &Data) -> Result<(String, Data, bool), String> {
+    let Data::Dict(entries) = request else { return Err("not an operation".into()) };
+    let field = |name: &str| entries.iter().find_map(|(k, v)| matches!(k, Data::Symbol(s) if s == name).then_some(v));
+    let string = |name: &str, default: Option<&str>| match (field(name), default) {
+        (Some(Data::String(s)), _) => Ok(Data::String(s.clone())),
+        (None, Some(default)) => Ok(Data::String(default.into())),
+        _ => Err(format!("an operation's {name} is a string")),
+    };
+    let sym = |s: &str| Data::Symbol(s.into());
+    let Some(Data::String(binding)) = field("binding") else { return Err("no binding named".into()) };
+    let Some(Data::Symbol(op)) = field("op") else { return Err("no operation named".into()) };
+    let fields = match op.as_str() {
+        "get" | "delete" => vec![(sym("key"), string("key", None)?)],
+        "put" => {
+            let value = field("value").ok_or("nothing to keep")?;
+            let ttl = match field("ttl") {
+                Some(Data::Int(n)) => Data::Int(*n),
+                Some(Data::Float(f)) => Data::Float(*f),
+                Some(Data::Bool(false)) | None => Data::Bool(false),
+                Some(_) => return Err("an operation's ttl is a number of seconds".into()),
+            };
+            vec![(sym("key"), string("key", None)?), (sym("value"), Data::Bytes(encode(value))), (sym("ttl"), ttl)]
+        }
+        "list" => {
+            let limit = match field("limit") {
+                Some(Data::Int(n)) => Data::Int(*n),
+                None => Data::Int(1000),
+                Some(_) => return Err("an operation's limit is an integer".into()),
+            };
+            vec![(sym("prefix"), string("prefix", Some(""))?), (sym("limit"), limit)]
+        }
+        _ => return Err("no such operation".into()),
+    };
+    let operation = std::iter::once((sym("op"), sym(op))).chain(fields).collect();
+    Ok((binding.clone(), Data::Dict(operation), op == "get"))
+}
+
+/// The store's answer to a `get`, the value it kept decoded again.
+fn kv_found(answer: Data) -> Result<Data, String> {
+    let Data::Dict(entries) = answer else { return Ok(answer) };
+    let decoded = entries.into_iter().map(|(k, v)| match (&k, v) {
+        (Data::Symbol(s), Data::Bytes(bytes)) if s == "value" => {
+            crate::wire::decode(&bytes).map(|v| (k, v)).map_err(|_| "what is kept there cannot be read".to_string())
+        }
+        (_, v) => Ok((k, v)),
+    });
+    decoded.collect::<Result<_, _>>().map(Data::Dict)
+}
 
 /// Bytes a relayed REPL connection may have waiting to be written to its
 /// client.
@@ -177,12 +281,14 @@ impl Drop for Repl {
     }
 }
 
-/// What a deployment's worker is given: its name, entry, and files.
+/// What a deployment's worker is given: its name, entry, and files, and
+/// its bindings, of which the worker is given the `env`.
 #[derive(Clone)]
 struct Bundle {
     name: String,
     entry: String,
     files: Vec<(String, Vec<u8>)>,
+    bindings: Bindings,
 }
 
 /// A request the worker serves: who waits for its response, until it is
@@ -200,8 +306,12 @@ struct Pending {
     /// What sends its body.
     pump: Option<tokio::task::AbortHandle>,
     cancelled: bool,
-    /// Its fetches so far.
+    /// Its fetches so far, and its operations on storage.
     fetches: usize,
+    store_ops: usize,
+    /// The KV namespaces of the deployment it was sent for, as they were
+    /// then: a deployment since does not change what it reaches.
+    stores: Rc<HashMap<String, String>>,
 }
 
 impl Pending {
@@ -244,6 +354,12 @@ struct State {
     deploys: HashMap<u64, (Bundle, oneshot::Sender<Result<String, String>>)>,
     /// The last deployment a worker acknowledged, given to the next.
     last: Option<Bundle>,
+    /// The KV namespaces of the deployments acknowledged, by deployment
+    /// and binding.
+    stores: HashMap<String, Rc<HashMap<String, String>>>,
+    /// What keeps them, once installed: as many asks wait there as may
+    /// be made at once.
+    store: Option<mpsc::Sender<StoreAsk>>,
     sandbox: bool,
     started: VecDeque<Instant>,
     /// REPL connections relayed to the worker now, by number: what goes
@@ -254,6 +370,21 @@ struct State {
     fetching: usize,
     on_failure: Box<dyn FnMut(&Failure)>,
     on_output: Box<dyn FnMut(&Printed)>,
+}
+
+impl State {
+    /// The store, the namespace the binding `request` names stood for in
+    /// the deployment request `rid` was sent for, when it was sent, the
+    /// operation as the store takes it and whether it is a `get`: or why
+    /// not.
+    #[allow(clippy::type_complexity)]
+    fn namespace(&self, rid: u64, request: &Data) -> Result<(mpsc::Sender<StoreAsk>, String, Data, bool), String> {
+        let store = self.store.clone().ok_or("this host keeps nothing")?;
+        let (binding, operation, get) = kv_operation(request)?;
+        let stores = self.pending.get(&rid).map(|p| &p.stores);
+        let namespace = stores.and_then(|s| s.get(&binding)).ok_or_else(|| format!("the deployment has no KV binding {binding}"))?;
+        Ok((store, namespace.clone(), operation, get))
+    }
 }
 
 /// Serves deployments with a worker process: see the module.
@@ -297,6 +428,8 @@ impl Supervisor {
                 next_deploy: 0,
                 deploys: HashMap::new(),
                 last: None,
+                stores: HashMap::new(),
+                store: None,
                 sandbox,
                 started: VecDeque::new(),
                 repls: HashMap::new(),
@@ -547,6 +680,7 @@ impl Supervisor {
             FromWorker::Deployed { id, error, output } => match s.deploys.remove(&id) {
                 Some((bundle, reply)) => {
                     if error.is_none() {
+                        s.stores.insert(bundle.name.clone(), Rc::new(bundle.bindings.stores.clone()));
                         s.last = Some(bundle);
                     }
                     let _ = reply.send(error.map_or(Ok(output), Err));
@@ -564,21 +698,41 @@ impl Supervisor {
                 (s.on_output)(&Printed { deployment, request, output });
                 None
             }
-            FromWorker::Fetch { rid, fid, request } => {
+            FromWorker::Fetch { rid, fid, service, request } => {
+                let Some(service) = Service::named(&service) else { return Some(format!("no service {service}")) };
                 let (fetching, sent) = (s.fetching, s.next_rid);
                 let refused = match s.pending.get_mut(&rid) {
-                    Some(p) if !p.cancelled && p.fetches < FETCHES && fetching < FETCHING => {
-                        p.fetches += 1;
-                        None
+                    Some(p) => {
+                        let (count, limit, what) = match service {
+                            Service::Fetch => (&mut p.fetches, FETCHES, "fetches"),
+                            Service::Kv => (&mut p.store_ops, STORE_OPS, "uses its bindings"),
+                        };
+                        if *count >= limit {
+                            Some(format!("a request {what} {limit} times at most"))
+                        } else if p.cancelled {
+                            Some("the request was cancelled".to_string())
+                        } else if fetching >= FETCHING {
+                            Some("too many fetches at once".to_string())
+                        } else {
+                            *count += 1;
+                            None
+                        }
                     }
-                    Some(p) if p.fetches >= FETCHES => Some(format!("a request fetches {FETCHES} times at most")),
-                    Some(_) if fetching >= FETCHING => Some("too many fetches at once".to_string()),
-                    Some(_) => Some("the request was cancelled".to_string()),
                     None if rid <= sent => Some("the request is over".to_string()),
                     None => return Some(format!("a fetch for no request ({rid})")),
                 };
                 let send = s.worker.as_ref().map(|w| w.send.clone());
                 let refused = refused.or_else(|| (encode(&request).len() > FETCH_BYTES).then(|| "a fetch too large".to_string()));
+                // The namespace its binding stands for, in the deployment
+                // the request was sent for: not what the worker says.
+                let store = match (service, &refused) {
+                    (Service::Kv, None) => s.namespace(rid, &request).map(Some),
+                    _ => Ok(None),
+                };
+                let (refused, store) = match store {
+                    Ok(store) => (refused, store),
+                    Err(why) => (Some(why), None),
+                };
                 if let Some(why) = refused {
                     send.map(|w| w.send(ToWorker::Fetched { fid, response: Err(why) }));
                     return None;
@@ -594,7 +748,22 @@ impl Supervisor {
                         }
                     }
                     let place = Place(me.clone());
-                    let response = me.egress.fetch(&request).await;
+                    let response = match store {
+                        None => me.egress.fetch(&request).await,
+                        // Past what may wait there (a store that answers
+                        // none): refused, not queued.
+                        Some((store, namespace, operation, get)) => {
+                            let (reply, answer) = oneshot::channel();
+                            let stopped = || Err("the store did not answer".to_string());
+                            let answered = match store.try_send(StoreAsk { namespace, request: operation, reply }) {
+                                Ok(()) => tokio::time::timeout(STORE, answer)
+                                    .await
+                                    .map_or_else(|_| stopped(), |a| a.unwrap_or_else(|_| stopped())),
+                                Err(_) => Err("the store is busy".to_string()),
+                            };
+                            if get { answered.and_then(kv_found) } else { answered }
+                        }
+                    };
                     drop(place);
                     // To the worker that asked, if it is still the one.
                     let current = me.state.borrow().worker.as_ref().filter(|w| w.generation == generation).map(|w| w.send.clone());
@@ -783,7 +952,19 @@ impl Supervisor {
             }));
             pumping.abort_handle()
         });
-        let pending = Pending { name: name.into(), reply: Some(tx), deadline, body: None, credits, pump, cancelled: false, fetches: 0 };
+        let stores = s.stores.get(name).cloned().unwrap_or_default();
+        let pending = Pending {
+            name: name.into(),
+            reply: Some(tx),
+            deadline,
+            body: None,
+            credits,
+            pump,
+            cancelled: false,
+            fetches: 0,
+            store_ops: 0,
+            stores,
+        };
         s.pending.insert(rid, pending);
         drop(s);
         self.changed.notify_one();
@@ -795,10 +976,68 @@ impl Supervisor {
     /// hidden directories, `target` and `node_modules`): what loading it
     /// wrote, or why it was not.
     pub async fn deploy(&self, name: &str, entry: &Path) -> Result<String, String> {
+        self.deploy_with(name, entry, Bindings::default()).await
+    }
+
+    /// [`Supervisor::deploy`], the deployment given `bindings`: once the
+    /// worker serves it, its requests reach the namespaces these name,
+    /// in place of those of the deployment before.
+    pub async fn deploy_with(&self, name: &str, entry: &Path, bindings: Bindings) -> Result<String, String> {
         let dir = entry.parent().ok_or("an entry in no directory")?;
         let files = bundle(dir)?;
         let entry = entry.strip_prefix(dir).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
-        self.send_deploy(Bundle { name: name.into(), entry, files }).await
+        self.send_deploy(Bundle { name: name.into(), entry, files, bindings }).await
+    }
+
+    /// Have a task of `front` keep what requests keep in their KV
+    /// namespaces: `(%store-next)` waits for the next operation asked and
+    /// returns it, a list of its number, its namespace (a string, the
+    /// deployment's binding looked up) and the operation, a dict of its
+    /// `op` and fields, a value to keep a bytevector (`kv_operation`);
+    /// `(%store-reply number ok value)` answers it, with VALUE, data, if
+    /// OK, else with why not, a string. One not answered within ten
+    /// seconds is failed, and not handed on if it still waited; as many
+    /// wait as may be asked at once, and more are refused. Without a
+    /// store, requests keep nothing.
+    pub fn install_store(&self, front: &mut Vm) {
+        let wake = self.wake.clone();
+        front.set_wake_notifier(move || wake.notify_one());
+        let (tx, rx) = mpsc::channel::<StoreAsk>(FETCHING);
+        self.state.borrow_mut().store = Some(tx);
+        let rx = Rc::new(tokio::sync::Mutex::new(rx));
+        type Waiting = (u64, HashMap<u64, oneshot::Sender<Result<Data, String>>>);
+        let waiting = Rc::new(RefCell::new(Waiting::default()));
+        let asked = waiting.clone();
+        front.register_async("%store-next", 0, move |_vm, _args| {
+            let (rx, asked) = (rx.clone(), asked.clone());
+            async move {
+                let mut rx = rx.lock().await;
+                let ask = loop {
+                    let ask = rx.recv().await.ok_or_else(|| Error::new("the supervisor stopped"))?;
+                    // No one waits for it any more: not done late.
+                    if !ask.reply.is_closed() {
+                        break ask;
+                    }
+                };
+                let mut asked = asked.borrow_mut();
+                // Those no one waits for any more are forgotten.
+                asked.1.retain(|_, reply| !reply.is_closed());
+                asked.0 += 1;
+                let id = asked.0;
+                asked.1.insert(id, ask.reply);
+                Ok::<_, Error>(DataValue(Data::List(vec![Data::Int(id as i64), Data::String(ask.namespace), ask.request])))
+            }
+        });
+        front.register_fn_vm("%store-reply", move |vm: &mut Vm, id: i64, ok: bool, value: Value| -> Result<bool, Error> {
+            let Some(reply) = waiting.borrow_mut().1.remove(&(id as u64)) else { return Ok(false) };
+            let answer = match (ok, vm.to_data(&value, crate::REQUEST_BYTES)) {
+                (true, Ok(value)) => Ok(value),
+                (true, Err(e)) => Err(format!("the store's answer is no data: {}", e.msg)),
+                (false, Ok(Data::String(why))) => Err(why),
+                (false, _) => Err("the store failed".into()),
+            };
+            Ok(reply.send(answer).is_ok())
+        });
     }
 
     async fn send_deploy(&self, bundle: Bundle) -> Result<String, String> {
@@ -815,6 +1054,7 @@ impl Supervisor {
                 files: bundle.files.clone(),
                 wall_ms: self.options.wall.as_millis() as u64,
                 dev: self.options.dev,
+                env: bundle.bindings.env.clone(),
             };
             s.deploys.insert(id, (bundle, tx));
             let _ = send.send(message);
@@ -908,8 +1148,9 @@ impl Supervisor {
 /// and more.
 const DEPLOY: Duration = Duration::from_secs(60);
 
-/// The files under `dir`, by their paths in it: not in hidden
-/// directories, `target` or `node_modules`, nor through symbolic links.
+/// The files under `dir`, by their paths in it: not hidden ones (a
+/// deployment's secrets are in one), nor in hidden directories, `target`
+/// or `node_modules`, nor through symbolic links.
 fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::new();
     let mut total = 0;
@@ -924,7 +1165,7 @@ fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
                         dirs.push(path);
                     }
                 }
-                Ok(t) if t.is_file() => {
+                Ok(t) if t.is_file() && !name.starts_with('.') => {
                     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                     total += bytes.len();
                     if total > BUNDLE_BYTES {
@@ -939,4 +1180,73 @@ fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     }
     files.sort();
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(entries: &[(&str, Data)]) -> Data {
+        Data::Dict(entries.iter().map(|(k, v)| (Data::Symbol((*k).into()), v.clone())).collect())
+    }
+
+    fn string(s: &str) -> Data {
+        Data::String(s.into())
+    }
+
+    /// The store is handed what an operation has and no more: a value
+    /// encoded, no symbol of the tenant's.
+    #[test]
+    fn a_kv_operation_is_handed_on_without_the_tenants_symbols() {
+        let value = Data::List(vec![Data::Symbol("theirs".into()), Data::Keyword("a b".into())]);
+        let asked = dict(&[
+            ("op", Data::Symbol("put".into())),
+            ("binding", string("cache")),
+            ("key", string("k")),
+            ("value", value.clone()),
+            ("ttl", Data::Int(5)),
+            ("theirs", Data::Symbol("more".into())),
+        ]);
+        let (binding, operation, get) = kv_operation(&asked).unwrap();
+        assert_eq!((binding.as_str(), get), ("cache", false));
+        let expected = dict(&[
+            ("op", Data::Symbol("put".into())),
+            ("key", string("k")),
+            ("value", Data::Bytes(encode(&value))),
+            ("ttl", Data::Int(5)),
+        ]);
+        assert_eq!(operation, expected);
+        // What a `get` finds is what was kept.
+        let found = dict(&[("found", Data::Bool(true)), ("value", Data::Bytes(encode(&value)))]);
+        assert_eq!(kv_found(found).unwrap(), dict(&[("found", Data::Bool(true)), ("value", value)]));
+        assert!(kv_found(dict(&[("value", Data::Bytes(vec![255, 255]))])).is_err());
+        // Not operations.
+        for bad in [
+            dict(&[("op", Data::Symbol("drop".into())), ("binding", string("cache"))]),
+            dict(&[("op", Data::Symbol("get".into())), ("key", string("k"))]),
+            dict(&[("op", Data::Symbol("get".into())), ("binding", string("cache")), ("key", Data::Symbol("k".into()))]),
+            dict(&[("op", string("get")), ("binding", string("cache")), ("key", string("k"))]),
+            dict(&[("op", Data::Symbol("put".into())), ("binding", string("cache")), ("key", string("k"))]),
+            dict(&[("op", Data::Symbol("list".into())), ("binding", string("cache")), ("limit", string("all"))]),
+            string("get"),
+        ] {
+            assert!(kv_operation(&bad).is_err(), "{bad:?}");
+        }
+        let (_, listing, _) = kv_operation(&dict(&[("op", Data::Symbol("list".into())), ("binding", string("cache"))])).unwrap();
+        assert_eq!(listing, dict(&[("op", Data::Symbol("list".into())), ("prefix", string("")), ("limit", Data::Int(1000))]));
+    }
+
+    /// A deployment's files are not its hidden ones: its secrets stay
+    /// with the supervisor.
+    #[test]
+    fn a_bundle_has_no_hidden_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".techne/kv")).unwrap();
+        for file in ["app.scm", ".secrets.scm", "lib/a.scm", "lib/.hidden", ".techne/kv/ns.kv"] {
+            std::fs::write(dir.path().join(file), "x").unwrap();
+        }
+        let names: Vec<String> = bundle(dir.path()).unwrap().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["app.scm", "lib/a.scm"]);
+    }
 }

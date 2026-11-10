@@ -142,6 +142,9 @@ pub struct Limits {
     pub fetches: usize,
     /// Wall time a request routed to a debug instance has beyond `wall`.
     pub debug_pause: Duration,
+    /// Operations of a request on its bindings' storage (`kv-get` and
+    /// the others).
+    pub store_ops: usize,
 }
 
 impl Default for Limits {
@@ -159,15 +162,18 @@ impl Default for Limits {
             output: 64 << 10,
             fetches: 50,
             debug_pause: DEBUG_PAUSE,
+            store_ops: 1000,
         }
     }
 }
 
-/// A deployment: its code loaded into a world, snapshotted.
+/// A deployment: its code loaded into a world, snapshotted, and the
+/// bindings its requests are given.
 pub struct Deployment {
     snapshot: Snapshot,
     limits: Limits,
     output: Output,
+    env: Rc<Data>,
 }
 
 impl Deployment {
@@ -209,6 +215,15 @@ impl Deployment {
     /// What loading wrote to standard output and error.
     pub fn output(&self) -> &Output {
         &self.output
+    }
+
+    /// The deployment, its requests given `env` (a dict, by the names
+    /// the deployment has for its bindings: a secret's value, a KV
+    /// namespace's handle as `kv-get` takes it) in place of an empty one.
+    /// Loading saw none of it: a snapshot holds no secret.
+    pub fn with_env(mut self, env: Data) -> Deployment {
+        self.env = Rc::new(env);
+        self
     }
 }
 
@@ -687,6 +702,7 @@ impl Host {
                 },
             };
             let limits = p.deployment.limits.clone();
+            let env = p.deployment.env.clone();
             s.next_id += 1;
             let id = s.next_id;
             let context = Rc::new(outbound::Context {
@@ -695,9 +711,11 @@ impl Host {
                 broker: s.broker.clone(),
                 fetches: Default::default(),
                 limit: limits.fetches,
+                store_ops: Default::default(),
+                store_limit: limits.store_ops,
             });
             let started = match instance {
-                Ok(i) => match start(i, &job.request, &job.exchange, context, id, &limits) {
+                Ok(i) => match start(i, &job.request, &job.exchange, context, id, &limits, &env) {
                     (i, Ok((lifetime, task))) => Ok((i, lifetime, task)),
                     (i, Err(e)) => Err((Some(i), e)),
                 },
@@ -1038,7 +1056,7 @@ impl Loading {
         }
         vm.set_grant(Capability::Loading, false);
         let output = vm.take_output().unwrap_or_default();
-        Ok(Deployment { snapshot: vm.snapshot()?, limits, output })
+        Ok(Deployment { snapshot: vm.snapshot()?, limits, output, env: Rc::new(Data::Dict(Vec::new())) })
     }
 }
 
@@ -1153,6 +1171,7 @@ fn start(
     context: Rc<outbound::Context>,
     id: u64,
     limits: &Limits,
+    env: &Data,
 ) -> (Instance, Result<(LifetimeId, TaskId), Error>) {
     let vm = &mut instance.vm;
     // What a dev world wrote between requests is no request's.
@@ -1169,7 +1188,7 @@ fn start(
         let request = vm.from_data(request)?;
         let x = vm.make_foreign(exchange.clone(), "exchange")?;
         let reads = vm.from_data(&Data::Bool(exchange.reader.borrow().is_some()))?;
-        let env = vm.from_data(&Data::Dict(Vec::new()))?;
+        let env = vm.from_data(env)?;
         let ctx = vm.from_data(&Data::Dict(vec![(Data::Symbol("id".into()), Data::Int(id as i64))]))?;
         let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(limits.cpu), tasks: Some(limits.tasks) });
         vm.set_lifetime_data(lifetime, context);

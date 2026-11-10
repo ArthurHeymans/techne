@@ -665,6 +665,51 @@ fn a_poisoned_debug_instance_is_dropped() {
     assert!(!host.detach_debug("app", None));
 }
 
+/// A request is given its deployment's `env`, and asks the host's broker
+/// for what it keeps under its bindings, a bounded number of times.
+#[test]
+fn a_request_uses_its_bindings_through_the_broker() {
+    use techne_host::outbound::{Outbound, Service};
+    use techne_vm::data::Data;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, _) = host_with_failures();
+    let source = r#"(provide fetch)
+(define (fetch request env ctx)
+  (let ((store (dict-ref env 'store)))
+    (guard (e (#t (condition/report-string e)))
+      (kv-put! store "k" 1)
+      (string-append (kv-get store "k") (kv-get store "k")))))"#;
+    let sym = |s: &str| Data::Symbol(s.into());
+    let asked = Rc::new(RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    host.set_broker(Rc::new(move |o: Outbound| {
+        assert_eq!(o.service, Service::Kv);
+        seen.borrow_mut().push(format!("{:?}", o.request));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Ok(Data::Dict(vec![
+            (Data::Symbol("found".into()), Data::Bool(true)),
+            (Data::Symbol("value".into()), Data::String("v".into())),
+        ])));
+        rx
+    }));
+    let env = Data::Dict(vec![(sym("store"), Data::Dict(vec![(sym("kind"), sym("kv")), (sym("name"), Data::String("mine".into()))]))]);
+    let limits = |store_ops| Limits { store_ops, ..Limits::default() };
+    host.publish("app", deployment(dir.path(), "app", source, limits(3)).unwrap().with_env(env.clone()));
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"vv\")"]);
+    // By the binding's name, as the deployment has it.
+    assert!(asked.borrow().iter().all(|a| a.contains("\"mine\"")), "{:?}", asked.borrow());
+    assert_eq!(asked.borrow().len(), 3);
+    host.publish("app", deployment(dir.path(), "app", source, limits(2)).unwrap().with_env(env));
+    let refused = ask(&mut host, &[("app", "/")]);
+    assert!(refused[0].contains("2 times at most"), "{refused:?}");
+    // Without bindings: an empty `env`.
+    host.publish(
+        "app",
+        deployment(dir.path(), "app", "(provide fetch)\n(define (fetch r env c) (number->string (dict-size env)))", limits(1)).unwrap(),
+    );
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"0\")"]);
+}
+
 #[test]
 fn bodies_stream() {
     let dir = tempfile::tempdir().unwrap();

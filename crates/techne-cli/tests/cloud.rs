@@ -321,6 +321,78 @@ fn a_repl_into_a_debug_instance() {
     assert_eq!(get(port, "/"), "bonjour");
 }
 
+const KEEPER: &str = r#"(import (techne http))
+(provide fetch)
+(define (fetch request env ctx)
+  (let ((path (dict-ref request 'path))
+        (notes (dict-ref env 'notes #f)))
+    (cond ((equal? path "/put") (kv-put! notes "greeting" (dict "said" (dict-ref env 'greeting))) (response "kept"))
+          ((equal? path "/get") (json-response (kv-get notes "greeting" "nothing")))
+          ((equal? path "/keys") (json-response (kv-list notes)))
+          ((equal? path "/secret") (response (dict-ref env 'key)))
+          ((equal? path "/forged")
+           (response (guard (e (#t (condition/report-string e)))
+                       (kv-get (dict 'kind 'kv 'name "other") "greeting"))))
+          (else (response "?")))))
+"#;
+
+/// `techne cloud dev` on `app`: the process, and the port it serves on.
+fn serving(app: &std::path::Path) -> (Killed, u16) {
+    let mut child = Killed(
+        Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["cloud", "dev", app.to_str().unwrap(), "--port", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let out = lines(child.0.stdout.take().unwrap());
+    let line = line_with(&out, "Serving", PATIENCE);
+    let port = line.rsplit(':').next().unwrap().parse().unwrap_or_else(|_| panic!("{line}"));
+    (child, port)
+}
+
+/// A deployment is given the bindings its manifest names: a secret's
+/// value, a text, and a KV namespace, which the supervisor keeps: what a
+/// request kept there another reads, also after `techne cloud dev` is
+/// started again. A binding the deployment was not given reaches
+/// nothing.
+#[test]
+fn bindings_from_the_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app.scm");
+    std::fs::write(&app, KEEPER).unwrap();
+    std::fs::write(dir.path().join("manifest.scm"), r#"{bindings {notes (kv "notes") key (secret "KEY") greeting (text "hello")}}"#)
+        .unwrap();
+    std::fs::write(dir.path().join(".secrets.scm"), r#"{"KEY" "s3cret"}"#).unwrap();
+    let (child, port) = serving(&app);
+    assert_eq!(get(port, "/secret"), "s3cret");
+    assert_eq!(get(port, "/get"), r#""nothing""#);
+    assert_eq!(get(port, "/put"), "kept");
+    assert_eq!(get(port, "/get"), r#"{"said":"hello"}"#);
+    assert_eq!(get(port, "/keys"), r#"["greeting"]"#);
+    let forged = get(port, "/forged");
+    assert!(forged.contains("no KV binding other"), "{forged}");
+    // Kept by the supervisor, in a file: there for the next.
+    drop(child);
+    assert!(dir.path().join(".techne/kv/notes.kv").is_file());
+    let (_child, port) = serving(&app);
+    assert_eq!(get(port, "/get"), r#"{"said":"hello"}"#);
+}
+
+/// A manifest naming a secret that is not there deploys nothing.
+#[test]
+fn a_manifest_that_cannot_be_bound_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app.scm");
+    std::fs::write(&app, KEEPER).unwrap();
+    std::fs::write(dir.path().join("manifest.scm"), r#"{bindings {key (secret "KEY")}}"#).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_techne")).args(["cloud", "dev", app.to_str().unwrap(), "--port", "0"]).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("No such secret") && err.contains("KEY"), "{err}");
+}
+
 const ECHO: &str = r#"(import (techne http))
 (provide fetch)
 (define (fetch request env ctx)

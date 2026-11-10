@@ -145,7 +145,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
         f.0 += 1;
         let fid = f.0;
         f.1.insert(fid, reply);
-        let _ = ask.send(FromWorker::Fetch { rid: o.tag, fid, request: o.request });
+        let _ = ask.send(FromWorker::Fetch { rid: o.tag, fid, service: o.service.name().into(), request: o.request });
         rx
     }));
     let report = tx.clone();
@@ -172,12 +172,12 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
     let host_task = tokio::task::spawn_local(async move { driver.run(None).await });
     while let Some(d) = read_frame(&mut read).await? {
         match ToWorker::from_data(d)? {
-            ToWorker::Deploy { id, name, entry, files, wall_ms, dev: for_dev } => {
+            ToWorker::Deploy { id, name, entry, files, wall_ms, dev: for_dev, env } => {
                 let (host, tx, dev) = (host.clone(), tx.clone(), dev.clone());
                 tokio::task::spawn_local(async move {
                     let limits = Limits { wall: Duration::from_millis(wall_ms), ..Limits::default() };
                     let loaded = match unpack(id, &entry, &files) {
-                        Ok(entry) => Deployment::load_async(&entry, limits).await.map(|d| (entry, d)),
+                        Ok(entry) => Deployment::load_async(&entry, limits).await.map(|d| (entry, d.with_env(env))),
                         Err(e) => Err(techne_vm::vm::Error::new(e)),
                     };
                     let published = loaded.and_then(|(entry, d)| {

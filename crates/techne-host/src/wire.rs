@@ -39,8 +39,9 @@ const MAX_PARTS: usize = 1 << 20;
 /// What the supervisor says.
 #[derive(Debug)]
 pub enum ToWorker {
-    /// Load a deployment from its files, publish it as `name`: for
-    /// development, its dev world with a REPL, if `dev`.
+    /// Load a deployment from its files, publish it as `name`, its
+    /// requests given `env`: for development, its dev world with a REPL,
+    /// if `dev`.
     Deploy {
         id: u64,
         name: String,
@@ -48,6 +49,7 @@ pub enum ToWorker {
         files: Vec<(String, Vec<u8>)>,
         wall_ms: u64,
         dev: bool,
+        env: Data,
     },
     /// Serve `request` with the deployment published as `name`, with its
     /// debug instance if `debug` and it has one; its body streams, in
@@ -142,11 +144,13 @@ pub enum FromWorker {
         text: String,
         truncated: bool,
     },
-    /// Fetch `request` for request `rid` (as [`crate::egress::Egress`]
-    /// takes it), as fetch `fid`.
+    /// Ask `service` (`outbound::Service`'s name) for `request`, for
+    /// request `rid`, as ask `fid`: a fetch (as [`crate::egress::Egress`]
+    /// takes it), or an operation on one of its deployment's bindings.
     Fetch {
         rid: u64,
         fid: u64,
+        service: String,
         request: Data,
     },
     /// Bytes to REPL connection `cid`; its end.
@@ -175,7 +179,7 @@ fn int(n: u64) -> Data {
 impl ToWorker {
     pub fn to_data(&self) -> Data {
         match self {
-            ToWorker::Deploy { id, name, entry, files, wall_ms, dev } => Data::List(vec![
+            ToWorker::Deploy { id, name, entry, files, wall_ms, dev, env } => Data::List(vec![
                 sym("deploy"),
                 int(*id),
                 Data::String(name.clone()),
@@ -183,6 +187,7 @@ impl ToWorker {
                 Data::List(files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
                 int(*wall_ms),
                 Data::Bool(*dev),
+                env.clone(),
             ]),
             ToWorker::Request { rid, name, request, streams, debug } => Data::List(vec![
                 sym("request"),
@@ -219,7 +224,7 @@ impl ToWorker {
                         Ok((f.string()?, f.bytes()?))
                     })
                     .collect::<io::Result<_>>()?;
-                ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()?, dev: p.flag()? }
+                ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()?, dev: p.flag()?, env: p.any()? }
             }
             "request" => ToWorker::Request { rid: p.uint()?, name: p.string()?, request: p.any()?, streams: p.flag()?, debug: p.flag()? },
             "body" => ToWorker::Body { rid: p.uint()?, bytes: p.chunk()? },
@@ -269,7 +274,9 @@ impl FromWorker {
                 Data::String(text.clone()),
                 Data::Bool(*truncated),
             ]),
-            FromWorker::Fetch { rid, fid, request } => Data::List(vec![sym("fetch"), int(*rid), int(*fid), request.clone()]),
+            FromWorker::Fetch { rid, fid, service, request } => {
+                Data::List(vec![sym("fetch"), int(*rid), int(*fid), Data::String(service.clone()), request.clone()])
+            }
             FromWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
             FromWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
         }
@@ -291,7 +298,7 @@ impl FromWorker {
                 message: p.string()?,
             },
             "output" => FromWorker::Output { deployment: p.string()?, request: p.uint()?, text: p.string()?, truncated: p.flag()? },
-            "fetch" => FromWorker::Fetch { rid: p.uint()?, fid: p.uint()?, request: p.any()? },
+            "fetch" => FromWorker::Fetch { rid: p.uint()?, fid: p.uint()?, service: p.string()?, request: p.any()? },
             "repl-data" => FromWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => FromWorker::ReplClose { cid: p.uint()? },
             other => return Err(bad(&format!("no message {other}"))),
