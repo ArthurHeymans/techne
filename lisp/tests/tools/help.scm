@@ -8,6 +8,7 @@
     (define h (tool-help))
     (expect #t (< (string-length (tool-show h)) 1800))
     (expect #t (and (string-contains (tool-show h) "\n(tool-read project PATH") #t))
+    (expect #t (and (string-contains (tool-ref h 'cli) "techne tool [--text] ROOT FORM") #t))
     (expect #f (tool-ref h 'recipes))
     (expect #t (pair? (tool-ref h 'signatures)))
     (expect 22 (length (tool-help 'recipes)))

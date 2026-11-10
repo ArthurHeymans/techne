@@ -38,6 +38,9 @@
     (expect "é needle\n" (tool-ref (tool-expand p (tool-ref hit 'handle)) 'text))
     (expect "top\né needle\n\n" (tool-ref context 'text))
     (expect (tool-ref hit 'revision) (tool-ref context 'revision))
+    ;; More context than the bound is the bound's, not an error.
+    (expect "top\né needle\n\nneedle tail\nlast\n"
+      (tool-ref (tool-ref (car (tool-ref (tool-search p "needle" #:prefix "a" #:before 99 #:after 99) 'items)) 'context) 'text))
     (expect #f (tool-ref found 'context-truncated))
     (expect #t (and (string-contains (tool-show found) "]\n1: top\n2: é needle\n3: ") #t))
     (expect #t (and (string-contains (tool-show found) (tool-ref context 'revision)) #t))
@@ -66,7 +69,6 @@
   (lambda (root p)
     (for-each (lambda (query) (expect #t (fails query)))
       (list (lambda () (tool-search p "x" #:before -1))
-            (lambda () (tool-search p "x" #:after 9))
             (lambda () (tool-search p "x" #:after 1.5))
             (lambda () (tool-search p "x" #:chars 0))
             (lambda () (tool-search p "x" #:group-by 'unknown))
