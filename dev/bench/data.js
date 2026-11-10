@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794329055086,
+  "lastUpdate": 1794329057160,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -51860,6 +51860,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642703723,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106089,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5ae0ffd71ce5c939939e7820acbda0730bd28b44",
+          "message": "Merge pull request #350 from ArthurHeymans/dependabot/cargo/rustyline-19.0.0\n\ndeps: bump rustyline from 15.0.0 to 19.0.0",
+          "timestamp": "2026-11-10T17:34:59+01:00",
+          "tree_id": "f434217ab33d1498882e060cdf41c3724daa5c8d",
+          "url": "https://github.com/ArthurHeymans/techne/commit/5ae0ffd71ce5c939939e7820acbda0730bd28b44"
+        },
+        "date": 1794329057091,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690658221,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642895919,
             "unit": "instructions"
           },
           {
