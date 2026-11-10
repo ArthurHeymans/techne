@@ -66,6 +66,10 @@ const FIRST_SYNC_MAX: usize = 64 << 10;
 /// Captures are collected over windows aligned to this many bytes.
 const BUCKET: usize = 16 << 10;
 
+/// The most bytes collected at once after a whole `BUCKET` did not fit
+/// the budget (`Entry::narrow`): larger requests span several snapshots.
+const NARROW: usize = 4 << 10;
+
 /// How long one snapshot may spend parsing and collecting captures, in
 /// step with the parts' deadlines being ten times as long in a debug
 /// build (`runtime::PART_DEADLINE`).
@@ -77,7 +81,9 @@ const LISP_BUDGET: Duration = Duration::from_secs(2);
 /// How long a collection that ran out of budget is not tried again:
 /// a pathological document costs one budget per second rather than one
 /// per snapshot, and a transient overrun (a loaded machine) colours
-/// again on its own.
+/// again on its own. A window wider than `NARROW` is first
+/// tried again in pieces: trying the same again, from nothing
+/// and with the same budget, would run out the same way for good (#347).
 const COOLDOWN: Duration = Duration::from_secs(1);
 
 pub use techne_syntax::GRAMMARS;
@@ -236,10 +242,16 @@ struct Entry {
     generation: u64,
     /// Captures collected over [from, to) of the tree of `generation`:
     /// a few windows, the latest first, so panes showing different
-    /// parts of one document each find theirs.
+    /// parts of one document each find theirs. In narrow mode a window
+    /// grows by one piece per snapshot until it covers the requested range.
     collected: Vec<(u64, usize, usize, Vec<FaceRange>)>,
     /// When collecting over this tree last ran out of budget.
     gave_up: Option<Instant>,
+    /// Whether a `BUCKET` of this document once cost more than the
+    /// budget (dense text, a slow or loaded machine): its captures are
+    /// collected over `NARROW` windows from then on, its later trees'
+    /// too, each of which would else spend a budget finding out again.
+    narrow: bool,
 }
 
 /// What the worker is asked, and answers: owned, `Send` by what it
@@ -487,6 +499,7 @@ impl Syntax {
                 continue;
             }
             let generation = self.next_generation();
+            let narrow = self.docs.get(&done.doc).is_some_and(|e| e.narrow);
             self.docs.insert(
                 done.doc,
                 Entry {
@@ -499,6 +512,7 @@ impl Syntax {
                     generation,
                     collected: Vec::new(),
                     gave_up: None,
+                    narrow,
                 },
             );
             self.follow(&document.borrow(), &language);
@@ -571,6 +585,7 @@ impl Syntax {
                         generation,
                         collected: Vec::new(),
                         gave_up: None,
+                        narrow: false,
                     },
                 );
                 if let Some(p) = self.pending.remove(&id) {
@@ -615,6 +630,10 @@ impl Syntax {
         let (Some(entry), Some(lang)) = (self.docs.get_mut(&id), self.languages.get_mut(&language)) else {
             return Vec::new();
         };
+        let to = to.min(entry.rope.len_bytes());
+        if from >= to {
+            return Vec::new();
+        }
         let inside = |ranges: &[FaceRange]| ranges.iter().filter(|r| r.from < to && r.to > from).copied().collect::<Vec<_>>();
         if let Some(i) =
             entry.collected.iter().position(|(generation, cf, ct, _)| *generation == entry.generation && *cf <= from && to <= *ct)
@@ -624,23 +643,54 @@ impl Syntax {
             entry.collected.insert(0, hit);
             return answer;
         }
-        if entry.gave_up.is_some_and(|at| at.elapsed() < COOLDOWN) {
-            return Vec::new();
-        }
         // Over the aligned window the cache keeps, not only what was
-        // asked: the next scroll asks from inside it.
-        let (af, at) = (from / BUCKET * BUCKET, (to.div_ceil(BUCKET) * BUCKET).min(entry.rope.len_bytes()));
-        match collect(lang, faces, entry, af, at, deadline) {
-            Some(ranges) => {
+        // asked: the next scroll asks from inside it. In narrow mode,
+        // extend a cached prefix by at most one piece on each snapshot.
+        let unit = if entry.narrow { NARROW } else { BUCKET };
+        let (af, at) = (from / unit * unit, (to.div_ceil(unit) * unit).min(entry.rope.len_bytes()));
+        let prefix = entry
+            .collected
+            .iter()
+            .position(|(generation, cf, ct, _)| entry.narrow && *generation == entry.generation && *cf == af && af < *ct && *ct < to);
+        if entry.gave_up.is_some_and(|at| at.elapsed() < COOLDOWN) {
+            return prefix.map_or_else(Vec::new, |i| inside(&entry.collected[i].3));
+        }
+        let begin = prefix.map_or(af, |i| entry.collected[i].2);
+        let end = if entry.narrow { (begin + NARROW).min(at) } else { at };
+        let wake = || {
+            if let Some(wake) = &*self.wake.lock().expect("the wake") {
+                let _ = wake.send(Msg::Wake);
+            }
+        };
+        match collect(lang, faces, entry, begin, end, deadline) {
+            Some(mut ranges) => {
+                if let Some(i) = prefix {
+                    ranges.extend(entry.collected.remove(i).3);
+                    // A capture can span pieces. Keep it once and keep
+                    // holding nodes below their children, as collect does.
+                    ranges.sort_by(|a, b| (b.to - b.from).cmp(&(a.to - a.from)).then(a.from.cmp(&b.from)));
+                    ranges.dedup_by_key(|r| (r.from, r.to));
+                }
                 let answer = inside(&ranges);
                 entry.collected.retain(|c| c.0 == entry.generation);
-                entry.collected.insert(0, (entry.generation, af, at, ranges));
+                entry.collected.insert(0, (entry.generation, af, end, ranges));
                 entry.collected.truncate(WINDOWS);
+                entry.gave_up = None;
+                if end < to {
+                    wake();
+                }
                 answer
+            }
+            // The pane can ask for a whole BUCKET (or more): narrowing
+            // its alignment alone would retry the same oversized span.
+            None if !entry.narrow && at - af > NARROW => {
+                entry.narrow = true;
+                wake();
+                Vec::new()
             }
             None => {
                 entry.gave_up = Some(Instant::now());
-                Vec::new()
+                prefix.map_or_else(Vec::new, |i| inside(&entry.collected[i].3))
             }
         }
     }
@@ -1360,6 +1410,133 @@ mod tests {
             done
         });
         assert!(commented, "the edit's tree landed");
+    }
+
+    /// A window whose captures do not fit the budget is not tried again
+    /// and again, plain for good: what was asked for is collected alone,
+    /// at once, and so are the windows of the trees after it.
+    #[test]
+    fn a_window_over_the_budget_is_narrowed_to_what_was_asked() {
+        let mut s = rust();
+        let mut faces = Faces::empty();
+        let d = doc(&"fn f() {}\n".repeat(6_000));
+        let id = d.borrow().id();
+        s.set_budget(Duration::from_secs(30));
+        assert!(!s.highlights(&d, "rust", 0, 4096, &mut faces).is_empty(), "parsed here and coloured");
+        assert_eq!(s.docs[&id].collected[0].2, BUCKET, "over a whole window");
+        // No time at all: more matches than are counted between two looks
+        // at the clock, in a window not collected yet.
+        let (wake, woken) = mpsc::channel();
+        s.set_wake(wake);
+        s.budget = Duration::ZERO;
+        assert!(s.highlights(&d, "rust", 2 * BUCKET, 2 * BUCKET + 2048, &mut faces).is_empty());
+        let e = &s.docs[&id];
+        assert!(e.narrow && e.gave_up.is_none(), "narrowed, not given up");
+        assert!(matches!(woken.try_recv(), Ok(Msg::Wake)), "the next snapshot is asked for");
+        s.budget = Duration::from_secs(30);
+        assert!(!s.highlights(&d, "rust", 2 * BUCKET, 2 * BUCKET + 2048, &mut faces).is_empty(), "coloured at once");
+        let c = &s.docs[&id].collected[0];
+        assert_eq!((c.1, c.2), (2 * BUCKET, 2 * BUCKET + NARROW));
+        // Narrowed and still over: given up for a while, as before.
+        s.budget = Duration::ZERO;
+        edit(&d, 0..0, "\n");
+        s.highlights(&d, "rust", 2 * BUCKET, 2 * BUCKET + 2048, &mut faces);
+        let e = &s.docs[&id];
+        assert!(e.narrow && e.gave_up.is_some(), "the edited tree's windows are narrow too");
+    }
+
+    /// The pane asks for 16 KiB, even when only a smaller piece fits.
+    /// An unaligned request needs five pieces: keeping only four loose
+    /// pieces would evict the first before the pane was ever complete.
+    #[test]
+    fn large_requests_are_collected_in_pieces_across_snapshots() {
+        for (from, to) in [(0, BUCKET), (BUCKET + 13, 2 * BUCKET + 13), (3 * BUCKET + 13, 60_000)] {
+            let mut s = rust();
+            // A capture spanning every piece must stay below its children
+            // and occur only once when their captures are combined.
+            s.languages.get_mut("rust").unwrap().sources[0].1.push_str("\n(source_file) @comment");
+            let mut faces = Faces::empty();
+            let d = doc(&"fn f() {}\n".repeat(6_000));
+            let id = d.borrow().id();
+            s.set_budget(Duration::from_secs(30));
+            let expected = s.highlights(&d, "rust", from, to, &mut faces);
+            assert!(!expected.is_empty());
+            s.docs.get_mut(&id).unwrap().collected.clear();
+            let (wake, woken) = mpsc::channel();
+            s.set_wake(wake);
+            s.budget = Duration::ZERO;
+            assert!(s.highlights(&d, "rust", from, to, &mut faces).is_empty());
+            assert!(s.docs[&id].narrow && s.docs[&id].gave_up.is_none(), "narrowed, not cooled down");
+            assert!(matches!(woken.try_recv(), Ok(Msg::Wake)));
+
+            s.budget = Duration::from_secs(30);
+            let af = from / NARROW * NARROW;
+            for next in ((af + NARROW)..(to + NARROW)).step_by(NARROW) {
+                let end = next.min(d.borrow().len());
+                s.begin_snapshot();
+                let ranges = s.highlights(&d, "rust", from, to, &mut faces);
+                let cached = &s.docs[&id].collected[0];
+                assert_eq!((cached.1, cached.2), (af, end), "one more piece, not the full span");
+                assert_eq!(s.docs[&id].collected.len(), 1, "the pieces share a cache window");
+                assert!(!ranges.is_empty(), "partial colours are drawn too");
+                if end < to {
+                    assert!(matches!(woken.try_recv(), Ok(Msg::Wake)), "continue without input");
+                    if end == af + NARROW {
+                        // Another pane used the shared snapshot budget.
+                        // A failed piece keeps the prefix and cools down;
+                        // once that expires, collection resumes after it.
+                        s.snapshot = Some(Instant::now());
+                        assert_eq!(s.highlights(&d, "rust", from, to, &mut faces), ranges);
+                        assert!(s.docs[&id].gave_up.is_some());
+                        assert!(woken.try_recv().is_err(), "no busy retry of a failed piece");
+                        s.begin_snapshot();
+                        assert_eq!(s.highlights(&d, "rust", from, to, &mut faces), ranges, "cooldown keeps partial colours");
+                        assert_eq!(s.docs[&id].collected[0].2, end, "no work in cooldown");
+                        s.docs.get_mut(&id).unwrap().gave_up = Some(Instant::now() - COOLDOWN);
+                    }
+                } else {
+                    assert!(woken.try_recv().is_err(), "no more work to wake for");
+                    assert_eq!(ranges, expected, "same captures and nesting as a full collection");
+                }
+            }
+            s.budget = Duration::ZERO;
+            s.begin_snapshot();
+            assert_eq!(s.highlights(&d, "rust", from, to, &mut faces), expected, "the completed range is cached");
+            assert!(s.docs[&id].gave_up.is_none());
+        }
+    }
+
+    #[test]
+    fn overlong_requests_stop_at_eof() {
+        let mut s = rust();
+        s.set_budget(Duration::from_secs(30));
+        let mut faces = Faces::empty();
+        let d = doc(&"fn f() {}\n".repeat(2_000));
+        let (id, len) = (d.borrow().id(), d.borrow().len());
+        let expected = s.highlights(&d, "rust", 0, len, &mut faces);
+        let entry = s.docs.get_mut(&id).unwrap();
+        entry.collected.clear();
+        entry.narrow = true;
+        let (wake, woken) = mpsc::channel();
+        s.set_wake(wake);
+        for piece in 1..=len.div_ceil(NARROW) {
+            s.begin_snapshot();
+            let ranges = s.highlights(&d, "rust", 0, len + BUCKET, &mut faces);
+            if piece * NARROW < len {
+                assert!(matches!(woken.try_recv(), Ok(Msg::Wake)));
+            } else {
+                assert_eq!(ranges, expected);
+                assert!(woken.try_recv().is_err(), "no wake beyond EOF");
+            }
+        }
+        s.budget = Duration::ZERO;
+        s.begin_snapshot();
+        assert_eq!(s.highlights(&d, "rust", 0, usize::MAX, &mut faces), expected, "overlong cache hit");
+        for from in [len, len + 1, usize::MAX] {
+            assert!(s.highlights(&d, "rust", from, usize::MAX, &mut faces).is_empty(), "nothing past EOF");
+        }
+        assert!(s.highlights(&d, "rust", 0, 0, &mut faces).is_empty());
+        assert!(woken.try_recv().is_err());
     }
 
     #[test]
