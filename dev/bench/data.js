@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794314529389,
+  "lastUpdate": 1794314530995,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -51517,6 +51517,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 106059,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "458cc60f83d51ca10d88a1bb6dd1e8efbfdce628",
+          "message": "Merge pull request #348 from ArthurHeymans/ci/nightly-green\n\nMake the nightly run finish and report, and settle what it was hiding",
+          "timestamp": "2026-11-10T13:35:52+01:00",
+          "tree_id": "8a345ba21c48c0fda8e13fd7038166ea78c00aab",
+          "url": "https://github.com/ArthurHeymans/techne/commit/458cc60f83d51ca10d88a1bb6dd1e8efbfdce628"
+        },
+        "date": 1794314530948,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690482999,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642703723,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106089,
             "unit": "data"
           }
         ]
