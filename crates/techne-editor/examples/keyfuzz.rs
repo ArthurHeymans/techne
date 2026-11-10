@@ -65,6 +65,14 @@ const HANG_COUNTED: Duration = Duration::from_secs(3600);
 /// 200 instructions a word. Listed, not failed on, as `KNOWN_SLOW` is.
 const LARGE_INPUT: usize = 64 << 10;
 
+/// The keys of an insertion past which `.`, typing them again in one key,
+/// is known to pass the budget: each is a key's work, some 190,000
+/// instructions for a plain character (2.0 M for one, 12.0 M for 50, 38.4 M
+/// for 200) and more for one that indents or pairs, so that 83 of them
+/// took 31 M (`scheme-modal`, nightly of 2026-11-09). Listed, not failed
+/// on, as `LARGE_INPUT` is.
+const LONG_REPEAT: usize = 64;
+
 /// Keys over the budget that are known, each with its plan (PLAN.md,
 /// Stage 1, slice 7): (corpus, `*` for any, command, why). Listed, not
 /// failed on.
@@ -230,9 +238,11 @@ fn start(c: &Corpus) -> Runtime {
     // Recompiling their bodies after an evaluation would use those bindings.
     rt.eval(
         "(define (keyfuzz-before-key)
-           (sset! (current-session) 'ran-user-code #f) (collect-garbage))
+           (sset! (current-session) 'ran-user-code #f)
+           (sset! (current-session) 'repeated-keys 0) (collect-garbage))
          (define (keyfuzz-this-command) (sget (current-session) 'this-command))
          (define (keyfuzz-ran-user-code) (sget (current-session) 'ran-user-code))
+         (define (keyfuzz-repeated-keys) (or (sget (current-session) 'repeated-keys) 0))
          (define (keyfuzz-input-length)
            (let ((v (sget (current-session) 'input-view)))
              (if v (document-length (view-document v)) 0)))",
@@ -406,12 +416,13 @@ fn before_key(rt: &mut Runtime) -> Vec<String> {
 }
 
 /// What a trace asks after each key, and a replay too: the command it ran,
-/// whether it ran the user's code, whose time is not the budget's, and what
-/// went wrong, which ends the run.
+/// whether it ran the user's code, whose time is not the budget's, how many
+/// keys it typed again (`.`), and what went wrong, which ends the run.
 fn after_key(rt: &mut Runtime, log: &mut Log) {
     log.line(&["command", &rt.eval("(keyfuzz-this-command)").expect("the command probe")]);
     log.line(&["user", &rt.eval("(keyfuzz-ran-user-code)").expect("the user-code probe")]);
     log.line(&["input", &rt.eval("(keyfuzz-input-length)").expect("the input probe")]);
+    log.line(&["repeat", &rt.eval("(keyfuzz-repeated-keys)").expect("the repeat probe")]);
     log.check(rt);
 }
 
@@ -429,6 +440,8 @@ struct Run {
     /// How long the minibuffer's input was after each key, in bytes, 0
     /// when it is closed.
     inputs: Vec<usize>,
+    /// How many keys of an insertion each key typed again, 0 but for `.`.
+    repeats: Vec<usize>,
     /// The failure's signature and what it says.
     failure: Option<(String, String)>,
 }
@@ -481,6 +494,7 @@ fn run(args: &[String], counted: Option<&Path>) -> Run {
             ["command", name] => out.commands.push(name.to_string()),
             ["user", ran] => out.user.push(ran == "#t"),
             ["input", n] => out.inputs.push(n.parse().unwrap_or(0)),
+            ["repeat", n] => out.repeats.push(n.parse().unwrap_or(0)),
             ["fail", sig, detail] => out.failure = Some((sig.to_string(), detail.to_string())),
             _ => {}
         }
@@ -646,7 +660,9 @@ fn count(o: &Options) -> bool {
                 // The input before the key, or after it.
                 let input = trace.inputs[i].max(if i > 0 { trace.inputs[i - 1] } else { 0 });
                 let large = input > LARGE_INPUT;
+                let repeat = trace.repeats[i];
                 let known = large
+                    || repeat >= LONG_REPEAT
                     || KNOWN_SLOW.iter().any(|&(corpus, command, _)| (corpus == "*" || corpus == c.name) && command == trace.commands[i]);
                 println!(
                     "  key {} ({}, {}): {n} instructions{}",
@@ -655,6 +671,8 @@ fn count(o: &Options) -> bool {
                     trace.commands[i],
                     if large {
                         format!(" (known: an input of {input} bytes)")
+                    } else if repeat >= LONG_REPEAT {
+                        format!(" (known: {repeat} keys typed again)")
                     } else if known {
                         " (known)".to_string()
                     } else {

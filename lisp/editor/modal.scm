@@ -145,7 +145,7 @@ The leader key, SPC, is bound in main.scm.")
   (unless (sget s 'replaying)
     (if (eq? (state s) 'insert)
         (begin (sset! s 'pending-change redo) (sset! s 'insert-keys '()))
-        (sset! s 'last-change redo))))
+        (begin (sset! s 'last-change redo) (sset! s 'last-change-keys 0)))))
 
 (define (operator! s op extents-of)
   (let ((redo (lambda (s) (operate! s op extents-of))))
@@ -188,6 +188,8 @@ The leader key, SPC, is bound in main.scm.")
                  (start s)
                  (for-each (lambda (k) (insert-key s k)) keys)
                  (leave-insert! s)))
+        ;; How many keys `.` presses again: its work is theirs.
+        (sset! s 'last-change-keys (length keys))
         (sset! s 'pending-change #f))))
   (clamp! s))
 
@@ -293,6 +295,9 @@ The leader key, SPC, is bound in main.scm.")
     (let ((redo (sget s 'last-change)))
       (if redo
           (begin (sset! s 'replaying #t)
+                 ;; For whoever judges this key's time, as `ran-user-code`
+                 ;; is: it is that of the keys typed again.
+                 (sset! s 'repeated-keys (sget s 'last-change-keys))
                  (act! s redo)
                  (sset! s 'replaying #f))
           (message! s "no change to repeat"))))
