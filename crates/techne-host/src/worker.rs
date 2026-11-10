@@ -63,8 +63,9 @@ pub trait Dev {
     /// (`Host::publish_dev`), or served as in production with a debug
     /// instance (`Host::attach_debug`).
     fn publish(&mut self, host: &Host, name: &str, entry: &Path, deployment: Deployment) -> Result<(), techne_vm::vm::Error>;
-    /// Serve a REPL client on `stream`, which the supervisor relays.
-    fn connect(&mut self, stream: tokio::io::DuplexStream);
+    /// Serve a REPL client on `stream`, which the supervisor relays,
+    /// authenticated as `principal` if as anyone.
+    fn connect(&mut self, stream: tokio::io::DuplexStream, principal: Option<String>);
 }
 
 /// Bytes a relayed REPL connection may have waiting to be read here.
@@ -265,13 +266,13 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     let _ = reply.send(response);
                 }
             }
-            ToWorker::ReplOpen { cid } => {
+            ToWorker::ReplOpen { cid, principal } => {
                 let Some(dev) = &mut *dev.borrow_mut() else {
                     let _ = tx.send(FromWorker::ReplClose { cid });
                     continue;
                 };
                 let (ours, theirs) = tokio::io::duplex(REPL_CHUNK);
-                dev.connect(theirs);
+                dev.connect(theirs, principal);
                 let (mut from, mut to) = tokio::io::split(ours);
                 let (queue, mut queued) = mpsc::channel::<Vec<u8>>(REPL_QUEUE);
                 repls.borrow_mut().insert(cid, queue);

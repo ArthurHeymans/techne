@@ -429,6 +429,25 @@ when they reach the socket.
   `techne.el` moved to JSON over a WebSocket; until then it costs a parser
   and keeps the nREPL clients that exist.
 
+Of what follows, this much exists (`lisp/cloud/tokens.scm`,
+`lisp/cloud/auth.scm`, `Remote::serve_stream_as` in `nrepl.rs`;
+`techne cloud dev --nrepl PORT --auth` runs it locally). Tokens are
+their claims (subject, projects, scopes, expiry, the ids of the tokens
+they were made from) and an HMAC of them under the service's key; one
+made from another has at most its maker's projects, scopes and expiry,
+and is revoked with it. A REPL connection's first message is
+`authenticate` with a token, checked by the supervisor, in Lisp, before
+any byte of the connection reaches a worker: it must allow `eval` on the
+project, or `prod` for a debug instance; a connection that does not
+authenticate in ten seconds or its first kibibytes is closed, and few
+may be at it at once. The worker's REPL is told the principal, and
+keeps what is each one's apart: sessions (a bounded number, and nothing
+without one), the evaluations one interrupts, inspectors, and the
+debuggers one answers or looks into. Not yet: TLS on the stream (the
+local listener is loopback), quotas in tokens, a place where revoked
+tokens are kept, accounts that mint them, the non-evaluating inspector,
+the audit log.
+
 The nREPL server is for a trusted local user today; before it faces the
 internet:
 

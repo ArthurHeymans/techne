@@ -321,6 +321,74 @@ fn a_repl_into_a_debug_instance() {
     assert_eq!(get(port, "/"), "bonjour");
 }
 
+/// With `--auth`, a REPL client reaches the dev world only once it has
+/// shown a token that holds: its evaluations, in a session of its own,
+/// change the next request as before.
+#[test]
+fn a_repl_authenticates_with_a_token() {
+    use techne_node::bencode::B;
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app.scm");
+    std::fs::write(&app, GREETER.replace("GREETING", "hello")).unwrap();
+    let mut child = Killed(
+        Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["cloud", "dev", app.to_str().unwrap(), "--port", "0", "--nrepl", "0", "--auth"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let out = lines(child.0.stdout.take().unwrap());
+    let (mut port, mut nrepl, mut token) = (None, None, None);
+    while port.is_none() || nrepl.is_none() || token.is_none() {
+        let line = out.recv_timeout(PATIENCE).expect("the ports and the token");
+        if line.starts_with("Serving") {
+            port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+        } else if line.starts_with("nREPL server started on port") {
+            nrepl = line.split_whitespace().nth(5).and_then(|p| p.parse::<u16>().ok());
+        } else if let Some(t) = line.strip_prefix("Token: ") {
+            token = Some(t.to_string());
+        }
+    }
+    let (port, nrepl, token) = (port.unwrap(), nrepl.unwrap(), token.unwrap());
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", nrepl)).unwrap();
+        c.set_read_timeout(Some(PATIENCE)).unwrap();
+        c
+    };
+    let refused = |msg: &B| matches!(msg.get("status"), Some(B::List(l)) if l.iter().any(|s| s.as_str() == Some("unauthenticated")));
+    // Not authenticated: nothing is evaluated, and the connection ends.
+    let mut c = connect();
+    let eval = vec![("op", B::str("eval")), ("code", B::str("(define (greeting) \"pwned\")")), ("id", B::str("1"))];
+    assert!(refused(&nrepl_until(&mut c, eval, "done")));
+    assert_eq!(c.read(&mut [0u8; 16]).unwrap(), 0);
+    // Nor with a token that is none, or one changed.
+    for bad in ["nothing", &format!("{token}x")] {
+        let mut c = connect();
+        assert!(refused(&nrepl_until(&mut c, vec![("op", B::str("authenticate")), ("token", B::str(bad)), ("id", B::str("1"))], "done")));
+    }
+    // Nor with the token in a first message past what one may be: closed,
+    // unanswered.
+    let mut c = connect();
+    let mut long = Vec::new();
+    let pad = "x".repeat(9000);
+    techne_node::bencode::dict(vec![("op", B::str("authenticate")), ("token", B::str(&token)), ("pad", B::str(&pad))]).encode(&mut long);
+    c.write_all(&long).unwrap();
+    assert_eq!(c.read(&mut [0u8; 16]).unwrap_or(0), 0);
+    assert_eq!(get(port, "/"), "hello");
+    // Authenticated: a session of its own, and what it evaluates serves.
+    let mut c = connect();
+    assert!(!refused(&nrepl_until(&mut c, vec![("op", B::str("authenticate")), ("token", B::str(&token)), ("id", B::str("1"))], "done")));
+    let cloned = nrepl_until(&mut c, vec![("op", B::str("clone")), ("id", B::str("2"))], "done");
+    let session = cloned.get("new-session").and_then(B::as_str).unwrap().to_string();
+    let eval =
+        vec![("op", B::str("eval")), ("code", B::str("(define (greeting) \"hi\")")), ("session", B::str(&session)), ("id", B::str("3"))];
+    nrepl_until(&mut c, eval, "done");
+    assert_eq!(get(port, "/"), "hi");
+    // The key is kept, not the token.
+    assert!(dir.path().join(".techne/token-key").is_file());
+}
+
 const KEEPER: &str = r#"(import (techne http))
 (provide fetch)
 (define (fetch request env ctx)

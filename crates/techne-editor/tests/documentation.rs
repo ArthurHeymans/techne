@@ -29,6 +29,8 @@ fn documentation_problems() {
         "lisp/http/debug-route.scm",
         "lisp/cloud/kv.scm",
         "lisp/cloud/manifest.scm",
+        "lisp/cloud/tokens.scm",
+        "lisp/cloud/auth.scm",
     ] {
         vm.eval_source(&format!("(require {:?})", root.join(file).display().to_string())).unwrap_or_else(|e| panic!("{file}: {e}"));
     }

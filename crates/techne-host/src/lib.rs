@@ -75,6 +75,7 @@
 //! ([`Host::detach_debug`]), poisoned, or its deployment replaced, it is
 //! dropped, and the requests routed to it then are served as any other.
 
+pub mod ask;
 pub mod body;
 pub mod egress;
 pub mod outbound;

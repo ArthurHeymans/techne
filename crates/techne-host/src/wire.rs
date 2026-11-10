@@ -84,10 +84,11 @@ pub enum ToWorker {
         fid: u64,
         response: Result<Data, String>,
     },
-    /// A REPL client connected, as connection `cid`; bytes from it; its
-    /// end.
+    /// A REPL client connected, as connection `cid`, authenticated as
+    /// `principal` if as anyone; bytes from it; its end.
     ReplOpen {
         cid: u64,
+        principal: Option<String>,
     },
     ReplData {
         cid: u64,
@@ -205,7 +206,7 @@ impl ToWorker {
                 Ok(r) => vec![sym("fetched"), int(*fid), Data::Bool(true), r.clone()],
                 Err(e) => vec![sym("fetched"), int(*fid), Data::Bool(false), Data::String(e.clone())],
             }),
-            ToWorker::ReplOpen { cid } => Data::List(vec![sym("repl-open"), int(*cid)]),
+            ToWorker::ReplOpen { cid, principal } => Data::List(vec![sym("repl-open"), int(*cid), failure(principal)]),
             ToWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
             ToWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
         }
@@ -239,7 +240,7 @@ impl ToWorker {
                 };
                 ToWorker::Fetched { fid, response }
             }
-            "repl-open" => ToWorker::ReplOpen { cid: p.uint()? },
+            "repl-open" => ToWorker::ReplOpen { cid: p.uint()?, principal: p.failure()? },
             "repl-data" => ToWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => ToWorker::ReplClose { cid: p.uint()? },
             other => return Err(bad(&format!("no message {other}"))),

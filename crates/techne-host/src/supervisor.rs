@@ -59,12 +59,7 @@ use std::{
 };
 
 use techne_sandbox::cgroup::{self, Cgroups};
-use techne_vm::{
-    api::Value,
-    data::Data,
-    tasks::Progress,
-    vm::{Error, Vm},
-};
+use techne_vm::{data::Data, tasks::Progress, vm::Vm};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
@@ -73,7 +68,8 @@ use tokio::{
 
 use crate::{
     Failure, Printed, Response,
-    body::{self, DataValue, Piece, Reader},
+    ask::Asker,
+    body::{self, Piece, Reader},
     outbound::Service,
     wire::{BUNDLE_BYTES, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, encode, read_frame, write_encoded},
     worker,
@@ -199,14 +195,6 @@ impl Default for Bindings {
     fn default() -> Bindings {
         Bindings { env: Data::Dict(Vec::new()), stores: HashMap::new() }
     }
-}
-
-/// What the store is asked: an operation on a namespace, as
-/// `kv_operation` makes it, and who waits for its answer.
-struct StoreAsk {
-    namespace: String,
-    request: Data,
-    reply: oneshot::Sender<Result<Data, String>>,
 }
 
 /// What a worker asked of a KV binding (`outbound::Service::Kv`), as the
@@ -359,7 +347,7 @@ struct State {
     stores: HashMap<String, Rc<HashMap<String, String>>>,
     /// What keeps them, once installed: as many asks wait there as may
     /// be made at once.
-    store: Option<mpsc::Sender<StoreAsk>>,
+    store: Option<Asker>,
     sandbox: bool,
     started: VecDeque<Instant>,
     /// REPL connections relayed to the worker now, by number: what goes
@@ -378,7 +366,7 @@ impl State {
     /// operation as the store takes it and whether it is a `get`: or why
     /// not.
     #[allow(clippy::type_complexity)]
-    fn namespace(&self, rid: u64, request: &Data) -> Result<(mpsc::Sender<StoreAsk>, String, Data, bool), String> {
+    fn namespace(&self, rid: u64, request: &Data) -> Result<(Asker, String, Data, bool), String> {
         let store = self.store.clone().ok_or("this host keeps nothing")?;
         let (binding, operation, get) = kv_operation(request)?;
         let stores = self.pending.get(&rid).map(|p| &p.stores);
@@ -753,14 +741,8 @@ impl Supervisor {
                         // Past what may wait there (a store that answers
                         // none): refused, not queued.
                         Some((store, namespace, operation, get)) => {
-                            let (reply, answer) = oneshot::channel();
-                            let stopped = || Err("the store did not answer".to_string());
-                            let answered = match store.try_send(StoreAsk { namespace, request: operation, reply }) {
-                                Ok(()) => tokio::time::timeout(STORE, answer)
-                                    .await
-                                    .map_or_else(|_| stopped(), |a| a.unwrap_or_else(|_| stopped())),
-                                Err(_) => Err("the store is busy".to_string()),
-                            };
+                            let asked = Data::List(vec![Data::String(namespace), operation]);
+                            let answered = store.ask(asked, STORE).await.map_err(|why| format!("the store: {why}"));
                             if get { answered.and_then(kv_found) } else { answered }
                         }
                     };
@@ -990,54 +972,26 @@ impl Supervisor {
     }
 
     /// Have a task of `front` keep what requests keep in their KV
-    /// namespaces: `(%store-next)` waits for the next operation asked and
-    /// returns it, a list of its number, its namespace (a string, the
-    /// deployment's binding looked up) and the operation, a dict of its
-    /// `op` and fields, a value to keep a bytevector (`kv_operation`);
-    /// `(%store-reply number ok value)` answers it, with VALUE, data, if
-    /// OK, else with why not, a string. One not answered within ten
-    /// seconds is failed, and not handed on if it still waited; as many
-    /// wait as may be asked at once, and more are refused. Without a
-    /// store, requests keep nothing.
+    /// namespaces (`crate::ask`, as `store`): `(%store-next)` returns the
+    /// next operation asked, a list of its number and what is asked, a
+    /// list of its namespace (a string, the deployment's binding looked
+    /// up) and the operation, a dict of its `op` and fields, a value to
+    /// keep a bytevector (`kv_operation`); `(%store-reply number ok
+    /// value)` answers it. One not answered within ten seconds is failed,
+    /// and not handed on if it still waited; as many wait as may be asked
+    /// at once, and more are refused. Without a store, requests keep
+    /// nothing.
     pub fn install_store(&self, front: &mut Vm) {
+        self.wakes(front);
+        self.state.borrow_mut().store = Some(crate::ask::install(front, "store", FETCHING));
+    }
+
+    /// Have what `front`'s tasks wait on wake the supervisor's driver
+    /// (`Supervisor::run`), as `install` does: for a front world given
+    /// natives of the caller's own.
+    pub fn wakes(&self, front: &mut Vm) {
         let wake = self.wake.clone();
         front.set_wake_notifier(move || wake.notify_one());
-        let (tx, rx) = mpsc::channel::<StoreAsk>(FETCHING);
-        self.state.borrow_mut().store = Some(tx);
-        let rx = Rc::new(tokio::sync::Mutex::new(rx));
-        type Waiting = (u64, HashMap<u64, oneshot::Sender<Result<Data, String>>>);
-        let waiting = Rc::new(RefCell::new(Waiting::default()));
-        let asked = waiting.clone();
-        front.register_async("%store-next", 0, move |_vm, _args| {
-            let (rx, asked) = (rx.clone(), asked.clone());
-            async move {
-                let mut rx = rx.lock().await;
-                let ask = loop {
-                    let ask = rx.recv().await.ok_or_else(|| Error::new("the supervisor stopped"))?;
-                    // No one waits for it any more: not done late.
-                    if !ask.reply.is_closed() {
-                        break ask;
-                    }
-                };
-                let mut asked = asked.borrow_mut();
-                // Those no one waits for any more are forgotten.
-                asked.1.retain(|_, reply| !reply.is_closed());
-                asked.0 += 1;
-                let id = asked.0;
-                asked.1.insert(id, ask.reply);
-                Ok::<_, Error>(DataValue(Data::List(vec![Data::Int(id as i64), Data::String(ask.namespace), ask.request])))
-            }
-        });
-        front.register_fn_vm("%store-reply", move |vm: &mut Vm, id: i64, ok: bool, value: Value| -> Result<bool, Error> {
-            let Some(reply) = waiting.borrow_mut().1.remove(&(id as u64)) else { return Ok(false) };
-            let answer = match (ok, vm.to_data(&value, crate::REQUEST_BYTES)) {
-                (true, Ok(value)) => Ok(value),
-                (true, Err(e)) => Err(format!("the store's answer is no data: {}", e.msg)),
-                (false, Ok(Data::String(why))) => Err(why),
-                (false, _) => Err("the store failed".into()),
-            };
-            Ok(reply.send(answer).is_ok())
-        });
     }
 
     async fn send_deploy(&self, bundle: Bundle) -> Result<String, String> {
@@ -1066,7 +1020,10 @@ impl Supervisor {
     }
 
     /// Accept REPL clients on `addr` (loopback, for development), each
-    /// relayed to the worker's dev world: the address bound.
+    /// relayed to the worker's dev world, for no one in particular: the
+    /// address bound. Anyone who can connect evaluates there: what
+    /// listens elsewhere authenticates its clients first, and relays
+    /// them itself ([`Supervisor::relay`]).
     pub async fn serve_repl(&self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
@@ -1074,15 +1031,18 @@ impl Supervisor {
         tokio::task::spawn_local(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let _ = stream.set_nodelay(true);
-                me.relay(stream);
+                me.relay(stream, None, Vec::new());
             }
         });
         Ok(bound)
     }
 
     /// Relay `stream`, a REPL client, to the worker as a connection of its
-    /// own, until either end closes it.
-    fn relay(&self, stream: tokio::net::TcpStream) {
+    /// own, until either end closes it: for `principal`, if the caller
+    /// authenticated the client as that (the worker's REPL keeps what is
+    /// each principal's apart), `sent` being what the client sent already
+    /// that is the REPL's to read.
+    pub fn relay(&self, stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + 'static, principal: Option<String>, sent: Vec<u8>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (cid, send) = {
             let mut s = self.state.borrow_mut();
@@ -1091,8 +1051,11 @@ impl Supervisor {
             (s.next_cid, send)
         };
         let (queue, mut queued) = mpsc::channel::<Vec<u8>>(REPL_QUEUE);
-        let _ = send.send(ToWorker::ReplOpen { cid });
-        let (mut from, mut to) = stream.into_split();
+        let _ = send.send(ToWorker::ReplOpen { cid, principal });
+        for bytes in sent.chunks(REPL_CHUNK) {
+            let _ = send.send(ToWorker::ReplData { cid, bytes: bytes.to_vec() });
+        }
+        let (mut from, mut to) = tokio::io::split(stream);
         tokio::task::spawn_local(async move {
             while let Some(bytes) = queued.recv().await {
                 if to.write_all(&bytes).await.is_err() {
@@ -1121,8 +1084,7 @@ impl Supervisor {
     /// Define `(host-fetch deployment request #:debug #f)` in the front
     /// world, as [`crate::Host::install`] does.
     pub fn install(&self, front: &mut Vm) {
-        let wake = self.wake.clone();
-        front.set_wake_notifier(move || wake.notify_one());
+        self.wakes(front);
         let me = self.clone();
         body::install_front(front, move |deployment, request, body, debug| me.fetch_routed(deployment, request, body, debug));
     }

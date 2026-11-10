@@ -46,6 +46,18 @@
 //! world serves one at a time), up to its deadline, a minute
 //! (`DEV_WALL`) rather than 30 seconds.
 //!
+//! With `--auth` too, a REPL client authenticates before anything it
+//! sends reaches the worker: its first message is `authenticate`, with a
+//! token, which a task of the front world checks
+//! (`lisp/cloud/auth.scm`, `lisp/cloud/tokens.scm`) against the key kept
+//! in `.techne/token-key` beside FILE; it must allow `eval` on the
+//! deployment, or `prod` for a debug instance. A token that does, good
+//! for thirty days, is printed at the start. A client then evaluates in
+//! sessions of its own (`clone`), which are its principal's alone
+//! (`Remote::serve_stream_as`). A connection that does not authenticate
+//! within ten seconds, or in its first kibibytes, is closed; few wait to
+//! at once.
+//!
 //! With `--debug` too, the deployment is served as in production, by
 //! instances started from its snapshot, and the nREPL server is in a
 //! debug instance beside them (`Host::attach_debug`): a world from the
@@ -74,7 +86,7 @@ use techne_vm::{
     vm::{Error, ROOT_MODULE, Vm},
 };
 
-const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--nrepl PORT [--debug]]
+const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--nrepl PORT [--debug] [--auth]]
 
 Serve the deployment whose entry module is FILE on 127.0.0.1:PORT (8787
 by default; 0 picks one), deploying again whenever a Lisp file under
@@ -82,7 +94,16 @@ FILE's directory changes. With --nrepl, serve it from a world kept across
 requests, with an nREPL server into it on that port. With --debug too,
 serve it as in production, and put the nREPL server in a debug instance
 beside, which serves the requests carrying the header techne-debug-route
-with the credential printed.";
+with the credential printed. With --auth, an nREPL client must
+authenticate first, with a token such as the one printed.";
+
+/// Connections that may be authenticating at once: more are closed.
+const AUTHENTICATING: usize = 16;
+
+/// How long a connection has to authenticate, and how many bytes its
+/// first message may be.
+const AUTHENTICATE: Duration = Duration::from_secs(10);
+const FIRST_MESSAGE: usize = 8 << 10;
 
 /// How long a request may take in the dev world, paused in a debugger
 /// say.
@@ -134,12 +155,14 @@ struct Options {
     /// The nREPL server in a debug instance, the deployment served as in
     /// production.
     debug: bool,
+    /// nREPL clients authenticate with a token.
+    auth: bool,
 }
 
 /// The options, from `FILE [--port PORT] [--nrepl PORT [--debug]]` in any
 /// order.
 fn parse(args: &[String]) -> Option<Options> {
-    let mut options = Options { file: PathBuf::new(), port: 8787, nrepl: None, debug: false };
+    let mut options = Options { file: PathBuf::new(), port: 8787, nrepl: None, debug: false, auth: false };
     let mut file = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -147,13 +170,14 @@ fn parse(args: &[String]) -> Option<Options> {
             "--port" => options.port = args.next()?.parse().ok()?,
             "--nrepl" => options.nrepl = Some(args.next()?.parse().ok()?),
             "--debug" => options.debug = true,
+            "--auth" => options.auth = true,
             _ if file.is_none() && !arg.starts_with("--") => file = Some(PathBuf::from(arg)),
             _ => return None,
         }
     }
     options.file = file?;
     // A debug instance is reached through its REPL alone.
-    if options.debug && options.nrepl.is_none() {
+    if (options.debug || options.auth) && options.nrepl.is_none() {
         return None;
     }
     Some(options)
@@ -186,17 +210,25 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
         let manifests = Rc::new(RefCell::new(Manifests::new()?));
         let bound = manifests.borrow_mut().bindings(&dir)?;
         supervisor.deploy_with(NAME, &entry, bound).await.map_err(Error::new)?;
-        if let Some(port) = options.nrepl {
-            let bound =
-                supervisor.serve_repl(&format!("127.0.0.1:{port}")).await.map_err(|e| Error::new(format!("nREPL on port {port}: {e}")))?;
-            // The port file first: clients may act on the line at once.
-            let _ = std::fs::write(dir.join(".nrepl-port"), bound.port().to_string());
-            println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
-        }
         let mut front = Vm::new();
         techne_net::install_on(&mut front, tokio::runtime::Handle::current())?;
         supervisor.install(&mut front);
         supervisor.install_store(&mut front);
+        if let Some(port) = options.nrepl {
+            let addr = format!("127.0.0.1:{port}");
+            let bound = match options.auth {
+                true => {
+                    let auth = techne_host::ask::install(&mut front, "auth", AUTHENTICATING);
+                    authenticate_with(&mut front, &dir, if options.debug { "prod" } else { "eval" })?;
+                    serve_repl_authenticated(supervisor.clone(), &addr, auth).await
+                }
+                false => supervisor.serve_repl(&addr).await,
+            };
+            let bound = bound.map_err(|e| Error::new(format!("nREPL on port {port}: {e}")))?;
+            // The port file first: clients may act on the line at once.
+            let _ = std::fs::write(dir.join(".nrepl-port"), bound.port().to_string());
+            println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
+        }
         serve_front(&mut front, port, &entry, options.debug)?;
         let redeploying = supervisor.clone();
         let watched = dir.clone();
@@ -218,6 +250,97 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
         supervisor.run(&mut front).await?;
         Ok(())
     })
+}
+
+/// Have a task of `front` answer whether tokens allow `scope` on the
+/// deployment (`lisp/cloud/auth.scm`), with the key kept in `.techne`
+/// under `dir`, and print a token that does.
+fn authenticate_with(front: &mut Vm, dir: &Path, scope: &str) -> Result<(), Error> {
+    let cloud = techne_vm::library::lisp_dir().join("cloud");
+    front.eval_source(&format!(
+        r#"(require {:?} {:?})
+           (let* ((key (token-key-in {:?}))
+                  (token (make-token key "dev" #:projects (list {NAME:?}) #:scopes token-scopes
+                                     #:expires (+ (current-second) (* 30 24 3600)))))
+             (display (string-append "Token: " token "\n"))
+             (flush-output-port)
+             (spawn (lambda () (auth-serve key {NAME:?} {scope:?}))))"#,
+        cloud.join("auth.scm").display().to_string(),
+        cloud.join("tokens.scm").display().to_string(),
+        dir.join(".techne").display().to_string(),
+    ))?;
+    Ok(())
+}
+
+/// Accept REPL clients on `addr`, each relayed by `supervisor` once it
+/// has authenticated (`authenticate`), for the principal `auth` answered:
+/// the address bound.
+async fn serve_repl_authenticated(
+    supervisor: techne_host::supervisor::Supervisor,
+    addr: &str,
+    auth: techne_host::ask::Asker,
+) -> std::io::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    let places = std::sync::Arc::new(tokio::sync::Semaphore::new(AUTHENTICATING));
+    tokio::task::spawn_local(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            // Too many at it already: closed.
+            let Ok(place) = places.clone().try_acquire_owned() else { continue };
+            let _ = stream.set_nodelay(true);
+            let (supervisor, auth) = (supervisor.clone(), auth.clone());
+            tokio::task::spawn_local(async move {
+                let admitted = tokio::time::timeout(AUTHENTICATE, authenticate(&mut stream, &auth)).await.ok().flatten();
+                drop(place);
+                if let Some((principal, sent)) = admitted {
+                    supervisor.relay(stream, Some(principal), sent);
+                }
+            });
+        }
+    });
+    Ok(bound)
+}
+
+/// Read the first message of `stream`, an nREPL client: an
+/// `authenticate` with a `token` that `auth` says holds, answered
+/// `done`; anything else is answered `unauthenticated`. The principal,
+/// and what the client sent after the message.
+async fn authenticate(stream: &mut tokio::net::TcpStream, auth: &techne_host::ask::Asker) -> Option<(String, Vec<u8>)> {
+    use techne_node::bencode::{B, dict, parse};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let (message, used) = loop {
+        match parse(&buf) {
+            Ok(Some((message, used))) if used <= FIRST_MESSAGE => break (message, used),
+            Ok(None) if buf.len() < FIRST_MESSAGE => {}
+            _ => return None,
+        }
+        match stream.read(&mut chunk).await {
+            Ok(n @ 1..) => buf.extend_from_slice(&chunk[..n]),
+            _ => return None,
+        }
+    };
+    let token = match message.get("op").and_then(B::as_str) {
+        Some("authenticate") => message.get("token").and_then(B::as_str),
+        _ => None,
+    };
+    let principal = match token {
+        Some(token) => match auth.ask(Data::String(token.into()), AUTHENTICATE).await {
+            Ok(Data::String(principal)) => Some(principal),
+            _ => None,
+        },
+        None => None,
+    };
+    let statuses: &[&str] = if principal.is_some() { &["done"] } else { &["error", "unauthenticated", "done"] };
+    let mut fields = vec![("status", B::List(statuses.iter().map(B::str).collect()))];
+    if let Some(id) = message.get("id") {
+        fields.push(("id", id.clone()));
+    }
+    let mut reply = Vec::new();
+    dict(fields).encode(&mut reply);
+    stream.write_all(&reply).await.ok()?;
+    principal.map(|p| (p, buf[used..].to_vec()))
 }
 
 /// A world reading deployments' manifests (`lisp/cloud/manifest.scm`).
@@ -402,9 +525,9 @@ impl techne_host::worker::Dev for DevWorker {
         }
     }
 
-    fn connect(&mut self, stream: tokio::io::DuplexStream) {
+    fn connect(&mut self, stream: tokio::io::DuplexStream, principal: Option<String>) {
         if let Some((_, server)) = &*self.slot.borrow() {
-            server.remote().serve_stream(stream);
+            server.remote().serve_stream_as(stream, principal);
         }
     }
 }

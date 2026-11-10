@@ -57,6 +57,7 @@ nix build                       # the package: result/bin/techne, its Lisp in re
 techne cloud dev app.scm        # serve a deployment (doc/serverless.md) locally, deploying on save
 techne cloud dev app.scm --nrepl 0  # ... from a dev world, with an nREPL server for Emacs into it
 techne cloud dev app.scm --nrepl 0 --debug  # ... as in production, the nREPL server in a debug instance beside
+techne cloud dev app.scm --nrepl 0 --auth   # ... its nREPL clients authenticating with a token
 ```
 
 `techne-vm`, `techne-node` and `techne-lsp` also build binaries of their own,

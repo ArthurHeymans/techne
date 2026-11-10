@@ -194,6 +194,9 @@ struct Reply {
     id: Option<B>,
     session: Option<String>,
     conn: u64,
+    /// Who asked, on a connection served for someone
+    /// (`Remote::serve_stream_as`).
+    principal: Option<String>,
 }
 
 impl Reply {
@@ -281,7 +284,9 @@ struct Shared {
     jobs: Mutex<std::sync::mpsc::Sender<Job>>,
     /// Called after a job is posted: the world's owner runs `Server::poll`.
     wake: Box<dyn Fn() + Send + Sync>,
-    sessions: Mutex<HashSet<String>>,
+    /// The sessions, and whose each is: a session is found by its owner
+    /// alone.
+    sessions: Mutex<HashMap<String, Option<String>>>,
     /// The `techne-debug-subscribe` requests, in the order they came.
     subscribers: Mutex<Vec<Reply>>,
     /// Evaluations in progress, by key (in the order they started).
@@ -301,6 +306,8 @@ struct Debuggers {
 
 struct Waiting {
     conn: u64,
+    /// Whose it is: no one else chooses for it, or inspects it.
+    principal: Option<String>,
     /// How many restarts it offers.
     restarts: usize,
 }
@@ -308,6 +315,7 @@ struct Waiting {
 /// An evaluation in progress, for `interrupt`.
 struct Running {
     session: Option<String>,
+    principal: Option<String>,
     /// Its request's id.
     id: Option<B>,
     /// The execution of its task, and the interrupt handle of its world:
@@ -434,7 +442,8 @@ fn start_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: 
     match task {
         Ok(task) => {
             let exec = vm.task_execution(&task).map(|e| (e, state.interrupt.clone()));
-            state.shared.running.lock().unwrap().insert(key, Running { session: reply.session.clone(), id: reply.id.clone(), exec });
+            let running = Running { session: reply.session.clone(), principal: reply.principal.clone(), id: reply.id.clone(), exec };
+            state.shared.running.lock().unwrap().insert(key, running);
             state.evals.borrow_mut().insert(key, Evaluation { reply, task });
         }
         Err(e) => reply.error(&e.to_string(), &[]),
@@ -562,7 +571,7 @@ fn debug_open_for(
         if debuggers.gone.contains(&reply.conn) {
             return Ok(false);
         }
-        debuggers.waiting.insert(id, Waiting { conn: reply.conn, restarts: restarts.len() });
+        debuggers.waiting.insert(id, Waiting { conn: reply.conn, principal: reply.principal.clone(), restarts: restarts.len() });
     }
     let message = condition_text(vm, &condition);
     let kind = vm.call_global("%nrepl-condition-type", std::slice::from_ref(&condition)).ok().and_then(|t| vm.get::<String>(&t).ok());
@@ -937,7 +946,7 @@ impl Server {
         let shared = Arc::new(Shared {
             jobs: Mutex::new(jobs),
             wake: Box::new(wake),
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
             subscribers: Mutex::default(),
             running: Mutex::default(),
             debuggers: Mutex::default(),
@@ -1147,7 +1156,7 @@ impl Remote {
             loop {
                 let (stream, _) = listener.accept().await?;
                 let _ = stream.set_nodelay(true);
-                tokio::spawn(connection(stream, shared.clone(), NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed)));
+                tokio::spawn(connection(stream, shared.clone(), NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed), None));
             }
         })
     }
@@ -1156,8 +1165,20 @@ impl Remote {
     /// (a sandboxed worker's supervisor, which has the network), as one
     /// accepted by `serve`, until it ends.
     pub fn serve_stream(&self, stream: impl AsyncRead + AsyncWrite + Send + 'static) {
+        self.serve_stream_as(stream, None)
+    }
+
+    /// [`Remote::serve_stream`], for `principal` if given: whoever
+    /// relays the connection has authenticated its client as that. Such a
+    /// client's sessions, the evaluations it interrupts, its inspectors
+    /// and the debuggers it answers are its principal's alone, those of
+    /// others as unknown to it as if they were not there; it evaluates
+    /// and inspects in sessions only (`clone` first), a bounded number
+    /// of them. Clients served for no one, as before, share what is
+    /// theirs among themselves.
+    pub fn serve_stream_as(&self, stream: impl AsyncRead + AsyncWrite + Send + 'static, principal: Option<String>) {
         let shared = self.0.clone();
-        techne_process::runtime().spawn(connection(stream, shared, NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed)));
+        techne_process::runtime().spawn(connection(stream, shared, NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed), principal));
     }
 
     /// Have the world's owner poll, as a request arriving does.
@@ -1238,20 +1259,39 @@ const OPS: &[&str] = &[
     "techne-debug-subscribe",
 ];
 
-fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn: u64) {
+/// The sessions a principal may have at once.
+const SESSIONS: usize = 16;
+
+/// The most bytes of a message, and so of what a connection may send
+/// before a whole one.
+const MESSAGE: usize = 32 << 20;
+
+fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn: u64, principal: &Option<String>) {
     let text = |k: &str| msg.get(k).and_then(B::as_str).map(str::to_string);
     let session = text("session");
-    let reply = Reply { out: out.clone(), id: msg.get("id").cloned(), session: session.clone(), conn };
+    let reply = Reply { out: out.clone(), id: msg.get("id").cloned(), session: session.clone(), conn, principal: principal.clone() };
+    // Another's session is as one that is not there.
     if let Some(s) = &session
-        && !shared.sessions.lock().unwrap().contains(s)
+        && shared.sessions.lock().unwrap().get(s) != Some(principal)
     {
         return reply.error(&format!("unknown session {s}"), &["unknown-session"]);
     }
     let op = text("op").unwrap_or_default();
+    // What is kept by session is kept apart by it: for a principal,
+    // nothing is kept without one, where another's would be.
+    if principal.is_some() && session.is_none() && !matches!(op.as_str(), "clone" | "describe" | "ls-sessions") {
+        return reply.error("a session is needed: clone one", &["no-session"]);
+    }
     match op.as_str() {
         "clone" => {
+            let mut sessions = shared.sessions.lock().unwrap();
+            if principal.is_some() && sessions.values().filter(|owner| *owner == principal).count() >= SESSIONS {
+                drop(sessions);
+                return reply.error(&format!("{SESSIONS} sessions at most"), &["too-many-sessions"]);
+            }
             let id = session_id(shared);
-            shared.sessions.lock().unwrap().insert(id.clone());
+            sessions.insert(id.clone(), principal.clone());
+            drop(sessions);
             reply.send(vec![("new-session", B::str(&id)), ("status", B::List(vec![B::str("done")]))]);
         }
         "close" => {
@@ -1262,7 +1302,8 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             reply.status(&["done", "session-closed"]);
         }
         "ls-sessions" => {
-            let sessions = shared.sessions.lock().unwrap().iter().map(B::str).collect();
+            let sessions =
+                shared.sessions.lock().unwrap().iter().filter(|(_, owner)| *owner == principal).map(|(s, _)| B::str(s)).collect();
             reply.send(vec![("sessions", B::List(sessions))]);
             reply.status(&["done"]);
         }
@@ -1302,7 +1343,7 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             // The session's evaluation `interrupt-id` names, or its latest.
             let exec = {
                 let running = shared.running.lock().unwrap();
-                let mine: Vec<&Running> = running.values().filter(|r| r.session == session).collect();
+                let mine: Vec<&Running> = running.values().filter(|r| r.session == session && r.principal == *principal).collect();
                 match msg.get("interrupt-id") {
                     Some(wanted) => match mine.iter().find(|r| r.id.as_ref() == Some(wanted)) {
                         Some(r) => Ok(r.exec.clone()),
@@ -1338,7 +1379,8 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
         }
         "techne-debug-restart" | "techne-debug-abort" => {
             let id = msg.get("debug-id").and_then(B::as_int).unwrap_or(-1) as u64;
-            let Some(restarts) = shared.debuggers.lock().unwrap().waiting.get(&id).map(|w| w.restarts) else {
+            let mine = shared.debuggers.lock().unwrap().waiting.get(&id).filter(|w| w.principal == *principal).map(|w| w.restarts);
+            let Some(restarts) = mine else {
                 return reply.error(&format!("no debugger {id} is waiting"), &["no-debugger"]);
             };
             let cmd = if op == "techne-debug-abort" {
@@ -1370,7 +1412,13 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             reply.status(&["techne-debug-subscribed"]);
         }
         "techne-debug-inspect" => match msg.get("debug-id").and_then(B::as_int) {
-            Some(id) if id >= 0 => shared.post(Job::Inspect { action: Inspect::Condition(id as u64), reply }),
+            Some(id) if id >= 0 => {
+                let mine = shared.debuggers.lock().unwrap().waiting.get(&(id as u64)).is_some_and(|w| w.principal == *principal);
+                match mine {
+                    true => shared.post(Job::Inspect { action: Inspect::Condition(id as u64), reply }),
+                    false => reply.error(&format!("no debugger {id} is waiting"), &["no-debugger"]),
+                }
+            }
             _ => reply.error("techne-debug-inspect needs a debug-id", &[]),
         },
         _ => reply.status(&["error", "unknown-op", "done"]),
@@ -1380,7 +1428,7 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
 /// The number of the next client connected, whichever way.
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
-async fn connection(stream: impl AsyncRead + AsyncWrite + Send + 'static, shared: Arc<Shared>, conn: u64) {
+async fn connection(stream: impl AsyncRead + AsyncWrite + Send + 'static, shared: Arc<Shared>, conn: u64, principal: Option<String>) {
     let (mut r, mut w) = tokio::io::split(stream);
     let (out, mut rx) = mpsc::unbounded_channel::<B>();
     let writer = tokio::spawn(async move {
@@ -1397,10 +1445,13 @@ async fn connection(stream: impl AsyncRead + AsyncWrite + Send + 'static, shared
     'read: loop {
         loop {
             match parse(&buf) {
+                Ok(Some((_, used))) if used > MESSAGE => break 'read,
                 Ok(Some((msg, used))) => {
                     buf.drain(..used);
-                    dispatch(&shared, &msg, &out, conn);
+                    dispatch(&shared, &msg, &out, conn, &principal);
                 }
+                // As much as a message may be, and not one yet.
+                Ok(None) if buf.len() >= MESSAGE => break 'read,
                 Ok(None) => break,
                 Err(_) => break 'read,
             }
@@ -1429,10 +1480,15 @@ async fn connection(stream: impl AsyncRead + AsyncWrite + Send + 'static, shared
 /// a world of its own on a thread of its own. Calls `ready` with the bound
 /// address, then serves until the process exits.
 pub fn serve(addr: &str, ready: impl FnOnce(std::net::SocketAddr)) -> std::io::Result<()> {
+    start()?.serve(addr, ready)
+}
+
+/// A server with a world of its own on a thread of its own, as `serve`
+/// has, serving no one yet: what serves clients on it.
+pub fn start() -> std::io::Result<Remote> {
     let (remote_tx, remote_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new().name("techne-nrepl-vm".into()).spawn(move || vm_thread(remote_tx))?;
-    let remote = remote_rx.recv().map_err(|_| std::io::Error::other("the VM did not start"))?;
-    remote.serve(addr, ready)
+    remote_rx.recv().map_err(|_| std::io::Error::other("the VM did not start"))
 }
 
 #[cfg(test)]

@@ -206,7 +206,8 @@ Each is answered before the next is taken; one that fails is answered
 with why."
   (let loop ()
     (let* ((asked (%store-next))
-           (id (car asked)))
+           (id (car asked))
+           (what (cadr asked)))
       (guard (e (#t (%store-reply id #f (if (error-object? e) (condition/report-string e) "the store failed"))))
-        (%store-reply id #t (kv-store-handle store (cadr asked) (caddr asked))))
+        (%store-reply id #t (kv-store-handle store (car what) (cadr what))))
       (loop))))
