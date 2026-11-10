@@ -475,47 +475,46 @@ fn lisp_files(dir: &Path) -> Vec<(PathBuf, Option<u64>)> {
 }
 
 /// What a worker of `techne cloud dev --nrepl` does for development: each
-/// deployment served from a dev world (`Host::publish_dev`) with an nREPL
-/// server in it, which moves to the next dev world on a deployment anew;
-/// clients relayed by the supervisor. With `debug`, each deployment is
-/// served as in production instead, and the server is in its debug
-/// instance (`Host::attach_debug`).
+/// deployment loaded has a dev world (`Host::publish_dev`), and the nREPL
+/// server is in the world of the one published (`activate`), to which it
+/// moves from the one before, its clients staying connected; they are
+/// relayed by the supervisor. With `debug`, each deployment is served as
+/// in production instead, and the server is in the debug instance
+/// (`Host::attach_debug`) of the one published.
 #[derive(Default)]
 pub struct DevWorker {
-    /// The server, in the dev world (or debug instance) of the deployment
-    /// it is numbered with.
-    slot: Rc<RefCell<Option<(u64, Server)>>>,
-    /// How many deployments were published.
+    repl: Rc<RefCell<Repl>>,
+    /// How many deployments were loaded, and the number of each still
+    /// served, by its name.
     deployed: u64,
+    names: std::collections::HashMap<String, u64>,
     debug: bool,
 }
+
+/// The nREPL server of a worker, and where it is and is to be.
+#[derive(Default)]
+struct Repl {
+    /// The server, in the world of the deployment it is numbered with.
+    server: Option<(u64, Server)>,
+    /// The number of the deployment published, whose world is the
+    /// server's: it moves there when that world is next driven.
+    active: u64,
+    /// Clients that connected while the server was in no world yet.
+    waiting: Vec<(tokio::io::DuplexStream, Option<String>)>,
+}
+
+/// Clients that may wait for the server to be in a world.
+const WAITING: usize = 16;
 
 impl techne_host::worker::Dev for DevWorker {
     fn publish(&mut self, host: &Host, name: &str, entry: &Path, deployment: Deployment) -> Result<(), Error> {
         self.deployed += 1;
-        let (generation, slot, waker) = (self.deployed, self.slot.clone(), host.waker());
-        let entry = entry.display().to_string();
-        let attach = move |vm: &mut Vm| -> Result<Box<dyn Attached>, Error> {
-            let taken = slot.borrow_mut().take();
-            let server = match taken {
-                Some((before, server)) => match server.replace(vm, "the deployment was deployed again") {
-                    Ok(server) => server,
-                    // Kept in the world before, still the deployment's.
-                    Err((server, e)) => {
-                        *slot.borrow_mut() = Some((before, server));
-                        return Err(e);
-                    }
-                },
-                None => Server::install(vm, waker)?,
-            };
-            if let Some(module) = vm.loaded_module(&entry) {
-                server.set_module(module);
-            }
-            // A failing request breaks into the subscribed client's debugger.
-            vm.eval_in(ROOT_MODULE, "<techne cloud>", "(set! %host-debugger %nrepl-debug-request)")?;
-            *slot.borrow_mut() = Some((generation, server));
-            Ok(Box::new(DevRepl { slot, generation }))
-        };
+        self.names.insert(name.into(), self.deployed);
+        let waker: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(host.waker());
+        let world = DevRepl { repl: self.repl.clone(), generation: self.deployed, entry: entry.display().to_string(), waker };
+        // The server stays where it is: a deployment loaded is not yet
+        // the one served.
+        let attach = move |_: &mut Vm| -> Result<Box<dyn Attached>, Error> { Ok(Box::new(world)) };
         if self.debug {
             // Served by its instances whether or not a REPL reaches it.
             host.publish(name, deployment);
@@ -525,30 +524,90 @@ impl techne_host::worker::Dev for DevWorker {
         }
     }
 
+    fn activate(&mut self, host: &Host, name: &str) {
+        if let Some(generation) = self.names.get(name) {
+            self.repl.borrow_mut().active = *generation;
+            // Its world is driven, and the server moves.
+            (host.waker())();
+        }
+    }
+
+    fn retire(&mut self, name: &str) {
+        self.names.remove(name);
+    }
+
     fn connect(&mut self, stream: tokio::io::DuplexStream, principal: Option<String>) {
-        if let Some((_, server)) = &*self.slot.borrow() {
-            server.remote().serve_stream_as(stream, principal);
+        let mut repl = self.repl.borrow_mut();
+        match &repl.server {
+            Some((_, server)) => server.remote().serve_stream_as(stream, principal),
+            None if repl.waiting.len() < WAITING => repl.waiting.push((stream, principal)),
+            None => {}
         }
     }
 }
 
-/// The nREPL server as attached to one dev world: it runs there only
-/// while that world is the deployment's, before it moves to the next.
+/// The nREPL server as attached to one deployment's dev world (or debug
+/// instance): it runs there while that deployment is the one published,
+/// and is moved there, when the world is driven, once it is.
 struct DevRepl {
-    slot: Rc<RefCell<Option<(u64, Server)>>>,
+    repl: Rc<RefCell<Repl>>,
     generation: u64,
+    /// The deployment's entry module, which sessions evaluate in.
+    entry: String,
+    waker: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+impl DevRepl {
+    /// Move the server to `vm`, this deployment's world, from where it
+    /// is, or start it there: clients stay connected, and those that
+    /// waited for it are served.
+    fn take_server(&self, repl: &mut Repl, vm: &mut Vm) {
+        let waker = self.waker.clone();
+        let moved = match repl.server.take() {
+            Some((before, server)) => server.replace(vm, "another deployment was published").map_err(|(server, e)| {
+                // Kept in the world before.
+                repl.server = Some((before, server));
+                e
+            }),
+            None => Server::install(vm, move || waker()),
+        };
+        let server = match moved {
+            Ok(server) => server,
+            Err(e) => {
+                eprintln!("techne cloud: the REPL is not in the deployment published: {}", e.msg);
+                // Not tried at each turn.
+                repl.active = repl.server.as_ref().map_or(0, |(g, _)| *g);
+                return;
+            }
+        };
+        if let Some(module) = vm.loaded_module(&self.entry) {
+            server.set_module(module);
+        }
+        // A failing request breaks into the subscribed client's debugger.
+        if let Err(e) = vm.eval_in(ROOT_MODULE, "<techne cloud>", "(set! %host-debugger %nrepl-debug-request)") {
+            eprintln!("techne cloud: requests do not break into the debugger: {}", e.msg);
+        }
+        for (stream, principal) in repl.waiting.drain(..) {
+            server.remote().serve_stream_as(stream, principal);
+        }
+        repl.server = Some((self.generation, server));
+    }
 }
 
 impl Attached for DevRepl {
     fn poll(&mut self, vm: &mut Vm) -> bool {
-        match &*self.slot.borrow() {
+        let mut repl = self.repl.borrow_mut();
+        if repl.active == self.generation && repl.server.as_ref().is_none_or(|(g, _)| *g != self.generation) {
+            self.take_server(&mut repl, vm);
+        }
+        match &repl.server {
             Some((g, server)) if *g == self.generation => server.poll(vm),
             _ => false,
         }
     }
 
     fn reap(&mut self, vm: &mut Vm) {
-        if let Some((g, server)) = &*self.slot.borrow()
+        if let Some((g, server)) = &self.repl.borrow().server
             && *g == self.generation
         {
             server.reap(vm);

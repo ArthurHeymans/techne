@@ -334,6 +334,10 @@ struct State {
     running: Vec<Running>,
     next_id: u64,
     next_debug: u64,
+    /// The generation of the next publication: none is another's, under
+    /// any name, so that an instance is kept only for the publication it
+    /// was started from.
+    next_generation: u64,
     broker: Option<outbound::Broker>,
     on_failure: Box<dyn FnMut(&Failure)>,
     on_output: Box<dyn FnMut(&Printed)>,
@@ -362,6 +366,7 @@ impl Host {
                 running: Vec::new(),
                 next_id: 0,
                 next_debug: 0,
+                next_generation: 0,
                 broker: None,
                 on_failure: Box::new(|f| eprintln!("techne-host: {} #{}: {} {}", f.deployment, f.request, f.status, f.message)),
                 on_output: Box::new(|p| {
@@ -398,12 +403,22 @@ impl Host {
     /// on the one they started on, whose instances are then dropped.
     pub fn publish(&self, name: &str, deployment: Deployment) {
         let mut s = self.state.borrow_mut();
-        let generation = s.published.get(name).map_or(0, |p| p.generation + 1);
+        let generation = s.generation();
         // The debug instance of the one before goes with it.
         s.retire_debug(name);
         s.published.insert(name.to_string(), Published { deployment, generation, idle: Vec::new(), dev: false, debug: None });
         drop(s);
         self.wake.notify_one();
+    }
+
+    /// Serve nothing under `name` any more: requests being served finish
+    /// on the deployment that was published under it, whose instances,
+    /// and debug instance, are then dropped; those asked from now on are
+    /// answered 404. Whether one was published.
+    pub fn unpublish(&self, name: &str) -> bool {
+        let mut s = self.state.borrow_mut();
+        s.retire_debug(name);
+        s.published.remove(name).is_some()
     }
 
     /// Give the deployment published under `name` a debug instance, in
@@ -474,7 +489,7 @@ impl Host {
     ) -> Result<(), Error> {
         deployment.limits.concurrency = 1;
         let mut s = self.state.borrow_mut();
-        let generation = s.published.get(name).map_or(0, |p| p.generation + 1);
+        let generation = s.generation();
         let mut world = new_instance(&deployment, generation, &self.wake)?;
         world.serve = Some(install_dev(&mut world.vm)?);
         world.attached = Some(attach(&mut world.vm)?);
@@ -893,10 +908,21 @@ impl State {
             None => {
                 if let Some(n) = self.busy.get_mut(deployment) {
                     *n = n.saturating_sub(1);
+                    // Names come and go with deployments: none is kept
+                    // for a count of none.
+                    if *n == 0 {
+                        self.busy.remove(deployment);
+                    }
                 }
             }
         }
         self.keep(deployment, instance);
+    }
+
+    /// A generation for a publication: its own.
+    fn generation(&mut self) -> u64 {
+        self.next_generation += 1;
+        self.next_generation
     }
 
     /// Keep `instance` for `deployment`'s next request, if it is still of

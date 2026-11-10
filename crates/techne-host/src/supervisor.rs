@@ -17,8 +17,23 @@
 //! read it is killed too. A worker that ends, killed or for
 //! a native that held its thread past a kill (`worker::STUCK`) or past its
 //! cgroup's memory, has its requests answered for, with 500, reported;
-//! another is started, at most a few a minute, and given the last
-//! deployment it acknowledged. Requests are not run again.
+//! another is started, at most a few a minute, and given the
+//! deployments published. Requests are not run again.
+//!
+//! A deployment is what it is made of: its id is a hash of its name,
+//! entry, files and bindings, and the worker serves it under its name and
+//! id, beside the others of its name. Which of them a name's requests go
+//! to is the supervisor's route for the name. So deploying is two steps:
+//! [`Supervisor::prepare`] has the worker load a deployment, which
+//! changes nothing of what is served, and fails alone;
+//! [`Supervisor::publish`] points the name at one prepared, at once, and
+//! only if it still points where the publisher saw it, when it says
+//! where (a late or repeated publish does not undo a newer one). A
+//! request is pinned when it is sent to the deployment its name was
+//! routed to then: it is served by that code, with those bindings,
+//! whatever is published after. A deployment no longer routed to is
+//! retired from the worker once its requests are done. Rolling back is
+//! publishing an earlier one, prepared again if it was retired.
 //!
 //! What a worker's requests fetch is fetched here ([`crate::egress`]),
 //! within the policy given (`Options::egress`): for a request the
@@ -269,14 +284,69 @@ impl Drop for Repl {
     }
 }
 
-/// What a deployment's worker is given: its name, entry, and files, and
-/// its bindings, of which the worker is given the `env`.
+/// What a deployment's worker is given: its name and id, entry, and
+/// files, and its bindings, of which the worker is given the `env`.
 #[derive(Clone)]
 struct Bundle {
     name: String,
+    id: String,
     entry: String,
     files: Vec<(String, Vec<u8>)>,
     bindings: Bindings,
+}
+
+impl Bundle {
+    /// The name the worker serves it under.
+    fn served(&self) -> String {
+        served(&self.name, &self.id)
+    }
+}
+
+/// The name a worker serves deployment `id` of `name` under.
+fn served(name: &str, id: &str) -> String {
+    format!("{name}@{id}")
+}
+
+/// The id of a deployment: a hash of all it is.
+fn deployment_id(name: &str, entry: &str, files: &[(String, Vec<u8>)], bindings: &Bindings) -> String {
+    use sha2::Digest;
+    let mut stores: Vec<_> = bindings.stores.iter().collect();
+    stores.sort();
+    let all = Data::List(vec![
+        Data::String(name.into()),
+        Data::String(entry.into()),
+        Data::List(files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
+        bindings.env.clone(),
+        Data::List(stores.into_iter().map(|(b, n)| Data::List(vec![Data::String(b.clone()), Data::String(n.clone())])).collect()),
+    ]);
+    // The whole digest: an id is what tells two deployments apart.
+    sha2::Sha256::digest(encode(&all)).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A deployment the worker has loaded.
+struct Ready {
+    bundle: Bundle,
+    /// Whether its name was ever routed to it: one that was and is no
+    /// longer is retired once its requests are done.
+    published: bool,
+    since: Instant,
+    /// Whether the worker there is now has it: not one given it again
+    /// after the worker before ended, until it says so.
+    loaded: bool,
+}
+
+/// How long a deployment prepared and never published is kept, and how
+/// many of a name's are.
+const UNPUBLISHED: Duration = Duration::from_secs(300);
+const UNPUBLISHED_EACH: usize = 4;
+
+/// What preparing a deployment gave ([`Supervisor::prepare`]).
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    /// The deployment's id, to publish it by.
+    pub id: String,
+    /// What loading it wrote; nothing for one that was loaded already.
+    pub output: String,
 }
 
 /// A request the worker serves: who waits for its response, until it is
@@ -287,6 +357,8 @@ struct Bundle {
 /// deadline.
 struct Pending {
     name: String,
+    /// The deployment it was sent for, as the worker serves it.
+    served: String,
     reply: Option<oneshot::Sender<Response>>,
     deadline: Instant,
     body: Option<mpsc::Sender<Piece>>,
@@ -340,10 +412,16 @@ struct State {
     pending: HashMap<u64, Pending>,
     next_deploy: u64,
     deploys: HashMap<u64, (Bundle, oneshot::Sender<Result<String, String>>)>,
-    /// The last deployment a worker acknowledged, given to the next.
-    last: Option<Bundle>,
-    /// The KV namespaces of the deployments acknowledged, by deployment
-    /// and binding.
+    /// The deployments the worker has loaded, by the names it serves
+    /// them under.
+    ready: HashMap<String, Ready>,
+    /// Who else waits for a deployment being loaded, by the name it is
+    /// served under.
+    joining: HashMap<String, Vec<oneshot::Sender<Result<String, String>>>>,
+    /// The id of the deployment each name's requests go to.
+    routes: HashMap<String, String>,
+    /// The KV namespaces of the deployments loaded, by the names they are
+    /// served under, and binding.
     stores: HashMap<String, Rc<HashMap<String, String>>>,
     /// What keeps them, once installed: as many asks wait there as may
     /// be made at once.
@@ -361,6 +439,31 @@ struct State {
 }
 
 impl State {
+    /// Keep a few of `name`'s deployments prepared and not published at
+    /// most, `kept`, just loaded, among them: the oldest others go. Done
+    /// once a new one has loaded, so that one that does not load costs
+    /// none of those there.
+    fn evict_unpublished(&mut self, name: &str, kept: &str) {
+        loop {
+            let mut waiting: Vec<(Instant, String)> = self
+                .ready
+                .iter()
+                .filter(|(_, r)| r.bundle.name == name && !r.published)
+                .map(|(served, r)| (r.since, served.clone()))
+                .collect();
+            if waiting.len() <= UNPUBLISHED_EACH {
+                return;
+            }
+            waiting.sort();
+            let Some((_, oldest)) = waiting.into_iter().find(|(_, served)| served != kept) else { return };
+            self.ready.remove(&oldest);
+            self.stores.remove(&oldest);
+            if let Some(w) = &self.worker {
+                let _ = w.send.send(ToWorker::Retire { name: oldest });
+            }
+        }
+    }
+
     /// The store, the namespace the binding `request` names stood for in
     /// the deployment request `rid` was sent for, when it was sent, the
     /// operation as the store takes it and whether it is a `get`: or why
@@ -415,7 +518,9 @@ impl Supervisor {
                 pending: HashMap::new(),
                 next_deploy: 0,
                 deploys: HashMap::new(),
-                last: None,
+                ready: HashMap::new(),
+                joining: HashMap::new(),
+                routes: HashMap::new(),
                 stores: HashMap::new(),
                 store: None,
                 sandbox,
@@ -667,11 +772,19 @@ impl Supervisor {
             },
             FromWorker::Deployed { id, error, output } => match s.deploys.remove(&id) {
                 Some((bundle, reply)) => {
-                    if error.is_none() {
-                        s.stores.insert(bundle.name.clone(), Rc::new(bundle.bindings.stores.clone()));
-                        s.last = Some(bundle);
+                    let served = bundle.served();
+                    let result = error.map_or(Ok(output), Err);
+                    if result.is_ok() {
+                        s.stores.insert(served.clone(), Rc::new(bundle.bindings.stores.clone()));
+                        let published = s.routes.get(&bundle.name) == Some(&bundle.id) || s.ready.get(&served).is_some_and(|r| r.published);
+                        let name = bundle.name.clone();
+                        s.ready.insert(served.clone(), Ready { bundle, published, since: Instant::now(), loaded: true });
+                        s.evict_unpublished(&name, &served);
                     }
-                    let _ = reply.send(error.map_or(Ok(output), Err));
+                    for waiter in s.joining.remove(&served).unwrap_or_default() {
+                        let _ = waiter.send(result.clone());
+                    }
+                    let _ = reply.send(result);
                     None
                 }
                 None => Some(format!("a deployment it was not given ({id})")),
@@ -787,8 +900,18 @@ impl Supervisor {
                     libc::syscall(libc::SYS_pidfd_send_signal, w.pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0);
                 },
             }
-            // Its REPL connections end with it.
+            // Its REPL connections end with it, and what it had loaded:
+            // the next is given what is published.
             s.repls.clear();
+            let State { ready, routes, stores, .. } = &mut *s;
+            ready.retain(|_, r| routes.get(&r.bundle.name) == Some(&r.bundle.id));
+            ready.values_mut().for_each(|r| r.loaded = false);
+            stores.retain(|served, _| ready.contains_key(served));
+            for (_, waiters) in s.joining.drain() {
+                for waiter in waiters {
+                    let _ = waiter.send(Err(why.into()));
+                }
+            }
             (std::mem::take(&mut s.pending), std::mem::take(&mut s.deploys))
         };
         // Their responses' bodies streaming are cut short.
@@ -806,7 +929,8 @@ impl Supervisor {
     }
 
     /// Start another worker, if not too many were this minute, and give
-    /// it the last deployment acknowledged.
+    /// it the deployments published: until it has loaded one, that one's
+    /// requests are refused.
     async fn restart(&self) {
         let wait = {
             let mut s = self.state.borrow_mut();
@@ -827,13 +951,41 @@ impl Supervisor {
             eprintln!("techne cloud: no worker: {e}");
             return;
         }
-        let last = self.state.borrow().last.clone();
-        if let Some(b) = last {
+        let published: Vec<Bundle> = self.state.borrow().ready.values().map(|r| r.bundle.clone()).collect();
+        for b in published {
+            let (name, served) = (b.name.clone(), b.served());
             match self.send_deploy(b).await {
-                Ok(_) => eprintln!("techne cloud: a new worker serves the deployment"),
-                Err(e) => eprintln!("techne cloud: the new worker did not load the deployment: {e}"),
+                Ok(_) => {
+                    if let Some(w) = &self.state.borrow().worker {
+                        let _ = w.send.send(ToWorker::Activate { name: served });
+                    }
+                    eprintln!("techne cloud: a new worker serves {name}")
+                }
+                Err(e) => eprintln!("techne cloud: the new worker did not load {name}: {e}"),
             }
         }
+    }
+
+    /// Have the worker serve no more the deployments its names are no
+    /// longer routed to, once their requests are done, and those
+    /// prepared long ago and never published.
+    fn retire(&self) {
+        let mut s = self.state.borrow_mut();
+        let State { ready, routes, pending, deploys, stores, worker, .. } = &mut *s;
+        let now = Instant::now();
+        ready.retain(|served, r| {
+            let routed = routes.get(&r.bundle.name) == Some(&r.bundle.id);
+            let waited = r.published || now.duration_since(r.since) > UNPUBLISHED;
+            let busy = pending.values().any(|p| &p.served == served) || deploys.values().any(|(b, _)| &b.served() == served);
+            if routed || !waited || busy {
+                return true;
+            }
+            stores.remove(served);
+            if let Some(w) = worker {
+                let _ = w.send.send(ToWorker::Retire { name: served.clone() });
+            }
+            false
+        });
     }
 
     /// Answer `reply` for deployment `name` with `status`, and report it.
@@ -853,6 +1005,7 @@ impl Supervisor {
     /// abandoned; for ever.
     async fn watch(self) {
         loop {
+            self.retire();
             let now = Instant::now();
             let (abandoned, cut): (Vec<u64>, Vec<u64>) = {
                 let s = self.state.borrow();
@@ -917,12 +1070,24 @@ impl Supervisor {
             self.answer(tx, name, 503, "no worker");
             return rx;
         };
+        // Pinned here to the deployment the name is routed to now.
+        let Some(served) = s.routes.get(name).map(|id| served(name, id)) else {
+            drop(s);
+            self.answer(tx, name, 404, "no such deployment");
+            return rx;
+        };
+        // A worker started anew has yet to load it.
+        if !s.ready.get(&served).is_some_and(|r| r.loaded) {
+            drop(s);
+            self.answer(tx, name, 503, "the deployment is being loaded");
+            return rx;
+        }
         s.next_rid += 1;
         let rid = s.next_rid;
         let pause = if debug { crate::DEBUG_PAUSE } else { Duration::ZERO };
         let deadline = Instant::now() + self.options.wall + pause + GRACE;
         let credits = body.as_ref().map(|_| Rc::new(Semaphore::new(WINDOW)));
-        let _ = send.send(ToWorker::Request { rid, name: name.into(), request, streams: body.is_some(), debug });
+        let _ = send.send(ToWorker::Request { rid, name: served.clone(), request, streams: body.is_some(), debug });
         let pump = body.zip(credits.clone()).map(|(reader, credits)| {
             let send = send.clone();
             let pumping = tokio::task::spawn_local(body::pump(reader, credits, move |piece| {
@@ -934,9 +1099,10 @@ impl Supervisor {
             }));
             pumping.abort_handle()
         });
-        let stores = s.stores.get(name).cloned().unwrap_or_default();
+        let stores = s.stores.get(&served).cloned().unwrap_or_default();
         let pending = Pending {
             name: name.into(),
+            served,
             reply: Some(tx),
             deadline,
             body: None,
@@ -954,21 +1120,110 @@ impl Supervisor {
     }
 
     /// Have the worker serve the deployment whose entry module is `entry`
-    /// as `name`, its files those under the entry's directory (but in
-    /// hidden directories, `target` and `node_modules`): what loading it
-    /// wrote, or why it was not.
+    /// as `name`, its files those under the entry's directory (but hidden
+    /// ones, and in hidden directories, `target` and `node_modules`):
+    /// prepared, then published whatever the name was routed to. What
+    /// loading it wrote, or why it was not.
     pub async fn deploy(&self, name: &str, entry: &Path) -> Result<String, String> {
         self.deploy_with(name, entry, Bindings::default()).await
     }
 
-    /// [`Supervisor::deploy`], the deployment given `bindings`: once the
-    /// worker serves it, its requests reach the namespaces these name,
-    /// in place of those of the deployment before.
+    /// [`Supervisor::deploy`], the deployment given `bindings`: once
+    /// published, the name's requests reach the namespaces these name.
     pub async fn deploy_with(&self, name: &str, entry: &Path, bindings: Bindings) -> Result<String, String> {
+        let prepared = self.prepare(name, entry, bindings).await?;
+        self.publish(name, &prepared.id, None)?;
+        Ok(prepared.output)
+    }
+
+    /// Have the worker load the deployment whose entry module is `entry`,
+    /// for `name`, with `bindings`, its files those under the entry's
+    /// directory as [`Supervisor::deploy`] takes them: its id, by which
+    /// to publish it. Nothing served changes; one that does not load is
+    /// an error and no more. The same deployment prepared again is the
+    /// one there is.
+    pub async fn prepare(&self, name: &str, entry: &Path, bindings: Bindings) -> Result<Prepared, String> {
         let dir = entry.parent().ok_or("an entry in no directory")?;
         let files = bundle(dir)?;
         let entry = entry.strip_prefix(dir).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
-        self.send_deploy(Bundle { name: name.into(), entry, files, bindings }).await
+        self.prepare_files(name, &entry, files, bindings).await
+    }
+
+    /// [`Supervisor::prepare`], of `files` given, by their paths, `entry`
+    /// among them.
+    pub async fn prepare_files(
+        &self,
+        name: &str,
+        entry: &str,
+        files: Vec<(String, Vec<u8>)>,
+        bindings: Bindings,
+    ) -> Result<Prepared, String> {
+        if name.is_empty() || name.contains('@') {
+            return Err(format!("{name}: not a deployment's name"));
+        }
+        let id = deployment_id(name, entry, &files, &bindings);
+        let key = served(name, &id);
+        let joined = {
+            let mut s = self.state.borrow_mut();
+            if s.ready.get(&key).is_some_and(|r| r.loaded) {
+                return Ok(Prepared { id, output: String::new() });
+            }
+            // Being loaded already: that loading is this one's too.
+            if s.deploys.values().any(|(b, _)| b.served() == key) {
+                let (tx, rx) = oneshot::channel();
+                s.joining.entry(key).or_default().push(tx);
+                Some(rx)
+            } else if s.deploys.values().filter(|(b, _)| b.name == name).count() >= UNPUBLISHED_EACH {
+                return Err(format!("too many deployments of {name} are being prepared"));
+            } else {
+                None
+            }
+        };
+        let output = match joined {
+            Some(loading) => loading.await.map_err(|_| "the worker is gone".to_string())?,
+            None => self.send_deploy(Bundle { name: name.into(), id: id.clone(), entry: entry.into(), files, bindings }).await,
+        };
+        output.map(|output| Prepared { id, output })
+    }
+
+    /// Route `name`'s requests to its deployment `id`, prepared, from now
+    /// on: those sent already finish where they were sent. With
+    /// `expected`, only if the name is routed there now (to that id, or
+    /// nowhere): else an error, and nothing changes. The id it was routed
+    /// to before.
+    pub fn publish(&self, name: &str, id: &str, expected: Option<Option<&str>>) -> Result<Option<String>, String> {
+        let mut s = self.state.borrow_mut();
+        let now = s.routes.get(name).cloned();
+        if let Some(expected) = expected
+            && now.as_deref() != expected
+        {
+            return Err(format!("{name} is at {}, not {}", now.as_deref().unwrap_or("nothing"), expected.unwrap_or("nothing")));
+        }
+        let served = served(name, id);
+        let Some(ready) = s.ready.get_mut(&served).filter(|r| r.loaded) else {
+            return Err(format!("{name} has no deployment {id} prepared"));
+        };
+        ready.published = true;
+        s.routes.insert(name.into(), id.into());
+        if let Some(w) = &s.worker {
+            let _ = w.send.send(ToWorker::Activate { name: served });
+        }
+        drop(s);
+        self.changed.notify_one();
+        Ok(now)
+    }
+
+    /// The id of the deployment `name`'s requests go to.
+    pub fn route(&self, name: &str) -> Option<String> {
+        self.state.borrow().routes.get(name).cloned()
+    }
+
+    /// The ids of `name`'s deployments the worker has loaded, in order.
+    pub fn prepared(&self, name: &str) -> Vec<String> {
+        let mut ids: Vec<String> =
+            self.state.borrow().ready.values().filter(|r| r.bundle.name == name).map(|r| r.bundle.id.clone()).collect();
+        ids.sort();
+        ids
     }
 
     /// Have a task of `front` keep what requests keep in their KV
@@ -1003,7 +1258,7 @@ impl Supervisor {
             let id = s.next_deploy;
             let message = ToWorker::Deploy {
                 id,
-                name: bundle.name.clone(),
+                name: bundle.served(),
                 entry: bundle.entry.clone(),
                 files: bundle.files.clone(),
                 wall_ms: self.options.wall.as_millis() as u64,

@@ -122,11 +122,8 @@ provides its handler:
   the request was sent for, so a handle of a world's own making reaches
   nothing. Loading sees no `env`, and hidden files are no part of a
   bundle: a snapshot holds no secret, and a worker only those bound. A
-  request keeps the bindings of the deployment that was acknowledged
-  when it was sent, whatever is deployed after. (One sent while a
-  deployment is being acknowledged may be served by the new code with
-  the bindings of the one before: requests are not yet pinned to a
-  deployment by the supervisor.)
+  request keeps the bindings of the deployment it was sent for, as it
+  keeps its code, whatever is published after ("Deploying").
 - `ctx`: the request's id, its deadline, and `wait-until` (below).
 - Concurrency inside an instance is techne's tasks. A request runs as a
   task; waits on fetch, KV and timers suspend only it. Every task a request
@@ -244,6 +241,21 @@ A deployment goes through these states, each recorded:
    admission to one deployment and its bindings.
 5. **Draining**, for the previous one: its instances finish their requests
    (up to the wall limit) and are dropped.
+
+Of these, the supervisor has the mechanism today
+(`crates/techne-host/src/supervisor.rs`): a deployment's id is a hash of
+its name, entry, files and bindings, so the same one deployed twice is
+one; `Supervisor::prepare` has the worker load it, beside those it
+serves, which changes nothing served and fails alone (Built and Ready,
+with one worker); `Supervisor::publish` routes the name to it, at once,
+and only if the name is still routed where the publisher saw it; a
+request is pinned to the deployment its name was routed to when it was
+sent, code and bindings both; a deployment no longer routed to is
+retired from the worker once its requests are done (Draining), and its
+files with it. Not yet: a record of deployments that outlives the
+supervisor, bundles kept by hash to roll back to, and the `deploy`,
+`deployments` and `rollback` operations over them; `techne cloud dev`
+prepares and publishes at each save.
 
 Rollback publishes an earlier deployment that is still Ready or can be
 again. **It rolls back code only**: storage, schema changes and external

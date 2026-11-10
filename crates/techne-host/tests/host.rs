@@ -710,6 +710,34 @@ fn a_request_uses_its_bindings_through_the_broker() {
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"0\")"]);
 }
 
+/// A name unpublished and published again is another publication: an
+/// instance of the one before, done with its request after, is not kept
+/// for the new one's.
+#[test]
+fn an_instance_is_not_kept_for_another_publication_of_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, _) = host_with_failures();
+    host.publish("app", deployment(dir.path(), "app", APP, Limits::default()).unwrap());
+    let other = deployment(dir.path(), "other", "(provide fetch)\n(define (fetch r e c) \"other\")", Limits::default()).unwrap();
+    let mut front = asking(&host, &[("app", "/slow", false)]);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let publishing = host.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(publishing.unpublish("app"));
+            assert!(!publishing.unpublish("app"));
+            publishing.publish("app", other);
+        });
+        host.run(Some(&mut front)).await.unwrap();
+    });
+    // Finished on the one it started on.
+    assert_eq!(answers(&mut front), ["(200 \"1\")"]);
+    let mut host = host;
+    assert_eq!(ask(&mut host, &[("app", "/"), ("app", "/")]), ["(200 \"other\")", "(200 \"other\")"]);
+}
+
 #[test]
 fn bodies_stream() {
     let dir = tempfile::tempdir().unwrap();

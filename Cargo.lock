@@ -3990,6 +3990,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rustls",
+ "sha2",
  "techne-net",
  "techne-sandbox",
  "techne-vm",

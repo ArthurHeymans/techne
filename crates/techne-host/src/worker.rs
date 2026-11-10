@@ -63,6 +63,11 @@ pub trait Dev {
     /// (`Host::publish_dev`), or served as in production with a debug
     /// instance (`Host::attach_debug`).
     fn publish(&mut self, host: &Host, name: &str, entry: &Path, deployment: Deployment) -> Result<(), techne_vm::vm::Error>;
+    /// The deployment published as `name` is the one its requests go to
+    /// from now on: its world is the REPL's.
+    fn activate(&mut self, _host: &Host, _name: &str) {}
+    /// The deployment published as `name` is served no more.
+    fn retire(&mut self, _name: &str) {}
     /// Serve a REPL client on `stream`, which the supervisor relays,
     /// authenticated as `principal` if as anyone.
     fn connect(&mut self, stream: tokio::io::DuplexStream, principal: Option<String>);
@@ -169,18 +174,35 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
     });
     let _ = tx.send(FromWorker::Ready);
     let running = Rc::new(std::cell::RefCell::new(HashMap::<u64, Serving>::new()));
+    // Where each deployment's files are, by the name it is published as.
+    let unpacked = Rc::new(std::cell::RefCell::new(HashMap::<String, PathBuf>::new()));
     let driver = host.clone();
     let host_task = tokio::task::spawn_local(async move { driver.run(None).await });
     while let Some(d) = read_frame(&mut read).await? {
         match ToWorker::from_data(d)? {
             ToWorker::Deploy { id, name, entry, files, wall_ms, dev: for_dev, env } => {
-                let (host, tx, dev) = (host.clone(), tx.clone(), dev.clone());
+                let (host, tx, dev, unpacked) = (host.clone(), tx.clone(), dev.clone(), unpacked.clone());
                 tokio::task::spawn_local(async move {
                     let limits = Limits { wall: Duration::from_millis(wall_ms), ..Limits::default() };
-                    let loaded = match unpack(id, &entry, &files) {
+                    // A directory of this worker's own, where it is not
+                    // sandboxed too, and of this deployment's.
+                    let root = std::env::temp_dir().join(format!("bundles-{}", std::process::id())).join(id.to_string());
+                    let ours = !root.exists();
+                    let loaded = match unpack(&root, &entry, &files) {
                         Ok(entry) => Deployment::load_async(&entry, limits).await.map(|d| (entry, d.with_env(env))),
                         Err(e) => Err(techne_vm::vm::Error::new(e)),
                     };
+                    // One not loaded leaves no files (those it wrote: not
+                    // what was there before it); one replaced under its
+                    // name, those of the one before.
+                    let before = match &loaded {
+                        Ok(_) => unpacked.borrow_mut().insert(name.clone(), root),
+                        Err(_) if ours => Some(root),
+                        Err(_) => None,
+                    };
+                    if let Some(before) = before {
+                        let _ = std::fs::remove_dir_all(before);
+                    }
                     let published = loaded.and_then(|(entry, d)| {
                         let output = d.output().text.clone();
                         match &mut *dev.borrow_mut() {
@@ -196,6 +218,20 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     };
                     let _ = tx.send(message);
                 });
+            }
+            ToWorker::Activate { name } => {
+                if let Some(dev) = &mut *dev.borrow_mut() {
+                    dev.activate(&host, &name);
+                }
+            }
+            ToWorker::Retire { name } => {
+                host.unpublish(&name);
+                if let Some(dev) = &mut *dev.borrow_mut() {
+                    dev.retire(&name);
+                }
+                if let Some(root) = unpacked.borrow_mut().remove(&name) {
+                    let _ = std::fs::remove_dir_all(root);
+                }
             }
             ToWorker::Request { rid, name, request, streams, debug } => {
                 // Its body written to the host as it arrives, each chunk
@@ -317,20 +353,19 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
     Ok(())
 }
 
-/// Write deployment `id`'s files to a directory of their own in the
+/// Write a deployment's files to `root`, a directory of their own in the
 /// tmpfs, each path relative and staying in it, each written once, a
 /// bounded number and size: the entry's path there.
-fn unpack(id: u64, entry: &str, files: &[(String, Vec<u8>)]) -> Result<PathBuf, String> {
+fn unpack(root: &Path, entry: &str, files: &[(String, Vec<u8>)]) -> Result<PathBuf, String> {
     use std::io::Write;
     if files.len() > BUNDLE_FILES || files.iter().map(|(_, b)| b.len()).sum::<usize>() > BUNDLE_BYTES {
         return Err("the deployment has too many files, or too large".into());
     }
-    let root = std::env::temp_dir().join("bundles").join(id.to_string());
     if root.exists() {
-        return Err(format!("deployment {id} was sent before"));
+        return Err(format!("{}: a deployment was sent as that before", root.display()));
     }
     let io = |e: std::io::Error| e.to_string();
-    std::fs::create_dir_all(&root).map_err(io)?;
+    std::fs::create_dir_all(root).map_err(io)?;
     for (path, bytes) in files {
         let dest = root.join(relative(path)?);
         if let Some(dir) = dest.parent() {

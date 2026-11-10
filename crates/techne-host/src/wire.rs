@@ -51,6 +51,16 @@ pub enum ToWorker {
         dev: bool,
         env: Data,
     },
+    /// The deployment published as `name` is the one its requests go to
+    /// from now on: for development, its world is the REPL's.
+    Activate {
+        name: String,
+    },
+    /// Serve the deployment published as `name` no more, and forget its
+    /// files: requests of it being served finish.
+    Retire {
+        name: String,
+    },
     /// Serve `request` with the deployment published as `name`, with its
     /// debug instance if `debug` and it has one; its body streams, in
     /// `Body` messages, if `streams`.
@@ -190,6 +200,8 @@ impl ToWorker {
                 Data::Bool(*dev),
                 env.clone(),
             ]),
+            ToWorker::Activate { name } => Data::List(vec![sym("activate"), Data::String(name.clone())]),
+            ToWorker::Retire { name } => Data::List(vec![sym("retire"), Data::String(name.clone())]),
             ToWorker::Request { rid, name, request, streams, debug } => Data::List(vec![
                 sym("request"),
                 int(*rid),
@@ -227,6 +239,8 @@ impl ToWorker {
                     .collect::<io::Result<_>>()?;
                 ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()?, dev: p.flag()?, env: p.any()? }
             }
+            "activate" => ToWorker::Activate { name: p.string()? },
+            "retire" => ToWorker::Retire { name: p.string()? },
             "request" => ToWorker::Request { rid: p.uint()?, name: p.string()?, request: p.any()?, streams: p.flag()?, debug: p.flag()? },
             "body" => ToWorker::Body { rid: p.uint()?, bytes: p.chunk()? },
             "body-end" => ToWorker::BodyEnd { rid: p.uint()?, error: p.failure()? },

@@ -181,6 +181,91 @@ fn a_deployment_reaches_its_own_namespaces() {
     });
 }
 
+/// What answers with what its `env` has as `who`, at once or after a
+/// while.
+const ROUTED: &str = r#"
+(provide fetch)
+(define (fetch request env ctx)
+  (when (string=? (dict-ref request 'path) "/slow") (sleep 300))
+  (dict-ref env 'who))
+"#;
+
+/// A deployment is prepared, which changes nothing served, then
+/// published, if its name is still routed where the publisher saw it; a
+/// request sent before finishes on the deployment it was sent for, which
+/// is then retired; an earlier one is published again by preparing it
+/// again; one that does not load changes nothing.
+#[test]
+fn deployments_are_prepared_published_and_rolled_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("app.scm");
+    std::fs::write(&entry, ROUTED).unwrap();
+    let who = |who: &str| Bindings { env: Data::Dict(vec![(Data::Symbol("who".into()), Data::String(who.into()))]), ..Bindings::default() };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let s = Supervisor::start(options(&[])).await.unwrap();
+        s.on_failure(|_| {});
+        let ask = async |path: &str| answer(&s.fetch("app", request(path), None).await.unwrap().head);
+        let one = s.prepare("app", &entry, who("one")).await.unwrap();
+        // Prepared: not served yet.
+        assert_eq!(ask("/").await.0, 404);
+        assert_eq!(s.route("app"), None);
+        assert_eq!(s.publish("app", &one.id, Some(None)).unwrap(), None);
+        assert_eq!(ask("/").await, (200, "one".into()));
+        // The same prepared again is the one there is.
+        let same = s.prepare("app", &entry, who("one")).await.unwrap();
+        assert_eq!((same.id.as_str(), same.output.as_str()), (one.id.as_str(), ""));
+        let two = s.prepare("app", &entry, who("two")).await.unwrap();
+        assert_ne!(two.id, one.id);
+        assert_eq!(s.prepared("app").len(), 2);
+        assert_eq!(ask("/").await, (200, "one".into()));
+        let before = s.fetch("app", request("/slow"), None);
+        // Published only where the publisher saw the name routed.
+        assert!(s.publish("app", &two.id, Some(None)).is_err());
+        assert!(s.publish("app", &two.id, Some(Some("0000000000000000"))).is_err());
+        assert_eq!(s.route("app").as_deref(), Some(one.id.as_str()));
+        assert_eq!(s.publish("app", &two.id, Some(Some(&one.id))).unwrap().as_deref(), Some(one.id.as_str()));
+        assert_eq!(ask("/").await, (200, "two".into()));
+        // Sent before: served by the one it was sent for.
+        assert_eq!(answer(&before.await.unwrap().head), (200, "one".into()));
+        // Which is retired, its requests done.
+        let start = Instant::now();
+        while s.prepared("app") != [two.id.clone()] {
+            assert!(start.elapsed() < Duration::from_secs(5), "{:?}", s.prepared("app"));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(s.publish("app", &one.id, None).is_err());
+        // Rolled back: prepared again, and published.
+        let again = s.prepare("app", &entry, who("one")).await.unwrap();
+        assert_eq!(again.id, one.id);
+        s.publish("app", &again.id, Some(Some(&two.id))).unwrap();
+        assert_eq!(ask("/").await, (200, "one".into()));
+        // One that does not load changes nothing.
+        let broken = dir.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join("app.scm"), "(provide fetch) (car 1)").unwrap();
+        assert!(s.prepare("app", &broken.join("app.scm"), who("three")).await.is_err());
+        assert_eq!(ask("/").await, (200, "one".into()));
+        assert_eq!(s.route("app").as_deref(), Some(one.id.as_str()));
+        assert!(s.prepare("a@b", &entry, who("x")).await.is_err());
+        // Prepared twice at once: loaded once, for both.
+        let (a, b) = tokio::join!(s.prepare("app", &entry, who("four")), s.prepare("app", &entry, who("four")));
+        assert_eq!(a.unwrap().id, b.unwrap().id);
+        assert_eq!(s.prepared("app").len(), 2);
+        // A few prepared and not published are kept, the oldest going
+        // once another has loaded; one that does not load costs none.
+        for n in 0..6 {
+            s.prepare("app", &entry, who(&format!("more {n}"))).await.unwrap();
+        }
+        let kept = s.prepared("app");
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        assert!(s.prepare("app", &broken.join("app.scm"), who("five")).await.is_err());
+        assert_eq!(s.prepared("app"), kept);
+        assert_eq!(ask("/").await, (200, "one".into()));
+    });
+}
+
 #[test]
 fn a_worker_answers_as_a_host_does() {
     // Compiled code too, in a sandbox.
@@ -234,6 +319,10 @@ fn a_worker_that_answers_what_it_was_not_asked_is_killed() {
         let failures = Rc::new(RefCell::new(Vec::new()));
         let seen = failures.clone();
         s.on_failure(move |f| seen.borrow_mut().push(format!("{}: {} {}", f.deployment, f.status, f.message)));
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("app.scm");
+        std::fs::write(&entry, APP).unwrap();
+        s.deploy("app", &entry).await.unwrap();
         let r = s.fetch("app", request("/"), None).await.unwrap();
         assert_eq!(answer(&r.head).0, 500);
         assert!(failures.borrow().iter().any(|f| f.contains("misbehaved")), "{:?}", failures.borrow());

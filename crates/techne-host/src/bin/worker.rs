@@ -1,8 +1,9 @@
 //! A worker for the tests: `techne-worker --fd N [--unsandboxed]`, as
 //! `techne cloud worker` is; with TECHNE_TEST_SPIN set, deployments'
 //! worlds have `(%spin)`, a native that never returns nor looks for stops;
-//! with TECHNE_TEST_LIE set, it says it is ready, then answers a request
-//! it was never sent, as a compromised worker might.
+//! with TECHNE_TEST_LIE set, it says it is ready and that it loaded what
+//! it is given, then answers a request it was never sent, as a
+//! compromised worker might.
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,7 +29,7 @@ fn main() -> std::process::ExitCode {
 
 fn lie(fd: i32) -> std::process::ExitCode {
     use std::os::fd::FromRawFd;
-    use techne_host::wire::{FromWorker, write_frame};
+    use techne_host::wire::{FromWorker, ToWorker, read_frame, write_frame};
     // SAFETY: the descriptor the supervisor gave.
     let mut socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
     let _ = std::io::Read::read_exact(&mut socket, &mut [0]);
@@ -37,7 +38,17 @@ fn lie(fd: i32) -> std::process::ExitCode {
     rt.block_on(async {
         let mut s = tokio::net::UnixStream::from_std(socket).unwrap();
         write_frame(&mut s, &FromWorker::Ready.to_data()).await.unwrap();
-        // After a request has had time to be sent.
+        // A deployment is said to be loaded, so that requests are sent.
+        while let Ok(Some(frame)) = read_frame(&mut s).await {
+            match ToWorker::from_data(frame) {
+                Ok(ToWorker::Deploy { id, .. }) => {
+                    let loaded = FromWorker::Deployed { id, error: None, output: String::new() };
+                    write_frame(&mut s, &loaded.to_data()).await.unwrap();
+                }
+                // A request: after it, the lie.
+                _ => break,
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let lie = FromWorker::Response { rid: 999, response: techne_vm::data::Data::Bool(true), streams: false };
         let _ = write_frame(&mut s, &lie.to_data()).await;
