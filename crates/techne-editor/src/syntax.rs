@@ -66,6 +66,10 @@ const FIRST_SYNC_MAX: usize = 64 << 10;
 /// Captures are collected over windows aligned to this many bytes.
 const BUCKET: usize = 16 << 10;
 
+/// What captures are collected over instead, around the range asked for,
+/// once a whole `BUCKET` did not fit the budget (`Entry::narrow`).
+const NARROW: usize = 4 << 10;
+
 /// How long one snapshot may spend parsing and collecting captures, in
 /// step with the parts' deadlines being ten times as long in a debug
 /// build (`runtime::PART_DEADLINE`).
@@ -77,7 +81,9 @@ const LISP_BUDGET: Duration = Duration::from_secs(2);
 /// How long a collection that ran out of budget is not tried again:
 /// a pathological document costs one budget per second rather than one
 /// per snapshot, and a transient overrun (a loaded machine) colours
-/// again on its own.
+/// again on its own. A window wider than what was asked for is first
+/// tried again narrowed (`NARROW`): trying the same again, from nothing
+/// and with the same budget, would run out the same way for good (#347).
 const COOLDOWN: Duration = Duration::from_secs(1);
 
 pub use techne_syntax::GRAMMARS;
@@ -240,6 +246,11 @@ struct Entry {
     collected: Vec<(u64, usize, usize, Vec<FaceRange>)>,
     /// When collecting over this tree last ran out of budget.
     gave_up: Option<Instant>,
+    /// Whether a `BUCKET` of this document once cost more than the
+    /// budget (dense text, a slow or loaded machine): its captures are
+    /// collected over `NARROW` windows from then on, its later trees'
+    /// too, each of which would else spend a budget finding out again.
+    narrow: bool,
 }
 
 /// What the worker is asked, and answers: owned, `Send` by what it
@@ -487,6 +498,7 @@ impl Syntax {
                 continue;
             }
             let generation = self.next_generation();
+            let narrow = self.docs.get(&done.doc).is_some_and(|e| e.narrow);
             self.docs.insert(
                 done.doc,
                 Entry {
@@ -499,6 +511,7 @@ impl Syntax {
                     generation,
                     collected: Vec::new(),
                     gave_up: None,
+                    narrow,
                 },
             );
             self.follow(&document.borrow(), &language);
@@ -571,6 +584,7 @@ impl Syntax {
                         generation,
                         collected: Vec::new(),
                         gave_up: None,
+                        narrow: false,
                     },
                 );
                 if let Some(p) = self.pending.remove(&id) {
@@ -629,7 +643,8 @@ impl Syntax {
         }
         // Over the aligned window the cache keeps, not only what was
         // asked: the next scroll asks from inside it.
-        let (af, at) = (from / BUCKET * BUCKET, (to.div_ceil(BUCKET) * BUCKET).min(entry.rope.len_bytes()));
+        let window = |unit: usize| (from / unit * unit, (to.div_ceil(unit) * unit).min(entry.rope.len_bytes()));
+        let (af, at) = window(if entry.narrow { NARROW } else { BUCKET });
         match collect(lang, faces, entry, af, at, deadline) {
             Some(ranges) => {
                 let answer = inside(&ranges);
@@ -637,6 +652,15 @@ impl Syntax {
                 entry.collected.insert(0, (entry.generation, af, at, ranges));
                 entry.collected.truncate(WINDOWS);
                 answer
+            }
+            // Less would fit: the next snapshot tries that, and is asked
+            // for now, not when a key next brings one.
+            None if !entry.narrow && window(NARROW) != (af, at) => {
+                entry.narrow = true;
+                if let Some(wake) = &*self.wake.lock().expect("the wake") {
+                    let _ = wake.send(Msg::Wake);
+                }
+                Vec::new()
             }
             None => {
                 entry.gave_up = Some(Instant::now());
@@ -1360,6 +1384,39 @@ mod tests {
             done
         });
         assert!(commented, "the edit's tree landed");
+    }
+
+    /// A window whose captures do not fit the budget is not tried again
+    /// and again, plain for good: what was asked for is collected alone,
+    /// at once, and so are the windows of the trees after it.
+    #[test]
+    fn a_window_over_the_budget_is_narrowed_to_what_was_asked() {
+        let mut s = rust();
+        let mut faces = Faces::empty();
+        let d = doc(&"fn f() {}\n".repeat(6_000));
+        let id = d.borrow().id();
+        s.set_budget(Duration::from_secs(30));
+        assert!(!s.highlights(&d, "rust", 0, 4096, &mut faces).is_empty(), "parsed here and coloured");
+        assert_eq!(s.docs[&id].collected[0].2, BUCKET, "over a whole window");
+        // No time at all: more matches than are counted between two looks
+        // at the clock, in a window not collected yet.
+        let (wake, woken) = mpsc::channel();
+        s.set_wake(wake);
+        s.budget = Duration::ZERO;
+        assert!(s.highlights(&d, "rust", 2 * BUCKET, 2 * BUCKET + 2048, &mut faces).is_empty());
+        let e = &s.docs[&id];
+        assert!(e.narrow && e.gave_up.is_none(), "narrowed, not given up");
+        assert!(matches!(woken.try_recv(), Ok(Msg::Wake)), "the next snapshot is asked for");
+        s.budget = Duration::from_secs(30);
+        assert!(!s.highlights(&d, "rust", 2 * BUCKET, 2 * BUCKET + 2048, &mut faces).is_empty(), "coloured at once");
+        let c = &s.docs[&id].collected[0];
+        assert_eq!((c.1, c.2), (2 * BUCKET, 2 * BUCKET + NARROW));
+        // Narrowed and still over: given up for a while, as before.
+        s.budget = Duration::ZERO;
+        edit(&d, 0..0, "\n");
+        s.highlights(&d, "rust", 2 * BUCKET, 2 * BUCKET + 2048, &mut faces);
+        let e = &s.docs[&id];
+        assert!(e.narrow && e.gave_up.is_some(), "the edited tree's windows are narrow too");
     }
 
     #[test]
