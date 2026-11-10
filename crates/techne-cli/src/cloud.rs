@@ -26,6 +26,19 @@
 //! manifest is read again at each deployment; a secret changed is seen
 //! at the next.
 //!
+//! Deploying is `lisp/cloud/control.scm`'s, in the front world: each
+//! deployment is prepared, its bundle kept under `.techne/bundles`, and
+//! published if nothing overtook it, and recorded in
+//! `.techne/deployments.scm`. With `--ops PORT`, the operations
+//! `deployments`, `deploy` and `rollback` are served there as JSON over
+//! HTTP (`POST /v1/ops`) on 127.0.0.1:PORT, for a token that allows them,
+//! such as the one printed at the start and kept in `.techne/token`;
+//! `techne cloud deployments FILE`, `techne cloud deploy FILE` and
+//! `techne cloud rollback FILE [ID]` ask them of the `techne cloud dev`
+//! serving FILE, with that token or the one in `TECHNE_TOKEN`. Rolled
+//! back, a deployment's code and bindings serve again, until a file is
+//! next saved; what was kept in storage stays.
+//!
 //! With `--nrepl PORT`, the deployment is served instead by one world
 //! kept across requests, its dev world (`Host::publish_dev`) in the
 //! worker, with an nREPL server in it ([`DevWorker`]), whose clients the
@@ -79,14 +92,17 @@ use std::{
 
 use std::{cell::RefCell, rc::Rc};
 
-use techne_host::{Attached, Deployment, Host, Limits, supervisor::Bindings};
+use techne_host::{Attached, Deployment, Host, Limits};
 use techne_node::nrepl::Server;
 use techne_vm::{
     data::Data,
     vm::{Error, ROOT_MODULE, Vm},
 };
 
-const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--nrepl PORT [--debug] [--auth]]
+const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--ops PORT] [--nrepl PORT [--debug] [--auth]]
+       techne cloud deployments FILE
+       techne cloud deploy FILE
+       techne cloud rollback FILE [ID]
 
 Serve the deployment whose entry module is FILE on 127.0.0.1:PORT (8787
 by default; 0 picks one), deploying again whenever a Lisp file under
@@ -95,7 +111,13 @@ requests, with an nREPL server into it on that port. With --debug too,
 serve it as in production, and put the nREPL server in a debug instance
 beside, which serves the requests carrying the header techne-debug-route
 with the credential printed. With --auth, an nREPL client must
-authenticate first, with a token such as the one printed.";
+authenticate first, with a token such as the one printed. With --ops,
+serve the operations on its deployments on that port, which the other
+commands ask of it: the deployments published, deploying again, and
+going back to the one before or to ID.";
+
+/// How long a deployment may take, loading and all.
+const DEPLOYING: Duration = Duration::from_secs(90);
 
 /// Connections that may be authenticating at once: more are closed.
 const AUTHENTICATING: usize = 16;
@@ -138,7 +160,59 @@ pub fn main(args: Vec<String>) -> ExitCode {
             },
             None => usage(),
         },
+        Some((op, rest)) if matches!(op.as_str(), "deployments" | "deploy" | "rollback") => {
+            let id = rest.get(1).filter(|_| op == "rollback");
+            match rest.first() {
+                Some(file) if rest.len() <= 1 + usize::from(id.is_some()) => match operate(op, Path::new(file), id.map(String::as_str)) {
+                    Ok(answer) => {
+                        println!("{answer}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("techne cloud: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                _ => usage(),
+            }
+        }
         _ => usage(),
+    }
+}
+
+/// Ask the `techne cloud dev --ops` serving `file` for operation `op`
+/// (on deployment `id`, if given), with the token in `TECHNE_TOKEN` or
+/// the one it keeps: its answer, JSON, or why there is none.
+fn operate(op: &str, file: &Path, id: Option<&str>) -> Result<String, String> {
+    use std::io::{Read, Write};
+    let entry = file.canonicalize().map_err(|e| format!("{}: {e}", file.display()))?;
+    let kept = entry.parent().unwrap_or(Path::new("/")).join(".techne");
+    let read = |name: &str| std::fs::read_to_string(kept.join(name)).map(|s| s.trim().to_string());
+    let port: u16 =
+        read("ops-port").ok().and_then(|p| p.parse().ok()).ok_or("no techne cloud dev --ops serves it (no .techne/ops-port)")?;
+    let token = std::env::var("TECHNE_TOKEN").or_else(|_| read("token")).map_err(|_| "no token: set TECHNE_TOKEN")?;
+    if id.is_some_and(|id| !id.bytes().all(|b| b.is_ascii_hexdigit())) || token.bytes().any(|b| b.is_ascii_control()) {
+        return Err("not an id, or not a token".into());
+    }
+    let body = match id {
+        Some(id) => format!(r#"{{"op":"{op}","id":"{id}"}}"#),
+        None => format!(r#"{{"op":"{op}"}}"#),
+    };
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("port {port}: {e}"))?;
+    let io = |e: std::io::Error| e.to_string();
+    c.set_read_timeout(Some(DEPLOYING + Duration::from_secs(10))).map_err(io)?;
+    write!(
+        c,
+        "POST /v1/ops HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .map_err(io)?;
+    let mut answer = String::new();
+    c.read_to_string(&mut answer).map_err(io)?;
+    let (head, body) = answer.split_once("\r\n\r\n").ok_or("no answer")?;
+    match head.split_whitespace().nth(1) {
+        Some("200") => Ok(body.to_string()),
+        _ => Err(body.to_string()),
     }
 }
 
@@ -157,12 +231,14 @@ struct Options {
     debug: bool,
     /// nREPL clients authenticate with a token.
     auth: bool,
+    /// The port the operations on deployments are served on.
+    ops: Option<u16>,
 }
 
 /// The options, from `FILE [--port PORT] [--nrepl PORT [--debug]]` in any
 /// order.
 fn parse(args: &[String]) -> Option<Options> {
-    let mut options = Options { file: PathBuf::new(), port: 8787, nrepl: None, debug: false, auth: false };
+    let mut options = Options { file: PathBuf::new(), port: 8787, nrepl: None, debug: false, auth: false, ops: None };
     let mut file = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -171,6 +247,7 @@ fn parse(args: &[String]) -> Option<Options> {
             "--nrepl" => options.nrepl = Some(args.next()?.parse().ok()?),
             "--debug" => options.debug = true,
             "--auth" => options.auth = true,
+            "--ops" => options.ops = Some(args.next()?.parse().ok()?),
             _ if file.is_none() && !arg.starts_with("--") => file = Some(PathBuf::from(arg)),
             _ => return None,
         }
@@ -207,22 +284,64 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         let supervisor = Supervisor::start(worker).await.map_err(|e| Error::new(format!("no worker: {e}")))?;
-        let manifests = Rc::new(RefCell::new(Manifests::new()?));
-        let bound = manifests.borrow_mut().bindings(&dir)?;
-        supervisor.deploy_with(NAME, &entry, bound).await.map_err(Error::new)?;
         let mut front = Vm::new();
         techne_net::install_on(&mut front, tokio::runtime::Handle::current())?;
         supervisor.install(&mut front);
         supervisor.install_store(&mut front);
+        supervisor.install_control(&mut front);
+        let control = techne_host::ask::install(&mut front, "control", 4);
+        let cloud = techne_vm::library::lisp_dir().join("cloud");
+        front.eval_source(&format!(
+            r#"(require {:?})
+               (define control (make-control {NAME:?} {:?} {:?}))
+               (spawn (lambda () (control-serve control)))"#,
+            cloud.join("control.scm").display().to_string(),
+            entry.display().to_string(),
+            dir.join(".techne").display().to_string(),
+        ))?;
+        let deploy = || Data::List(vec![Data::String("deploy".into())]);
+        // The first deployment, the front world driven until it is
+        // there: nothing is served before.
+        let first = {
+            let asked = control.ask(deploy(), DEPLOYING);
+            tokio::pin!(asked);
+            tokio::select! {
+                deployed = &mut asked => deployed,
+                ended = supervisor.run(&mut front) => Err(ended.err().map_or("the front world ended".into(), |e| e.msg.clone())),
+            }
+        };
+        first.map_err(Error::new)?;
+        // Before the Lisp that asks through it is loaded: a module names
+        // the natives there are when it is.
+        let auth = options.auth.then(|| techne_host::ask::install(&mut front, "auth", AUTHENTICATING));
+        if options.auth || options.ops.is_some() {
+            tokens(&mut front, &dir)?;
+        }
+        if let Some(port) = options.ops {
+            front.eval_source(&format!(
+                r#"(require {:?})
+                   (let ((listener (tcp-listen {port})))
+                     (replace-file {:?} (number->string (cadr (tcp-local-address listener))))
+                     (display (string-append "Operations on http://127.0.0.1:"
+                                             (number->string (cadr (tcp-local-address listener))) "\n"))
+                     (flush-output-port)
+                     (spawn (lambda () (http-serve listener (control-ops-handler control token-key)))))"#,
+                techne_vm::library::lisp_dir().join("http/server.scm").display().to_string(),
+                dir.join(".techne/ops-port").display().to_string(),
+            ))?;
+        }
         if let Some(port) = options.nrepl {
             let addr = format!("127.0.0.1:{port}");
-            let bound = match options.auth {
-                true => {
-                    let auth = techne_host::ask::install(&mut front, "auth", AUTHENTICATING);
-                    authenticate_with(&mut front, &dir, if options.debug { "prod" } else { "eval" })?;
+            let bound = match auth {
+                Some(auth) => {
+                    let scope = if options.debug { "prod" } else { "eval" };
+                    front.eval_source(&format!(
+                        r#"(require {:?}) (spawn (lambda () (auth-serve token-key {NAME:?} {scope:?})))"#,
+                        cloud.join("auth.scm").display().to_string()
+                    ))?;
                     serve_repl_authenticated(supervisor.clone(), &addr, auth).await
                 }
-                false => supervisor.serve_repl(&addr).await,
+                None => supervisor.serve_repl(&addr).await,
             };
             let bound = bound.map_err(|e| Error::new(format!("nREPL on port {port}: {e}")))?;
             // The port file first: clients may act on the line at once.
@@ -230,18 +349,11 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
             println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
         }
         serve_front(&mut front, port, &entry, options.debug)?;
-        let redeploying = supervisor.clone();
-        let watched = dir.clone();
-        tokio::task::spawn_local(watch_files(watched, seen, move || {
-            let (supervisor, entry) = (redeploying.clone(), entry.clone());
-            let bound = manifests.borrow_mut().bindings(&dir);
+        tokio::task::spawn_local(watch_files(dir, seen, move || {
+            let (control, entry) = (control.clone(), entry.clone());
             async move {
                 eprintln!("techne cloud: loading {}", entry.display());
-                let deployed = match bound {
-                    Ok(bound) => supervisor.deploy_with(NAME, &entry, bound).await,
-                    Err(e) => Err(e.msg.clone()),
-                };
-                match deployed {
+                match control.ask(deploy(), DEPLOYING).await {
                     Ok(_) => eprintln!("techne cloud: deployed {}", entry.display()),
                     Err(e) => eprintln!("techne cloud: not deployed, the last deployment keeps serving: {e}"),
                 }
@@ -252,22 +364,24 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
     })
 }
 
-/// Have a task of `front` answer whether tokens allow `scope` on the
-/// deployment (`lisp/cloud/auth.scm`), with the key kept in `.techne`
-/// under `dir`, and print a token that does.
-fn authenticate_with(front: &mut Vm, dir: &Path, scope: &str) -> Result<(), Error> {
+/// Define `token-key` in `front`, the key kept in `.techne` under `dir`
+/// (`lisp/cloud/auth.scm`), and print a token made with it that allows
+/// everything on the deployment for thirty days, kept in `.techne/token`
+/// too, for the commands that ask this one.
+fn tokens(front: &mut Vm, dir: &Path) -> Result<(), Error> {
     let cloud = techne_vm::library::lisp_dir().join("cloud");
     front.eval_source(&format!(
         r#"(require {:?} {:?})
-           (let* ((key (token-key-in {:?}))
-                  (token (make-token key "dev" #:projects (list {NAME:?}) #:scopes token-scopes
-                                     #:expires (+ (current-second) (* 30 24 3600)))))
+           (define token-key (token-key-in {:?}))
+           (let ((token (make-token token-key "dev" #:projects (list {NAME:?}) #:scopes token-scopes
+                                    #:expires (+ (current-second) (* 30 24 3600)))))
+             (replace-file {:?} token)
              (display (string-append "Token: " token "\n"))
-             (flush-output-port)
-             (spawn (lambda () (auth-serve key {NAME:?} {scope:?}))))"#,
+             (flush-output-port))"#,
         cloud.join("auth.scm").display().to_string(),
         cloud.join("tokens.scm").display().to_string(),
         dir.join(".techne").display().to_string(),
+        dir.join(".techne/token").display().to_string(),
     ))?;
     Ok(())
 }
@@ -341,40 +455,6 @@ async fn authenticate(stream: &mut tokio::net::TcpStream, auth: &techne_host::as
     dict(fields).encode(&mut reply);
     stream.write_all(&reply).await.ok()?;
     principal.map(|p| (p, buf[used..].to_vec()))
-}
-
-/// A world reading deployments' manifests (`lisp/cloud/manifest.scm`).
-struct Manifests(Vm);
-
-impl Manifests {
-    fn new() -> Result<Manifests, Error> {
-        let mut vm = Vm::new();
-        let manifest = techne_vm::library::lisp_dir().join("cloud/manifest.scm");
-        vm.eval_source(&format!("(require {:?})", manifest.display().to_string()))?;
-        Ok(Manifests(vm))
-    }
-
-    /// The bindings of the deployment in `dir`, as its manifest has them
-    /// now.
-    fn bindings(&mut self, dir: &Path) -> Result<Bindings, Error> {
-        let vm = &mut self.0;
-        let read = vm.eval_source("read-bindings")?;
-        let dir = vm.from_data(&Data::String(dir.display().to_string()))?;
-        let found = vm.call(&read, &[dir]).map_err(|e| Error::new(format!("the manifest: {}", e.msg)))?;
-        let Data::Dict(parts) = vm.to_data(&found, 4 << 20)? else { return Err(Error::new("the manifest's bindings are no dict")) };
-        let part = |name: &str| parts.iter().find(|(k, _)| matches!(k, Data::Symbol(s) if s == name)).map(|(_, v)| v.clone());
-        let stores = match part("stores") {
-            Some(Data::Dict(stores)) => stores
-                .into_iter()
-                .filter_map(|(k, v)| match (k, v) {
-                    (Data::String(binding), Data::String(namespace)) => Some((binding, namespace)),
-                    _ => None,
-                })
-                .collect(),
-            _ => Default::default(),
-        };
-        Ok(Bindings { env: part("env").unwrap_or(Data::Dict(Vec::new())), stores })
-    }
 }
 
 /// Start `lisp/http`'s server in `front` on `port`, handing requests to

@@ -252,10 +252,21 @@ and only if the name is still routed where the publisher saw it; a
 request is pinned to the deployment its name was routed to when it was
 sent, code and bindings both; a deployment no longer routed to is
 retired from the worker once its requests are done (Draining), and its
-files with it. Not yet: a record of deployments that outlives the
-supervisor, bundles kept by hash to roll back to, and the `deploy`,
-`deployments` and `rollback` operations over them; `techne cloud dev`
-prepares and publishes at each save.
+files with it. For development the worker's REPL moves to a
+deployment's world when it is published, not when it is prepared.
+
+What is done with that mechanism is Lisp, in the supervisor's front
+world (`lisp/cloud/control.scm`): to deploy is to prepare, keep the
+bundle (files and bindings, by id, the latest ten), publish if nothing
+overtook it, and record it; to roll back is to prepare an earlier one
+again from its bundle and publish it the same way. The record and the
+bundles are files, which outlive the supervisor. `techne cloud dev
+--ops PORT` serves the operations `deployments`, `deploy` and
+`rollback` as JSON over HTTP (`POST /v1/ops`, a bearer token allowing
+`inspect` or `deploy` on the project), and `techne cloud deployments`,
+`deploy` and `rollback` ask them. Not yet: uploading a bundle (the
+supervisor reads the project's directory), `dry-run`, idempotency keys,
+the other operations and the audit log.
 
 Rollback publishes an earlier deployment that is still Ready or can be
 again. **It rolls back code only**: storage, schema changes and external

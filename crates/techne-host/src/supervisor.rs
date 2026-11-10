@@ -84,7 +84,7 @@ use tokio::{
 use crate::{
     Failure, Printed, Response,
     ask::Asker,
-    body::{self, Piece, Reader},
+    body::{self, DataValue, Piece, Reader},
     outbound::Service,
     wire::{BUNDLE_BYTES, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, encode, read_frame, write_encoded},
     worker,
@@ -204,6 +204,71 @@ pub struct Bindings {
     /// The KV namespace each of its KV bindings stands for, by the
     /// binding's name.
     pub stores: HashMap<String, String>,
+}
+
+impl Bindings {
+    /// The bindings `data` describes, as `lisp/cloud/manifest.scm` reads
+    /// a manifest: a dict of `env` and of `stores`, a dict of strings.
+    pub fn from_data(data: &Data) -> Result<Bindings, String> {
+        let Data::Dict(parts) = data else { return Err("bindings are a dict of env and stores".into()) };
+        let part = |name: &str| parts.iter().find(|(k, _)| matches!(k, Data::Symbol(s) if s == name)).map(|(_, v)| v);
+        let mut stores = HashMap::new();
+        match part("stores") {
+            Some(Data::Dict(entries)) => {
+                for entry in entries {
+                    let (Data::String(binding), Data::String(namespace)) = entry else {
+                        return Err("stores are strings by strings".into());
+                    };
+                    stores.insert(binding.clone(), namespace.clone());
+                }
+            }
+            None => {}
+            Some(_) => return Err("stores are a dict".into()),
+        }
+        let env = match part("env") {
+            Some(env @ Data::Dict(_)) => env.clone(),
+            None => Data::Dict(Vec::new()),
+            Some(_) => return Err("env is a dict".into()),
+        };
+        Ok(Bindings { env, stores })
+    }
+
+    fn to_data(&self) -> Data {
+        let mut stores: Vec<_> = self.stores.iter().map(|(b, n)| (Data::String(b.clone()), Data::String(n.clone()))).collect();
+        stores.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+        Data::Dict(vec![(Data::Symbol("env".into()), self.env.clone()), (Data::Symbol("stores".into()), Data::Dict(stores))])
+    }
+}
+
+impl Bundle {
+    /// All of it, as bytes to keep: `Bundle::decode` reads them.
+    fn encode(&self) -> Vec<u8> {
+        encode(&Data::List(vec![
+            Data::String(self.name.clone()),
+            Data::String(self.entry.clone()),
+            Data::List(self.files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
+            self.bindings.to_data(),
+        ]))
+    }
+
+    /// The name, entry, files and bindings `bytes` keep.
+    #[allow(clippy::type_complexity)]
+    fn decode(bytes: &[u8]) -> Result<(String, String, Vec<(String, Vec<u8>)>, Bindings), String> {
+        let bad = || "not a deployment's bundle".to_string();
+        let Ok(Data::List(parts)) = crate::wire::decode(bytes) else { return Err(bad()) };
+        let [Data::String(name), Data::String(entry), Data::List(files), bindings] = &parts[..] else { return Err(bad()) };
+        let files = files
+            .iter()
+            .map(|f| match f {
+                Data::List(f) => match &f[..] {
+                    [Data::String(path), Data::Bytes(bytes)] => Ok((path.clone(), bytes.clone())),
+                    _ => Err(bad()),
+                },
+                _ => Err(bad()),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((name.clone(), entry.clone(), files, Bindings::from_data(bindings)?))
+    }
 }
 
 impl Default for Bindings {
@@ -1180,7 +1245,11 @@ impl Supervisor {
             }
         };
         let output = match joined {
-            Some(loading) => loading.await.map_err(|_| "the worker is gone".to_string())?,
+            // No longer than the loading it joined is waited for.
+            Some(loading) => match tokio::time::timeout(DEPLOY, loading).await {
+                Ok(loaded) => loaded.map_err(|_| "the worker is gone".to_string())?,
+                Err(_) => Err("the worker did not load it in time".into()),
+            },
             None => self.send_deploy(Bundle { name: name.into(), id: id.clone(), entry: entry.into(), files, bindings }).await,
         };
         output.map(|output| Prepared { id, output })
@@ -1241,6 +1310,79 @@ impl Supervisor {
         self.state.borrow_mut().store = Some(crate::ask::install(front, "store", FETCHING));
     }
 
+    /// Give `front` what deploys: for Lisp there that keeps the record of
+    /// deployments and decides what is published (`lisp/cloud/control.scm`).
+    /// `(%cloud-prepare name entry bindings)` prepares the deployment whose
+    /// entry module is the file ENTRY, with BINDINGS (a dict of `env` and
+    /// `stores`, as `lisp/cloud/manifest.scm` reads them), as
+    /// [`Supervisor::prepare`] does: a list of its id and what loading
+    /// wrote. `(%cloud-publish name id expected)` publishes it, as
+    /// [`Supervisor::publish`] does: whatever NAME is routed to if
+    /// EXPECTED is #t, only if it is routed to nothing if #f, or to the
+    /// id EXPECTED; the id it was routed to, or #f. `(%cloud-route name)`
+    /// is that id now. `(%cloud-bundle name id)` is all of a deployment
+    /// prepared, as a bytevector to keep, or #f, and
+    /// `(%cloud-prepare-bundle name bytes)` prepares the deployment of
+    /// NAME kept so, as `%cloud-prepare` does. What fails is an error.
+    pub fn install_control(&self, front: &mut Vm) {
+        use techne_vm::{
+            api::{Bytes, Value},
+            vm::Error,
+        };
+        self.wakes(front);
+        let listed = |p: Prepared| DataValue(Data::List(vec![Data::String(p.id), Data::String(p.output)]));
+        let me = self.clone();
+        front.register_async("%cloud-prepare", 3, move |vm, args| {
+            let asked = (|| {
+                let (name, entry) = (args.get::<String>(vm, 0)?, args.get::<String>(vm, 1)?);
+                let bindings = args.value(vm, 2)?;
+                let bindings = Bindings::from_data(&vm.to_data(&bindings, crate::REQUEST_BYTES)?).map_err(Error::new)?;
+                Ok::<_, Error>((name, entry, bindings))
+            })();
+            let me = me.clone();
+            async move {
+                let (name, entry, bindings) = asked?;
+                me.prepare(&name, Path::new(&entry), bindings).await.map(listed).map_err(Error::new)
+            }
+        });
+        let me = self.clone();
+        front.register_async("%cloud-prepare-bundle", 2, move |vm, args| {
+            let asked = (|| Ok::<_, Error>((args.get::<String>(vm, 0)?, args.get::<Bytes>(vm, 1)?.0)))();
+            let me = me.clone();
+            async move {
+                let (name, bytes) = asked?;
+                if bytes.len() > MAX_FRAME {
+                    return Err(Error::new("the bundle is larger than a deployment may be"));
+                }
+                let (kept, entry, files, bindings) = Bundle::decode(&bytes).map_err(Error::new)?;
+                if kept != name {
+                    return Err(Error::new(format!("the bundle is a deployment of {kept}, not {name}")));
+                }
+                me.prepare_files(&name, &entry, files, bindings).await.map(listed).map_err(Error::new)
+            }
+        });
+        let me = self.clone();
+        front.register_fn_vm("%cloud-publish", move |vm: &mut Vm, name: String, id: String, expected: Value| -> Result<DataValue, Error> {
+            let expected = match vm.to_data(&expected, 1024)? {
+                Data::Bool(true) => None,
+                Data::Bool(false) => Some(None),
+                Data::String(id) => Some(Some(id)),
+                _ => return Err(Error::new("what is expected is #t, #f or an id")),
+            };
+            let before = me.publish(&name, &id, expected.as_ref().map(|e| e.as_deref())).map_err(Error::new)?;
+            Ok(DataValue(before.map_or(Data::Bool(false), Data::String)))
+        });
+        let me = self.clone();
+        front.register_fn("%cloud-route", move |name: String| -> DataValue {
+            DataValue(me.route(&name).map_or(Data::Bool(false), Data::String))
+        });
+        let me = self.clone();
+        front.register_fn("%cloud-bundle", move |name: String, id: String| -> DataValue {
+            let kept = me.state.borrow().ready.get(&served(&name, &id)).map(|r| r.bundle.encode());
+            DataValue(kept.map_or(Data::Bool(false), Data::Bytes))
+        });
+    }
+
     /// Have what `front`'s tasks wait on wake the supervisor's driver
     /// (`Supervisor::run`), as `install` does: for a front world given
     /// natives of the caller's own.
@@ -1251,7 +1393,8 @@ impl Supervisor {
 
     async fn send_deploy(&self, bundle: Bundle) -> Result<String, String> {
         let (tx, rx) = oneshot::channel();
-        {
+        let served = bundle.served();
+        let sent = {
             let mut s = self.state.borrow_mut();
             let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else { return Err("no worker".into()) };
             s.next_deploy += 1;
@@ -1267,10 +1410,22 @@ impl Supervisor {
             };
             s.deploys.insert(id, (bundle, tx));
             let _ = send.send(message);
-        }
+            id
+        };
         match tokio::time::timeout(DEPLOY, rx).await {
             Ok(r) => r.map_err(|_| "the worker is gone".to_string())?,
-            Err(_) => Err("the worker did not load it in time".into()),
+            // Given up: no one joins it from now on, those who did are
+            // told, and a worker that says later that it loaded it says
+            // what it was not asked (`heard`).
+            Err(_) => {
+                let why = "the worker did not load it in time".to_string();
+                let mut s = self.state.borrow_mut();
+                s.deploys.remove(&sent);
+                for waiter in s.joining.remove(&served).unwrap_or_default() {
+                    let _ = waiter.send(Err(why.clone()));
+                }
+                Err(why)
+            }
         }
     }
 

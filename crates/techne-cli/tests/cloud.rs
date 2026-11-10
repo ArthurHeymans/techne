@@ -448,6 +448,115 @@ fn bindings_from_the_manifest() {
     assert_eq!(get(port, "/get"), r#"{"said":"hello"}"#);
 }
 
+/// `techne cloud` asked for `args` about `app`, with `token` if given in
+/// place of the one kept: whether it succeeded, and what it said.
+fn cloud(args: &[&str], app: &std::path::Path, token: Option<&str>) -> (bool, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_techne"));
+    command.arg("cloud").arg(args[0]).arg(app).args(&args[1..]).env_remove("TECHNE_TOKEN");
+    if let Some(token) = token {
+        command.env("TECHNE_TOKEN", token);
+    }
+    let out = command.output().unwrap();
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+/// The ids in `answer`, a `deployments` reply, the latest first, and the
+/// one published.
+fn deployments(answer: &str) -> (Vec<String>, String) {
+    let hex = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let after =
+        |key: &str| answer.split(key).skip(1).filter_map(|rest| rest.split('"').next()).filter(|id| hex(id)).map(str::to_string).collect();
+    let ids: Vec<String> = after("\"id\":\"");
+    let current: Vec<String> = after("\"current\":\"");
+    (ids, current.first().cloned().unwrap_or_default())
+}
+
+/// Deployments are recorded and their bundles kept: `techne cloud
+/// deployments` lists them, `techne cloud rollback` publishes the one
+/// before again, its code and what it was bound to, and the record
+/// outlives `techne cloud dev`. Without a token that holds, nothing.
+#[test]
+fn deployments_are_listed_and_rolled_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app.scm");
+    std::fs::write(&app, APP.replace("VERSION", "1")).unwrap();
+    let serve = || {
+        let mut child = Killed(
+            Command::new(env!("CARGO_BIN_EXE_techne"))
+                .args(["cloud", "dev", app.to_str().unwrap(), "--port", "0", "--ops", "0"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let out = lines(child.0.stdout.take().unwrap());
+        let (mut port, mut ops) = (None, false);
+        while port.is_none() || !ops {
+            let line = out.recv_timeout(PATIENCE).expect("the ports");
+            if line.starts_with("Serving") {
+                port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+            }
+            ops |= line.starts_with("Operations on");
+        }
+        (child, port.unwrap())
+    };
+    let (child, port) = serve();
+    assert_eq!(get(port, "/a"), r#"{"path":"/a","v":1}"#);
+    let (ok, listed) = cloud(&["deployments"], &app, None);
+    assert!(ok, "{listed}");
+    let (ids, current) = deployments(&listed);
+    assert_eq!((ids.len(), &ids[0]), (1, &current), "{listed}");
+    let first = current;
+    // Nothing to go back to yet; and nothing without a token that holds.
+    assert!(!cloud(&["rollback"], &app, None).0);
+    let (ok, refused) = cloud(&["deployments"], &app, Some("tk1.nothing.at-all"));
+    assert!(!ok && refused.contains("unauthenticated"), "{refused}");
+    // Saved: another deployment, the one before kept.
+    std::fs::write(&app, APP.replace("VERSION", "2")).unwrap();
+    until(port, "/b", r#"{"path":"/b","v":2}"#);
+    let (ids, second) = deployments(&cloud(&["deployments"], &app, None).1);
+    assert_eq!(ids, [second.clone(), first.clone()]);
+    // Rolled back to the one before: its code serves again.
+    let (ok, rolled) = cloud(&["rollback"], &app, None);
+    assert!(ok && rolled.contains(&first), "{rolled}");
+    assert_eq!(get(port, "/c"), r#"{"path":"/c","v":1}"#);
+    assert_eq!(deployments(&cloud(&["deployments"], &app, None).1), (vec![first.clone(), second.clone()], first.clone()));
+    // And forward again, by id; one that is not there is refused.
+    assert!(cloud(&["rollback", &second], &app, None).0);
+    assert_eq!(get(port, "/d"), r#"{"path":"/d","v":2}"#);
+    let (ok, missing) = cloud(&["rollback", &"0".repeat(64)], &app, None);
+    assert!(!ok && missing.contains("No bundle is kept"), "{missing}");
+    assert_eq!(get(port, "/d"), r#"{"path":"/d","v":2}"#);
+    // Deployed as it is: the one published already.
+    let (ok, same) = cloud(&["deploy"], &app, None);
+    assert!(ok && same.contains(&second), "{same}");
+    // A bundle kept that is none, or larger than one may be, is refused,
+    // and a record that cannot be read: nothing published changes.
+    let kept = dir.path().join(".techne/bundles").join(format!("{first}.bundle"));
+    let bundle = std::fs::read(&kept).unwrap();
+    std::fs::write(&kept, vec![7u8; 33 << 20]).unwrap();
+    let (ok, large) = cloud(&["rollback", &first], &app, None);
+    assert!(!ok && large.contains("too large"), "{large}");
+    std::fs::write(&kept, b"junk").unwrap();
+    assert!(!cloud(&["rollback", &first], &app, None).0);
+    std::fs::write(&kept, bundle).unwrap();
+    let record = dir.path().join(".techne/deployments.scm");
+    let recorded = std::fs::read(&record).unwrap();
+    std::fs::write(&record, b"((").unwrap();
+    let (ok, unread) = cloud(&["rollback", &first], &app, None);
+    assert!(!ok && unread.contains("cannot be read"), "{unread}");
+    assert_eq!(get(port, "/d"), r#"{"path":"/d","v":2}"#);
+    std::fs::write(&record, recorded).unwrap();
+    // The record outlives the supervisor.
+    drop(child);
+    let (_child, port) = serve();
+    assert_eq!(get(port, "/e"), r#"{"path":"/e","v":2}"#);
+    let (ids, current) = deployments(&cloud(&["deployments"], &app, None).1);
+    assert_eq!((ids, current), (vec![second.clone(), first.clone()], second));
+    assert!(cloud(&["rollback", &first], &app, None).0);
+    assert_eq!(get(port, "/f"), r#"{"path":"/f","v":1}"#);
+}
+
 /// A manifest naming a secret that is not there deploys nothing.
 #[test]
 fn a_manifest_that_cannot_be_bound_is_refused() {
