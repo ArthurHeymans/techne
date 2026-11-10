@@ -1869,7 +1869,7 @@
       "is_macro": false
     },
     "syntax-capture-names": {
-      "description": "(syntax-capture-names name)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1035\n\nReturn the capture names of the highlight queries of the syntax\nlanguage NAME, or #f when there is no such language.",
+      "description": "(syntax-capture-names name)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1057\n\nReturn the capture names of the highlight queries of the syntax\nlanguage NAME, or #f when there is no such language.",
       "is_macro": false
     },
     "syntax-captures": {
@@ -1877,27 +1877,27 @@
       "is_macro": false
     },
     "syntax-check-language": {
-      "description": "(syntax-check-language grammar highlights definitions)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1028\n\nCheck that GRAMMAR, one of `syntax-grammars`, compiles its\nHIGHLIGHTS and DEFINITIONS queries, each the text of one or #f:\nraise the error of one that does not.",
+      "description": "(syntax-check-language grammar highlights definitions)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1050\n\nCheck that GRAMMAR, one of `syntax-grammars`, compiles its\nHIGHLIGHTS and DEFINITIONS queries, each the text of one or #f:\nraise the error of one that does not.",
       "is_macro": false
     },
     "syntax-define-language!": {
-      "description": "(syntax-define-language! name grammar highlights last-wins)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1022\n\nDefine the syntax language NAME, a string, parsed with GRAMMAR,\none of `syntax-grammars`. HIGHLIGHTS is the text of its\nhighlight queries, or #f for the grammar's own; of the patterns\nmatching a node, the last wins it if LAST-WINS, else the first.\nA query that does not compile is an error.",
+      "description": "(syntax-define-language! name grammar highlights last-wins)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1044\n\nDefine the syntax language NAME, a string, parsed with GRAMMAR,\none of `syntax-grammars`. HIGHLIGHTS is the text of its\nhighlight queries, or #f for the grammar's own; of the patterns\nmatching a node, the last wins it if LAST-WINS, else the first.\nA query that does not compile is an error.",
       "is_macro": false
     },
     "syntax-down": {
-      "description": "(syntax-down document language from forward)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1067\n\nReturn where `down-list` goes from FROM in DOCUMENT's tree in\nLANGUAGE: into the first node after FROM that holds others, past\nits opening token (or to its first child), or with FORWARD #f\ninto the last one before FROM, before its closing. Return #f\nwhen there is none. The search is the tree's, not one call per\nnode: a big file with no list in it answers at once.",
+      "description": "(syntax-down document language from forward)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1089\n\nReturn where `down-list` goes from FROM in DOCUMENT's tree in\nLANGUAGE: into the first node after FROM that holds others, past\nits opening token (or to its first child), or with FORWARD #f\ninto the last one before FROM, before its closing. Return #f\nwhen there is none. The search is the tree's, not one call per\nnode: a big file with no list in it answers at once.",
       "is_macro": false
     },
     "syntax-forget-language!": {
-      "description": "(syntax-forget-language! name)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1032\n\nForget the syntax language NAME and its documents' trees.",
+      "description": "(syntax-forget-language! name)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1054\n\nForget the syntax language NAME and its documents' trees.",
       "is_macro": false
     },
     "syntax-grammars": {
-      "description": "(syntax-grammars)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1016\n\nReturn the names of the grammars built in, as strings.",
+      "description": "(syntax-grammars)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1038\n\nReturn the names of the grammars built in, as strings.",
       "is_macro": false
     },
     "syntax-highlight-query": {
-      "description": "(syntax-highlight-query name)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1040\n\nReturn the text of the highlight queries of the syntax language\nNAME, its own or its grammar's, or #f when there is no such\nlanguage. The grammars' own are built in: Lisp has no other\nway to read them.",
+      "description": "(syntax-highlight-query name)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1062\n\nReturn the text of the highlight queries of the syntax language\nNAME, its own or its grammar's, or #f when there is no such\nlanguage. The grammars' own are built in: Lisp has no other\nway to read them.",
       "is_macro": false
     },
     "syntax-highlights": {
@@ -1905,35 +1905,35 @@
       "is_macro": false
     },
     "syntax-node-at": {
-      "description": "(syntax-node-at document language from to named)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1050\n\nReturn the smallest node of DOCUMENT's tree in LANGUAGE that\nholds FROM to TO, or #f. Only named nodes when NAMED is true.",
+      "description": "(syntax-node-at document language from to named)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1072\n\nReturn the smallest node of DOCUMENT's tree in LANGUAGE that\nholds FROM to TO, or #f. Only named nodes when NAMED is true.",
       "is_macro": false
     },
     "syntax-node-child-count": {
-      "description": "(syntax-node-child-count document language node)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1115\n\nReturn how many children NODE has in DOCUMENT's tree in LANGUAGE.",
+      "description": "(syntax-node-child-count document language node)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1137\n\nReturn how many children NODE has in DOCUMENT's tree in LANGUAGE.",
       "is_macro": false
     },
     "syntax-node-child-near": {
-      "description": "(syntax-node-child-near document language node position forward)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1084\n\nReturn the child of NODE nearest POSITION in DOCUMENT's tree in\nLANGUAGE: the first starting at or after it, or with FORWARD #f\nthe last ending at or before it; #f when there is none. A node\nwith ten thousand children (a big file's top level) answers\nwithout making a list of them.",
+      "description": "(syntax-node-child-near document language node position forward)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1106\n\nReturn the child of NODE nearest POSITION in DOCUMENT's tree in\nLANGUAGE: the first starting at or after it, or with FORWARD #f\nthe last ending at or before it; #f when there is none. A node\nwith ten thousand children (a big file's top level) answers\nwithout making a list of them.",
       "is_macro": false
     },
     "syntax-node-children": {
-      "description": "(syntax-node-children document language node)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1073\n\nReturn the children of NODE in DOCUMENT's tree in LANGUAGE, in\norder, named and anonymous.",
+      "description": "(syntax-node-children document language node)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1095\n\nReturn the children of NODE in DOCUMENT's tree in LANGUAGE, in\norder, named and anonymous.",
       "is_macro": false
     },
     "syntax-node-parent": {
-      "description": "(syntax-node-parent document language node)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1057\n\nReturn the parent of NODE in DOCUMENT's tree in LANGUAGE, or #f.",
+      "description": "(syntax-node-parent document language node)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1079\n\nReturn the parent of NODE in DOCUMENT's tree in LANGUAGE, or #f.",
       "is_macro": false
     },
     "syntax-query": {
-      "description": "(syntax-query document language query from to)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1123\n\nReturn the captures of QUERY, a tree-sitter query's text, over\nFROM to TO of DOCUMENT's tree in LANGUAGE: a list of (capture\nstart end), CAPTURE the name without its @, in the order they\noccur. A query that does not compile is an error.",
+      "description": "(syntax-query document language query from to)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1145\n\nReturn the captures of QUERY, a tree-sitter query's text, over\nFROM to TO of DOCUMENT's tree in LANGUAGE: a list of (capture\nstart end), CAPTURE the name without its @, in the order they\noccur. A query that does not compile is an error.",
       "is_macro": false
     },
     "syntax-query-later": {
-      "description": "(syntax-query-later document language query from to)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1151\n\nAs `syntax-query`, on a thread of its own: the calling task waits,\nthe editor does not. For a query over the whole of a big document.",
+      "description": "(syntax-query-later document language query from to)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1173\n\nAs `syntax-query`, on a thread of its own: the calling task waits,\nthe editor does not. For a query over the whole of a big document.",
       "is_macro": false
     },
     "syntax-root": {
-      "description": "(syntax-root document language)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1044\n\nReturn the root node of DOCUMENT's tree in LANGUAGE.\nA node is (kind start end named?), KIND a string. The tree is\nparsed from the document's text as it is, if it was not.",
+      "description": "(syntax-root document language)  built-in procedure, @source@/crates/techne-editor/src/syntax.rs:1066\n\nReturn the root node of DOCUMENT's tree in LANGUAGE.\nA node is (kind start end named?), KIND a string. The tree is\nparsed from the document's text as it is, if it was not.",
       "is_macro": false
     },
     "take-target": {
