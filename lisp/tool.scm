@@ -96,6 +96,11 @@
                              (number->string (length request)) " arguments; " usage)))
       (else
         (when (member "--stdin" flags) (set! input (read-all (current-input-port))))
+        ;; ROOT left out, its place taken by FORM: said so, not that a
+        ;; directory named as the form is does not exist.
+        (when (and (string-prefix? "(" (car request)) (not (file-exists? (car request))))
+          (error (string-append "techne tool: ROOT, a directory, comes before FORM, and "
+                                (car request) " is not one; " usage)))
         (let* ((root (%repository-canonical-root (car request)))
                (source (form-source (if (pair? (cdr request)) (cadr request) "(tool-help)")))
                (session (if (= (length request) 3) (caddr request) (default-session)))

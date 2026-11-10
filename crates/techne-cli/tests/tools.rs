@@ -376,6 +376,20 @@ fn flags_may_come_anywhere_and_unknown_ones_are_errors() {
 }
 
 #[test]
+fn a_form_where_root_belongs_is_said_to_be_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(dir.path());
+    let out = Command::new(env!("CARGO_BIN_EXE_techne"))
+        .args(["tool", "(tool-help)"])
+        .env("TECHNE_NODE_DIR", &session.node_dir)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ROOT, a directory, comes before FORM") && stderr.contains("usage: techne tool"), "{stderr}");
+}
+
+#[test]
 fn one_form_is_required_and_errors_are_nonzero() {
     let dir = tempfile::tempdir().unwrap();
     for source in ["", "1 2", "(tool-read project \"absent\")"] {
