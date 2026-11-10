@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794342636747,
+  "lastUpdate": 1794342638534,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -52556,6 +52556,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642897675,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106089,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "909d72dd7c9961c22635bf9541083a2d3786761c",
+          "message": "Merge pull request #352 from ArthurHeymans/tool/wide-windows\n\ntechne tool: a too-wide read gives the bounded window, not an error",
+          "timestamp": "2026-11-10T21:22:48+01:00",
+          "tree_id": "f45132d6a2c0a307af1ab8c71d50074ad977e5d2",
+          "url": "https://github.com/ArthurHeymans/techne/commit/909d72dd7c9961c22635bf9541083a2d3786761c"
+        },
+        "date": 1794342638474,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690659421,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642897554,
             "unit": "instructions"
           },
           {
