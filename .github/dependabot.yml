@@ -13,6 +13,13 @@ updates:
       minor-and-patch:
         update-types: [minor, patch]
     open-pull-requests-limit: 10
+    ignore:
+      # num-bigint 0.5 is not the num-bigint the rest of the num crates
+      # (num-rational's ratios of bigints) are built on: the bump (#327)
+      # compiles nowhere until they move too. Before 1.0 a breaking
+      # release is a minor one here.
+      - dependency-name: num-bigint
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     commit-message:
       prefix: "deps"
   - package-ecosystem: github-actions

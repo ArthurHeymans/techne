@@ -47,9 +47,21 @@ jobs:
           export TECHNE_HOSTILE_SEEDS=1000
           echo "hostile seeds from $TECHNE_HOSTILE_START" >> "$GITHUB_STEP_SUMMARY"
           cargo test --release -p techne-vm --features hostile,counting-allocator --test hostile corruption_fuzz
-      # Random keys for the editor, many more traces, then the
-      # instructions of each key of some: the failure printed is a
-      # `keyfuzz replay` command reproducing it.
+
+  # Random keys for the editor, many more traces, then the instructions
+  # of each key of some: the failure printed is a `keyfuzz replay` command
+  # reproducing it. A job of its own: counting under callgrind takes most
+  # of an hour, and after the fuzzers above it ran out of their two.
+  keyfuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
       - run: |
           start=$(( $(date +%s) / 86400 * 100 ))
           echo "keyfuzz seeds from $start" >> "$GITHUB_STEP_SUMMARY"
@@ -96,9 +108,12 @@ jobs:
       # As in CI's tests: the sandboxed worker needs user namespaces.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         shell: bash
+      # A test killing a child as it writes its profile leaves a corrupt
+      # one: the others still merge (--failure-mode all), and the night
+      # fails only when none does.
       - run: |
-          cargo llvm-cov --release --html
-          cargo llvm-cov report --release --summary-only > summary.txt
+          cargo llvm-cov --release --html --failure-mode all
+          cargo llvm-cov report --release --summary-only --failure-mode all > summary.txt
           { echo '```'; cat summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
         env:
           TECHNE_TEST_MODES: default
@@ -134,10 +149,11 @@ jobs:
 
   # A night that fails opens an issue, or comments on the one still open,
   # so that it does not wait for someone to look at the runs. The failing
-  # seed is in the run's log.
+  # seed is in the run's log. A job past its timeout is cancelled, not
+  # failed: reported too, as is a run cancelled by hand.
   report:
-    needs: [fuzz, miri, coverage, http]
-    if: failure()
+    needs: [fuzz, keyfuzz, miri, coverage, http]
+    if: failure() || cancelled()
     runs-on: ubuntu-24.04
     permissions:
       issues: write
@@ -152,7 +168,8 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           failed=$(jq -r 'to_entries[] | select(.value.result == "failure") | .key' <<<"$NEEDS" | paste -sd ' ' -)
-          body="Nightly run failed ($failed): $RUN"
+          cancelled=$(jq -r 'to_entries[] | select(.value.result == "cancelled") | .key' <<<"$NEEDS" | paste -sd ' ' -)
+          body="Nightly run failed (${failed:-none}; timed out or cancelled: ${cancelled:-none}): $RUN"
           gh label create nightly --color B60205 --description "A nightly run failed" 2>/dev/null || true
           open=$(gh issue list --label nightly --state open --json number --jq '.[0].number // empty')
           if [[ -n $open ]]; then
