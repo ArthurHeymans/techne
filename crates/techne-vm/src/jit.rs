@@ -1565,11 +1565,6 @@ struct Flow {
     live_out: Vec<Regs>,
     /// Registers whose machine copy may differ from memory.
     dirty_in: Vec<Regs>,
-    /// Registers a `guard` or escape landing in this function may read. A
-    /// raise can land there from any instruction, so they count as live
-    /// everywhere (they are part of every `live_in`/`live_out`).
-    #[allow(dead_code)]
-    landing: Regs,
 }
 
 /// The control flow of the instructions compiled (`combine`).
@@ -1615,6 +1610,9 @@ fn analyze(
     let succs = &shape.succs;
     let mut live_in = vec![Regs::empty(n); len];
     let mut live_out = vec![Regs::empty(n); len];
+    // Registers a `guard` or escape landing in this function may read. A
+    // raise can land there from any instruction, so they count as live
+    // everywhere: they are part of every `live_in`/`live_out`.
     let mut landing = Regs::empty(n);
     loop {
         let mut changed = false;
@@ -1696,14 +1694,14 @@ fn analyze(
             break;
         }
     }
-    Flow { live_in, live_out, dirty_in, landing }
+    Flow { live_in, live_out, dirty_in }
 }
 
 /// The registers a call of a known native (`op`) writes back only if
 /// native code is left after it, given those `dirty` and `live` before it
 /// and the fixnums `known` there: the fixnums, which the GC does not move,
 /// but for its arguments, which the native reads, and its result's
-/// register, whose old value a handler may read (`Flow::landing`) but
+/// register, whose old value a handler may read (a landing, in `flow`) but
 /// which must not overwrite the result once the call has stored it.
 fn deferred(op: &Op, dirty: &Regs, live: &Regs, known: &Regs) -> Regs {
     let mut regs = dirty.and(live).and(known);
