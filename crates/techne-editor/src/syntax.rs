@@ -630,6 +630,10 @@ impl Syntax {
         let (Some(entry), Some(lang)) = (self.docs.get_mut(&id), self.languages.get_mut(&language)) else {
             return Vec::new();
         };
+        let to = to.min(entry.rope.len_bytes());
+        if from >= to {
+            return Vec::new();
+        }
         let inside = |ranges: &[FaceRange]| ranges.iter().filter(|r| r.from < to && r.to > from).copied().collect::<Vec<_>>();
         if let Some(i) =
             entry.collected.iter().position(|(generation, cf, ct, _)| *generation == entry.generation && *cf <= from && to <= *ct)
@@ -1500,6 +1504,39 @@ mod tests {
             assert_eq!(s.highlights(&d, "rust", from, to, &mut faces), expected, "the completed range is cached");
             assert!(s.docs[&id].gave_up.is_none());
         }
+    }
+
+    #[test]
+    fn overlong_requests_stop_at_eof() {
+        let mut s = rust();
+        s.set_budget(Duration::from_secs(30));
+        let mut faces = Faces::empty();
+        let d = doc(&"fn f() {}\n".repeat(2_000));
+        let (id, len) = (d.borrow().id(), d.borrow().len());
+        let expected = s.highlights(&d, "rust", 0, len, &mut faces);
+        let entry = s.docs.get_mut(&id).unwrap();
+        entry.collected.clear();
+        entry.narrow = true;
+        let (wake, woken) = mpsc::channel();
+        s.set_wake(wake);
+        for piece in 1..=len.div_ceil(NARROW) {
+            s.begin_snapshot();
+            let ranges = s.highlights(&d, "rust", 0, len + BUCKET, &mut faces);
+            if piece * NARROW < len {
+                assert!(matches!(woken.try_recv(), Ok(Msg::Wake)));
+            } else {
+                assert_eq!(ranges, expected);
+                assert!(woken.try_recv().is_err(), "no wake beyond EOF");
+            }
+        }
+        s.budget = Duration::ZERO;
+        s.begin_snapshot();
+        assert_eq!(s.highlights(&d, "rust", 0, usize::MAX, &mut faces), expected, "overlong cache hit");
+        for from in [len, len + 1, usize::MAX] {
+            assert!(s.highlights(&d, "rust", from, usize::MAX, &mut faces).is_empty(), "nothing past EOF");
+        }
+        assert!(s.highlights(&d, "rust", 0, 0, &mut faces).is_empty());
+        assert!(woken.try_recv().is_err());
     }
 
     #[test]
