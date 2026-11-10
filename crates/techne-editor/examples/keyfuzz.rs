@@ -13,7 +13,8 @@
 //!
 //! - `keyfuzz fuzz [--seeds A-B] [--keys N] [--corpus NAME]` runs traces and
 //!   fails on the first failure; keys slower than ten times the keystroke
-//!   budget in wall time are listed as candidates for `count`.
+//!   budget in wall time are listed as candidates for `count`, but those
+//!   running the user's code.
 //! - `keyfuzz count [--seeds A-B] [--keys N] [--corpus NAME] [--shrink]` runs
 //!   each trace under callgrind, counting the instructions of each key (as
 //!   `runtime/bench/icount.scm` does for `keys`), a collection made before
@@ -591,7 +592,11 @@ fn fuzz(o: &Options) -> bool {
             let args = ["trace".to_string(), c.name.to_string(), seed.to_string(), o.keys.to_string()];
             let trace = run(&args, None);
             for (i, us) in trace.took.iter().enumerate() {
-                if Duration::from_micros(*us) > SLOW {
+                // But a key running the user's code, whose time is not the
+                // budget's and which `count` passes over: evaluating the
+                // buffer was most of the list (a crash's last key has no
+                // answer yet).
+                if Duration::from_micros(*us) > SLOW && !trace.user.get(i).copied().unwrap_or(false) {
                     candidates.push(format!("{} seed {seed} key {} ({}): {} ms", c.name, i + 1, trace.keys[i], us / 1000));
                 }
             }
