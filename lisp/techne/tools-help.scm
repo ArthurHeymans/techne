@@ -11,6 +11,7 @@ Use tool-describe to page a long docstring. Help needs no file/process grants."
         (else
           '((kind help)
             (purpose "Bounded tools, not an autonomous agent. CLI forms retain definitions; project is already bound.")
+            (cli "techne tool [--text] ROOT FORM, ROOT a directory and FORM one argument: techne tool --text . '(tool-show (tool-read project \"README.md\"))'")
             (signatures ((tool-read project PATH #:from 1 #:lines 200 #:chars 16000)
                          (tool-search project LITERAL #:prefix "DIR/")
                          (tool-read-symbol project PATH NAME)

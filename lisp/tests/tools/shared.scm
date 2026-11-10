@@ -81,6 +81,12 @@
     (expect '(#t #f #f) (map (lambda (key) (tool-ref definition key)) '(region-complete file-eof next-line)))
     (define range-error (guard (e (#t (condition/report-string e))) (tool-files p #:limit 100)))
     (expect #t (and (string-contains range-error "expected 1 to 50") #t))
+    ;; A window wider than its bound is the bound, with its continuation.
+    (fixture-write root "tall" (apply string-append (map (lambda (i) "x\n") (iota 250))))
+    (define tall (tool-read p "tall" #:lines 1000))
+    (expect '(#t #f 201) (map (lambda (key) (tool-ref tall key)) '(region-complete file-eof next-line)))
+    (expect 201 (tool-ref (tool-lines p (tool-ref tall 'handle) #:from 1 #:lines 1000) 'next-line))
+    (expect #t (fails (lambda () (tool-read p "tall" #:lines 0))))
     (fixture-write root "pages" "changed")
     (define old (tool-expand p (tool-ref first 'handle)))
     (expect '(4 #f 2) (map (lambda (key) (tool-ref old key)) '(file-lines file-eof next-line)))

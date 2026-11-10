@@ -53,7 +53,8 @@ file contents. Skipped and problems describe incomplete traversal. Call
       "Read a bounded region of PATH in PROJECT, starting at line FROM.
 For a known small file, read it directly rather than listing definitions first.
 Defaults are 200 lines and 16000 characters. Read LINES lines at most,
-1 to 200; return CHARS characters at most,
+1 to 200 (more reads 200, and `next-line` continues); return CHARS
+characters at most,
 1 to 16000. Lines are 1-based: a trailing newline ends the final line,
 not an extra empty line. An empty file has line 1. The reply names its
 revision and a handle for the selected region, NOT the entire file.
@@ -65,7 +66,7 @@ Once complete, `next-line` gives the next source line for `tool-read`.
 Do not infer file EOF from `truncated` or `next`: they describe only
 character clipping inside the selected region. `tool-show` numbers source
 and states snapshot file-lines by default; #:numbered #f opts out."
-      (%response (%tool-read project path from lines chars)))
+      (%response (%tool-read project path from (%at-most lines 200) chars)))
 
     (define (tool-expand project handle #:offset [offset 0] #:chars [chars 8000])
       "Read CHARS characters of PROJECT's snapshot HANDLE from OFFSET.
@@ -89,7 +90,8 @@ an item offset. Normally items carry paths, revisions, lines and handles.
 Previews center on the match and contain at most 240 characters; inspect
 preview-truncated and preview-offset for clipping, and column for the
 1-based Unicode match column. Each hit's handle still covers one line.
-BEFORE and AFTER, each 0 to 8, add context from the SAME immutable source.
+BEFORE and AFTER, each 0 to 8 (more gives 8), add context from the SAME
+immutable source.
 Each hit then has context-handle and context (an expandable read reply).
 CHARS, 1 to 16000, bounds context text across the entire reply, not per
 hit. Inspect context-truncated: clipped contexts have next offsets;
@@ -115,7 +117,8 @@ Inspect enclosing-status and enclosing-complete: unavailable or partial
 syntax is not proof that a match has no owner. With partial syntax an
 owner is only a candidate. This is syntactic navigation, not semantic
 reference resolution. Grouped counts cannot request enclosing metadata."
-      (%response (%tool-search project query prefix limit offset before after chars group-by enclosing)))
+      (%response (%tool-search project query prefix limit offset (%at-most before 8) (%at-most after 8)
+                               chars group-by enclosing)))
 
     (define (tool-symbols project path #:name [name ""] #:limit [limit 50] #:offset [offset 0] #:chars [chars 8000])
       "List definitions of PATH in PROJECT with source spans and handles.
@@ -174,6 +177,11 @@ conditional atomic rename, not a lock against other programs."
     (define (%count n max who)
       (unless (and (integer? n) (exact? n) (<= 1 n max))
         (error who (string-append "count out of range; expected 1 to " (number->string max)) n)))
+    ;; A window wider than its bound is the bound, not an error: the reply
+    ;; says where the rest is, and one wide request in a batch does not
+    ;; lose the batch's other answers. Anything else is checked as before.
+    (define (%at-most n max)
+      (if (and (integer? n) (exact? n)) (min n max) n))
     (define (%offset n)
       (unless (and (integer? n) (exact? n) (>= n 0))
         (error "tool: offset must be a non-negative integer")))
@@ -474,10 +482,11 @@ Unlike `tool-search`, this reads the snapshot, not the disk."
 
     (define (tool-lines project handle #:from [from 1] #:lines [lines 40] #:chars [chars 8000])
       "Read LINES lines, 1 to 200, from line FROM of PROJECT's snapshot HANDLE.
+More than 200 reads 200.
 Lines are numbered as in the snapshot's whole file or output, as
 `tool-find` reports them, and stay within HANDLE's region. Return at
 most CHARS characters, 1 to 16000, with an expandable handle."
-      (%response (%tool-lines project handle from lines chars)))
+      (%response (%tool-lines project handle from (%at-most lines 200) chars)))
 
     (define (tool-apply! project patch)
       "Apply PATCH, search/replace blocks, to files of PROJECT.
