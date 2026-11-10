@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794332179002,
+  "lastUpdate": 1794332180649,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -52208,6 +52208,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642895919,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106089,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b04e2c2d7335e82ed8901bca404bf9b979696b9d",
+          "message": "Merge pull request #351 from ArthurHeymans/editor/narrow-captures\n\nColour dense source that one budget cannot cover",
+          "timestamp": "2026-11-10T18:28:48+01:00",
+          "tree_id": "935f219b14711eddfa8acb777272d406a2ba892d",
+          "url": "https://github.com/ArthurHeymans/techne/commit/b04e2c2d7335e82ed8901bca404bf9b979696b9d"
+        },
+        "date": 1794332180592,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690658891,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642897675,
             "unit": "instructions"
           },
           {
