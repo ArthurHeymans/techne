@@ -36,6 +36,18 @@ The world must be granted entropy."
 (define (subset? items of)
   (every (lambda (item) (and (member item of) #t)) items))
 
+;; Whether PROJECTS, a token's, have PROJECT: by its name, or, for
+;; `tenant/project`, by `tenant/*`, all of a tenant's.
+(define (covers? projects project)
+  (or (and (member project projects) #t)
+      (any (lambda (p)
+             (let ((n (string-length p)))
+               (and (>= n 2)
+                    (string=? (substring p (- n 2) n) "/*")
+                    (not (string-suffix? "/*" project))
+                    (string-prefix? (substring p 0 (- n 1)) project))))
+           projects)))
+
 (define (strings? x)
   (and (list? x) (every string? x)))
 
@@ -109,8 +121,11 @@ the id of a token it was made from."
                             claims))))))))
 
 (define (token-allows? claims project scope)
-  "Return #t if CLAIMS, a token's, allow SCOPE on PROJECT."
-  (and (member project (dict-ref claims "projects"))
+  "Return #t if CLAIMS, a token's, allow SCOPE on PROJECT.
+A token has a project by its name, or, a tenant's (`tenant/project`),
+by `tenant/*`, which is all of that tenant's."
+  (and (string? project)
+       (covers? (dict-ref claims "projects") project)
        (member scope (dict-ref claims "scopes"))
        #t))
 
@@ -125,7 +140,7 @@ an error. Revoking TOKEN revokes it."
     (let ((projects (or projects (dict-ref maker "projects")))
           (scopes (or scopes (dict-ref maker "scopes")))
           (expires (or expires (dict-ref maker "exp"))))
-      (unless (and (strings? projects) (subset? projects (dict-ref maker "projects")))
+      (unless (and (strings? projects) (every (lambda (p) (covers? (dict-ref maker "projects") p)) projects))
         (error "A token is made for its maker's projects at most:" projects))
       (unless (and (strings? scopes) (subset? scopes (dict-ref maker "scopes")))
         (error "A token is made with its maker's scopes at most:" scopes))

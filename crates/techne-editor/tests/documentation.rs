@@ -33,6 +33,7 @@ fn documentation_problems() {
         "lisp/cloud/auth.scm",
         "lisp/cloud/control.scm",
         "lisp/cloud/hosts.scm",
+        "lisp/cloud/serve.scm",
     ] {
         vm.eval_source(&format!("(require {:?})", root.join(file).display().to_string())).unwrap_or_else(|e| panic!("{file}: {e}"));
     }

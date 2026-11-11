@@ -24,11 +24,11 @@
 ;;; /v1/ops`), for a token that allows them on the project
 ;;; (`tokens.scm`): `deploy` to deploy and roll back, `inspect` to list.
 
-(require "manifest.scm")
 (require "tokens.scm")
 (require "../http/http.scm")
 
-(provide make-control control? control-deploy! control-rollback! control-deployments control-serve control-ops-handler)
+(provide make-control control? control-name control-deploy! control-rollback! control-restore! control-deployments
+         control-serve control-ops-handler)
 
 ;; How many deployments' bundles are kept, and events recorded; the most
 ;; bytes a bundle kept may be (a deployment's files, and their encoding).
@@ -155,8 +155,25 @@ directory that is there."
                       (delete-file (string-append (bundles-directory c) "/" file)))))
                 (directory-list (bundles-directory c))))))
 
-(define (control-deploy! c)
+(define (control-restore! c)
+  "Publish again what the record of C says was published last.
+For a supervisor started anew, which serves nothing yet: prepared from
+the bundle kept, and published whatever is. #f, and nothing done, if
+nothing was recorded; an error if its bundle is not kept, or is not it."
+  (in-turn c
+    (lambda ()
+      (let ((events (history c)))
+        (and (pair? events)
+             (let* ((id (caar events))
+                    (prepared (%cloud-prepare-bundle (control-name c) (read-bytes (bundle-file c id)))))
+               (unless (equal? (car prepared) id) (error "The bundle kept is not of the deployment:" id))
+               (%cloud-publish (control-name c) id #t)
+               id))))))
+
+(define (control-deploy! c #:stage [stage #f] #:entry [entry (control-entry c)])
   "Deploy the project of C as its files and manifest are now.
+STAGE, if given, is called first, in this deploy's turn, to put them
+there; ENTRY is its entry module, if not the one C was made with.
 Prepared, its bundle kept, and published if the project is still routed
 where it was when this began: a dict of its `id`, the id `previous` to
 it (#f if none), the `output` of loading it, and whether it is
@@ -167,10 +184,13 @@ cannot be read, is an error and changes nothing. One deploy or rollback
 runs at a time."
   (in-turn c
     (lambda ()
+      (when stage (stage))
+      ;; Its manifest is read by the supervisor, in a world made for it:
+      ;; not here, where what a tenant wrote would be read into a world
+      ;; that lasts.
       (let* ((name (control-name c))
-             (bindings (read-bindings (path-directory (control-entry c))))
              (seen (%cloud-route name))
-             (prepared (%cloud-prepare name (control-entry c) bindings))
+             (prepared (%cloud-prepare-directory name entry))
              (id (car prepared)))
         ;; Read before anything is published: it must be there to add to.
         (history c)

@@ -107,6 +107,17 @@ impl Fleet {
         Ok(fleet)
     }
 
+    /// Start a worker as a tenant's would be, and stop it: an error where
+    /// one cannot be started, sandboxed and bounded as the fleet's
+    /// options require. For a service to refuse to start, before it
+    /// listens, where it could serve no one.
+    pub async fn preflight(&self) -> std::io::Result<()> {
+        let trial = Supervisor::asleep(self.options.worker.clone(), self.cgroups.clone(), "preflight--")?;
+        trial.start_now().await?;
+        trial.sleep();
+        Ok(())
+    }
+
     /// The supervisor of tenant `name`, added if the fleet does not have
     /// it: asleep, until it is given something to do.
     pub fn tenant(&self, name: &str) -> Result<Supervisor, String> {
@@ -217,6 +228,30 @@ impl Fleet {
             t.supervisor.set_store(store.clone(), name);
         }
         s.store = Some(store);
+    }
+
+    /// Give `front` what deploys, as [`Supervisor::install_control`]
+    /// does, each NAME a target, `tenant/project`: of a tenant the fleet
+    /// has, or it is an error (`Fleet::tenant` adds one).
+    pub fn install_control(&self, front: &mut Vm) {
+        self.wakes(front);
+        let me = self.clone();
+        crate::supervisor::install_control_with(
+            front,
+            Rc::new(move |target: &str| {
+                let (tenant, project) = target.split_once('/').ok_or_else(|| format!("{target}: not a tenant's project"))?;
+                if !name_ok(project) {
+                    return Err(format!("{project}: not a project's name"));
+                }
+                let mut s = me.state.borrow_mut();
+                let t = s.tenants.get_mut(tenant).ok_or_else(|| format!("{tenant}: no such tenant"))?;
+                t.used = Instant::now();
+                Ok((t.supervisor.clone(), project.to_string()))
+            }),
+        );
+        // Tenants are added from Lisp, by those that may.
+        let me = self.clone();
+        front.register_fn("%fleet-tenant", move |name: String| -> Result<bool, String> { me.tenant(&name).map(|_| true) });
     }
 
     /// Have what `front`'s tasks wait on wake the fleet's driver

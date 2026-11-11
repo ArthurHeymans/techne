@@ -103,6 +103,10 @@ const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--ops PORT] [--
        techne cloud deployments FILE
        techne cloud deploy FILE
        techne cloud rollback FILE [ID]
+       techne cloud serve --state DIR --domain DOMAIN [--port PORT] [--ops PORT] [--live N] [--idle SECONDS] [--unconfined]
+       techne cloud invite --state DIR TENANT
+       techne cloud deploy FILE --to URL --tenant TENANT --project PROJECT
+       techne cloud deployments|rollback [ID]|secret NAME VALUE --to URL --tenant TENANT --project PROJECT
 
 Serve the deployment whose entry module is FILE on 127.0.0.1:PORT (8787
 by default; 0 picks one), deploying again whenever a Lisp file under
@@ -114,7 +118,13 @@ with the credential printed. With --auth, an nREPL client must
 authenticate first, with a token such as the one printed. With --ops,
 serve the operations on its deployments on that port, which the other
 commands ask of it: the deployments published, deploying again, and
-going back to the one before or to ID.";
+going back to the one before or to ID.
+
+serve runs a cloud of tenants, kept in DIR: each project invited tenants
+deploy is served at PROJECT.TENANT.DOMAIN on PORT, by a worker for each
+tenant, stopped when idle. invite gives a tenant a token for its
+projects. With --to, the address of a serve's operations, the commands
+ask it, with the token in TECHNE_TOKEN: deploy uploads FILE's directory.";
 
 /// How long a deployment may take, loading and all.
 const DEPLOYING: Duration = Duration::from_secs(90);
@@ -160,6 +170,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
             },
             None => usage(),
         },
+        Some((serve, rest)) if serve == "serve" => done(serve_fleet(rest).map(|()| String::new())),
+        Some((invite, rest)) if invite == "invite" => done(invite_tenant(rest)),
+        Some((op, rest)) if rest.iter().any(|a| a == "--to") => done(operate_remote(op, rest)),
         Some((op, rest)) if matches!(op.as_str(), "deployments" | "deploy" | "rollback") => {
             let id = rest.get(1).filter(|_| op == "rollback");
             match rest.first() {
@@ -180,40 +193,248 @@ pub fn main(args: Vec<String>) -> ExitCode {
     }
 }
 
+/// Say `answer`, or why there is none: how a command ended.
+fn done(answer: Result<String, String>) -> ExitCode {
+    match answer {
+        Ok(answer) => {
+            if !answer.is_empty() {
+                println!("{answer}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) if e.is_empty() => usage(),
+        Err(e) => {
+            eprintln!("techne cloud: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The value after `flag` in `args`, and `args` without both.
+fn flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
+    let at = args.iter().position(|a| a == flag)?;
+    (at + 1 < args.len()).then(|| args.drain(at..at + 2).nth(1)).flatten()
+}
+
+/// `techne cloud serve --state DIR --domain DOMAIN [--port PORT] [--ops
+/// PORT] [--live N] [--idle SECONDS] [--unconfined]`: a fleet of the
+/// tenants invited (`lisp/cloud/serve.scm`), each project served at
+/// `project.tenant.DOMAIN` on 127.0.0.1:PORT, the operations on them on
+/// 127.0.0.1:PORT of `--ops`, for something in front that has the
+/// network and TLS. Workers are sandboxed and their resources bounded,
+/// or it does not start: but with `--unconfined`, for trying it where
+/// they cannot be.
+fn serve_fleet(args: &[String]) -> Result<(), String> {
+    use techne_host::{
+        fleet::{Fleet, FleetOptions},
+        supervisor::{Options as WorkerOptions, ResourceConfinement, Sandboxing},
+    };
+    let mut args = args.to_vec();
+    let number = |args: &mut Vec<String>, name: &str, default: u64| match flag(args, name) {
+        Some(n) => n.parse::<u64>().map_err(|_| String::new()),
+        None => Ok(default),
+    };
+    let (state, domain) = (flag(&mut args, "--state").ok_or("")?, flag(&mut args, "--domain").ok_or("")?);
+    let (port, ops) = (number(&mut args, "--port", 8787)?, number(&mut args, "--ops", 8788)?);
+    let (live, idle) = (number(&mut args, "--live", 64)?, number(&mut args, "--idle", 300)?);
+    let unconfined = args.iter().position(|a| a == "--unconfined").map(|at| args.remove(at)).is_some();
+    if !args.is_empty() || domain.contains(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-')) {
+        return Err(String::new());
+    }
+    std::fs::create_dir_all(&state).map_err(|e| format!("{state}: {e}"))?;
+    let state = Path::new(&state).canonicalize().map_err(|e| e.to_string())?;
+    let options = FleetOptions {
+        worker: WorkerOptions {
+            program: std::env::current_exe().map_err(|e| e.to_string())?,
+            args: vec!["cloud".into(), "worker".into()],
+            env: Vec::new(),
+            sandboxing: if unconfined { Sandboxing::IfAvailable } else { Sandboxing::Required },
+            resources: if unconfined { ResourceConfinement::IfAvailable } else { ResourceConfinement::Required },
+            cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
+            wall: Limits::default().wall,
+            dev: false,
+            egress: Default::default(),
+        },
+        live: live as usize,
+        idle: Duration::from_secs(idle),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let fleet = Fleet::new(options).map_err(|e| e.to_string())?;
+        // Before it listens: a worker can be started, confined as said.
+        fleet.preflight().await.map_err(|e| format!("no worker can be started: {e}"))?;
+        let mut front = Vm::new();
+        let failed = |e: Error| e.msg.clone();
+        techne_net::install_on(&mut front, tokio::runtime::Handle::current()).map_err(failed)?;
+        // Before the Lisp that names them is loaded.
+        fleet.install(&mut front);
+        fleet.install_store(&mut front);
+        fleet.install_control(&mut front);
+        let lisp = techne_vm::library::lisp_dir();
+        let file = |name: &str| lisp.join(name).display().to_string();
+        front
+            .eval_source(&format!(
+                r#"(require {:?} {:?} {:?} {:?})
+                   (define cloud (make-cloud {:?}))
+                   (spawn (lambda () (kv-serve-tenants {:?})))
+                   (spawn (lambda ()
+                            (cloud-restore! cloud)
+                            (let ((ops (tcp-listen {ops})) (listener (tcp-listen {port})))
+                              (display (string-append "Operations on http://127.0.0.1:"
+                                                      (number->string (cadr (tcp-local-address ops))) "\n"))
+                              (display (string-append "Serving " {domain:?} " on http://127.0.0.1:"
+                                                      (number->string (cadr (tcp-local-address listener))) "\n"))
+                              (flush-output-port)
+                              (spawn (lambda () (http-serve ops (cloud-ops-handler cloud) #:max-body (* 32 1024 1024)
+                                                            #:max-connections 64 #:stream-bodies #t)))
+                              (http-serve listener (host-routing {domain:?} (lambda (target request) (host-fetch target request)))
+                                          #:stream-bodies #t))))"#,
+                file("cloud/serve.scm"),
+                file("cloud/kv.scm"),
+                file("cloud/hosts.scm"),
+                file("http/server.scm"),
+                state.display().to_string(),
+                state.join("kv").display().to_string(),
+            ))
+            .map_err(failed)?;
+        fleet.run(&mut front).await.map_err(failed)
+    })
+}
+
+/// `techne cloud invite --state DIR TENANT`: invite TENANT to the cloud
+/// kept in DIR (`cloud-invite!`): a token for all its projects.
+fn invite_tenant(args: &[String]) -> Result<String, String> {
+    let mut args = args.to_vec();
+    let state = flag(&mut args, "--state").ok_or("")?;
+    let [tenant] = &args[..] else { return Err(String::new()) };
+    let mut vm = Vm::new();
+    let failed = |e: Error| e.msg.clone();
+    let serve = techne_vm::library::lisp_dir().join("cloud/serve.scm").display().to_string();
+    vm.eval_source(&format!("(require {serve:?})")).map_err(failed)?;
+    let token = vm.eval_source(&format!("(cloud-invite! (make-cloud {state:?}) {tenant:?})")).map_err(failed)?;
+    vm.get::<String>(&token).map_err(failed)
+}
+
+/// `S` as a JSON string.
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `bytes` in base64, padded.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            match i <= chunk.len() {
+                true => out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char),
+                false => out.push('='),
+            }
+        }
+    }
+    out
+}
+
+/// A command with `--to URL --tenant TENANT --project PROJECT`: the
+/// operation `op` asked of the `techne cloud serve` whose operations
+/// are at URL (`http://HOST:PORT`), with the token in `TECHNE_TOKEN`:
+/// `deploy FILE`, the files under FILE's directory uploaded;
+/// `deployments`; `rollback [ID]`; `secret NAME VALUE`.
+fn operate_remote(op: &str, args: &[String]) -> Result<String, String> {
+    let mut args = args.to_vec();
+    let need = |args: &mut Vec<String>, name: &str| flag(args, name).ok_or(String::new());
+    let (to, tenant, project) = (need(&mut args, "--to")?, need(&mut args, "--tenant")?, need(&mut args, "--project")?);
+    let addr = to.strip_prefix("http://").ok_or("--to is http://HOST:PORT")?.trim_end_matches('/').to_string();
+    let token = std::env::var("TECHNE_TOKEN").map_err(|_| "no token: set TECHNE_TOKEN")?;
+    let mut fields = vec![("tenant", json_string(&tenant)), ("project", json_string(&project))];
+    match (op, &args[..]) {
+        ("deployments", []) | ("rollback", []) => fields.push(("op", json_string(op))),
+        ("rollback", [id]) => fields.extend([("op", json_string(op)), ("id", json_string(id))]),
+        ("secret", [name, value]) => {
+            fields.extend([("op", json_string("secret-put")), ("name", json_string(name)), ("value", json_string(value))])
+        }
+        ("deploy", [file]) => {
+            let entry = Path::new(file).canonicalize().map_err(|e| format!("{file}: {e}"))?;
+            let dir = entry.parent().ok_or("an entry in no directory")?;
+            let name = entry.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let files: Vec<String> = techne_host::supervisor::bundle(dir)?
+                .iter()
+                .map(|(p, b)| format!("{}:{}", json_string(p), json_string(&base64(b))))
+                .collect();
+            fields.extend([("op", json_string(op)), ("entry", json_string(&name)), ("files", format!("{{{}}}", files.join(",")))]);
+        }
+        _ => return Err(String::new()),
+    }
+    let body: Vec<String> = fields.iter().map(|(k, v)| format!("{}:{v}", json_string(k))).collect();
+    let named = |name: &str| !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !(named(&tenant) && named(&project)) {
+        return Err("not a tenant's or a project's name".into());
+    }
+    post(&addr, &token, Some(&format!("{tenant}/{project}")), &format!("{{{}}}", body.join(",")))
+}
+
+/// POST `body`, an operation, to the operations at `addr`, with `token`,
+/// on `project` (`tenant/project`) if a cloud's: the answer, or what was
+/// answered instead.
+fn post(addr: &str, token: &str, project: Option<&str>, body: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    if token.bytes().any(|b| b.is_ascii_control() || b == b' ') || addr.bytes().any(|b| b.is_ascii_control() || b == b' ' || b == b'/') {
+        return Err("not a token, or not an address".into());
+    }
+    let mut c = std::net::TcpStream::connect(addr).map_err(|e| format!("{addr}: {e}"))?;
+    let io = |e: std::io::Error| e.to_string();
+    c.set_read_timeout(Some(DEPLOYING + Duration::from_secs(10))).map_err(io)?;
+    write!(
+        c,
+        "POST /v1/ops HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        project.map(|p| format!("Techne-Project: {p}\r\n")).unwrap_or_default(),
+        body.len()
+    )
+    .map_err(io)?;
+    // Refused from its head, the rest may not be taken: what was
+    // answered is read all the same.
+    let sent = c.write_all(body.as_bytes());
+    let mut answer = String::new();
+    let read = c.read_to_string(&mut answer);
+    let Some((head, body)) = answer.split_once("\r\n\r\n") else {
+        return Err(match (sent, read) {
+            (Err(e), _) | (_, Err(e)) => format!("refused, the connection closed: {e}"),
+            _ => "no answer".into(),
+        });
+    };
+    match head.split_whitespace().nth(1) {
+        Some("200") => Ok(body.to_string()),
+        _ => Err(body.to_string()),
+    }
+}
+
 /// Ask the `techne cloud dev --ops` serving `file` for operation `op`
 /// (on deployment `id`, if given), with the token in `TECHNE_TOKEN` or
 /// the one it keeps: its answer, JSON, or why there is none.
 fn operate(op: &str, file: &Path, id: Option<&str>) -> Result<String, String> {
-    use std::io::{Read, Write};
     let entry = file.canonicalize().map_err(|e| format!("{}: {e}", file.display()))?;
     let kept = entry.parent().unwrap_or(Path::new("/")).join(".techne");
     let read = |name: &str| std::fs::read_to_string(kept.join(name)).map(|s| s.trim().to_string());
     let port: u16 =
         read("ops-port").ok().and_then(|p| p.parse().ok()).ok_or("no techne cloud dev --ops serves it (no .techne/ops-port)")?;
     let token = std::env::var("TECHNE_TOKEN").or_else(|_| read("token")).map_err(|_| "no token: set TECHNE_TOKEN")?;
-    if id.is_some_and(|id| !id.bytes().all(|b| b.is_ascii_hexdigit())) || token.bytes().any(|b| b.is_ascii_control()) {
-        return Err("not an id, or not a token".into());
-    }
     let body = match id {
-        Some(id) => format!(r#"{{"op":"{op}","id":"{id}"}}"#),
-        None => format!(r#"{{"op":"{op}"}}"#),
+        Some(id) => format!(r#"{{"op":{},"id":{}}}"#, json_string(op), json_string(id)),
+        None => format!(r#"{{"op":{}}}"#, json_string(op)),
     };
-    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("port {port}: {e}"))?;
-    let io = |e: std::io::Error| e.to_string();
-    c.set_read_timeout(Some(DEPLOYING + Duration::from_secs(10))).map_err(io)?;
-    write!(
-        c,
-        "POST /v1/ops HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .map_err(io)?;
-    let mut answer = String::new();
-    c.read_to_string(&mut answer).map_err(io)?;
-    let (head, body) = answer.split_once("\r\n\r\n").ok_or("no answer")?;
-    match head.split_whitespace().nth(1) {
-        Some("200") => Ok(body.to_string()),
-        _ => Err(body.to_string()),
-    }
+    post(&format!("127.0.0.1:{port}"), &token, None, &body)
 }
 
 fn usage() -> ExitCode {

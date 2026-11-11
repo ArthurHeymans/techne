@@ -49,4 +49,21 @@
   (check "its maker's, by default" '("eval") (dict-ref sub "scopes"))
   (check "the chain grows" 2 (length (dict-ref sub "chain"))))
 
+;; All of a tenant's projects, and no other tenant's.
+(define wide (verify-token key (make-token key "acme" #:projects '("acme/*") #:scopes '("deploy") #:expires 2000) #:now 1000))
+(check "a tenant's project" #t (token-allows? wide "acme/shop" "deploy"))
+(check "not another tenant's" #f (token-allows? wide "acme-two/shop" "deploy"))
+(check "nor one named to look like it" #f (token-allows? wide "bolt/acme/shop" "deploy"))
+(check "nor the tenant alone" #f (token-allows? wide "acme" "deploy"))
+(check "nor what is no name" #f (token-allows? wide #f "deploy"))
+(let ((wide-token (make-token key "acme" #:projects '("acme/*") #:scopes '("deploy") #:expires 2000)))
+  (check "one of them, for an agent" '("acme/shop")
+         (dict-ref (verify-token key (attenuate-token key wide-token "agent" #:projects '("acme/shop") #:now 1000) #:now 1000) "projects"))
+  (check-true "not another tenant's, for an agent"
+              (fails? (lambda () (attenuate-token key wide-token "agent" #:projects '("bolt/shop") #:now 1000))))
+  (check-true "nor all of another's" (fails? (lambda () (attenuate-token key wide-token "agent" #:projects '("bolt/*") #:now 1000)))))
+(check-true "one project is not all of them"
+            (fails? (lambda () (attenuate-token key (make-token key "a" #:projects '("acme/shop") #:scopes '("deploy") #:expires 2000)
+                                                "agent" #:projects '("acme/*") #:now 1000))))
+
 (test-summary)

@@ -559,6 +559,112 @@ impl State {
     }
 }
 
+/// The most bytes of a manifest, and of the secrets beside it.
+const MANIFEST_BYTES: u64 = 256 << 10;
+
+/// The bindings of the deployment in `dir`, as its manifest and secrets
+/// say (`lisp/cloud/manifest.scm`): read in a world of their own, made
+/// for it and dropped after, of bounded memory. A manifest is its
+/// tenant's to write: what reading it interns and allocates goes with
+/// that world, and nothing of it but the bindings, as data, comes out.
+pub fn read_bindings(dir: &Path) -> Result<Bindings, String> {
+    for file in ["manifest.scm", ".secrets.scm"] {
+        if std::fs::metadata(dir.join(file)).is_ok_and(|m| m.len() > MANIFEST_BYTES) {
+            return Err(format!("{file} is larger than a manifest may be"));
+        }
+    }
+    let failed = |e: techne_vm::vm::Error| format!("the manifest: {}", e.msg);
+    let mut vm = Vm::new();
+    vm.set_memory_limit(64 << 20);
+    let manifest = techne_vm::library::lisp_dir().join("cloud/manifest.scm").display().to_string();
+    vm.eval_source(&format!("(require {manifest:?})")).map_err(failed)?;
+    let read = vm.eval_source("read-bindings").map_err(failed)?;
+    let dir = vm.from_data(&Data::String(dir.display().to_string())).map_err(failed)?;
+    let found = vm.call(&read, &[dir]).map_err(failed)?;
+    Bindings::from_data(&vm.to_data(&found, 4 << 20).map_err(failed)?)
+}
+
+/// Which supervisor a name given to the natives that deploy is of, and
+/// its deployment's name there: or why none.
+pub(crate) type Resolve = Rc<dyn Fn(&str) -> Result<(Supervisor, String), String>>;
+
+/// Define in `front` the natives [`Supervisor::install_control`] says,
+/// each NAME resolved by `resolve` to a supervisor and a name there (a
+/// fleet's are `tenant/project`).
+pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
+    use techne_vm::{
+        api::{Bytes, Value},
+        vm::Error,
+    };
+    let listed = |p: Prepared| DataValue(Data::List(vec![Data::String(p.id), Data::String(p.output)]));
+    let of = resolve.clone();
+    front.register_async("%cloud-prepare-directory", 2, move |vm, args| {
+        let asked = (|| {
+            let (name, entry) = (args.get::<String>(vm, 0)?, args.get::<String>(vm, 1)?);
+            let (me, name) = of(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, entry))
+        })();
+        async move {
+            let (me, name, entry) = asked?;
+            let entry = Path::new(&entry);
+            let bindings = read_bindings(entry.parent().unwrap_or(Path::new("/"))).map_err(Error::new)?;
+            me.prepare(&name, entry, bindings).await.map(listed).map_err(Error::new)
+        }
+    });
+    let of = resolve.clone();
+    front.register_async("%cloud-prepare", 3, move |vm, args| {
+        let asked = (|| {
+            let (name, entry) = (args.get::<String>(vm, 0)?, args.get::<String>(vm, 1)?);
+            let bindings = args.value(vm, 2)?;
+            let bindings = Bindings::from_data(&vm.to_data(&bindings, crate::REQUEST_BYTES)?).map_err(Error::new)?;
+            let (me, name) = of(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, entry, bindings))
+        })();
+        async move {
+            let (me, name, entry, bindings) = asked?;
+            me.prepare(&name, Path::new(&entry), bindings).await.map(listed).map_err(Error::new)
+        }
+    });
+    let of = resolve.clone();
+    front.register_async("%cloud-prepare-bundle", 2, move |vm, args| {
+        let asked = (|| {
+            let (name, bytes) = (args.get::<String>(vm, 0)?, args.get::<Bytes>(vm, 1)?.0);
+            let (me, name) = of(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, bytes))
+        })();
+        async move {
+            let (me, name, bytes) = asked?;
+            if bytes.len() > MAX_FRAME {
+                return Err(Error::new("the bundle is larger than a deployment may be"));
+            }
+            let (kept, entry, files, bindings) = Bundle::decode(&bytes).map_err(Error::new)?;
+            if kept != name {
+                return Err(Error::new(format!("the bundle is a deployment of {kept}, not {name}")));
+            }
+            me.prepare_files(&name, &entry, files, bindings).await.map(listed).map_err(Error::new)
+        }
+    });
+    let of = resolve.clone();
+    front.register_fn_vm("%cloud-publish", move |vm: &mut Vm, name: String, id: String, expected: Value| -> Result<DataValue, Error> {
+        let expected = match vm.to_data(&expected, 1024)? {
+            Data::Bool(true) => None,
+            Data::Bool(false) => Some(None),
+            Data::String(id) => Some(Some(id)),
+            _ => return Err(Error::new("what is expected is #t, #f or an id")),
+        };
+        let (me, name) = of(&name).map_err(Error::new)?;
+        let before = me.publish(&name, &id, expected.as_ref().map(|e| e.as_deref())).map_err(Error::new)?;
+        Ok(DataValue(before.map_or(Data::Bool(false), Data::String)))
+    });
+    let of = resolve.clone();
+    front.register_fn("%cloud-route", move |name: String| -> DataValue {
+        DataValue(of(&name).ok().and_then(|(me, name)| me.route(&name)).map_or(Data::Bool(false), Data::String))
+    });
+    front.register_fn("%cloud-bundle", move |name: String, id: String| -> DataValue {
+        DataValue(resolve(&name).ok().and_then(|(me, name)| me.bundle_of(&name, &id)).map_or(Data::Bool(false), Data::Bytes))
+    });
+}
+
 /// Kill worker `w`, all of it.
 fn kill(w: &Running) {
     match &w.cgroup {
@@ -669,6 +775,17 @@ impl Supervisor {
         };
         tokio::task::spawn_local(s.clone().watch());
         Ok(s)
+    }
+
+    /// Start its worker now, as the first thing that needs one would:
+    /// whether one can be, confined as its options require.
+    pub(crate) async fn start_now(&self) -> std::io::Result<()> {
+        self.state.borrow_mut().asleep = false;
+        let started = self.start_worker().await;
+        if started.is_err() {
+            self.state.borrow_mut().asleep = true;
+        }
+        started
     }
 
     /// Stop the worker until it is next needed, if nothing needs it now:
@@ -1502,7 +1619,10 @@ impl Supervisor {
 
     /// Give `front` what deploys: for Lisp there that keeps the record of
     /// deployments and decides what is published (`lisp/cloud/control.scm`).
-    /// `(%cloud-prepare name entry bindings)` prepares the deployment whose
+    /// `(%cloud-prepare-directory name entry)` prepares the deployment
+    /// whose entry module is the file ENTRY, bound as the manifest beside
+    /// it says ([`read_bindings`]: the manifest is not read in `front`),
+    /// and `(%cloud-prepare name entry bindings)` the deployment whose
     /// entry module is the file ENTRY, with BINDINGS (a dict of `env` and
     /// `stores`, as `lisp/cloud/manifest.scm` reads them), as
     /// [`Supervisor::prepare`] does: a list of its id and what loading
@@ -1515,62 +1635,14 @@ impl Supervisor {
     /// `(%cloud-prepare-bundle name bytes)` prepares the deployment of
     /// NAME kept so, as `%cloud-prepare` does. What fails is an error.
     pub fn install_control(&self, front: &mut Vm) {
-        use techne_vm::{
-            api::{Bytes, Value},
-            vm::Error,
-        };
         self.wakes(front);
-        let listed = |p: Prepared| DataValue(Data::List(vec![Data::String(p.id), Data::String(p.output)]));
         let me = self.clone();
-        front.register_async("%cloud-prepare", 3, move |vm, args| {
-            let asked = (|| {
-                let (name, entry) = (args.get::<String>(vm, 0)?, args.get::<String>(vm, 1)?);
-                let bindings = args.value(vm, 2)?;
-                let bindings = Bindings::from_data(&vm.to_data(&bindings, crate::REQUEST_BYTES)?).map_err(Error::new)?;
-                Ok::<_, Error>((name, entry, bindings))
-            })();
-            let me = me.clone();
-            async move {
-                let (name, entry, bindings) = asked?;
-                me.prepare(&name, Path::new(&entry), bindings).await.map(listed).map_err(Error::new)
-            }
-        });
-        let me = self.clone();
-        front.register_async("%cloud-prepare-bundle", 2, move |vm, args| {
-            let asked = (|| Ok::<_, Error>((args.get::<String>(vm, 0)?, args.get::<Bytes>(vm, 1)?.0)))();
-            let me = me.clone();
-            async move {
-                let (name, bytes) = asked?;
-                if bytes.len() > MAX_FRAME {
-                    return Err(Error::new("the bundle is larger than a deployment may be"));
-                }
-                let (kept, entry, files, bindings) = Bundle::decode(&bytes).map_err(Error::new)?;
-                if kept != name {
-                    return Err(Error::new(format!("the bundle is a deployment of {kept}, not {name}")));
-                }
-                me.prepare_files(&name, &entry, files, bindings).await.map(listed).map_err(Error::new)
-            }
-        });
-        let me = self.clone();
-        front.register_fn_vm("%cloud-publish", move |vm: &mut Vm, name: String, id: String, expected: Value| -> Result<DataValue, Error> {
-            let expected = match vm.to_data(&expected, 1024)? {
-                Data::Bool(true) => None,
-                Data::Bool(false) => Some(None),
-                Data::String(id) => Some(Some(id)),
-                _ => return Err(Error::new("what is expected is #t, #f or an id")),
-            };
-            let before = me.publish(&name, &id, expected.as_ref().map(|e| e.as_deref())).map_err(Error::new)?;
-            Ok(DataValue(before.map_or(Data::Bool(false), Data::String)))
-        });
-        let me = self.clone();
-        front.register_fn("%cloud-route", move |name: String| -> DataValue {
-            DataValue(me.route(&name).map_or(Data::Bool(false), Data::String))
-        });
-        let me = self.clone();
-        front.register_fn("%cloud-bundle", move |name: String, id: String| -> DataValue {
-            let kept = me.state.borrow().ready.get(&served(&name, &id)).map(|r| r.bundle.encode());
-            DataValue(kept.map_or(Data::Bool(false), Data::Bytes))
-        });
+        install_control_with(front, Rc::new(move |name: &str| Ok((me.clone(), name.to_string()))));
+    }
+
+    /// All of deployment `id` of `name`, prepared, as bytes to keep.
+    fn bundle_of(&self, name: &str, id: &str) -> Option<Vec<u8>> {
+        self.state.borrow().ready.get(&served(name, id)).map(|r| r.bundle.encode())
     }
 
     /// Have what `front`'s tasks wait on wake the supervisor's driver
@@ -1713,7 +1785,7 @@ const DEPLOY: Duration = Duration::from_secs(60);
 /// The files under `dir`, by their paths in it: not hidden ones (a
 /// deployment's secrets are in one), nor in hidden directories, `target`
 /// or `node_modules`, nor through symbolic links.
-fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+pub fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::new();
     let mut total = 0;
     let mut dirs = vec![dir.to_path_buf()];

@@ -592,8 +592,19 @@ then.
   reads from the host name in Lisp (`lisp/cloud/hosts.scm`,
   `project.tenant.DOMAIN`); a tenant or project that is not there is
   answered 404 and starts nothing; one store keeps every tenant's KV
-  namespaces, a directory each, told the tenant by the supervisor. Not
-  yet: a worker per runtime version, and a command that serves a fleet.
+  namespaces, a directory each, told the tenant by the supervisor.
+  `techne cloud serve --state DIR --domain DOMAIN` runs one
+  (`lisp/cloud/serve.scm`): tenants are invited by whoever runs it
+  (`techne cloud invite`, which gives a token for all a tenant's
+  projects; there is no signing up), deploy by uploading their files
+  (`techne cloud deploy FILE --to URL --tenant T --project P`), put
+  secrets, list and roll back, each over `POST /v1/ops` with a token
+  that allows it on `tenant/project`; what each project had published
+  is published again when the service starts again. Its state is a
+  directory of files, accounts included, until there is a database to
+  keep them in. It refuses to start where workers cannot be sandboxed
+  and bounded, but with `--unconfined`. Not yet: a worker per runtime
+  version, quotas, custom domains, TLS (something in front has it).
 - A zygote that forks pre-booted workers would cut cold starts further,
   but VM boot starts the JIT's thread and the allocator and cage hold
   process-wide state; it waits for a probe showing fork is safe and a
