@@ -103,7 +103,7 @@ const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--ops PORT] [--
        techne cloud deployments FILE
        techne cloud deploy FILE
        techne cloud rollback FILE [ID]
-       techne cloud serve --state DIR --domain DOMAIN [--port PORT] [--ops PORT] [--live N] [--idle SECONDS] [--unconfined]
+       techne cloud serve --state DIR --domain DOMAIN [--port PORT] [--ops PORT] [--nrepl PORT] [--live N] [--idle SECONDS] [--unconfined]
        techne cloud invite --state DIR TENANT
        techne cloud deploy FILE --to URL --tenant TENANT --project PROJECT
        techne cloud deployments|rollback [ID]|secret NAME VALUE --to URL --tenant TENANT --project PROJECT
@@ -237,6 +237,7 @@ fn serve_fleet(args: &[String]) -> Result<(), String> {
     let (state, domain) = (flag(&mut args, "--state").ok_or("")?, flag(&mut args, "--domain").ok_or("")?);
     let (port, ops) = (number(&mut args, "--port", 8787)?, number(&mut args, "--ops", 8788)?);
     let (live, idle) = (number(&mut args, "--live", 64)?, number(&mut args, "--idle", 300)?);
+    let nrepl = flag(&mut args, "--nrepl").map(|p| p.parse::<u16>().map_err(|_| String::new())).transpose()?;
     let unconfined = args.iter().position(|a| a == "--unconfined").map(|at| args.remove(at)).is_some();
     if !args.is_empty() || domain.contains(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-')) {
         return Err(String::new());
@@ -271,6 +272,7 @@ fn serve_fleet(args: &[String]) -> Result<(), String> {
         fleet.install(&mut front);
         fleet.install_store(&mut front);
         fleet.install_control(&mut front);
+        let sessions = techne_host::ask::install(&mut front, "debug", AUTHENTICATING);
         let lisp = techne_vm::library::lisp_dir();
         let file = |name: &str| lisp.join(name).display().to_string();
         front
@@ -278,6 +280,7 @@ fn serve_fleet(args: &[String]) -> Result<(), String> {
                 r#"(require {:?} {:?} {:?} {:?})
                    (define cloud (make-cloud {:?}))
                    (spawn (lambda () (kv-serve-tenants {:?})))
+                   (spawn (lambda () (cloud-debug-serve cloud)))
                    (spawn (lambda ()
                             (cloud-restore! cloud)
                             (let ((ops (tcp-listen {ops})) (listener (tcp-listen {port})))
@@ -288,7 +291,9 @@ fn serve_fleet(args: &[String]) -> Result<(), String> {
                               (flush-output-port)
                               (spawn (lambda () (http-serve ops (cloud-ops-handler cloud) #:max-body (* 32 1024 1024)
                                                             #:max-connections 64 #:stream-bodies #t)))
-                              (http-serve listener (host-routing {domain:?} (lambda (target request) (host-fetch target request)))
+                              (http-serve listener
+                                          (cloud-front-handler cloud {domain:?}
+                                                               (lambda (target request debug) (host-fetch target request #:debug debug)))
                                           #:stream-bodies #t))))"#,
                 file("cloud/serve.scm"),
                 file("cloud/kv.scm"),
@@ -298,6 +303,12 @@ fn serve_fleet(args: &[String]) -> Result<(), String> {
                 state.join("kv").display().to_string(),
             ))
             .map_err(failed)?;
+        if let Some(port) = nrepl {
+            let bound = serve_debug_sessions(fleet.clone(), &format!("127.0.0.1:{port}"), sessions)
+                .await
+                .map_err(|e| format!("nREPL on port {port}: {e}"))?;
+            println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
+        }
         fleet.run(&mut front).await.map_err(failed)
     })
 }
@@ -636,13 +647,12 @@ async fn serve_repl_authenticated(
     Ok(bound)
 }
 
-/// Read the first message of `stream`, an nREPL client: an
-/// `authenticate` with a `token` that `auth` says holds, answered
-/// `done`; anything else is answered `unauthenticated`. The principal,
-/// and what the client sent after the message.
-async fn authenticate(stream: &mut tokio::net::TcpStream, auth: &techne_host::ask::Asker) -> Option<(String, Vec<u8>)> {
-    use techne_node::bencode::{B, dict, parse};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// The first message of `stream`, an nREPL client, and what the client
+/// sent after it: none for what is no message, or one past what a first
+/// one may be, which is answered nothing.
+async fn first_message(stream: &mut tokio::net::TcpStream) -> Option<(techne_node::bencode::B, Vec<u8>)> {
+    use techne_node::bencode::parse;
+    use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     let (message, used) = loop {
@@ -656,26 +666,130 @@ async fn authenticate(stream: &mut tokio::net::TcpStream, auth: &techne_host::as
             _ => return None,
         }
     };
-    let token = match message.get("op").and_then(B::as_str) {
-        Some("authenticate") => message.get("token").and_then(B::as_str),
-        _ => None,
-    };
-    let principal = match token {
-        Some(token) => match auth.ask(Data::String(token.into()), AUTHENTICATE).await {
+    Some((message, buf[used..].to_vec()))
+}
+
+/// What `message`, a client's first, has as `field`, if it is an
+/// `authenticate`.
+fn authenticating(message: &techne_node::bencode::B, field: &str) -> Option<String> {
+    use techne_node::bencode::B;
+    (message.get("op").and_then(B::as_str) == Some("authenticate"))
+        .then(|| message.get(field).and_then(B::as_str).map(str::to_string))
+        .flatten()
+}
+
+/// Answer `message`, an `authenticate` (or what came in its place, if
+/// none), on `stream`: `done` with `fields` if `admitted`, else
+/// `unauthenticated`. Whether it was written.
+async fn answer_first(
+    stream: &mut tokio::net::TcpStream,
+    message: Option<&techne_node::bencode::B>,
+    admitted: bool,
+    fields: Vec<(&str, techne_node::bencode::B)>,
+) -> bool {
+    use techne_node::bencode::{B, dict};
+    use tokio::io::AsyncWriteExt;
+    let statuses: &[&str] = if admitted { &["done"] } else { &["error", "unauthenticated", "done"] };
+    let mut all = vec![("status", B::List(statuses.iter().map(B::str).collect()))];
+    all.extend(fields);
+    if let Some(id) = message.and_then(|m| m.get("id")) {
+        all.push(("id", id.clone()));
+    }
+    let mut reply = Vec::new();
+    dict(all).encode(&mut reply);
+    stream.write_all(&reply).await.is_ok()
+}
+
+/// Read the first message of `stream`, an nREPL client: an
+/// `authenticate` with a `token` that `auth` says holds, answered
+/// `done`; anything else is answered `unauthenticated`. The principal,
+/// and what the client sent after the message.
+async fn authenticate(stream: &mut tokio::net::TcpStream, auth: &techne_host::ask::Asker) -> Option<(String, Vec<u8>)> {
+    let (message, sent) = first_message(stream).await?;
+    let principal = match authenticating(&message, "token") {
+        Some(token) => match auth.ask(Data::String(token), AUTHENTICATE).await {
             Ok(Data::String(principal)) => Some(principal),
             _ => None,
         },
         None => None,
     };
-    let statuses: &[&str] = if principal.is_some() { &["done"] } else { &["error", "unauthenticated", "done"] };
-    let mut fields = vec![("status", B::List(statuses.iter().map(B::str).collect()))];
-    if let Some(id) = message.get("id") {
-        fields.push(("id", id.clone()));
-    }
-    let mut reply = Vec::new();
-    dict(fields).encode(&mut reply);
-    stream.write_all(&reply).await.ok()?;
-    principal.map(|p| (p, buf[used..].to_vec()))
+    let written = answer_first(stream, Some(&message), principal.is_some(), Vec::new()).await;
+    principal.filter(|_| written).map(|p| (p, sent))
+}
+
+/// Accept REPL clients of a cloud's projects on `addr`: each
+/// authenticates with a first message, an `authenticate` with its
+/// `token` and the `project` it is for (`tenant/project`), which
+/// `sessions` opens a debugging session for (`cloud-debug-serve`) or
+/// refuses; answered `done` with the session's `techne-debug-route`
+/// credential, it is relayed to the project's debug instance, attached
+/// for it. The session is closed when the connection ends. The address
+/// bound.
+async fn serve_debug_sessions(
+    fleet: techne_host::fleet::Fleet,
+    addr: &str,
+    sessions: techne_host::ask::Asker,
+) -> std::io::Result<std::net::SocketAddr> {
+    use techne_node::bencode::B;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    let places = std::sync::Arc::new(tokio::sync::Semaphore::new(AUTHENTICATING));
+    tokio::task::spawn_local(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let Ok(place) = places.clone().try_acquire_owned() else { continue };
+            let _ = stream.set_nodelay(true);
+            let (fleet, sessions) = (fleet.clone(), sessions.clone());
+            tokio::task::spawn_local(async move {
+                let text = |s: &str| Data::String(s.into());
+                let opened = tokio::time::timeout(AUTHENTICATE, async {
+                    let (message, sent) = first_message(&mut stream).await?;
+                    let asked = authenticating(&message, "token").zip(authenticating(&message, "project"));
+                    let session = match &asked {
+                        Some((token, target)) => {
+                            match sessions.ask(Data::List(vec![text("open"), text(token), text(target)]), AUTHENTICATE).await {
+                                Ok(Data::List(session)) => match &session[..] {
+                                    [Data::String(principal), Data::String(credential)] => Some((principal.clone(), credential.clone())),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        }
+                        None => None,
+                    };
+                    Some((message, sent, asked.map(|(_, target)| target).zip(session)))
+                })
+                .await
+                .ok()
+                .flatten();
+                drop(place);
+                // What is no message is answered nothing; one refused,
+                // that it is.
+                let Some((message, sent, session)) = opened else { return };
+                let Some((target, (principal, credential))) = session else {
+                    answer_first(&mut stream, Some(&message), false, Vec::new()).await;
+                    return;
+                };
+                let close = || sessions.ask(Data::List(vec![text("close"), text(&target), text(&credential)]), AUTHENTICATE);
+                let supervisor = target.split_once('/').and_then(|(tenant, project)| Some((fleet.known(tenant)?, project.to_string())));
+                let answered =
+                    answer_first(&mut stream, Some(&message), supervisor.is_some(), vec![("techne-debug-route", B::str(&credential))])
+                        .await;
+                let ended = match supervisor.filter(|_| answered) {
+                    Some((supervisor, project)) => supervisor.attach(&project, stream, principal, sent).await.ok(),
+                    None => None,
+                };
+                // Until the connection ends: then the session does, for
+                // sure, however busy what closes it is.
+                if let Some(ended) = ended {
+                    let _ = ended.await;
+                }
+                while close().await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            });
+        }
+    });
+    Ok(bound)
 }
 
 /// Start `lisp/http`'s server in `front` on `port`, handing requests to
@@ -790,6 +904,50 @@ pub struct DevWorker {
     deployed: u64,
     names: std::collections::HashMap<String, u64>,
     debug: bool,
+    /// The entry module of each deployment served as in production, by
+    /// its name; the debug instance attached to each that has one, for
+    /// its REPL clients; and the deployment each such client is of.
+    entries: std::collections::HashMap<String, String>,
+    debugged: std::collections::HashMap<String, Debugged>,
+    clients: std::collections::HashMap<u64, String>,
+    /// The clients whose debug instance is gone, to be closed (`gone`).
+    orphans: Vec<u64>,
+}
+
+impl DevWorker {
+    /// The deployment published as `name` has its debug instance no
+    /// longer: its clients are to be closed.
+    fn orphan(&mut self, name: &str) {
+        self.debugged.remove(name);
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.clients).into_iter().partition(|(_, of)| of == name);
+        self.clients = kept.into_iter().collect();
+        self.orphans.extend(gone.into_iter().map(|(cid, _)| cid));
+    }
+}
+
+/// A deployment's debug instance, attached for REPL clients.
+struct Debugged {
+    /// Its number in the host.
+    id: u64,
+    /// The nREPL server in it.
+    server: Rc<RefCell<Option<Server>>>,
+    clients: usize,
+}
+
+/// The nREPL server of a debug instance attached for clients, as
+/// attached to its world.
+struct DebugRepl(Rc<RefCell<Option<Server>>>);
+
+impl Attached for DebugRepl {
+    fn poll(&mut self, vm: &mut Vm) -> bool {
+        self.0.borrow().as_ref().is_some_and(|server| server.poll(vm))
+    }
+
+    fn reap(&mut self, vm: &mut Vm) {
+        if let Some(server) = &*self.0.borrow() {
+            server.reap(vm);
+        }
+    }
 }
 
 /// The nREPL server of a worker, and where it is and is to be.
@@ -835,6 +993,73 @@ impl techne_host::worker::Dev for DevWorker {
 
     fn retire(&mut self, name: &str) {
         self.names.remove(name);
+        // Its debug instance went with it, in the host: its clients go.
+        self.entries.remove(name);
+        self.orphan(name);
+    }
+
+    fn gone(&mut self, host: &Host) -> Vec<u64> {
+        // Poisoned, say: the host has it no longer.
+        let lost: Vec<String> =
+            self.debugged.iter().filter(|(name, d)| host.debugging(name) != Some(d.id)).map(|(name, _)| name.clone()).collect();
+        for name in lost {
+            self.orphan(&name);
+        }
+        std::mem::take(&mut self.orphans)
+    }
+
+    fn loaded(&mut self, name: &str, entry: &Path) {
+        self.entries.insert(name.into(), entry.display().to_string());
+    }
+
+    fn attach(
+        &mut self,
+        host: &Host,
+        name: &str,
+        cid: u64,
+        stream: tokio::io::DuplexStream,
+        principal: Option<String>,
+    ) -> Result<(), Error> {
+        // One the host has no longer is not attached to: another is.
+        if self.debugged.get(name).is_some_and(|d| host.debugging(name) != Some(d.id)) {
+            self.orphan(name);
+        }
+        if !self.debugged.contains_key(name) {
+            let entry = self.entries.get(name).cloned().ok_or_else(|| Error::new("no such deployment"))?;
+            let server = Rc::new(RefCell::new(None));
+            let (installed, waker) = (server.clone(), host.waker());
+            let id = host.attach_debug(name, move |vm| {
+                let server = Server::install(vm, waker)?;
+                if let Some(module) = vm.loaded_module(&entry) {
+                    server.set_module(module);
+                }
+                // A failing request routed there breaks into the
+                // subscribed client's debugger.
+                vm.eval_in(ROOT_MODULE, "<techne cloud>", "(set! %host-debugger %nrepl-debug-request)")?;
+                *installed.borrow_mut() = Some(server);
+                Ok(Box::new(DebugRepl(installed)))
+            })?;
+            self.debugged.insert(name.into(), Debugged { id, server, clients: 0 });
+        }
+        let debugged = self.debugged.get_mut(name).ok_or_else(|| Error::new("no debug instance"))?;
+        match &*debugged.server.borrow() {
+            Some(server) => server.remote().serve_stream_as(stream, principal),
+            None => return Err(Error::new("no REPL in the debug instance")),
+        }
+        debugged.clients += 1;
+        self.clients.insert(cid, name.into());
+        Ok(())
+    }
+
+    fn closed(&mut self, host: &Host, cid: u64) {
+        let Some(name) = self.clients.remove(&cid) else { return };
+        let Some(debugged) = self.debugged.get_mut(&name) else { return };
+        debugged.clients = debugged.clients.saturating_sub(1);
+        // Its last client gone: the debug instance is retired.
+        if debugged.clients == 0 {
+            host.detach_debug(&name, Some(debugged.id));
+            self.debugged.remove(&name);
+        }
     }
 
     fn connect(&mut self, stream: tokio::io::DuplexStream, principal: Option<String>) {

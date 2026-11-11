@@ -48,4 +48,16 @@
   (check "a string response: debug" "debug" (dict-ref r 'body))
   (check "marked too" "private, no-store" (dict-ref (dict-ref r 'headers) "cache-control")))
 
+;; The credentials that route now, asked for each request.
+(define now (list credential))
+(define route-now (debug-routing serve (lambda () now)))
+(check "one of those that route now: debug" "debug" (dict-ref (route-now (request "/" "techne-debug-route" credential)) 'body))
+(set! now (list (make-debug-credential) (make-debug-credential)))
+(check "no longer one of them: production" "production" (dict-ref (route-now (request "/" "techne-debug-route" credential)) 'body))
+(check "the second of them: debug" "debug" (dict-ref (route-now (request "/" "techne-debug-route" (cadr now))) 'body))
+(set! now '())
+(set! seen '())
+(check "none route: production" "production" (dict-ref (route-now (request "/" "techne-debug-route" credential)) 'body))
+(check "the header taken all the same" (dict) (car seen))
+
 (test-summary)

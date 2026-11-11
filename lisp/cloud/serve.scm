@@ -30,9 +30,10 @@
 (require "auth.scm")
 (require "hosts.scm")
 (require "../http/http.scm")
+(require "../http/debug-route.scm")
 (import (techne crypto))
 
-(provide make-cloud cloud? cloud-invite! cloud-restore! cloud-ops-handler)
+(provide make-cloud cloud? cloud-invite! cloud-restore! cloud-ops-handler cloud-front-handler cloud-debug-serve)
 
 ;; A tenant's projects, a deployment's files, the bytes of them, and the
 ;; directories a file may be under, at most.
@@ -43,9 +44,17 @@
 ;; Operations at once, of all tenants: each may hold an upload.
 (define max-operations 8)
 
+;; Debugging sessions at once, of all tenants, and of one project.
+(define max-sessions 32)
+(define max-sessions-each 4)
+
 (define-record-type cloud
-  (%make-cloud state key controls operations turn)
+  (%make-cloud state key controls operations turn sessions)
   cloud?
+  ;; A box of the debugging sessions there are: (target . credential)
+  ;; each, a request showing the credential being its project's debug
+  ;; instance's to serve.
+  (sessions cloud-sessions)
   (state cloud-state)
   (key cloud-key)
   ;; Each project's control, by its target: one, so that its deploys
@@ -96,7 +105,68 @@ Its token key is the one kept there, made if none is."
   (ensure-directory (string-append state "/tenants"))
   (let ((turn (make-channel 1)))
     (channel-send turn #t)
-    (%make-cloud state (token-key-in state) (dict) (box '()) turn)))
+    (%make-cloud state (token-key-in state) (dict) (box '()) turn (box '()))))
+
+;; The credentials that route to TARGET's debug instance now.
+(define (credentials-of cloud target)
+  (filter-map (lambda (s) (and (equal? (car s) target) (cdr s))) (unbox (cloud-sessions cloud))))
+
+;; Change the sessions there are by CHANGE, a procedure of them; what it
+;; returns #f for changes nothing, and is #f.
+(define (change-sessions! cloud change)
+  (let* ((box (cloud-sessions cloud))
+         (now (unbox box))
+         (next (change now)))
+    (and next (or (box-cas! box now next) (change-sessions! cloud change)))))
+
+(define (cloud-front-handler cloud domain serve)
+  "Return an HTTP handler serving CLOUD's projects by host name, in DOMAIN.
+(SERVE target request debug) answers REQUEST for TARGET,
+`tenant/project`, as `host-routing` finds it, from its debug instance
+if DEBUG: which is for a request whose `techne-debug-route` header is
+the credential of a debugging session of that project there is now
+(`cloud-debug-serve`), and no other. The header reaches no project."
+  (host-routing domain
+                (lambda (target request)
+                  ((debug-routing (lambda (request debug) (serve target request debug))
+                                  (lambda () (credentials-of cloud target)))
+                   request))))
+
+(define (cloud-debug-serve cloud #:revoked? [revoked? (lambda (id) #f)])
+  "Open and close CLOUD's debugging sessions as asked, for ever.
+Asked (\"open\" token target): a session of the project TARGET, for a
+token that holds and allows `prod` on it, of a tenant invited, answered
+with a list of whom the token is for and the session's credential,
+which routes requests to the project's debug instance while the session
+lasts; refused otherwise (a token REVOKED? says is revoked does not
+hold, as `verify-token` has it), and past the sessions there may be. Asked
+(\"close\" target credential): that session is over."
+  (let loop ()
+    (let* ((asked (%debug-next))
+           (id (car asked))
+           (what (cadr asked)))
+      (guard (e (#t (%debug-reply id #f "refused")))
+        (cond
+         ((and (list? what) (= (length what) 3) (equal? (car what) "open"))
+          (let* ((target (caddr what))
+                 (claims (verify-token (cloud-key cloud) (cadr what) #:revoked? revoked?))
+                 (named (and (string? target) (host-target (string-append (target-host target) ".x") "x")))
+                 (credential (make-debug-credential)))
+            (if (and claims named (equal? named target)
+                     (token-allows? claims target "prod")
+                     (file-exists? (string-append (cloud-state cloud) "/tenants/" target))
+                     (change-sessions! cloud
+                                       (lambda (now)
+                                         (and (< (length now) max-sessions)
+                                              (< (length (filter (lambda (s) (equal? (car s) target)) now)) max-sessions-each)
+                                              (cons (cons target credential) now)))))
+                (%debug-reply id #t (list (dict-ref claims "sub") credential))
+                (%debug-reply id #f "refused"))))
+         ((and (list? what) (= (length what) 3) (equal? (car what) "close"))
+          (change-sessions! cloud (lambda (now) (remove (lambda (s) (equal? s (cons (cadr what) (caddr what)))) now)))
+          (%debug-reply id #t #t))
+         (else (%debug-reply id #f "refused"))))
+      (loop))))
 
 (define (tenant-directory cloud tenant)
   (string-append (cloud-state cloud) "/tenants/" tenant))

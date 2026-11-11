@@ -63,6 +63,7 @@ techne cloud deployments app.scm   # the deployments published, the latest first
 techne cloud rollback app.scm      # publish the one before again (or the one given by id)
 techne cloud serve --state DIR --domain cloud.example   # a cloud of tenants: PROJECT.TENANT.cloud.example, a worker each
 techne cloud invite --state DIR acme                    # ... a tenant invited: a token for its projects
+techne cloud serve --state DIR --domain cloud.example --nrepl 7888   # ... with an nREPL into projects in production, for their tokens
 techne cloud deploy app.scm --to http://127.0.0.1:8788 --tenant acme --project shop   # ... a project uploaded and published
 ```
 

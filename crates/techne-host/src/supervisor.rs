@@ -345,6 +345,8 @@ const REPL_QUEUE: usize = 64;
 struct Repl {
     queue: mpsc::Sender<Vec<u8>>,
     reader: tokio::task::AbortHandle,
+    /// Dropped with it: who waits for the connection's end is told.
+    _ended: oneshot::Sender<()>,
 }
 
 impl Drop for Repl {
@@ -1715,15 +1717,57 @@ impl Supervisor {
     /// each principal's apart), `sent` being what the client sent already
     /// that is the REPL's to read.
     pub fn relay(&self, stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + 'static, principal: Option<String>, sent: Vec<u8>) {
+        let _ = self.relay_to(None, stream, principal, sent);
+    }
+
+    /// Relay `stream`, a REPL client authenticated as `principal`, to a
+    /// debug instance of the deployment `name` is routed to now, attached
+    /// for it if it has none (`Host::attach_debug`): the worker started
+    /// if the supervisor sleeps, which it does not while the client is
+    /// connected. What resolves when the connection has ended, however it
+    /// does (the debug instance goes with its last client, and with its
+    /// deployment); or why there is none.
+    pub async fn attach(
+        &self,
+        name: &str,
+        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + 'static,
+        principal: String,
+        sent: Vec<u8>,
+    ) -> Result<oneshot::Receiver<()>, String> {
+        if self.sleeping() || self.state.borrow().waking {
+            self.awake().await?;
+        }
+        let served = {
+            let s = self.state.borrow();
+            let id = s.routes.get(name).ok_or("no such deployment")?;
+            let served = served(name, id);
+            if !s.ready.get(&served).is_some_and(|r| r.loaded) {
+                return Err("the deployment is being loaded".into());
+            }
+            served
+        };
+        self.relay_to(Some(served), stream, Some(principal), sent).ok_or_else(|| "no worker".to_string())
+    }
+
+    /// `relay`, to the debug instance of the deployment served as
+    /// `target` if given: what resolves at the connection's end, if it
+    /// was relayed.
+    fn relay_to(
+        &self,
+        target: Option<String>,
+        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + 'static,
+        principal: Option<String>,
+        sent: Vec<u8>,
+    ) -> Option<oneshot::Receiver<()>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (cid, send) = {
             let mut s = self.state.borrow_mut();
-            let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else { return };
+            let send = s.worker.as_ref().map(|w| w.send.clone())?;
             s.next_cid += 1;
             (s.next_cid, send)
         };
         let (queue, mut queued) = mpsc::channel::<Vec<u8>>(REPL_QUEUE);
-        let _ = send.send(ToWorker::ReplOpen { cid, principal });
+        let _ = send.send(ToWorker::ReplOpen { cid, principal, target });
         for bytes in sent.chunks(REPL_CHUNK) {
             let _ = send.send(ToWorker::ReplData { cid, bytes: bytes.to_vec() });
         }
@@ -1750,7 +1794,9 @@ impl Supervisor {
             }
         });
         let reader = reader.abort_handle();
-        self.state.borrow_mut().repls.insert(cid, Repl { queue, reader });
+        let (ended, end) = oneshot::channel();
+        self.state.borrow_mut().repls.insert(cid, Repl { queue, reader, _ended: ended });
+        Some(end)
     }
 
     /// Define `(host-fetch deployment request #:debug #f)` in the front

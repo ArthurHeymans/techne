@@ -457,6 +457,13 @@ impl Host {
         Ok(id)
     }
 
+    /// The number of the debug instance the deployment published under
+    /// `name` has now, if it has one: one poisoned, or gone with its
+    /// deployment, is its no longer.
+    pub fn debugging(&self, name: &str) -> Option<u64> {
+        self.state.borrow().published.get(name).and_then(|p| p.debug.as_ref()).map(|d| d.id)
+    }
+
     /// Drop debug instance `id` of the deployment published under `name`
     /// (any, with no `id`), if it has it still: a request running on it is
     /// answered 504, and those routed to it from now on are served as any

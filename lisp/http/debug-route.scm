@@ -49,11 +49,17 @@ The world must be granted entropy."
 A request whose `techne-debug-route` header is CREDENTIAL, a string, is
 served with DEBUG and its response marked: a `techne-debug` header, and
 a cache-control that lets no shared cache keep it. Any other is served
-without. SERVE never sees the header."
+without. SERVE never sees the header. CREDENTIAL may be a procedure
+instead, called for each request that shows one: the credentials that
+route now, a list of strings, each compared, none if it is empty."
   (lambda (request)
     (let* ((headers (dict-ref request 'headers (dict)))
            (given (dict-ref headers debug-route-header #f))
            (request (if given (dict-set request 'headers (dict-delete headers debug-route-header)) request)))
-      (if (and given (digest=? given credential))
+      (if (and given
+               (if (procedure? credential)
+                   ;; Each compared, whichever is the one.
+                   (fold (lambda (c found) (or (digest=? given c) found)) #f (credential))
+                   (digest=? given credential)))
           (mark-debugged (serve request #t))
           (serve request #f)))))

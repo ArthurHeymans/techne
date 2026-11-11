@@ -368,8 +368,18 @@ on it then failing with 504; a routed request has a minute more of wall
 time. Routing is by a credential in the `techne-debug-route` header,
 decided by the front in Lisp (`lisp/http/debug-route.scm`), which marks
 the responses; `techne cloud dev --nrepl PORT --debug` runs it locally,
-its credential made at the start and printed. Still to do: sessions that
-issue and expire credentials, a share of real traffic and filters, the
+its credential made at the start and printed. On a fleet (`techne cloud
+serve --nrepl PORT`), a client's first message is `authenticate` with
+its token and the `project` it attaches to: for a token that allows
+`prod` on it, a debugging session is opened, its credential answered
+(`techne-debug-route`), and the connection relayed to the project's
+debug instance, attached for its first client and detached with its
+last; the tenant's worker is started for it if it sleeps, and kept
+while a client is connected. The credential routes while the session
+lasts, to that project alone, and is gone when the connection ends
+(`lisp/cloud/serve.scm`). Sessions are few at once, in all and for one
+project. Still to do: credentials that expire by themselves, a share of
+real traffic and filters, the
 audit log, and the paused state (a request's deadline is fixed when it
 is admitted, not when it pauses). A request routed to a debug instance
 that goes before serving it is served as any other, within the wall time
