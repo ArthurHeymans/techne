@@ -184,6 +184,10 @@ impl Link {
 /// URL and headers.
 const FETCH_BYTES: usize = (1 << 20) + (64 << 10);
 
+/// Requests that may wait for a worker asleep to be started: more are
+/// refused.
+const DEFERRED: usize = 32;
+
 /// Fetches of a request, and of a worker's requests at once (with what
 /// they ask of the store).
 const FETCHES: usize = 50;
@@ -471,6 +475,18 @@ struct Running {
 }
 
 struct State {
+    /// No worker until one is next needed (`Supervisor::sleep`), and one
+    /// being started for that.
+    asleep: bool,
+    waking: bool,
+    /// Requests waiting for a worker to be started for them.
+    deferred: usize,
+    /// Whether a worker may be started for a supervisor asleep, if
+    /// someone bounds them.
+    gate: Option<Rc<dyn Fn() -> bool>>,
+    /// What the store is told the namespaces asked for are those of, if
+    /// it is one that supervisors share.
+    store_scope: Option<Rc<str>>,
     worker: Option<Running>,
     generation: u64,
     next_rid: u64,
@@ -543,6 +559,20 @@ impl State {
     }
 }
 
+/// Kill worker `w`, all of it.
+fn kill(w: &Running) {
+    match &w.cgroup {
+        Some(c) => {
+            let _ = c.kill();
+        }
+        // SAFETY: signalling the worker's waiter, whose death ends the
+        // worker, through its pidfd: none once reaped.
+        None => unsafe {
+            libc::syscall(libc::SYS_pidfd_send_signal, w.pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0);
+        },
+    }
+}
+
 /// Serves deployments with a worker process: see the module.
 #[derive(Clone)]
 pub struct Supervisor {
@@ -554,29 +584,60 @@ pub struct Supervisor {
     wake: Arc<Notify>,
     /// Wakes the watcher of deadlines.
     changed: Rc<Notify>,
+    /// Told when a worker woken has loaded what is published, or has not.
+    woke: Rc<Notify>,
+    /// What its workers' cgroups are named with, before their number:
+    /// its own among the supervisors that share the cgroups.
+    label: Rc<str>,
+}
+
+/// The cgroups workers are put in, adopted from the process's own: none,
+/// said, where there are none to adopt and `options` do not require
+/// them, an error where they do.
+pub fn adopt(options: &Options) -> std::io::Result<Option<Cgroups>> {
+    match Cgroups::adopt() {
+        Ok(c) => Ok(Some(c)),
+        Err(e) if options.resources == ResourceConfinement::Required => {
+            Err(std::io::Error::new(e.kind(), format!("workers require cgroup resource confinement: {e}")))
+        }
+        Err(e) => {
+            eprintln!("techne cloud: workers' resources are not bounded: {e}");
+            Ok(None)
+        }
+    }
 }
 
 impl Supervisor {
     /// A supervisor with its first worker started and ready. Call it on a
     /// current-thread runtime within a `LocalSet`.
     pub async fn start(options: Options) -> std::io::Result<Supervisor> {
-        let cgroups = match Cgroups::adopt() {
-            Ok(c) => Some(c),
-            Err(e) if options.resources == ResourceConfinement::Required => {
-                return Err(std::io::Error::new(e.kind(), format!("workers require cgroup resource confinement: {e}")));
-            }
-            Err(e) => {
-                eprintln!("techne cloud: workers' resources are not bounded: {e}");
-                None
-            }
-        };
+        let cgroups = adopt(&options)?;
+        let s = Supervisor::asleep(options, Rc::new(cgroups), "")?;
+        s.state.borrow_mut().asleep = false;
+        s.start_worker().await?;
+        Ok(s)
+    }
+
+    /// A supervisor with no worker yet: one is started when first needed,
+    /// by a deployment prepared or a request ([`Supervisor::sleep`]).
+    /// Its workers are put in `cgroups`, which other supervisors may
+    /// share, named with `label`, its own among them. Call it on a
+    /// current-thread runtime within a `LocalSet`.
+    pub fn asleep(options: Options, cgroups: Rc<Option<Cgroups>>, label: &str) -> std::io::Result<Supervisor> {
         let sandbox = options.sandboxing != Sandboxing::Off;
         let egress = Rc::new(crate::egress::Egress::new(options.egress.clone()).map_err(std::io::Error::other)?);
         let s = Supervisor {
             egress,
             options: Rc::new(options),
-            cgroups: Rc::new(cgroups),
+            cgroups,
+            woke: Rc::new(Notify::new()),
+            label: label.into(),
             state: Rc::new(RefCell::new(State {
+                asleep: true,
+                waking: false,
+                deferred: 0,
+                gate: None,
+                store_scope: None,
                 worker: None,
                 generation: 0,
                 next_rid: 0,
@@ -606,9 +667,97 @@ impl Supervisor {
             wake: Arc::new(Notify::new()),
             changed: Rc::new(Notify::new()),
         };
-        s.start_worker().await?;
         tokio::task::spawn_local(s.clone().watch());
         Ok(s)
+    }
+
+    /// Stop the worker until it is next needed, if nothing needs it now:
+    /// no request being served, deployment being loaded, REPL client or
+    /// fetch. What is published stays so, and is loaded again by the
+    /// worker a request or a deployment next starts; what was prepared
+    /// and not published is forgotten. Whether it sleeps now.
+    pub fn sleep(&self) -> bool {
+        let mut s = self.state.borrow_mut();
+        let idle = s.pending.is_empty() && s.deploys.is_empty() && s.repls.is_empty() && s.fetching == 0 && !s.waking;
+        let Some(w) = s.worker.take_if(|_| idle) else { return s.asleep };
+        kill(&w);
+        s.asleep = true;
+        // Not one that ended by itself: not counted against restarts.
+        s.started.pop_back();
+        let State { ready, routes, stores, .. } = &mut *s;
+        ready.retain(|_, r| routes.get(&r.bundle.name) == Some(&r.bundle.id));
+        ready.values_mut().for_each(|r| r.loaded = false);
+        stores.retain(|served, _| ready.contains_key(served));
+        true
+    }
+
+    /// Whether it has no worker, until one is next needed.
+    pub fn sleeping(&self) -> bool {
+        self.state.borrow().asleep
+    }
+
+    /// Have a worker, with what is published loaded: started now if it
+    /// sleeps, waited for if it is being started. Why not, if not.
+    async fn awake(&self) -> Result<(), String> {
+        // Whether there is room for its worker is asked first, of who
+        // bounds the workers there are (a fleet).
+        let gate = self.state.borrow().gate.clone().filter(|_| self.sleeping());
+        if gate.is_some_and(|room| !room()) {
+            return Err("no room for another worker now".into());
+        }
+        let start = {
+            let mut s = self.state.borrow_mut();
+            let start = s.asleep;
+            if start {
+                (s.asleep, s.waking) = (false, true);
+            }
+            start
+        };
+        if start {
+            // The supervisor's own to finish, whoever asked first and
+            // however long they wait: one that could not start a worker
+            // sleeps again, to be woken by the next that needs it.
+            let me = self.clone();
+            tokio::task::spawn_local(async move {
+                let started = me.restart(true).await;
+                let mut s = me.state.borrow_mut();
+                s.waking = false;
+                s.asleep = !started && s.worker.is_none();
+                drop(s);
+                me.woke.notify_waiters();
+            });
+        }
+        let deadline = Instant::now() + START + DEPLOY;
+        loop {
+            {
+                let s = self.state.borrow();
+                if !s.waking {
+                    return if s.worker.is_some() { Ok(()) } else { Err("no worker".into()) };
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("the worker did not start in time".into());
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(50), self.woke.notified()).await;
+        }
+    }
+
+    /// Ask `room` before a worker is started for a supervisor asleep:
+    /// none is, and what needed it is refused, unless it says there is
+    /// room for one (a fleet's bound on workers at once).
+    pub fn set_gate(&self, room: impl Fn() -> bool + 'static) {
+        self.state.borrow_mut().gate = Some(Rc::new(room));
+    }
+
+    /// Have the store asked for this supervisor's namespaces be `store`
+    /// (`crate::ask`), as [`Supervisor::install_store`] installs one, but
+    /// one that others share: each ask is then a list of `scope`, a
+    /// string that is this supervisor's own among them (its tenant), the
+    /// namespace and the operation.
+    pub fn set_store(&self, store: Asker, scope: &str) {
+        let mut s = self.state.borrow_mut();
+        s.store = Some(store);
+        s.store_scope = Some(scope.into());
     }
 
     /// The effective confinement of the current worker; none while no
@@ -688,7 +837,7 @@ impl Supervisor {
             _ => return Err(std::io::Error::other(format!("pidfd_open: {}", std::io::Error::last_os_error()))),
         };
         let cgroup = match &*self.cgroups {
-            Some(c) => match c.worker(&format!("w{generation}"), &self.options.cgroup).and_then(|w| w.add(pid).map(|()| w)) {
+            Some(c) => match c.worker(&format!("{}w{generation}", self.label), &self.options.cgroup).and_then(|w| w.add(pid).map(|()| w)) {
                 Ok(w) => Some(w),
                 // As when there are no cgroups: development goes on.
                 Err(e) if self.options.resources == ResourceConfinement::IfAvailable => {
@@ -919,7 +1068,9 @@ impl Supervisor {
                         // Past what may wait there (a store that answers
                         // none): refused, not queued.
                         Some((store, namespace, operation, get)) => {
-                            let asked = Data::List(vec![Data::String(namespace), operation]);
+                            let scope = me.state.borrow().store_scope.clone();
+                            let asked = scope.map(|s| Data::String(s.to_string())).into_iter();
+                            let asked = Data::List(asked.chain([Data::String(namespace), operation]).collect());
                             let answered = store.ask(asked, STORE).await.map_err(|why| format!("the store: {why}"));
                             if get { answered.and_then(kv_found) } else { answered }
                         }
@@ -955,16 +1106,7 @@ impl Supervisor {
         let (requests, deploys) = {
             let mut s = self.state.borrow_mut();
             let Some(w) = s.worker.take_if(|w| w.generation == generation) else { return };
-            match &w.cgroup {
-                Some(c) => {
-                    let _ = c.kill();
-                }
-                // SAFETY: signalling the worker's waiter, whose death ends
-                // the worker, through its pidfd: none once reaped.
-                None => unsafe {
-                    libc::syscall(libc::SYS_pidfd_send_signal, w.pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0);
-                },
-            }
+            kill(&w);
             // Its REPL connections end with it, and what it had loaded:
             // the next is given what is published.
             s.repls.clear();
@@ -990,13 +1132,15 @@ impl Supervisor {
             let _ = reply.send(Err(why.into()));
         }
         let me = self.clone();
-        tokio::task::spawn_local(async move { me.restart().await });
+        tokio::task::spawn_local(async move {
+            me.restart(false).await;
+        });
     }
 
     /// Start another worker, if not too many were this minute, and give
     /// it the deployments published: until it has loaded one, that one's
     /// requests are refused.
-    async fn restart(&self) {
+    async fn restart(&self, quiet: bool) -> bool {
         let wait = {
             let mut s = self.state.borrow_mut();
             let now = Instant::now();
@@ -1014,7 +1158,7 @@ impl Supervisor {
         }
         if let Err(e) = self.start_worker().await {
             eprintln!("techne cloud: no worker: {e}");
-            return;
+            return false;
         }
         let published: Vec<Bundle> = self.state.borrow().ready.values().map(|r| r.bundle.clone()).collect();
         for b in published {
@@ -1024,11 +1168,14 @@ impl Supervisor {
                     if let Some(w) = &self.state.borrow().worker {
                         let _ = w.send.send(ToWorker::Activate { name: served });
                     }
-                    eprintln!("techne cloud: a new worker serves {name}")
+                    if !quiet {
+                        eprintln!("techne cloud: a new worker serves {name}")
+                    }
                 }
                 Err(e) => eprintln!("techne cloud: the new worker did not load {name}: {e}"),
             }
         }
+        true
     }
 
     /// Have the worker serve no more the deployments its names are no
@@ -1130,15 +1277,55 @@ impl Supervisor {
     pub fn fetch_routed(&self, name: &str, request: Data, body: Option<Reader>, debug: bool) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
         let mut s = self.state.borrow_mut();
-        let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else {
-            drop(s);
-            self.answer(tx, name, 503, "no worker");
-            return rx;
-        };
         // Pinned here to the deployment the name is routed to now.
         let Some(served) = s.routes.get(name).map(|id| served(name, id)) else {
             drop(s);
             self.answer(tx, name, 404, "no such deployment");
+            return rx;
+        };
+        // Asleep, or being woken: asked once its worker has what is
+        // published.
+        if s.asleep || s.waking {
+            // A bounded number wait so: each holds its request.
+            if s.deferred >= DEFERRED {
+                drop(s);
+                self.answer(tx, name, 503, "too many requests wait for the worker to start");
+                return rx;
+            }
+            s.deferred += 1;
+            drop(s);
+            let (me, name) = (self.clone(), name.to_string());
+            let wall = self.options.wall;
+            tokio::task::spawn_local(async move {
+                let mut tx = tx;
+                // Abandoned by who asked, while it waits or after:
+                // dropped, and abandoned there too.
+                let woken = tokio::select! {
+                    woken = tokio::time::timeout(wall, me.awake()) => Some(woken.unwrap_or_else(|_| Err("the worker did not start in time".into()))),
+                    _ = tx.closed() => None,
+                };
+                me.state.borrow_mut().deferred -= 1;
+                match woken {
+                    Some(Ok(())) => {
+                        let served = me.fetch_routed(&name, request, body, debug);
+                        tokio::select! {
+                            response = served => {
+                                if let Ok(response) = response {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                            _ = tx.closed() => {}
+                        }
+                    }
+                    Some(Err(why)) => me.answer(tx, &name, 503, &why),
+                    None => {}
+                }
+            });
+            return rx;
+        }
+        let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else {
+            drop(s);
+            self.answer(tx, name, 503, "no worker");
             return rx;
         };
         // A worker started anew has yet to load it.
@@ -1228,6 +1415,9 @@ impl Supervisor {
         }
         let id = deployment_id(name, entry, &files, &bindings);
         let key = served(name, &id);
+        if self.sleeping() || self.state.borrow().waking {
+            self.awake().await?;
+        }
         let joined = {
             let mut s = self.state.borrow_mut();
             if s.ready.get(&key).is_some_and(|r| r.loaded) {

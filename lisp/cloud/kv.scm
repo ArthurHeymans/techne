@@ -31,7 +31,7 @@
 (import (techne crypto))
 
 (provide make-kv-store kv-store? kv-store-get kv-store-put! kv-store-delete! kv-store-list
-         kv-store-handle kv-serve kv-namespace-name?)
+         kv-store-handle kv-serve kv-serve-tenants kv-namespace-name?)
 
 (define max-key-bytes 512)
 (define max-value-bytes (* 1024 1024))
@@ -199,6 +199,25 @@ ask, values as bytevectors: `get` (`key`) answers a dict of `found` and
     ((delete) (kv-store-delete! store name (dict-ref request 'key #f)) #t)
     ((list) (kv-store-list store name #:prefix (dict-ref request 'prefix "") #:limit (dict-ref request 'limit max-listed)))
     (else (error "No such operation:" (dict-ref request 'op #f)))))
+
+(define (kv-serve-tenants directory #:max-bytes [max-bytes (* 64 1024 1024)])
+  "Answer the operations of a fleet's tenants, for ever.
+Each tenant has a store of its own, in a directory of its own under
+DIRECTORY, by its name, which must be one that names a file as a
+namespace's does: no tenant reaches another's namespaces, whatever they
+are called. A namespace holds at most MAX-BYTES."
+  (let loop ((stores (dict)))
+    (let* ((asked (%store-next))
+           (id (car asked))
+           (what (cadr asked))
+           (tenant (car what))
+           (store (and (kv-namespace-name? tenant)
+                       (or (dict-ref stores tenant #f)
+                           (make-kv-store (string-append directory "/" tenant) #:max-bytes max-bytes)))))
+      (guard (e (#t (%store-reply id #f (if (error-object? e) (condition/report-string e) "the store failed"))))
+        (unless store (error "Not a tenant's name:" tenant))
+        (%store-reply id #t (kv-store-handle store (cadr what) (caddr what))))
+      (loop (if store (dict-set stores tenant store) stores)))))
 
 (define (kv-serve store)
   "Answer with STORE the operations the supervisor's workers ask, for ever.

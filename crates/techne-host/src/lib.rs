@@ -78,6 +78,7 @@
 pub mod ask;
 pub mod body;
 pub mod egress;
+pub mod fleet;
 pub mod outbound;
 pub mod supervisor;
 pub mod wire;

@@ -586,13 +586,23 @@ then.
   for, with a diagnostic.
   `Supervisor::confinement` reports whether the current ready worker is
   sandboxed and cgroup-bounded (none while no worker is ready).
+  Today (`crates/techne-host/src/fleet.rs`): a fleet has a supervisor
+  and worker for each tenant, the workers' cgroups shared and named by
+  tenant; requests are asked by target, `tenant/project`, which a front
+  reads from the host name in Lisp (`lisp/cloud/hosts.scm`,
+  `project.tenant.DOMAIN`); a tenant or project that is not there is
+  answered 404 and starts nothing; one store keeps every tenant's KV
+  namespaces, a directory each, told the tenant by the supervisor. Not
+  yet: a worker per runtime version, and a command that serves a fleet.
 - A zygote that forks pre-booted workers would cut cold starts further,
   but VM boot starts the JIT's thread and the allocator and cage hold
   process-wide state; it waits for a probe showing fork is safe and a
   measurement showing exec is too slow.
 - A tenant without traffic has no worker. Idle workers stop after some
   minutes; the number of live workers is bounded, the least recently used
-  stopped first.
+  stopped first. (So it is, `Supervisor::sleep`: a worker is stopped
+  only when nothing needs it, and the next request or deployment starts
+  one, which loads what was published before the request is sent.)
 - **Runtime versions**: a deployment records the runtime it was built
   with; workers run that binary, so a tenant whose projects are on two
   versions has two workers. An upgrade rolls out per project; a

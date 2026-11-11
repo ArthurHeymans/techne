@@ -32,6 +32,7 @@ fn documentation_problems() {
         "lisp/cloud/tokens.scm",
         "lisp/cloud/auth.scm",
         "lisp/cloud/control.scm",
+        "lisp/cloud/hosts.scm",
     ] {
         vm.eval_source(&format!("(require {:?})", root.join(file).display().to_string())).unwrap_or_else(|e| panic!("{file}: {e}"));
     }
