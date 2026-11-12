@@ -17,14 +17,40 @@
 //! read it is killed too. A worker that ends, killed or for
 //! a native that held its thread past a kill (`worker::STUCK`) or past its
 //! cgroup's memory, has its requests answered for, with 500, reported;
-//! another is started, at most a few a minute, and given the last
-//! deployment it acknowledged. Requests are not run again.
+//! another is started, at most a few a minute, and given the
+//! deployments published. Requests are not run again.
+//!
+//! A deployment is what it is made of: its id is a hash of its name,
+//! entry, files and bindings, and the worker serves it under its name and
+//! id, beside the others of its name. Which of them a name's requests go
+//! to is the supervisor's route for the name. So deploying is two steps:
+//! [`Supervisor::prepare`] has the worker load a deployment, which
+//! changes nothing of what is served, and fails alone;
+//! [`Supervisor::publish`] points the name at one prepared, at once, and
+//! only if it still points where the publisher saw it, when it says
+//! where (a late or repeated publish does not undo a newer one). A
+//! request is pinned when it is sent to the deployment its name was
+//! routed to then: it is served by that code, with those bindings,
+//! whatever is published after. A deployment no longer routed to is
+//! retired from the worker once its requests are done. Rolling back is
+//! publishing an earlier one, prepared again if it was retired.
 //!
 //! What a worker's requests fetch is fetched here ([`crate::egress`]),
 //! within the policy given (`Options::egress`): for a request the
 //! supervisor sent it and still serves, a bounded number of times each
 //! (`FETCHES`), a bounded number at once (`FETCHING`); the worker's own
 //! counts are not trusted.
+//!
+//! What a worker's requests keep in their deployment's KV namespaces is
+//! kept by the supervisor too, for a store it is given
+//! ([`Supervisor::install_store`]: a task of the front world's, in Lisp).
+//! A deployment is deployed with its bindings ([`Bindings`]): what its
+//! requests are given, and which namespace each of its KV bindings stands
+//! for. A worker names a binding as its deployment does, never a
+//! namespace: the supervisor looks it up among those of the deployment
+//! the request it sent was for, and the store is asked for that
+//! namespace. So a worker reaches the namespaces of the deployments it
+//! serves requests of, and no other, whatever it says.
 //!
 //! For development (`Options::dev`), the worker serves each deployment
 //! from its dev world, with a REPL server in it ([`crate::worker::Dev`]),
@@ -57,7 +83,9 @@ use tokio::{
 
 use crate::{
     Failure, Printed, Response,
-    body::{self, Piece, Reader},
+    ask::Asker,
+    body::{self, DataValue, Piece, Reader},
+    outbound::Service,
     wire::{BUNDLE_BYTES, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, encode, read_frame, write_encoded},
     worker,
 };
@@ -156,9 +184,157 @@ impl Link {
 /// URL and headers.
 const FETCH_BYTES: usize = (1 << 20) + (64 << 10);
 
-/// Fetches of a request, and of a worker's requests at once.
+/// Requests that may wait for a worker asleep to be started: more are
+/// refused.
+const DEFERRED: usize = 32;
+
+/// Fetches of a request, and of a worker's requests at once (with what
+/// they ask of the store).
 const FETCHES: usize = 50;
 const FETCHING: usize = 64;
+
+/// Operations of a request on its bindings' storage.
+const STORE_OPS: usize = 1000;
+
+/// How long the store may take to answer.
+const STORE: Duration = Duration::from_secs(10);
+
+/// What a deployment is deployed with.
+#[derive(Clone, Debug)]
+pub struct Bindings {
+    /// What its requests are given as `env`: a dict, by the names the
+    /// deployment has for its bindings.
+    pub env: Data,
+    /// The KV namespace each of its KV bindings stands for, by the
+    /// binding's name.
+    pub stores: HashMap<String, String>,
+}
+
+impl Bindings {
+    /// The bindings `data` describes, as `lisp/cloud/manifest.scm` reads
+    /// a manifest: a dict of `env` and of `stores`, a dict of strings.
+    pub fn from_data(data: &Data) -> Result<Bindings, String> {
+        let Data::Dict(parts) = data else { return Err("bindings are a dict of env and stores".into()) };
+        let part = |name: &str| parts.iter().find(|(k, _)| matches!(k, Data::Symbol(s) if s == name)).map(|(_, v)| v);
+        let mut stores = HashMap::new();
+        match part("stores") {
+            Some(Data::Dict(entries)) => {
+                for entry in entries {
+                    let (Data::String(binding), Data::String(namespace)) = entry else {
+                        return Err("stores are strings by strings".into());
+                    };
+                    stores.insert(binding.clone(), namespace.clone());
+                }
+            }
+            None => {}
+            Some(_) => return Err("stores are a dict".into()),
+        }
+        let env = match part("env") {
+            Some(env @ Data::Dict(_)) => env.clone(),
+            None => Data::Dict(Vec::new()),
+            Some(_) => return Err("env is a dict".into()),
+        };
+        Ok(Bindings { env, stores })
+    }
+
+    fn to_data(&self) -> Data {
+        let mut stores: Vec<_> = self.stores.iter().map(|(b, n)| (Data::String(b.clone()), Data::String(n.clone()))).collect();
+        stores.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+        Data::Dict(vec![(Data::Symbol("env".into()), self.env.clone()), (Data::Symbol("stores".into()), Data::Dict(stores))])
+    }
+}
+
+impl Bundle {
+    /// All of it, as bytes to keep: `Bundle::decode` reads them.
+    fn encode(&self) -> Vec<u8> {
+        encode(&Data::List(vec![
+            Data::String(self.name.clone()),
+            Data::String(self.entry.clone()),
+            Data::List(self.files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
+            self.bindings.to_data(),
+        ]))
+    }
+
+    /// The name, entry, files and bindings `bytes` keep.
+    #[allow(clippy::type_complexity)]
+    fn decode(bytes: &[u8]) -> Result<(String, String, Vec<(String, Vec<u8>)>, Bindings), String> {
+        let bad = || "not a deployment's bundle".to_string();
+        let Ok(Data::List(parts)) = crate::wire::decode(bytes) else { return Err(bad()) };
+        let [Data::String(name), Data::String(entry), Data::List(files), bindings] = &parts[..] else { return Err(bad()) };
+        let files = files
+            .iter()
+            .map(|f| match f {
+                Data::List(f) => match &f[..] {
+                    [Data::String(path), Data::Bytes(bytes)] => Ok((path.clone(), bytes.clone())),
+                    _ => Err(bad()),
+                },
+                _ => Err(bad()),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((name.clone(), entry.clone(), files, Bindings::from_data(bindings)?))
+    }
+}
+
+impl Default for Bindings {
+    fn default() -> Bindings {
+        Bindings { env: Data::Dict(Vec::new()), stores: HashMap::new() }
+    }
+}
+
+/// What a worker asked of a KV binding (`outbound::Service::Kv`), as the
+/// store is handed it: the binding named, the operation, and whether it
+/// is a `get`. Only what an operation has is kept of it, and a value to
+/// keep is encoded (`wire::encode`): the store's world, which lasts and
+/// is not the tenant's, is given a tenant's strings and bytes and never
+/// its symbols, which it would intern for good.
+fn kv_operation(request: &Data) -> Result<(String, Data, bool), String> {
+    let Data::Dict(entries) = request else { return Err("not an operation".into()) };
+    let field = |name: &str| entries.iter().find_map(|(k, v)| matches!(k, Data::Symbol(s) if s == name).then_some(v));
+    let string = |name: &str, default: Option<&str>| match (field(name), default) {
+        (Some(Data::String(s)), _) => Ok(Data::String(s.clone())),
+        (None, Some(default)) => Ok(Data::String(default.into())),
+        _ => Err(format!("an operation's {name} is a string")),
+    };
+    let sym = |s: &str| Data::Symbol(s.into());
+    let Some(Data::String(binding)) = field("binding") else { return Err("no binding named".into()) };
+    let Some(Data::Symbol(op)) = field("op") else { return Err("no operation named".into()) };
+    let fields = match op.as_str() {
+        "get" | "delete" => vec![(sym("key"), string("key", None)?)],
+        "put" => {
+            let value = field("value").ok_or("nothing to keep")?;
+            let ttl = match field("ttl") {
+                Some(Data::Int(n)) => Data::Int(*n),
+                Some(Data::Float(f)) => Data::Float(*f),
+                Some(Data::Bool(false)) | None => Data::Bool(false),
+                Some(_) => return Err("an operation's ttl is a number of seconds".into()),
+            };
+            vec![(sym("key"), string("key", None)?), (sym("value"), Data::Bytes(encode(value))), (sym("ttl"), ttl)]
+        }
+        "list" => {
+            let limit = match field("limit") {
+                Some(Data::Int(n)) => Data::Int(*n),
+                None => Data::Int(1000),
+                Some(_) => return Err("an operation's limit is an integer".into()),
+            };
+            vec![(sym("prefix"), string("prefix", Some(""))?), (sym("limit"), limit)]
+        }
+        _ => return Err("no such operation".into()),
+    };
+    let operation = std::iter::once((sym("op"), sym(op))).chain(fields).collect();
+    Ok((binding.clone(), Data::Dict(operation), op == "get"))
+}
+
+/// The store's answer to a `get`, the value it kept decoded again.
+fn kv_found(answer: Data) -> Result<Data, String> {
+    let Data::Dict(entries) = answer else { return Ok(answer) };
+    let decoded = entries.into_iter().map(|(k, v)| match (&k, v) {
+        (Data::Symbol(s), Data::Bytes(bytes)) if s == "value" => {
+            crate::wire::decode(&bytes).map(|v| (k, v)).map_err(|_| "what is kept there cannot be read".to_string())
+        }
+        (_, v) => Ok((k, v)),
+    });
+    decoded.collect::<Result<_, _>>().map(Data::Dict)
+}
 
 /// Bytes a relayed REPL connection may have waiting to be written to its
 /// client.
@@ -169,6 +345,8 @@ const REPL_QUEUE: usize = 64;
 struct Repl {
     queue: mpsc::Sender<Vec<u8>>,
     reader: tokio::task::AbortHandle,
+    /// Dropped with it: who waits for the connection's end is told.
+    _ended: oneshot::Sender<()>,
 }
 
 impl Drop for Repl {
@@ -177,12 +355,69 @@ impl Drop for Repl {
     }
 }
 
-/// What a deployment's worker is given: its name, entry, and files.
+/// What a deployment's worker is given: its name and id, entry, and
+/// files, and its bindings, of which the worker is given the `env`.
 #[derive(Clone)]
 struct Bundle {
     name: String,
+    id: String,
     entry: String,
     files: Vec<(String, Vec<u8>)>,
+    bindings: Bindings,
+}
+
+impl Bundle {
+    /// The name the worker serves it under.
+    fn served(&self) -> String {
+        served(&self.name, &self.id)
+    }
+}
+
+/// The name a worker serves deployment `id` of `name` under.
+fn served(name: &str, id: &str) -> String {
+    format!("{name}@{id}")
+}
+
+/// The id of a deployment: a hash of all it is.
+fn deployment_id(name: &str, entry: &str, files: &[(String, Vec<u8>)], bindings: &Bindings) -> String {
+    use sha2::Digest;
+    let mut stores: Vec<_> = bindings.stores.iter().collect();
+    stores.sort();
+    let all = Data::List(vec![
+        Data::String(name.into()),
+        Data::String(entry.into()),
+        Data::List(files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
+        bindings.env.clone(),
+        Data::List(stores.into_iter().map(|(b, n)| Data::List(vec![Data::String(b.clone()), Data::String(n.clone())])).collect()),
+    ]);
+    // The whole digest: an id is what tells two deployments apart.
+    sha2::Sha256::digest(encode(&all)).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A deployment the worker has loaded.
+struct Ready {
+    bundle: Bundle,
+    /// Whether its name was ever routed to it: one that was and is no
+    /// longer is retired once its requests are done.
+    published: bool,
+    since: Instant,
+    /// Whether the worker there is now has it: not one given it again
+    /// after the worker before ended, until it says so.
+    loaded: bool,
+}
+
+/// How long a deployment prepared and never published is kept, and how
+/// many of a name's are.
+const UNPUBLISHED: Duration = Duration::from_secs(300);
+const UNPUBLISHED_EACH: usize = 4;
+
+/// What preparing a deployment gave ([`Supervisor::prepare`]).
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    /// The deployment's id, to publish it by.
+    pub id: String,
+    /// What loading it wrote; nothing for one that was loaded already.
+    pub output: String,
 }
 
 /// A request the worker serves: who waits for its response, until it is
@@ -193,6 +428,8 @@ struct Bundle {
 /// deadline.
 struct Pending {
     name: String,
+    /// The deployment it was sent for, as the worker serves it.
+    served: String,
     reply: Option<oneshot::Sender<Response>>,
     deadline: Instant,
     body: Option<mpsc::Sender<Piece>>,
@@ -200,8 +437,12 @@ struct Pending {
     /// What sends its body.
     pump: Option<tokio::task::AbortHandle>,
     cancelled: bool,
-    /// Its fetches so far.
+    /// Its fetches so far, and its operations on storage.
     fetches: usize,
+    store_ops: usize,
+    /// The KV namespaces of the deployment it was sent for, as they were
+    /// then: a deployment since does not change what it reaches.
+    stores: Rc<HashMap<String, String>>,
 }
 
 impl Pending {
@@ -236,14 +477,38 @@ struct Running {
 }
 
 struct State {
+    /// No worker until one is next needed (`Supervisor::sleep`), and one
+    /// being started for that.
+    asleep: bool,
+    waking: bool,
+    /// Requests waiting for a worker to be started for them.
+    deferred: usize,
+    /// Whether a worker may be started for a supervisor asleep, if
+    /// someone bounds them.
+    gate: Option<Rc<dyn Fn() -> bool>>,
+    /// What the store is told the namespaces asked for are those of, if
+    /// it is one that supervisors share.
+    store_scope: Option<Rc<str>>,
     worker: Option<Running>,
     generation: u64,
     next_rid: u64,
     pending: HashMap<u64, Pending>,
     next_deploy: u64,
     deploys: HashMap<u64, (Bundle, oneshot::Sender<Result<String, String>>)>,
-    /// The last deployment a worker acknowledged, given to the next.
-    last: Option<Bundle>,
+    /// The deployments the worker has loaded, by the names it serves
+    /// them under.
+    ready: HashMap<String, Ready>,
+    /// Who else waits for a deployment being loaded, by the name it is
+    /// served under.
+    joining: HashMap<String, Vec<oneshot::Sender<Result<String, String>>>>,
+    /// The id of the deployment each name's requests go to.
+    routes: HashMap<String, String>,
+    /// The KV namespaces of the deployments loaded, by the names they are
+    /// served under, and binding.
+    stores: HashMap<String, Rc<HashMap<String, String>>>,
+    /// What keeps them, once installed: as many asks wait there as may
+    /// be made at once.
+    store: Option<Asker>,
     sandbox: bool,
     started: VecDeque<Instant>,
     /// REPL connections relayed to the worker now, by number: what goes
@@ -254,6 +519,166 @@ struct State {
     fetching: usize,
     on_failure: Box<dyn FnMut(&Failure)>,
     on_output: Box<dyn FnMut(&Printed)>,
+}
+
+impl State {
+    /// Keep a few of `name`'s deployments prepared and not published at
+    /// most, `kept`, just loaded, among them: the oldest others go. Done
+    /// once a new one has loaded, so that one that does not load costs
+    /// none of those there.
+    fn evict_unpublished(&mut self, name: &str, kept: &str) {
+        loop {
+            let mut waiting: Vec<(Instant, String)> = self
+                .ready
+                .iter()
+                .filter(|(_, r)| r.bundle.name == name && !r.published)
+                .map(|(served, r)| (r.since, served.clone()))
+                .collect();
+            if waiting.len() <= UNPUBLISHED_EACH {
+                return;
+            }
+            waiting.sort();
+            let Some((_, oldest)) = waiting.into_iter().find(|(_, served)| served != kept) else { return };
+            self.ready.remove(&oldest);
+            self.stores.remove(&oldest);
+            if let Some(w) = &self.worker {
+                let _ = w.send.send(ToWorker::Retire { name: oldest });
+            }
+        }
+    }
+
+    /// The store, the namespace the binding `request` names stood for in
+    /// the deployment request `rid` was sent for, when it was sent, the
+    /// operation as the store takes it and whether it is a `get`: or why
+    /// not.
+    #[allow(clippy::type_complexity)]
+    fn namespace(&self, rid: u64, request: &Data) -> Result<(Asker, String, Data, bool), String> {
+        let store = self.store.clone().ok_or("this host keeps nothing")?;
+        let (binding, operation, get) = kv_operation(request)?;
+        let stores = self.pending.get(&rid).map(|p| &p.stores);
+        let namespace = stores.and_then(|s| s.get(&binding)).ok_or_else(|| format!("the deployment has no KV binding {binding}"))?;
+        Ok((store, namespace.clone(), operation, get))
+    }
+}
+
+/// The most bytes of a manifest, and of the secrets beside it.
+const MANIFEST_BYTES: u64 = 256 << 10;
+
+/// The bindings of the deployment in `dir`, as its manifest and secrets
+/// say (`lisp/cloud/manifest.scm`): read in a world of their own, made
+/// for it and dropped after, of bounded memory. A manifest is its
+/// tenant's to write: what reading it interns and allocates goes with
+/// that world, and nothing of it but the bindings, as data, comes out.
+pub fn read_bindings(dir: &Path) -> Result<Bindings, String> {
+    for file in ["manifest.scm", ".secrets.scm"] {
+        if std::fs::metadata(dir.join(file)).is_ok_and(|m| m.len() > MANIFEST_BYTES) {
+            return Err(format!("{file} is larger than a manifest may be"));
+        }
+    }
+    let failed = |e: techne_vm::vm::Error| format!("the manifest: {}", e.msg);
+    let mut vm = Vm::new();
+    vm.set_memory_limit(64 << 20);
+    let manifest = techne_vm::library::lisp_dir().join("cloud/manifest.scm").display().to_string();
+    vm.eval_source(&format!("(require {manifest:?})")).map_err(failed)?;
+    let read = vm.eval_source("read-bindings").map_err(failed)?;
+    let dir = vm.from_data(&Data::String(dir.display().to_string())).map_err(failed)?;
+    let found = vm.call(&read, &[dir]).map_err(failed)?;
+    Bindings::from_data(&vm.to_data(&found, 4 << 20).map_err(failed)?)
+}
+
+/// Which supervisor a name given to the natives that deploy is of, and
+/// its deployment's name there: or why none.
+pub(crate) type Resolve = Rc<dyn Fn(&str) -> Result<(Supervisor, String), String>>;
+
+/// Define in `front` the natives [`Supervisor::install_control`] says,
+/// each NAME resolved by `resolve` to a supervisor and a name there (a
+/// fleet's are `tenant/project`).
+pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
+    use techne_vm::{
+        api::{Bytes, Value},
+        vm::Error,
+    };
+    let listed = |p: Prepared| DataValue(Data::List(vec![Data::String(p.id), Data::String(p.output)]));
+    let of = resolve.clone();
+    front.register_async("%cloud-prepare-directory", 2, move |vm, args| {
+        let asked = (|| {
+            let (name, entry) = (args.get::<String>(vm, 0)?, args.get::<String>(vm, 1)?);
+            let (me, name) = of(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, entry))
+        })();
+        async move {
+            let (me, name, entry) = asked?;
+            let entry = Path::new(&entry);
+            let bindings = read_bindings(entry.parent().unwrap_or(Path::new("/"))).map_err(Error::new)?;
+            me.prepare(&name, entry, bindings).await.map(listed).map_err(Error::new)
+        }
+    });
+    let of = resolve.clone();
+    front.register_async("%cloud-prepare", 3, move |vm, args| {
+        let asked = (|| {
+            let (name, entry) = (args.get::<String>(vm, 0)?, args.get::<String>(vm, 1)?);
+            let bindings = args.value(vm, 2)?;
+            let bindings = Bindings::from_data(&vm.to_data(&bindings, crate::REQUEST_BYTES)?).map_err(Error::new)?;
+            let (me, name) = of(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, entry, bindings))
+        })();
+        async move {
+            let (me, name, entry, bindings) = asked?;
+            me.prepare(&name, Path::new(&entry), bindings).await.map(listed).map_err(Error::new)
+        }
+    });
+    let of = resolve.clone();
+    front.register_async("%cloud-prepare-bundle", 2, move |vm, args| {
+        let asked = (|| {
+            let (name, bytes) = (args.get::<String>(vm, 0)?, args.get::<Bytes>(vm, 1)?.0);
+            let (me, name) = of(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, bytes))
+        })();
+        async move {
+            let (me, name, bytes) = asked?;
+            if bytes.len() > MAX_FRAME {
+                return Err(Error::new("the bundle is larger than a deployment may be"));
+            }
+            let (kept, entry, files, bindings) = Bundle::decode(&bytes).map_err(Error::new)?;
+            if kept != name {
+                return Err(Error::new(format!("the bundle is a deployment of {kept}, not {name}")));
+            }
+            me.prepare_files(&name, &entry, files, bindings).await.map(listed).map_err(Error::new)
+        }
+    });
+    let of = resolve.clone();
+    front.register_fn_vm("%cloud-publish", move |vm: &mut Vm, name: String, id: String, expected: Value| -> Result<DataValue, Error> {
+        let expected = match vm.to_data(&expected, 1024)? {
+            Data::Bool(true) => None,
+            Data::Bool(false) => Some(None),
+            Data::String(id) => Some(Some(id)),
+            _ => return Err(Error::new("what is expected is #t, #f or an id")),
+        };
+        let (me, name) = of(&name).map_err(Error::new)?;
+        let before = me.publish(&name, &id, expected.as_ref().map(|e| e.as_deref())).map_err(Error::new)?;
+        Ok(DataValue(before.map_or(Data::Bool(false), Data::String)))
+    });
+    let of = resolve.clone();
+    front.register_fn("%cloud-route", move |name: String| -> DataValue {
+        DataValue(of(&name).ok().and_then(|(me, name)| me.route(&name)).map_or(Data::Bool(false), Data::String))
+    });
+    front.register_fn("%cloud-bundle", move |name: String, id: String| -> DataValue {
+        DataValue(resolve(&name).ok().and_then(|(me, name)| me.bundle_of(&name, &id)).map_or(Data::Bool(false), Data::Bytes))
+    });
+}
+
+/// Kill worker `w`, all of it.
+fn kill(w: &Running) {
+    match &w.cgroup {
+        Some(c) => {
+            let _ = c.kill();
+        }
+        // SAFETY: signalling the worker's waiter, whose death ends the
+        // worker, through its pidfd: none once reaped.
+        None => unsafe {
+            libc::syscall(libc::SYS_pidfd_send_signal, w.pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0);
+        },
+    }
 }
 
 /// Serves deployments with a worker process: see the module.
@@ -267,36 +692,71 @@ pub struct Supervisor {
     wake: Arc<Notify>,
     /// Wakes the watcher of deadlines.
     changed: Rc<Notify>,
+    /// Told when a worker woken has loaded what is published, or has not.
+    woke: Rc<Notify>,
+    /// What its workers' cgroups are named with, before their number:
+    /// its own among the supervisors that share the cgroups.
+    label: Rc<str>,
+}
+
+/// The cgroups workers are put in, adopted from the process's own: none,
+/// said, where there are none to adopt and `options` do not require
+/// them, an error where they do.
+pub fn adopt(options: &Options) -> std::io::Result<Option<Cgroups>> {
+    match Cgroups::adopt() {
+        Ok(c) => Ok(Some(c)),
+        Err(e) if options.resources == ResourceConfinement::Required => {
+            Err(std::io::Error::new(e.kind(), format!("workers require cgroup resource confinement: {e}")))
+        }
+        Err(e) => {
+            eprintln!("techne cloud: workers' resources are not bounded: {e}");
+            Ok(None)
+        }
+    }
 }
 
 impl Supervisor {
     /// A supervisor with its first worker started and ready. Call it on a
     /// current-thread runtime within a `LocalSet`.
     pub async fn start(options: Options) -> std::io::Result<Supervisor> {
-        let cgroups = match Cgroups::adopt() {
-            Ok(c) => Some(c),
-            Err(e) if options.resources == ResourceConfinement::Required => {
-                return Err(std::io::Error::new(e.kind(), format!("workers require cgroup resource confinement: {e}")));
-            }
-            Err(e) => {
-                eprintln!("techne cloud: workers' resources are not bounded: {e}");
-                None
-            }
-        };
+        let cgroups = adopt(&options)?;
+        let s = Supervisor::asleep(options, Rc::new(cgroups), "")?;
+        s.state.borrow_mut().asleep = false;
+        s.start_worker().await?;
+        Ok(s)
+    }
+
+    /// A supervisor with no worker yet: one is started when first needed,
+    /// by a deployment prepared or a request ([`Supervisor::sleep`]).
+    /// Its workers are put in `cgroups`, which other supervisors may
+    /// share, named with `label`, its own among them. Call it on a
+    /// current-thread runtime within a `LocalSet`.
+    pub fn asleep(options: Options, cgroups: Rc<Option<Cgroups>>, label: &str) -> std::io::Result<Supervisor> {
         let sandbox = options.sandboxing != Sandboxing::Off;
         let egress = Rc::new(crate::egress::Egress::new(options.egress.clone()).map_err(std::io::Error::other)?);
         let s = Supervisor {
             egress,
             options: Rc::new(options),
-            cgroups: Rc::new(cgroups),
+            cgroups,
+            woke: Rc::new(Notify::new()),
+            label: label.into(),
             state: Rc::new(RefCell::new(State {
+                asleep: true,
+                waking: false,
+                deferred: 0,
+                gate: None,
+                store_scope: None,
                 worker: None,
                 generation: 0,
                 next_rid: 0,
                 pending: HashMap::new(),
                 next_deploy: 0,
                 deploys: HashMap::new(),
-                last: None,
+                ready: HashMap::new(),
+                joining: HashMap::new(),
+                routes: HashMap::new(),
+                stores: HashMap::new(),
+                store: None,
                 sandbox,
                 started: VecDeque::new(),
                 repls: HashMap::new(),
@@ -315,9 +775,108 @@ impl Supervisor {
             wake: Arc::new(Notify::new()),
             changed: Rc::new(Notify::new()),
         };
-        s.start_worker().await?;
         tokio::task::spawn_local(s.clone().watch());
         Ok(s)
+    }
+
+    /// Start its worker now, as the first thing that needs one would:
+    /// whether one can be, confined as its options require.
+    pub(crate) async fn start_now(&self) -> std::io::Result<()> {
+        self.state.borrow_mut().asleep = false;
+        let started = self.start_worker().await;
+        if started.is_err() {
+            self.state.borrow_mut().asleep = true;
+        }
+        started
+    }
+
+    /// Stop the worker until it is next needed, if nothing needs it now:
+    /// no request being served, deployment being loaded, REPL client or
+    /// fetch. What is published stays so, and is loaded again by the
+    /// worker a request or a deployment next starts; what was prepared
+    /// and not published is forgotten. Whether it sleeps now.
+    pub fn sleep(&self) -> bool {
+        let mut s = self.state.borrow_mut();
+        let idle = s.pending.is_empty() && s.deploys.is_empty() && s.repls.is_empty() && s.fetching == 0 && !s.waking;
+        let Some(w) = s.worker.take_if(|_| idle) else { return s.asleep };
+        kill(&w);
+        s.asleep = true;
+        // Not one that ended by itself: not counted against restarts.
+        s.started.pop_back();
+        let State { ready, routes, stores, .. } = &mut *s;
+        ready.retain(|_, r| routes.get(&r.bundle.name) == Some(&r.bundle.id));
+        ready.values_mut().for_each(|r| r.loaded = false);
+        stores.retain(|served, _| ready.contains_key(served));
+        true
+    }
+
+    /// Whether it has no worker, until one is next needed.
+    pub fn sleeping(&self) -> bool {
+        self.state.borrow().asleep
+    }
+
+    /// Have a worker, with what is published loaded: started now if it
+    /// sleeps, waited for if it is being started. Why not, if not.
+    async fn awake(&self) -> Result<(), String> {
+        // Whether there is room for its worker is asked first, of who
+        // bounds the workers there are (a fleet).
+        let gate = self.state.borrow().gate.clone().filter(|_| self.sleeping());
+        if gate.is_some_and(|room| !room()) {
+            return Err("no room for another worker now".into());
+        }
+        let start = {
+            let mut s = self.state.borrow_mut();
+            let start = s.asleep;
+            if start {
+                (s.asleep, s.waking) = (false, true);
+            }
+            start
+        };
+        if start {
+            // The supervisor's own to finish, whoever asked first and
+            // however long they wait: one that could not start a worker
+            // sleeps again, to be woken by the next that needs it.
+            let me = self.clone();
+            tokio::task::spawn_local(async move {
+                let started = me.restart(true).await;
+                let mut s = me.state.borrow_mut();
+                s.waking = false;
+                s.asleep = !started && s.worker.is_none();
+                drop(s);
+                me.woke.notify_waiters();
+            });
+        }
+        let deadline = Instant::now() + START + DEPLOY;
+        loop {
+            {
+                let s = self.state.borrow();
+                if !s.waking {
+                    return if s.worker.is_some() { Ok(()) } else { Err("no worker".into()) };
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("the worker did not start in time".into());
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(50), self.woke.notified()).await;
+        }
+    }
+
+    /// Ask `room` before a worker is started for a supervisor asleep:
+    /// none is, and what needed it is refused, unless it says there is
+    /// room for one (a fleet's bound on workers at once).
+    pub fn set_gate(&self, room: impl Fn() -> bool + 'static) {
+        self.state.borrow_mut().gate = Some(Rc::new(room));
+    }
+
+    /// Have the store asked for this supervisor's namespaces be `store`
+    /// (`crate::ask`), as [`Supervisor::install_store`] installs one, but
+    /// one that others share: each ask is then a list of `scope`, a
+    /// string that is this supervisor's own among them (its tenant), the
+    /// namespace and the operation.
+    pub fn set_store(&self, store: Asker, scope: &str) {
+        let mut s = self.state.borrow_mut();
+        s.store = Some(store);
+        s.store_scope = Some(scope.into());
     }
 
     /// The effective confinement of the current worker; none while no
@@ -397,7 +956,7 @@ impl Supervisor {
             _ => return Err(std::io::Error::other(format!("pidfd_open: {}", std::io::Error::last_os_error()))),
         };
         let cgroup = match &*self.cgroups {
-            Some(c) => match c.worker(&format!("w{generation}"), &self.options.cgroup).and_then(|w| w.add(pid).map(|()| w)) {
+            Some(c) => match c.worker(&format!("{}w{generation}", self.label), &self.options.cgroup).and_then(|w| w.add(pid).map(|()| w)) {
                 Ok(w) => Some(w),
                 // As when there are no cgroups: development goes on.
                 Err(e) if self.options.resources == ResourceConfinement::IfAvailable => {
@@ -469,6 +1028,13 @@ impl Supervisor {
                 Ok(s) => format!("the worker ended ({s})"),
                 Err(e) => format!("the worker is gone: {e}"),
             };
+            // One not sandboxed wrote its deployments' files where they
+            // outlast it, in a directory named by its pid: removed, so
+            // that workers started and stopped leave nothing.
+            if !sandbox {
+                let tmp = me.options.env.iter().find(|(k, _)| k == "TMPDIR").map_or("/tmp".into(), |(_, v)| PathBuf::from(v));
+                let _ = std::fs::remove_dir_all(tmp.join(format!("bundles-{pid}")));
+            }
             me.end_worker(generation, &why);
         });
         self.state.borrow_mut().worker = Some(Running { generation, send, pidfd, cgroup });
@@ -546,10 +1112,19 @@ impl Supervisor {
             },
             FromWorker::Deployed { id, error, output } => match s.deploys.remove(&id) {
                 Some((bundle, reply)) => {
-                    if error.is_none() {
-                        s.last = Some(bundle);
+                    let served = bundle.served();
+                    let result = error.map_or(Ok(output), Err);
+                    if result.is_ok() {
+                        s.stores.insert(served.clone(), Rc::new(bundle.bindings.stores.clone()));
+                        let published = s.routes.get(&bundle.name) == Some(&bundle.id) || s.ready.get(&served).is_some_and(|r| r.published);
+                        let name = bundle.name.clone();
+                        s.ready.insert(served.clone(), Ready { bundle, published, since: Instant::now(), loaded: true });
+                        s.evict_unpublished(&name, &served);
                     }
-                    let _ = reply.send(error.map_or(Ok(output), Err));
+                    for waiter in s.joining.remove(&served).unwrap_or_default() {
+                        let _ = waiter.send(result.clone());
+                    }
+                    let _ = reply.send(result);
                     None
                 }
                 None => Some(format!("a deployment it was not given ({id})")),
@@ -564,21 +1139,41 @@ impl Supervisor {
                 (s.on_output)(&Printed { deployment, request, output });
                 None
             }
-            FromWorker::Fetch { rid, fid, request } => {
+            FromWorker::Fetch { rid, fid, service, request } => {
+                let Some(service) = Service::named(&service) else { return Some(format!("no service {service}")) };
                 let (fetching, sent) = (s.fetching, s.next_rid);
                 let refused = match s.pending.get_mut(&rid) {
-                    Some(p) if !p.cancelled && p.fetches < FETCHES && fetching < FETCHING => {
-                        p.fetches += 1;
-                        None
+                    Some(p) => {
+                        let (count, limit, what) = match service {
+                            Service::Fetch => (&mut p.fetches, FETCHES, "fetches"),
+                            Service::Kv => (&mut p.store_ops, STORE_OPS, "uses its bindings"),
+                        };
+                        if *count >= limit {
+                            Some(format!("a request {what} {limit} times at most"))
+                        } else if p.cancelled {
+                            Some("the request was cancelled".to_string())
+                        } else if fetching >= FETCHING {
+                            Some("too many fetches at once".to_string())
+                        } else {
+                            *count += 1;
+                            None
+                        }
                     }
-                    Some(p) if p.fetches >= FETCHES => Some(format!("a request fetches {FETCHES} times at most")),
-                    Some(_) if fetching >= FETCHING => Some("too many fetches at once".to_string()),
-                    Some(_) => Some("the request was cancelled".to_string()),
                     None if rid <= sent => Some("the request is over".to_string()),
                     None => return Some(format!("a fetch for no request ({rid})")),
                 };
                 let send = s.worker.as_ref().map(|w| w.send.clone());
                 let refused = refused.or_else(|| (encode(&request).len() > FETCH_BYTES).then(|| "a fetch too large".to_string()));
+                // The namespace its binding stands for, in the deployment
+                // the request was sent for: not what the worker says.
+                let store = match (service, &refused) {
+                    (Service::Kv, None) => s.namespace(rid, &request).map(Some),
+                    _ => Ok(None),
+                };
+                let (refused, store) = match store {
+                    Ok(store) => (refused, store),
+                    Err(why) => (Some(why), None),
+                };
                 if let Some(why) = refused {
                     send.map(|w| w.send(ToWorker::Fetched { fid, response: Err(why) }));
                     return None;
@@ -594,7 +1189,18 @@ impl Supervisor {
                         }
                     }
                     let place = Place(me.clone());
-                    let response = me.egress.fetch(&request).await;
+                    let response = match store {
+                        None => me.egress.fetch(&request).await,
+                        // Past what may wait there (a store that answers
+                        // none): refused, not queued.
+                        Some((store, namespace, operation, get)) => {
+                            let scope = me.state.borrow().store_scope.clone();
+                            let asked = scope.map(|s| Data::String(s.to_string())).into_iter();
+                            let asked = Data::List(asked.chain([Data::String(namespace), operation]).collect());
+                            let answered = store.ask(asked, STORE).await.map_err(|why| format!("the store: {why}"));
+                            if get { answered.and_then(kv_found) } else { answered }
+                        }
+                    };
                     drop(place);
                     // To the worker that asked, if it is still the one.
                     let current = me.state.borrow().worker.as_ref().filter(|w| w.generation == generation).map(|w| w.send.clone());
@@ -626,18 +1232,19 @@ impl Supervisor {
         let (requests, deploys) = {
             let mut s = self.state.borrow_mut();
             let Some(w) = s.worker.take_if(|w| w.generation == generation) else { return };
-            match &w.cgroup {
-                Some(c) => {
-                    let _ = c.kill();
-                }
-                // SAFETY: signalling the worker's waiter, whose death ends
-                // the worker, through its pidfd: none once reaped.
-                None => unsafe {
-                    libc::syscall(libc::SYS_pidfd_send_signal, w.pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0);
-                },
-            }
-            // Its REPL connections end with it.
+            kill(&w);
+            // Its REPL connections end with it, and what it had loaded:
+            // the next is given what is published.
             s.repls.clear();
+            let State { ready, routes, stores, .. } = &mut *s;
+            ready.retain(|_, r| routes.get(&r.bundle.name) == Some(&r.bundle.id));
+            ready.values_mut().for_each(|r| r.loaded = false);
+            stores.retain(|served, _| ready.contains_key(served));
+            for (_, waiters) in s.joining.drain() {
+                for waiter in waiters {
+                    let _ = waiter.send(Err(why.into()));
+                }
+            }
             (std::mem::take(&mut s.pending), std::mem::take(&mut s.deploys))
         };
         // Their responses' bodies streaming are cut short.
@@ -651,12 +1258,20 @@ impl Supervisor {
             let _ = reply.send(Err(why.into()));
         }
         let me = self.clone();
-        tokio::task::spawn_local(async move { me.restart().await });
+        tokio::task::spawn_local(async move {
+            // None could be started: asleep, so that what next needs
+            // one tries again, rather than refused from now on.
+            if !me.restart(false).await {
+                let mut s = me.state.borrow_mut();
+                s.asleep = s.worker.is_none() && !s.waking;
+            }
+        });
     }
 
     /// Start another worker, if not too many were this minute, and give
-    /// it the last deployment acknowledged.
-    async fn restart(&self) {
+    /// it the deployments published: until it has loaded one, that one's
+    /// requests are refused.
+    async fn restart(&self, quiet: bool) -> bool {
         let wait = {
             let mut s = self.state.borrow_mut();
             let now = Instant::now();
@@ -674,15 +1289,46 @@ impl Supervisor {
         }
         if let Err(e) = self.start_worker().await {
             eprintln!("techne cloud: no worker: {e}");
-            return;
+            return false;
         }
-        let last = self.state.borrow().last.clone();
-        if let Some(b) = last {
+        let published: Vec<Bundle> = self.state.borrow().ready.values().map(|r| r.bundle.clone()).collect();
+        for b in published {
+            let (name, served) = (b.name.clone(), b.served());
             match self.send_deploy(b).await {
-                Ok(_) => eprintln!("techne cloud: a new worker serves the deployment"),
-                Err(e) => eprintln!("techne cloud: the new worker did not load the deployment: {e}"),
+                Ok(_) => {
+                    if let Some(w) = &self.state.borrow().worker {
+                        let _ = w.send.send(ToWorker::Activate { name: served });
+                    }
+                    if !quiet {
+                        eprintln!("techne cloud: a new worker serves {name}")
+                    }
+                }
+                Err(e) => eprintln!("techne cloud: the new worker did not load {name}: {e}"),
             }
         }
+        true
+    }
+
+    /// Have the worker serve no more the deployments its names are no
+    /// longer routed to, once their requests are done, and those
+    /// prepared long ago and never published.
+    fn retire(&self) {
+        let mut s = self.state.borrow_mut();
+        let State { ready, routes, pending, deploys, stores, worker, .. } = &mut *s;
+        let now = Instant::now();
+        ready.retain(|served, r| {
+            let routed = routes.get(&r.bundle.name) == Some(&r.bundle.id);
+            let waited = r.published || now.duration_since(r.since) > UNPUBLISHED;
+            let busy = pending.values().any(|p| &p.served == served) || deploys.values().any(|(b, _)| &b.served() == served);
+            if routed || !waited || busy {
+                return true;
+            }
+            stores.remove(served);
+            if let Some(w) = worker {
+                let _ = w.send.send(ToWorker::Retire { name: served.clone() });
+            }
+            false
+        });
     }
 
     /// Answer `reply` for deployment `name` with `status`, and report it.
@@ -702,6 +1348,7 @@ impl Supervisor {
     /// abandoned; for ever.
     async fn watch(self) {
         loop {
+            self.retire();
             let now = Instant::now();
             let (abandoned, cut): (Vec<u64>, Vec<u64>) = {
                 let s = self.state.borrow();
@@ -752,18 +1399,78 @@ impl Supervisor {
     /// Ask the deployment published as `name` to answer `request`, as
     /// [`crate::Host::fetch`] does.
     pub fn fetch(&self, name: &str, request: Data, body: Option<Reader>) -> oneshot::Receiver<Response> {
+        self.fetch_routed(name, request, body, false)
+    }
+
+    /// [`Supervisor::fetch`], the request routed to the deployment's
+    /// debug instance if `debug`, as [`crate::Host::fetch_routed`] does:
+    /// the worker is waited for [`crate::DEBUG_PAUSE`] longer.
+    pub fn fetch_routed(&self, name: &str, request: Data, body: Option<Reader>, debug: bool) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
         let mut s = self.state.borrow_mut();
+        // Pinned here to the deployment the name is routed to now.
+        let Some(served) = s.routes.get(name).map(|id| served(name, id)) else {
+            drop(s);
+            self.answer(tx, name, 404, "no such deployment");
+            return rx;
+        };
+        // Asleep, or being woken: asked once its worker has what is
+        // published.
+        if s.asleep || s.waking {
+            // A bounded number wait so: each holds its request.
+            if s.deferred >= DEFERRED {
+                drop(s);
+                self.answer(tx, name, 503, "too many requests wait for the worker to start");
+                return rx;
+            }
+            s.deferred += 1;
+            drop(s);
+            let (me, name) = (self.clone(), name.to_string());
+            let wall = self.options.wall;
+            tokio::task::spawn_local(async move {
+                let mut tx = tx;
+                // Abandoned by who asked, while it waits or after:
+                // dropped, and abandoned there too.
+                let woken = tokio::select! {
+                    woken = tokio::time::timeout(wall, me.awake()) => Some(woken.unwrap_or_else(|_| Err("the worker did not start in time".into()))),
+                    _ = tx.closed() => None,
+                };
+                me.state.borrow_mut().deferred -= 1;
+                match woken {
+                    Some(Ok(())) => {
+                        let served = me.fetch_routed(&name, request, body, debug);
+                        tokio::select! {
+                            response = served => {
+                                if let Ok(response) = response {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                            _ = tx.closed() => {}
+                        }
+                    }
+                    Some(Err(why)) => me.answer(tx, &name, 503, &why),
+                    None => {}
+                }
+            });
+            return rx;
+        }
         let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else {
             drop(s);
             self.answer(tx, name, 503, "no worker");
             return rx;
         };
+        // A worker started anew has yet to load it.
+        if !s.ready.get(&served).is_some_and(|r| r.loaded) {
+            drop(s);
+            self.answer(tx, name, 503, "the deployment is being loaded");
+            return rx;
+        }
         s.next_rid += 1;
         let rid = s.next_rid;
-        let deadline = Instant::now() + self.options.wall + GRACE;
+        let pause = if debug { crate::DEBUG_PAUSE } else { Duration::ZERO };
+        let deadline = Instant::now() + self.options.wall + pause + GRACE;
         let credits = body.as_ref().map(|_| Rc::new(Semaphore::new(WINDOW)));
-        let _ = send.send(ToWorker::Request { rid, name: name.into(), request, streams: body.is_some() });
+        let _ = send.send(ToWorker::Request { rid, name: served.clone(), request, streams: body.is_some(), debug });
         let pump = body.zip(credits.clone()).map(|(reader, credits)| {
             let send = send.clone();
             let pumping = tokio::task::spawn_local(body::pump(reader, credits, move |piece| {
@@ -775,7 +1482,20 @@ impl Supervisor {
             }));
             pumping.abort_handle()
         });
-        let pending = Pending { name: name.into(), reply: Some(tx), deadline, body: None, credits, pump, cancelled: false, fetches: 0 };
+        let stores = s.stores.get(&served).cloned().unwrap_or_default();
+        let pending = Pending {
+            name: name.into(),
+            served,
+            reply: Some(tx),
+            deadline,
+            body: None,
+            credits,
+            pump,
+            cancelled: false,
+            fetches: 0,
+            store_ops: 0,
+            stores,
+        };
         s.pending.insert(rid, pending);
         drop(s);
         self.changed.notify_one();
@@ -783,42 +1503,219 @@ impl Supervisor {
     }
 
     /// Have the worker serve the deployment whose entry module is `entry`
-    /// as `name`, its files those under the entry's directory (but in
-    /// hidden directories, `target` and `node_modules`): what loading it
-    /// wrote, or why it was not.
+    /// as `name`, its files those under the entry's directory (but hidden
+    /// ones, and in hidden directories, `target` and `node_modules`):
+    /// prepared, then published whatever the name was routed to. What
+    /// loading it wrote, or why it was not.
     pub async fn deploy(&self, name: &str, entry: &Path) -> Result<String, String> {
+        self.deploy_with(name, entry, Bindings::default()).await
+    }
+
+    /// [`Supervisor::deploy`], the deployment given `bindings`: once
+    /// published, the name's requests reach the namespaces these name.
+    pub async fn deploy_with(&self, name: &str, entry: &Path, bindings: Bindings) -> Result<String, String> {
+        let prepared = self.prepare(name, entry, bindings).await?;
+        self.publish(name, &prepared.id, None)?;
+        Ok(prepared.output)
+    }
+
+    /// Have the worker load the deployment whose entry module is `entry`,
+    /// for `name`, with `bindings`, its files those under the entry's
+    /// directory as [`Supervisor::deploy`] takes them: its id, by which
+    /// to publish it. Nothing served changes; one that does not load is
+    /// an error and no more. The same deployment prepared again is the
+    /// one there is.
+    pub async fn prepare(&self, name: &str, entry: &Path, bindings: Bindings) -> Result<Prepared, String> {
         let dir = entry.parent().ok_or("an entry in no directory")?;
         let files = bundle(dir)?;
         let entry = entry.strip_prefix(dir).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
-        self.send_deploy(Bundle { name: name.into(), entry, files }).await
+        self.prepare_files(name, &entry, files, bindings).await
+    }
+
+    /// [`Supervisor::prepare`], of `files` given, by their paths, `entry`
+    /// among them.
+    pub async fn prepare_files(
+        &self,
+        name: &str,
+        entry: &str,
+        files: Vec<(String, Vec<u8>)>,
+        bindings: Bindings,
+    ) -> Result<Prepared, String> {
+        if name.is_empty() || name.contains('@') {
+            return Err(format!("{name}: not a deployment's name"));
+        }
+        let id = deployment_id(name, entry, &files, &bindings);
+        let key = served(name, &id);
+        if self.sleeping() || self.state.borrow().waking {
+            self.awake().await?;
+        }
+        let joined = {
+            let mut s = self.state.borrow_mut();
+            if s.ready.get(&key).is_some_and(|r| r.loaded) {
+                return Ok(Prepared { id, output: String::new() });
+            }
+            // Being loaded already: that loading is this one's too.
+            if s.deploys.values().any(|(b, _)| b.served() == key) {
+                let (tx, rx) = oneshot::channel();
+                s.joining.entry(key).or_default().push(tx);
+                Some(rx)
+            } else if s.deploys.values().filter(|(b, _)| b.name == name).count() >= UNPUBLISHED_EACH {
+                return Err(format!("too many deployments of {name} are being prepared"));
+            } else {
+                None
+            }
+        };
+        let output = match joined {
+            // No longer than the loading it joined is waited for.
+            Some(loading) => match tokio::time::timeout(DEPLOY, loading).await {
+                Ok(loaded) => loaded.map_err(|_| "the worker is gone".to_string())?,
+                Err(_) => Err("the worker did not load it in time".into()),
+            },
+            None => self.send_deploy(Bundle { name: name.into(), id: id.clone(), entry: entry.into(), files, bindings }).await,
+        };
+        output.map(|output| Prepared { id, output })
+    }
+
+    /// Route `name`'s requests to its deployment `id`, prepared, from now
+    /// on: those sent already finish where they were sent. With
+    /// `expected`, only if the name is routed there now (to that id, or
+    /// nowhere): else an error, and nothing changes. The id it was routed
+    /// to before.
+    pub fn publish(&self, name: &str, id: &str, expected: Option<Option<&str>>) -> Result<Option<String>, String> {
+        let mut s = self.state.borrow_mut();
+        let now = s.routes.get(name).cloned();
+        if let Some(expected) = expected
+            && now.as_deref() != expected
+        {
+            return Err(format!("{name} is at {}, not {}", now.as_deref().unwrap_or("nothing"), expected.unwrap_or("nothing")));
+        }
+        let served = served(name, id);
+        let Some(ready) = s.ready.get_mut(&served).filter(|r| r.loaded) else {
+            return Err(format!("{name} has no deployment {id} prepared"));
+        };
+        ready.published = true;
+        s.routes.insert(name.into(), id.into());
+        if let Some(w) = &s.worker {
+            // The one before serves what it was sent, and no debugging:
+            // its debug instance goes at the deploy, not when its last
+            // request is done.
+            if let Some(before) = now.as_deref().filter(|before| *before != id) {
+                let _ = w.send.send(ToWorker::Deactivate { name: self::served(name, before) });
+            }
+            let _ = w.send.send(ToWorker::Activate { name: served });
+        }
+        drop(s);
+        self.changed.notify_one();
+        Ok(now)
+    }
+
+    /// The id of the deployment `name`'s requests go to.
+    pub fn route(&self, name: &str) -> Option<String> {
+        self.state.borrow().routes.get(name).cloned()
+    }
+
+    /// The ids of `name`'s deployments the worker has loaded, in order.
+    pub fn prepared(&self, name: &str) -> Vec<String> {
+        let mut ids: Vec<String> =
+            self.state.borrow().ready.values().filter(|r| r.bundle.name == name).map(|r| r.bundle.id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Have a task of `front` keep what requests keep in their KV
+    /// namespaces (`crate::ask`, as `store`): `(%store-next)` returns the
+    /// next operation asked, a list of its number and what is asked, a
+    /// list of its namespace (a string, the deployment's binding looked
+    /// up) and the operation, a dict of its `op` and fields, a value to
+    /// keep a bytevector (`kv_operation`); `(%store-reply number ok
+    /// value)` answers it. One not answered within ten seconds is failed,
+    /// and not handed on if it still waited; as many wait as may be asked
+    /// at once, and more are refused. Without a store, requests keep
+    /// nothing.
+    pub fn install_store(&self, front: &mut Vm) {
+        self.wakes(front);
+        self.state.borrow_mut().store = Some(crate::ask::install(front, "store", FETCHING));
+    }
+
+    /// Give `front` what deploys: for Lisp there that keeps the record of
+    /// deployments and decides what is published (`lisp/cloud/control.scm`).
+    /// `(%cloud-prepare-directory name entry)` prepares the deployment
+    /// whose entry module is the file ENTRY, bound as the manifest beside
+    /// it says ([`read_bindings`]: the manifest is not read in `front`),
+    /// and `(%cloud-prepare name entry bindings)` the deployment whose
+    /// entry module is the file ENTRY, with BINDINGS (a dict of `env` and
+    /// `stores`, as `lisp/cloud/manifest.scm` reads them), as
+    /// [`Supervisor::prepare`] does: a list of its id and what loading
+    /// wrote. `(%cloud-publish name id expected)` publishes it, as
+    /// [`Supervisor::publish`] does: whatever NAME is routed to if
+    /// EXPECTED is #t, only if it is routed to nothing if #f, or to the
+    /// id EXPECTED; the id it was routed to, or #f. `(%cloud-route name)`
+    /// is that id now. `(%cloud-bundle name id)` is all of a deployment
+    /// prepared, as a bytevector to keep, or #f, and
+    /// `(%cloud-prepare-bundle name bytes)` prepares the deployment of
+    /// NAME kept so, as `%cloud-prepare` does. What fails is an error.
+    pub fn install_control(&self, front: &mut Vm) {
+        self.wakes(front);
+        let me = self.clone();
+        install_control_with(front, Rc::new(move |name: &str| Ok((me.clone(), name.to_string()))));
+    }
+
+    /// All of deployment `id` of `name`, prepared, as bytes to keep.
+    fn bundle_of(&self, name: &str, id: &str) -> Option<Vec<u8>> {
+        self.state.borrow().ready.get(&served(name, id)).map(|r| r.bundle.encode())
+    }
+
+    /// Have what `front`'s tasks wait on wake the supervisor's driver
+    /// (`Supervisor::run`), as `install` does: for a front world given
+    /// natives of the caller's own.
+    pub fn wakes(&self, front: &mut Vm) {
+        let wake = self.wake.clone();
+        front.set_wake_notifier(move || wake.notify_one());
     }
 
     async fn send_deploy(&self, bundle: Bundle) -> Result<String, String> {
         let (tx, rx) = oneshot::channel();
-        {
+        let served = bundle.served();
+        let sent = {
             let mut s = self.state.borrow_mut();
             let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else { return Err("no worker".into()) };
             s.next_deploy += 1;
             let id = s.next_deploy;
             let message = ToWorker::Deploy {
                 id,
-                name: bundle.name.clone(),
+                name: bundle.served(),
                 entry: bundle.entry.clone(),
                 files: bundle.files.clone(),
                 wall_ms: self.options.wall.as_millis() as u64,
                 dev: self.options.dev,
+                env: bundle.bindings.env.clone(),
             };
             s.deploys.insert(id, (bundle, tx));
             let _ = send.send(message);
-        }
+            id
+        };
         match tokio::time::timeout(DEPLOY, rx).await {
             Ok(r) => r.map_err(|_| "the worker is gone".to_string())?,
-            Err(_) => Err("the worker did not load it in time".into()),
+            // Given up: no one joins it from now on, those who did are
+            // told, and a worker that says later that it loaded it says
+            // what it was not asked (`heard`).
+            Err(_) => {
+                let why = "the worker did not load it in time".to_string();
+                let mut s = self.state.borrow_mut();
+                s.deploys.remove(&sent);
+                for waiter in s.joining.remove(&served).unwrap_or_default() {
+                    let _ = waiter.send(Err(why.clone()));
+                }
+                Err(why)
+            }
         }
     }
 
     /// Accept REPL clients on `addr` (loopback, for development), each
-    /// relayed to the worker's dev world: the address bound.
+    /// relayed to the worker's dev world, for no one in particular: the
+    /// address bound. Anyone who can connect evaluates there: what
+    /// listens elsewhere authenticates its clients first, and relays
+    /// them itself ([`Supervisor::relay`]).
     pub async fn serve_repl(&self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
@@ -826,25 +1723,73 @@ impl Supervisor {
         tokio::task::spawn_local(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let _ = stream.set_nodelay(true);
-                me.relay(stream);
+                me.relay(stream, None, Vec::new());
             }
         });
         Ok(bound)
     }
 
     /// Relay `stream`, a REPL client, to the worker as a connection of its
-    /// own, until either end closes it.
-    fn relay(&self, stream: tokio::net::TcpStream) {
+    /// own, until either end closes it: for `principal`, if the caller
+    /// authenticated the client as that (the worker's REPL keeps what is
+    /// each principal's apart), `sent` being what the client sent already
+    /// that is the REPL's to read.
+    pub fn relay(&self, stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + 'static, principal: Option<String>, sent: Vec<u8>) {
+        let _ = self.relay_to(None, stream, principal, sent);
+    }
+
+    /// Relay `stream`, a REPL client authenticated as `principal`, to a
+    /// debug instance of the deployment `name` is routed to now, attached
+    /// for it if it has none (`Host::attach_debug`): the worker started
+    /// if the supervisor sleeps, which it does not while the client is
+    /// connected. What resolves when the connection has ended, however it
+    /// does (the debug instance goes with its last client, and with its
+    /// deployment); or why there is none.
+    pub async fn attach(
+        &self,
+        name: &str,
+        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + 'static,
+        principal: String,
+        sent: Vec<u8>,
+    ) -> Result<oneshot::Receiver<()>, String> {
+        if self.sleeping() || self.state.borrow().waking {
+            self.awake().await?;
+        }
+        let served = {
+            let s = self.state.borrow();
+            let id = s.routes.get(name).ok_or("no such deployment")?;
+            let served = served(name, id);
+            if !s.ready.get(&served).is_some_and(|r| r.loaded) {
+                return Err("the deployment is being loaded".into());
+            }
+            served
+        };
+        self.relay_to(Some(served), stream, Some(principal), sent).ok_or_else(|| "no worker".to_string())
+    }
+
+    /// `relay`, to the debug instance of the deployment served as
+    /// `target` if given: what resolves at the connection's end, if it
+    /// was relayed.
+    fn relay_to(
+        &self,
+        target: Option<String>,
+        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + 'static,
+        principal: Option<String>,
+        sent: Vec<u8>,
+    ) -> Option<oneshot::Receiver<()>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (cid, send) = {
             let mut s = self.state.borrow_mut();
-            let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else { return };
+            let send = s.worker.as_ref().map(|w| w.send.clone())?;
             s.next_cid += 1;
             (s.next_cid, send)
         };
         let (queue, mut queued) = mpsc::channel::<Vec<u8>>(REPL_QUEUE);
-        let _ = send.send(ToWorker::ReplOpen { cid });
-        let (mut from, mut to) = stream.into_split();
+        let _ = send.send(ToWorker::ReplOpen { cid, principal, target });
+        for bytes in sent.chunks(REPL_CHUNK) {
+            let _ = send.send(ToWorker::ReplData { cid, bytes: bytes.to_vec() });
+        }
+        let (mut from, mut to) = tokio::io::split(stream);
         tokio::task::spawn_local(async move {
             while let Some(bytes) = queued.recv().await {
                 if to.write_all(&bytes).await.is_err() {
@@ -867,16 +1812,17 @@ impl Supervisor {
             }
         });
         let reader = reader.abort_handle();
-        self.state.borrow_mut().repls.insert(cid, Repl { queue, reader });
+        let (ended, end) = oneshot::channel();
+        self.state.borrow_mut().repls.insert(cid, Repl { queue, reader, _ended: ended });
+        Some(end)
     }
 
-    /// Define `(host-fetch deployment request)` in the front world, as
-    /// [`crate::Host::install`] does.
+    /// Define `(host-fetch deployment request #:debug #f)` in the front
+    /// world, as [`crate::Host::install`] does.
     pub fn install(&self, front: &mut Vm) {
-        let wake = self.wake.clone();
-        front.set_wake_notifier(move || wake.notify_one());
+        self.wakes(front);
         let me = self.clone();
-        body::install_front(front, move |deployment, request, body| me.fetch(deployment, request, body));
+        body::install_front(front, move |deployment, request, body, debug| me.fetch_routed(deployment, request, body, debug));
     }
 
     /// Drive `front` (installed) until its tasks have all finished.
@@ -900,9 +1846,10 @@ impl Supervisor {
 /// and more.
 const DEPLOY: Duration = Duration::from_secs(60);
 
-/// The files under `dir`, by their paths in it: not in hidden
-/// directories, `target` or `node_modules`, nor through symbolic links.
-fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+/// The files under `dir`, by their paths in it: not hidden ones (a
+/// deployment's secrets are in one), nor in hidden directories, `target`
+/// or `node_modules`, nor through symbolic links.
+pub fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::new();
     let mut total = 0;
     let mut dirs = vec![dir.to_path_buf()];
@@ -916,7 +1863,7 @@ fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
                         dirs.push(path);
                     }
                 }
-                Ok(t) if t.is_file() => {
+                Ok(t) if t.is_file() && !name.starts_with('.') => {
                     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                     total += bytes.len();
                     if total > BUNDLE_BYTES {
@@ -931,4 +1878,73 @@ fn bundle(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     }
     files.sort();
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(entries: &[(&str, Data)]) -> Data {
+        Data::Dict(entries.iter().map(|(k, v)| (Data::Symbol((*k).into()), v.clone())).collect())
+    }
+
+    fn string(s: &str) -> Data {
+        Data::String(s.into())
+    }
+
+    /// The store is handed what an operation has and no more: a value
+    /// encoded, no symbol of the tenant's.
+    #[test]
+    fn a_kv_operation_is_handed_on_without_the_tenants_symbols() {
+        let value = Data::List(vec![Data::Symbol("theirs".into()), Data::Keyword("a b".into())]);
+        let asked = dict(&[
+            ("op", Data::Symbol("put".into())),
+            ("binding", string("cache")),
+            ("key", string("k")),
+            ("value", value.clone()),
+            ("ttl", Data::Int(5)),
+            ("theirs", Data::Symbol("more".into())),
+        ]);
+        let (binding, operation, get) = kv_operation(&asked).unwrap();
+        assert_eq!((binding.as_str(), get), ("cache", false));
+        let expected = dict(&[
+            ("op", Data::Symbol("put".into())),
+            ("key", string("k")),
+            ("value", Data::Bytes(encode(&value))),
+            ("ttl", Data::Int(5)),
+        ]);
+        assert_eq!(operation, expected);
+        // What a `get` finds is what was kept.
+        let found = dict(&[("found", Data::Bool(true)), ("value", Data::Bytes(encode(&value)))]);
+        assert_eq!(kv_found(found).unwrap(), dict(&[("found", Data::Bool(true)), ("value", value)]));
+        assert!(kv_found(dict(&[("value", Data::Bytes(vec![255, 255]))])).is_err());
+        // Not operations.
+        for bad in [
+            dict(&[("op", Data::Symbol("drop".into())), ("binding", string("cache"))]),
+            dict(&[("op", Data::Symbol("get".into())), ("key", string("k"))]),
+            dict(&[("op", Data::Symbol("get".into())), ("binding", string("cache")), ("key", Data::Symbol("k".into()))]),
+            dict(&[("op", string("get")), ("binding", string("cache")), ("key", string("k"))]),
+            dict(&[("op", Data::Symbol("put".into())), ("binding", string("cache")), ("key", string("k"))]),
+            dict(&[("op", Data::Symbol("list".into())), ("binding", string("cache")), ("limit", string("all"))]),
+            string("get"),
+        ] {
+            assert!(kv_operation(&bad).is_err(), "{bad:?}");
+        }
+        let (_, listing, _) = kv_operation(&dict(&[("op", Data::Symbol("list".into())), ("binding", string("cache"))])).unwrap();
+        assert_eq!(listing, dict(&[("op", Data::Symbol("list".into())), ("prefix", string("")), ("limit", Data::Int(1000))]));
+    }
+
+    /// A deployment's files are not its hidden ones: its secrets stay
+    /// with the supervisor.
+    #[test]
+    fn a_bundle_has_no_hidden_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".techne/kv")).unwrap();
+        for file in ["app.scm", ".secrets.scm", "lib/a.scm", "lib/.hidden", ".techne/kv/ns.kv"] {
+            std::fs::write(dir.path().join(file), "x").unwrap();
+        }
+        let names: Vec<String> = bundle(dir.path()).unwrap().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["app.scm", "lib/a.scm"]);
+    }
 }

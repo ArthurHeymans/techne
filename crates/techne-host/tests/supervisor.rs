@@ -12,7 +12,7 @@ use std::{
 
 use techne_host::{
     body::{self, Reader},
-    supervisor::{Options, ResourceConfinement, Sandboxing, Supervisor},
+    supervisor::{Bindings, Options, ResourceConfinement, Sandboxing, Supervisor},
 };
 use techne_vm::data::Data;
 
@@ -96,6 +96,176 @@ fn supervised(options: Options, test: impl AsyncFnOnce(Supervisor, Rc<RefCell<Ve
     });
 }
 
+/// What keeps under a key, or reads it, through whatever its `env` has as
+/// `store`, or through a binding of its own making.
+const KEEPING: &str = r#"
+(provide fetch)
+(define (fetch request env ctx)
+  (let ((path (dict-ref request 'path))
+        (store (dict-ref env 'store #f)))
+    (guard (e (#t (condition/report-string e)))
+      (cond ((string=? path "/put") (kv-put! store "k" (dict-ref env 'who)) "kept")
+            ((string=? path "/get") (kv-get store "k" "nothing"))
+            ((string=? path "/forged") (kv-get (dict 'kind 'kv 'name "theirs") "k" "nothing"))
+            ((string=? path "/late-get") (sleep 300) (kv-get store "k" "nothing"))
+            ;; Data whose written form does not read back.
+            ((string=? path "/odd")
+             (let ((odd (list 'a-symbol (string->keyword "a b") 1.5 (bytevector 0 255) (dict "é" #t))))
+               (kv-put! store "odd" odd)
+               (if (equal? odd (kv-get store "odd")) "same" "changed")))
+
+            (else "?")))))
+"#;
+
+/// Deployments reach the namespaces their own bindings stand for, by the
+/// names they have for them, and no other, whatever they name; without a
+/// binding, nothing.
+#[test]
+fn a_deployment_reaches_its_own_namespaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = |name: &str| {
+        let d = dir.path().join(name);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("app.scm"), KEEPING).unwrap();
+        d.join("app.scm")
+    };
+    let bindings = |who: &str, namespace: &str| Bindings {
+        env: Data::Dict(vec![
+            (Data::Symbol("who".into()), Data::String(who.into())),
+            (
+                Data::Symbol("store".into()),
+                Data::Dict(vec![
+                    (Data::Symbol("kind".into()), Data::Symbol("kv".into())),
+                    (Data::Symbol("name".into()), Data::String("mine".into())),
+                ]),
+            ),
+        ]),
+        stores: [("mine".to_string(), namespace.to_string())].into(),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let s = Supervisor::start(options(&[])).await.unwrap();
+        s.on_failure(|_| {});
+        let mut front = techne_vm::vm::Vm::new();
+        s.install_store(&mut front);
+        let kv = techne_vm::library::lisp_dir().join("cloud/kv.scm").display().to_string();
+        let kept = dir.path().join("kept").display().to_string();
+        front.eval_source(&format!("(require {kv:?}) (spawn (lambda () (kv-serve (make-kv-store {kept:?}))))")).unwrap();
+        let driver = s.clone();
+        tokio::task::spawn_local(async move {
+            let _ = driver.run(&mut front).await;
+        });
+        s.deploy_with("a", &entry("a"), bindings("a", "ns-a")).await.unwrap();
+        s.deploy_with("b", &entry("b"), bindings("b", "ns-b")).await.unwrap();
+        s.deploy("bare", &entry("bare")).await.unwrap();
+        let ask = async |name: &str, path: &str| answer(&s.fetch(name, request(path), None).await.unwrap().head).1;
+        assert_eq!(ask("a", "/put").await, "kept");
+        // The same binding's name, another namespace.
+        assert_eq!(ask("b", "/get").await, "nothing");
+        assert_eq!(ask("b", "/put").await, "kept");
+        assert_eq!(ask("a", "/get").await, "a");
+        assert_eq!(ask("b", "/get").await, "b");
+        assert!(dir.path().join("kept/ns-a.kv").is_file() && dir.path().join("kept/ns-b.kv").is_file());
+        // A binding it was not given, and a deployment given none.
+        assert!(ask("a", "/forged").await.contains("no KV binding theirs"));
+        assert!(ask("bare", "/forged").await.contains("no KV binding theirs"));
+        assert!(ask("bare", "/get").await.contains("Not a KV binding"));
+        assert_eq!(ask("a", "/odd").await, "same");
+        // Deployed again with another namespace: that one from then on,
+        // and for a request sent before, the one it had then.
+        let before = s.fetch("a", request("/late-get"), None);
+        s.deploy_with("a", &entry("a2"), bindings("a", "ns-b")).await.unwrap();
+        assert_eq!(ask("a", "/get").await, "b");
+        assert_eq!(answer(&before.await.unwrap().head).1, "a");
+    });
+}
+
+/// What answers with what its `env` has as `who`, at once or after a
+/// while.
+const ROUTED: &str = r#"
+(provide fetch)
+(define (fetch request env ctx)
+  (when (string=? (dict-ref request 'path) "/slow") (sleep 300))
+  (dict-ref env 'who))
+"#;
+
+/// A deployment is prepared, which changes nothing served, then
+/// published, if its name is still routed where the publisher saw it; a
+/// request sent before finishes on the deployment it was sent for, which
+/// is then retired; an earlier one is published again by preparing it
+/// again; one that does not load changes nothing.
+#[test]
+fn deployments_are_prepared_published_and_rolled_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("app.scm");
+    std::fs::write(&entry, ROUTED).unwrap();
+    let who = |who: &str| Bindings { env: Data::Dict(vec![(Data::Symbol("who".into()), Data::String(who.into()))]), ..Bindings::default() };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let s = Supervisor::start(options(&[])).await.unwrap();
+        s.on_failure(|_| {});
+        let ask = async |path: &str| answer(&s.fetch("app", request(path), None).await.unwrap().head);
+        let one = s.prepare("app", &entry, who("one")).await.unwrap();
+        // Prepared: not served yet.
+        assert_eq!(ask("/").await.0, 404);
+        assert_eq!(s.route("app"), None);
+        assert_eq!(s.publish("app", &one.id, Some(None)).unwrap(), None);
+        assert_eq!(ask("/").await, (200, "one".into()));
+        // The same prepared again is the one there is.
+        let same = s.prepare("app", &entry, who("one")).await.unwrap();
+        assert_eq!((same.id.as_str(), same.output.as_str()), (one.id.as_str(), ""));
+        let two = s.prepare("app", &entry, who("two")).await.unwrap();
+        assert_ne!(two.id, one.id);
+        assert_eq!(s.prepared("app").len(), 2);
+        assert_eq!(ask("/").await, (200, "one".into()));
+        let before = s.fetch("app", request("/slow"), None);
+        // Published only where the publisher saw the name routed.
+        assert!(s.publish("app", &two.id, Some(None)).is_err());
+        assert!(s.publish("app", &two.id, Some(Some("0000000000000000"))).is_err());
+        assert_eq!(s.route("app").as_deref(), Some(one.id.as_str()));
+        assert_eq!(s.publish("app", &two.id, Some(Some(&one.id))).unwrap().as_deref(), Some(one.id.as_str()));
+        assert_eq!(ask("/").await, (200, "two".into()));
+        // Sent before: served by the one it was sent for.
+        assert_eq!(answer(&before.await.unwrap().head), (200, "one".into()));
+        // Which is retired, its requests done.
+        let start = Instant::now();
+        while s.prepared("app") != [two.id.clone()] {
+            assert!(start.elapsed() < Duration::from_secs(5), "{:?}", s.prepared("app"));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(s.publish("app", &one.id, None).is_err());
+        // Rolled back: prepared again, and published.
+        let again = s.prepare("app", &entry, who("one")).await.unwrap();
+        assert_eq!(again.id, one.id);
+        s.publish("app", &again.id, Some(Some(&two.id))).unwrap();
+        assert_eq!(ask("/").await, (200, "one".into()));
+        // One that does not load changes nothing.
+        let broken = dir.path().join("broken");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join("app.scm"), "(provide fetch) (car 1)").unwrap();
+        assert!(s.prepare("app", &broken.join("app.scm"), who("three")).await.is_err());
+        assert_eq!(ask("/").await, (200, "one".into()));
+        assert_eq!(s.route("app").as_deref(), Some(one.id.as_str()));
+        assert!(s.prepare("a@b", &entry, who("x")).await.is_err());
+        // Prepared twice at once: loaded once, for both.
+        let (a, b) = tokio::join!(s.prepare("app", &entry, who("four")), s.prepare("app", &entry, who("four")));
+        assert_eq!(a.unwrap().id, b.unwrap().id);
+        assert_eq!(s.prepared("app").len(), 2);
+        // A few prepared and not published are kept, the oldest going
+        // once another has loaded; one that does not load costs none.
+        for n in 0..6 {
+            s.prepare("app", &entry, who(&format!("more {n}"))).await.unwrap();
+        }
+        let kept = s.prepared("app");
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        assert!(s.prepare("app", &broken.join("app.scm"), who("five")).await.is_err());
+        assert_eq!(s.prepared("app"), kept);
+        assert_eq!(ask("/").await, (200, "one".into()));
+    });
+}
+
 #[test]
 fn a_worker_answers_as_a_host_does() {
     // Compiled code too, in a sandbox.
@@ -149,6 +319,10 @@ fn a_worker_that_answers_what_it_was_not_asked_is_killed() {
         let failures = Rc::new(RefCell::new(Vec::new()));
         let seen = failures.clone();
         s.on_failure(move |f| seen.borrow_mut().push(format!("{}: {} {}", f.deployment, f.status, f.message)));
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("app.scm");
+        std::fs::write(&entry, APP).unwrap();
+        s.deploy("app", &entry).await.unwrap();
         let r = s.fetch("app", request("/"), None).await.unwrap();
         assert_eq!(answer(&r.head).0, 500);
         assert!(failures.borrow().iter().any(|f| f.contains("misbehaved")), "{:?}", failures.borrow());

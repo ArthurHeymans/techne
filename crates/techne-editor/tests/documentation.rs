@@ -26,6 +26,14 @@ fn documentation_problems() {
         "lisp/schema.scm",
         "lisp/http/http.scm",
         "lisp/http/server.scm",
+        "lisp/http/debug-route.scm",
+        "lisp/cloud/kv.scm",
+        "lisp/cloud/manifest.scm",
+        "lisp/cloud/tokens.scm",
+        "lisp/cloud/auth.scm",
+        "lisp/cloud/control.scm",
+        "lisp/cloud/hosts.scm",
+        "lisp/cloud/serve.scm",
     ] {
         vm.eval_source(&format!("(require {:?})", root.join(file).display().to_string())).unwrap_or_else(|e| panic!("{file}: {e}"));
     }

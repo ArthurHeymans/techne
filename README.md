@@ -56,6 +56,15 @@ cargo build --release -p techne-cli --no-default-features  # without the editor'
 nix build                       # the package: result/bin/techne, its Lisp in result/share/techne
 techne cloud dev app.scm        # serve a deployment (doc/serverless.md) locally, deploying on save
 techne cloud dev app.scm --nrepl 0  # ... from a dev world, with an nREPL server for Emacs into it
+techne cloud dev app.scm --nrepl 0 --debug  # ... as in production, the nREPL server in a debug instance beside
+techne cloud dev app.scm --nrepl 0 --auth   # ... its nREPL clients authenticating with a token
+techne cloud dev app.scm --ops 0   # ... serving the operations on its deployments, for the two below
+techne cloud deployments app.scm   # the deployments published, the latest first
+techne cloud rollback app.scm      # publish the one before again (or the one given by id)
+techne cloud serve --state DIR --domain cloud.example   # a cloud of tenants: PROJECT.TENANT.cloud.example, a worker each
+techne cloud invite --state DIR acme                    # ... a tenant invited: a token for its projects
+techne cloud serve --state DIR --domain cloud.example --nrepl 7888   # ... with an nREPL into projects in production, for their tokens
+techne cloud deploy app.scm --to http://127.0.0.1:8788 --tenant acme --project shop   # ... a project uploaded and published
 ```
 
 `techne-vm`, `techne-node` and `techne-lsp` also build binaries of their own,

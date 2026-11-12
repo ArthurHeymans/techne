@@ -59,10 +59,44 @@ pub const UNSANDBOXED: u8 = 77;
 /// dev`, with its nREPL server), as this crate knows no REPL.
 pub trait Dev {
     /// Publish `deployment`, whose entry module is at `entry`, as `name`
-    /// on `host` for development (`Host::publish_dev`), its REPL attached.
+    /// on `host` with its REPL attached: for development
+    /// (`Host::publish_dev`), or served as in production with a debug
+    /// instance (`Host::attach_debug`).
     fn publish(&mut self, host: &Host, name: &str, entry: &Path, deployment: Deployment) -> Result<(), techne_vm::vm::Error>;
-    /// Serve a REPL client on `stream`, which the supervisor relays.
-    fn connect(&mut self, stream: tokio::io::DuplexStream);
+    /// The deployment published as `name` is the one its requests go to
+    /// from now on: its world is the REPL's.
+    fn activate(&mut self, _host: &Host, _name: &str) {}
+    /// The deployment published as `name` is served no more.
+    fn retire(&mut self, _name: &str) {}
+    /// A deployment served as in production was published as `name`, its
+    /// entry module at `entry`: one a REPL may be attached to.
+    fn loaded(&mut self, _name: &str, _entry: &Path) {}
+    /// Serve REPL client `cid` on `stream`, authenticated as `principal`
+    /// if as anyone, in the debug instance of the deployment published as
+    /// `name` on `host` (`Host::attach_debug`), attached for it if it has
+    /// none: an error if it cannot be.
+    fn attach(
+        &mut self,
+        _host: &Host,
+        _name: &str,
+        _cid: u64,
+        _stream: tokio::io::DuplexStream,
+        _principal: Option<String>,
+    ) -> Result<(), techne_vm::vm::Error> {
+        Err(techne_vm::vm::Error::new("this worker attaches no REPL"))
+    }
+    /// REPL client `cid` is gone: a debug instance no client is attached
+    /// to any more is detached.
+    fn closed(&mut self, _host: &Host, _cid: u64) {}
+    /// The REPL clients whose debug instance is gone (with its
+    /// deployment, or poisoned), each said once: their connections are
+    /// closed, so that no one is left talking to nothing.
+    fn gone(&mut self, _host: &Host) -> Vec<u64> {
+        Vec::new()
+    }
+    /// Serve a REPL client on `stream`, which the supervisor relays,
+    /// authenticated as `principal` if as anyone.
+    fn connect(&mut self, stream: tokio::io::DuplexStream, principal: Option<String>);
 }
 
 /// Bytes a relayed REPL connection may have waiting to be read here.
@@ -143,7 +177,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
         f.0 += 1;
         let fid = f.0;
         f.1.insert(fid, reply);
-        let _ = ask.send(FromWorker::Fetch { rid: o.tag, fid, request: o.request });
+        let _ = ask.send(FromWorker::Fetch { rid: o.tag, fid, service: o.service.name().into(), request: o.request });
         rx
     }));
     let report = tx.clone();
@@ -164,26 +198,70 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
             truncated: p.output.truncated,
         });
     });
+    // Close the connections of the REPL clients whose debug instance is
+    // gone: here, and so for the supervisor and the client.
+    let close_gone = {
+        let (dev, repls, tx, host) = (dev.clone(), repls.clone(), tx.clone(), host.clone());
+        move || {
+            let gone = dev.borrow_mut().as_mut().map(|dev| dev.gone(&host)).unwrap_or_default();
+            for cid in gone {
+                if repls.borrow_mut().remove(&cid).is_some() {
+                    let _ = tx.send(FromWorker::ReplClose { cid });
+                }
+            }
+        }
+    };
+    // Now and then too: a debug world poisoned is gone with no message
+    // to say so.
+    let looking = close_gone.clone();
+    tokio::task::spawn_local(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            looking();
+        }
+    });
     let _ = tx.send(FromWorker::Ready);
     let running = Rc::new(std::cell::RefCell::new(HashMap::<u64, Serving>::new()));
+    // Where each deployment's files are, by the name it is published as.
+    let unpacked = Rc::new(std::cell::RefCell::new(HashMap::<String, PathBuf>::new()));
     let driver = host.clone();
     let host_task = tokio::task::spawn_local(async move { driver.run(None).await });
     while let Some(d) = read_frame(&mut read).await? {
         match ToWorker::from_data(d)? {
-            ToWorker::Deploy { id, name, entry, files, wall_ms, dev: for_dev } => {
-                let (host, tx, dev) = (host.clone(), tx.clone(), dev.clone());
+            ToWorker::Deploy { id, name, entry, files, wall_ms, dev: for_dev, env } => {
+                let (host, tx, dev, unpacked) = (host.clone(), tx.clone(), dev.clone(), unpacked.clone());
                 tokio::task::spawn_local(async move {
                     let limits = Limits { wall: Duration::from_millis(wall_ms), ..Limits::default() };
-                    let loaded = match unpack(id, &entry, &files) {
-                        Ok(entry) => Deployment::load_async(&entry, limits).await.map(|d| (entry, d)),
+                    // A directory of this worker's own, where it is not
+                    // sandboxed too, and of this deployment's.
+                    let root = std::env::temp_dir().join(format!("bundles-{}", std::process::id())).join(id.to_string());
+                    let ours = !root.exists();
+                    let loaded = match unpack(&root, &entry, &files) {
+                        Ok(entry) => Deployment::load_async(&entry, limits).await.map(|d| (entry, d.with_env(env))),
                         Err(e) => Err(techne_vm::vm::Error::new(e)),
                     };
+                    // One not loaded leaves no files (those it wrote: not
+                    // what was there before it); one replaced under its
+                    // name, those of the one before.
+                    let before = match &loaded {
+                        Ok(_) => unpacked.borrow_mut().insert(name.clone(), root),
+                        Err(_) if ours => Some(root),
+                        Err(_) => None,
+                    };
+                    if let Some(before) = before {
+                        let _ = std::fs::remove_dir_all(before);
+                    }
                     let published = loaded.and_then(|(entry, d)| {
                         let output = d.output().text.clone();
                         match &mut *dev.borrow_mut() {
                             Some(dev) if for_dev => dev.publish(&host, &name, &entry, d)?,
                             _ if for_dev => return Err(techne_vm::vm::Error::new("this worker has no development")),
-                            _ => host.publish(&name, d),
+                            dev => {
+                                host.publish(&name, d);
+                                if let Some(dev) = dev {
+                                    dev.loaded(&name, &entry);
+                                }
+                            }
                         }
                         Ok(output)
                     });
@@ -194,7 +272,26 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     let _ = tx.send(message);
                 });
             }
-            ToWorker::Request { rid, name, request, streams } => {
+            ToWorker::Activate { name } => {
+                if let Some(dev) = &mut *dev.borrow_mut() {
+                    dev.activate(&host, &name);
+                }
+            }
+            ToWorker::Deactivate { name } => {
+                host.detach_debug(&name, None);
+                close_gone();
+            }
+            ToWorker::Retire { name } => {
+                host.unpublish(&name);
+                if let Some(dev) = &mut *dev.borrow_mut() {
+                    dev.retire(&name);
+                }
+                close_gone();
+                if let Some(root) = unpacked.borrow_mut().remove(&name) {
+                    let _ = std::fs::remove_dir_all(root);
+                }
+            }
+            ToWorker::Request { rid, name, request, streams, debug } => {
                 // Its body written to the host as it arrives, each chunk
                 // credited once taken.
                 let (queue, reader) = match streams {
@@ -209,7 +306,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     }
                     false => (None, None),
                 };
-                let reply = host.fetch_as(rid, &name, request, reader);
+                let reply = host.fetch_routed(rid, &name, request, reader, debug);
                 let credits = Rc::new(Semaphore::new(WINDOW));
                 let (tx, running_, credits_) = (tx.clone(), running.clone(), credits.clone());
                 let task = tokio::task::spawn_local(async move {
@@ -263,13 +360,22 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     let _ = reply.send(response);
                 }
             }
-            ToWorker::ReplOpen { cid } => {
-                let Some(dev) = &mut *dev.borrow_mut() else {
+            ToWorker::ReplOpen { cid, principal, target } => {
+                let (ours, theirs) = tokio::io::duplex(REPL_CHUNK);
+                let connected = match (&mut *dev.borrow_mut(), target) {
+                    (Some(dev), Some(target)) => dev.attach(&host, &target, cid, theirs, principal).is_ok(),
+                    (Some(dev), None) => {
+                        dev.connect(theirs, principal);
+                        true
+                    }
+                    (None, _) => false,
+                };
+                // Those of a debug instance found gone meanwhile.
+                close_gone();
+                if !connected {
                     let _ = tx.send(FromWorker::ReplClose { cid });
                     continue;
-                };
-                let (ours, theirs) = tokio::io::duplex(REPL_CHUNK);
-                dev.connect(theirs);
+                }
                 let (mut from, mut to) = tokio::io::split(ours);
                 let (queue, mut queued) = mpsc::channel::<Vec<u8>>(REPL_QUEUE);
                 repls.borrow_mut().insert(cid, queue);
@@ -282,7 +388,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     }
                     let _ = to.shutdown().await;
                 });
-                let (tx, repls) = (tx.clone(), repls.clone());
+                let (tx, repls, dev, host) = (tx.clone(), repls.clone(), dev.clone(), host.clone());
                 tokio::task::spawn_local(async move {
                     use tokio::io::AsyncReadExt;
                     let mut chunk = vec![0; REPL_CHUNK];
@@ -294,19 +400,29 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     // Closed here: closed for both.
                     if repls.borrow_mut().remove(&cid).is_some() {
                         let _ = tx.send(FromWorker::ReplClose { cid });
+                        if let Some(dev) = &mut *dev.borrow_mut() {
+                            dev.closed(&host, cid);
+                        }
                     }
                 });
             }
             ToWorker::ReplData { cid, bytes } => {
                 // A connection that cannot keep up is closed.
-                let mut repls = repls.borrow_mut();
-                if repls.get(&cid).is_some_and(|q| q.try_send(bytes).is_err()) {
-                    repls.remove(&cid);
+                let slow = repls.borrow().get(&cid).is_some_and(|q| q.try_send(bytes).is_err());
+                if slow {
+                    repls.borrow_mut().remove(&cid);
                     let _ = tx.send(FromWorker::ReplClose { cid });
+                    if let Some(dev) = &mut *dev.borrow_mut() {
+                        dev.closed(&host, cid);
+                    }
                 }
             }
             ToWorker::ReplClose { cid } => {
-                repls.borrow_mut().remove(&cid);
+                if repls.borrow_mut().remove(&cid).is_some()
+                    && let Some(dev) = &mut *dev.borrow_mut()
+                {
+                    dev.closed(&host, cid);
+                }
             }
         }
     }
@@ -314,20 +430,19 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
     Ok(())
 }
 
-/// Write deployment `id`'s files to a directory of their own in the
+/// Write a deployment's files to `root`, a directory of their own in the
 /// tmpfs, each path relative and staying in it, each written once, a
 /// bounded number and size: the entry's path there.
-fn unpack(id: u64, entry: &str, files: &[(String, Vec<u8>)]) -> Result<PathBuf, String> {
+fn unpack(root: &Path, entry: &str, files: &[(String, Vec<u8>)]) -> Result<PathBuf, String> {
     use std::io::Write;
     if files.len() > BUNDLE_FILES || files.iter().map(|(_, b)| b.len()).sum::<usize>() > BUNDLE_BYTES {
         return Err("the deployment has too many files, or too large".into());
     }
-    let root = std::env::temp_dir().join("bundles").join(id.to_string());
     if root.exists() {
-        return Err(format!("deployment {id} was sent before"));
+        return Err(format!("{}: a deployment was sent as that before", root.display()));
     }
     let io = |e: std::io::Error| e.to_string();
-    std::fs::create_dir_all(&root).map_err(io)?;
+    std::fs::create_dir_all(root).map_err(io)?;
     for (path, bytes) in files {
         let dest = root.join(relative(path)?);
         if let Some(dir) = dest.parent() {

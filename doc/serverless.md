@@ -5,9 +5,12 @@ Status: in progress. Parts of milestones 1 and 2 exist:
 snapshot, each request under a lifetime, and dev worlds a REPL drives;
 its supervisor serves them from a worker process sandboxed by
 `crates/techne-sandbox`, bodies streaming both ways; `techne cloud dev`
-runs both locally, with the nREPL server and its debugger in the worker
-("Runtime work" says what of each is done). The broker, storage and the
-hosted service are not started. Where the design relies on something that exists, it says
+runs both locally, with the nREPL server and its debugger in the worker,
+in a dev world or, with `--debug`, in a debug instance beside a
+deployment served as in production; a deployment's manifest binds
+secrets, texts and KV namespaces, which the supervisor keeps
+("Runtime work" says what of each is done). SQL storage, accounts and
+the hosted service are not started. Where the design relies on something that exists, it says
 where; everything else is new work, and the milestones say which parts
 are probes before they are commitments.
 
@@ -108,6 +111,19 @@ provides its handler:
   its standard output and error is captured, bounded, and handed to the
   host with the request, not to the worker's own streams, where only the
   runtime's diagnostics go (`Vm::capture_output`; `crates/techne-host`).
+  Today (`crates/techne-host`, `lisp/cloud/manifest.scm`): `env` is a
+  dict by the names the manifest gives its bindings (`manifest.scm`
+  beside the entry module, data, never evaluated): `(dict-ref env
+  'cache)`. A secret (its value from `.secrets.scm`, which is no part of
+  the bundle) or a text is its string; a KV namespace is a handle for
+  `kv-get`, `kv-put!` (with `#:ttl`), `kv-delete!` and `kv-list`, whose
+  values are data. The handle names the binding, not the namespace: the
+  supervisor looks the namespace up among the bindings of the deployment
+  the request was sent for, so a handle of a world's own making reaches
+  nothing. Loading sees no `env`, and hidden files are no part of a
+  bundle: a snapshot holds no secret, and a worker only those bound. A
+  request keeps the bindings of the deployment it was sent for, as it
+  keeps its code, whatever is published after ("Deploying").
 - `ctx`: the request's id, its deadline, and `wait-until` (below).
 - Concurrency inside an instance is techne's tasks. A request runs as a
   task; waits on fetch, KV and timers suspend only it. Every task a request
@@ -226,6 +242,32 @@ A deployment goes through these states, each recorded:
 5. **Draining**, for the previous one: its instances finish their requests
    (up to the wall limit) and are dropped.
 
+Of these, the supervisor has the mechanism today
+(`crates/techne-host/src/supervisor.rs`): a deployment's id is a hash of
+its name, entry, files and bindings, so the same one deployed twice is
+one; `Supervisor::prepare` has the worker load it, beside those it
+serves, which changes nothing served and fails alone (Built and Ready,
+with one worker); `Supervisor::publish` routes the name to it, at once,
+and only if the name is still routed where the publisher saw it; a
+request is pinned to the deployment its name was routed to when it was
+sent, code and bindings both; a deployment no longer routed to is
+retired from the worker once its requests are done (Draining), and its
+files with it. For development the worker's REPL moves to a
+deployment's world when it is published, not when it is prepared.
+
+What is done with that mechanism is Lisp, in the supervisor's front
+world (`lisp/cloud/control.scm`): to deploy is to prepare, keep the
+bundle (files and bindings, by id, the latest ten), publish if nothing
+overtook it, and record it; to roll back is to prepare an earlier one
+again from its bundle and publish it the same way. The record and the
+bundles are files, which outlive the supervisor. `techne cloud dev
+--ops PORT` serves the operations `deployments`, `deploy` and
+`rollback` as JSON over HTTP (`POST /v1/ops`, a bearer token allowing
+`inspect` or `deploy` on the project), and `techne cloud deployments`,
+`deploy` and `rollback` ask them. Not yet: uploading a bundle (the
+supervisor reads the project's directory), `dry-run`, idempotency keys,
+the other operations and the audit log.
+
 Rollback publishes an earlier deployment that is still Ready or can be
 again. **It rolls back code only**: storage, schema changes and external
 effects stay. Storage changes must stay compatible with the previous
@@ -316,8 +358,33 @@ Not all of this runs today: an exception handler can wait in its task,
 with the live restarts (runtime/TECHNE-VM.md, "Restarts"), and the
 nREPL server's evaluations do, each in a task of its own, several
 waiting at once while others run. Bounded procedure tracing is available
-through `(techne debug)` and streams to the calling evaluation's output;
-debug instances and routing are still to do (runtime work 7).
+through `(techne debug)` and streams to the calling evaluation's output.
+Debug instances exist in the host (`Host::attach_debug`,
+`Host::fetch_routed`): one for a deployment, serving the requests routed
+to it one at a time (so a request waiting in the debugger holds back the
+others routed there, not yet each with a debugger of its own), kept
+across them, dropped when detached, poisoned or at a deploy, a request
+on it then failing with 504; a routed request has a minute more of wall
+time. Routing is by a credential in the `techne-debug-route` header,
+decided by the front in Lisp (`lisp/http/debug-route.scm`), which marks
+the responses; `techne cloud dev --nrepl PORT --debug` runs it locally,
+its credential made at the start and printed. On a fleet (`techne cloud
+serve --nrepl PORT`), a client's first message is `authenticate` with
+its token and the `project` it attaches to: for a token that allows
+`prod` on it, a debugging session is opened, its credential answered
+(`techne-debug-route`), and the connection relayed to the project's
+debug instance, attached for its first client and detached with its
+last; the tenant's worker is started for it if it sleeps, and kept
+while a client is connected. The credential routes while the session
+lasts, to that project alone, and is gone when the connection ends
+(`lisp/cloud/serve.scm`). Sessions are few at once, in all and for one
+project. Still to do: credentials that expire by themselves, a share of
+real traffic and filters, the
+audit log, and the paused state (a request's deadline is fixed when it
+is admitted, not when it pauses). A request routed to a debug instance
+that goes before serving it is served as any other, within the wall time
+any other has; those waiting for a debug instance are bounded apart from
+the deployment's own.
 
 Dev worlds remain the place for experiments with preview storage; a
 debug instance is for the problem that only shows in production.
@@ -394,6 +461,25 @@ when they reach the socket.
 - If nobody but `techne.el` ends up using bencode, it can be dropped and
   `techne.el` moved to JSON over a WebSocket; until then it costs a parser
   and keeps the nREPL clients that exist.
+
+Of what follows, this much exists (`lisp/cloud/tokens.scm`,
+`lisp/cloud/auth.scm`, `Remote::serve_stream_as` in `nrepl.rs`;
+`techne cloud dev --nrepl PORT --auth` runs it locally). Tokens are
+their claims (subject, projects, scopes, expiry, the ids of the tokens
+they were made from) and an HMAC of them under the service's key; one
+made from another has at most its maker's projects, scopes and expiry,
+and is revoked with it. A REPL connection's first message is
+`authenticate` with a token, checked by the supervisor, in Lisp, before
+any byte of the connection reaches a worker: it must allow `eval` on the
+project, or `prod` for a debug instance; a connection that does not
+authenticate in ten seconds or its first kibibytes is closed, and few
+may be at it at once. The worker's REPL is told the principal, and
+keeps what is each one's apart: sessions (a bounded number, and nothing
+without one), the evaluations one interrupts, inspectors, and the
+debuggers one answers or looks into. Not yet: TLS on the stream (the
+local listener is loopback), quotas in tokens, a place where revoked
+tokens are kept, accounts that mint them, the non-evaluating inspector,
+the audit log.
 
 The nREPL server is for a trusted local user today; before it faces the
 internet:
@@ -510,13 +596,34 @@ then.
   for, with a diagnostic.
   `Supervisor::confinement` reports whether the current ready worker is
   sandboxed and cgroup-bounded (none while no worker is ready).
+  Today (`crates/techne-host/src/fleet.rs`): a fleet has a supervisor
+  and worker for each tenant, the workers' cgroups shared and named by
+  tenant; requests are asked by target, `tenant/project`, which a front
+  reads from the host name in Lisp (`lisp/cloud/hosts.scm`,
+  `project.tenant.DOMAIN`); a tenant or project that is not there is
+  answered 404 and starts nothing; one store keeps every tenant's KV
+  namespaces, a directory each, told the tenant by the supervisor.
+  `techne cloud serve --state DIR --domain DOMAIN` runs one
+  (`lisp/cloud/serve.scm`): tenants are invited by whoever runs it
+  (`techne cloud invite`, which gives a token for all a tenant's
+  projects; there is no signing up), deploy by uploading their files
+  (`techne cloud deploy FILE --to URL --tenant T --project P`), put
+  secrets, list and roll back, each over `POST /v1/ops` with a token
+  that allows it on `tenant/project`; what each project had published
+  is published again when the service starts again. Its state is a
+  directory of files, accounts included, until there is a database to
+  keep them in. It refuses to start where workers cannot be sandboxed
+  and bounded, but with `--unconfined`. Not yet: a worker per runtime
+  version, quotas, custom domains, TLS (something in front has it).
 - A zygote that forks pre-booted workers would cut cold starts further,
   but VM boot starts the JIT's thread and the allocator and cage hold
   process-wide state; it waits for a probe showing fork is safe and a
   measurement showing exec is too slow.
 - A tenant without traffic has no worker. Idle workers stop after some
   minutes; the number of live workers is bounded, the least recently used
-  stopped first.
+  stopped first. (So it is, `Supervisor::sleep`: a worker is stopped
+  only when nothing needs it, and the next request or deployment starts
+  one, which loads what was published before the request is sent.)
 - **Runtime versions**: a deployment records the runtime it was built
   with; workers run that binary, so a tenant whose projects are on two
   versions has two workers. An upgrade rolls out per project; a
@@ -661,6 +768,20 @@ admission as requests.
 - **Control plane**: accounts, tokens, projects, deployments, routes, in
   one SQLite database; bundles as files named by hash, read by the
   supervisor and passed to workers over their socket.
+- **KV, today**: kept by the supervisor as logical operations (get, put,
+  delete, list), by a store written in Lisp (`lisp/cloud/kv.scm`) that a
+  task of the front world runs; the supervisor's Rust checks the request
+  and the binding, counts (1000 operations a request, with fetches a
+  bounded number at once, as many waiting for the store, more refused)
+  and hands it the namespace and the operation, a value encoded as
+  bytes: the store's world, which lasts, is given a tenant's strings and
+  bytes, never data of its making to read
+  (`Supervisor::install_store`). A namespace is a file, written whole
+  and replaced at each change, so never half written; not forced to the
+  disk, and costing its size at each write, which a log would not: good
+  for a cache and small state, to be replaced by the engine below when
+  that exists. Keys are at most 512 bytes, values a mebibyte, a
+  namespace 64 MiB. `techne cloud dev` keeps them under `.techne/kv`.
 - **Storage**: a database per binding, in SQLite's file format, run by
   Turso (PLAN.md, Stage 1, workstream C, step 5), in the supervisor or
   the worker ("The supervisor as broker"). Backups are copies the
@@ -690,7 +811,10 @@ is the storage layout and that the supervisor can start any worker locally.
   the supervisor, which relays the connection: a definition sent from the
   file changes the next request, and the connection follows the
   deployment to its next dev world when it is deployed again; it ends
-  with its worker.
+  with its worker. With `--debug` too, the deployment is served by
+  instances as in production and the nREPL server is in its debug
+  instance, reached by requests carrying the credential printed
+  ("Debugging in production").
 - **Emacs** (`editors/emacs/techne.el`): connect with a token over TLS;
   choose a dev world or attach a debug instance, shown in the mode line;
   route one's own requests to it, set break on error, trace; deploy the
@@ -871,7 +995,10 @@ What techne-vm and techne-node need that they do not have:
    whose debugger waits on a channel for the client's choice, several at
    once (`nrepl.rs`). Procedure tracing is built in `(techne debug)`:
    bounded, task-labelled call/result/condition snapshots, streamed through
-   ordinary nREPL output. Needed: a routing hook in the host.
+   ordinary nREPL output. The host routes requests to a deployment's
+   debug instance (`Host::attach_debug`, `Host::fetch_routed`), one at a
+   time. Needed: several requests on it at once, each with its debugger;
+   sessions and their credentials.
 8. **Conditions as data.** A bounded export of a condition by Rust: its
    kind, message, irritants written briefly, source sites and frames, and
    a stable code for each kind of failure, without calling Scheme (nREPL
