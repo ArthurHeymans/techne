@@ -211,6 +211,15 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
             }
         }
     };
+    // Now and then too: a debug world poisoned is gone with no message
+    // to say so.
+    let looking = close_gone.clone();
+    tokio::task::spawn_local(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            looking();
+        }
+    });
     let _ = tx.send(FromWorker::Ready);
     let running = Rc::new(std::cell::RefCell::new(HashMap::<u64, Serving>::new()));
     // Where each deployment's files are, by the name it is published as.
@@ -267,6 +276,10 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                 if let Some(dev) = &mut *dev.borrow_mut() {
                     dev.activate(&host, &name);
                 }
+            }
+            ToWorker::Deactivate { name } => {
+                host.detach_debug(&name, None);
+                close_gone();
             }
             ToWorker::Retire { name } => {
                 host.unpublish(&name);

@@ -24,7 +24,15 @@
 (let ((r (route (request "/"))))
   (check "no credential: production" "production" (dict-ref r 'body))
   (check "its headers as given" "public, max-age=60" (dict-ref (dict-ref r 'headers) "Cache-Control"))
-  (check "unmarked" #f (dict-ref (dict-ref r 'headers) "techne-debug" #f)))
+  (check "unmarked" #f (dict-ref (dict-ref r 'headers) "techne-debug" #f))
+  (check "varying with the routing header, for caches" "techne-debug-route" (dict-ref (dict-ref r 'headers) "vary")))
+(check "beside what it varies with already" "Accept, Origin, techne-debug-route"
+       (dict-ref (dict-ref ((debug-routing (lambda (request debug) (response "x" #:headers (dict "Vary" "Accept, Origin"))) credential)
+                            (request "/"))
+                           'headers)
+                 "vary"))
+(check "a string, too" "techne-debug-route"
+       (dict-ref (dict-ref ((debug-routing (lambda (request debug) "x") credential) (request "/")) 'headers) "vary"))
 
 ;; Another credential routes nothing, and the deployment does not see it.
 (set! seen '())

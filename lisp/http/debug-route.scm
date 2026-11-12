@@ -43,13 +43,33 @@ The world must be granted entropy."
                               "techne-debug" (hex-encode (random-bytes 8)))))
         response)))
 
+;; RESPONSE, not a debug instance's, saying that what is answered
+;; depends on the routing header: a cache that kept it answers no
+;; request that shows a credential with it.
+(define (vary-on-route response)
+  (let ((response (if (string? response) (dict 'body response) response)))
+    (if (dict? response)
+        (let* ((given (dict-ref response 'headers (dict)))
+               (names (filter (lambda (name) (string=? (string-downcase name) "vary")) (dict-keys given)))
+               (said (append-map (lambda (name)
+                                   (let ((value (dict-ref given name)))
+                                     (if (string? value) (list value) value)))
+                                 names))
+               (headers (fold (lambda (name h) (dict-delete h name)) given names)))
+          (dict-set response 'headers
+                    (dict-set headers "vary"
+                              (fold (lambda (value all) (string-append value ", " all)) debug-route-header (reverse said)))))
+        response)))
+
 (define (debug-routing serve credential)
   "Return a handler routing requests with CREDENTIAL to a debug instance.
 (SERVE request debug) answers REQUEST, from the debug instance if DEBUG.
 A request whose `techne-debug-route` header is CREDENTIAL, a string, is
 served with DEBUG and its response marked: a `techne-debug` header, and
 a cache-control that lets no shared cache keep it. Any other is served
-without. SERVE never sees the header. CREDENTIAL may be a procedure
+without, and says that it varies with the header, so that a cache
+answers no request showing a credential with it. SERVE never sees the
+header. CREDENTIAL may be a procedure
 instead, called for each request that shows one: the credentials that
 route now, a list of strings, each compared, none if it is empty."
   (lambda (request)
@@ -62,4 +82,4 @@ route now, a list of strings, each compared, none if it is empty."
                    (fold (lambda (c found) (or (digest=? given c) found)) #f (credential))
                    (digest=? given credential)))
           (mark-debugged (serve request #t))
-          (serve request #f)))))
+          (vary-on-route (serve request #f))))))

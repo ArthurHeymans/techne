@@ -14,9 +14,11 @@
 ;;; `put!` or `delete!` returned from is in the file, and a file is never
 ;;; half written. (It is not forced to the disk: a power loss may lose
 ;;; the last changes. Writing it whole costs its size at each change;
-;;; a log would not, and needs files opened to append.) A namespace is
-;;; read when first used, and kept in memory from then on: one store owns
-;;; a directory at a time.
+;;; a log would not, and needs files opened to append.) The namespace
+;;; last used is kept in memory, read again from its file when another
+;;; was used since: a store holds one namespace's worth at most, and
+;;; `kv-serve-tenants` a few stores. One store owns a directory at a
+;;; time.
 ;;;
 ;;; `kv-serve` answers the operations a supervisor's workers ask
 ;;; (`%store-next`, `%store-reply`: crates/techne-host/src/supervisor.rs),
@@ -33,6 +35,8 @@
 (provide make-kv-store kv-store? kv-store-get kv-store-put! kv-store-delete! kv-store-list
          kv-store-handle kv-serve kv-serve-tenants kv-namespace-name?)
 
+;; Tenants' stores `kv-serve-tenants` holds in memory at once.
+(define max-resident-stores 8)
 (define max-key-bytes 512)
 (define max-value-bytes (* 1024 1024))
 (define max-listed 1000)
@@ -115,7 +119,10 @@ file."
                             (dict)
                             (if (list? kept) kept (error "The namespace's file is not one:" name))))
              (entries (live-entries store entries)))
-        (set-kv-store-namespaces! store (dict-set (kv-store-namespaces store) name entries))
+        ;; In place of the one used before: one namespace of a store is
+        ;; in memory at a time, the others in their files, so that what
+        ;; is held is bounded whatever number there are.
+        (set-kv-store-namespaces! store (dict name entries))
         entries)))
 
 ;; Namespace NAME is ENTRIES from now on, in its file first: if that
@@ -132,8 +139,7 @@ file."
                                  (list-sort string<? live))
                             port))))
     (set-kv-store-namespaces! store
-                              (dict-set (kv-store-namespaces store) name
-                                        (fold (lambda (key kept) (dict-set kept key (dict-ref entries key))) (dict) live)))))
+                              (dict name (fold (lambda (key kept) (dict-set kept key (dict-ref entries key))) (dict) live)))))
 
 (define (check-key key)
   (unless (and (string? key) (<= 1 (bytevector-length (string->utf8 key)) max-key-bytes))
@@ -217,7 +223,11 @@ are called. A namespace holds at most MAX-BYTES."
       (guard (e (#t (%store-reply id #f (if (error-object? e) (condition/report-string e) "the store failed"))))
         (unless store (error "Not a tenant's name:" tenant))
         (%store-reply id #t (kv-store-handle store (cadr what) (caddr what))))
-      (loop (if store (dict-set stores tenant store) stores)))))
+      ;; A few tenants' stores at once: the others' are in their files.
+      (loop (cond ((not store) stores)
+                  ((dict-ref stores tenant #f) stores)
+                  ((>= (dict-size stores) max-resident-stores) (dict tenant store))
+                  (else (dict-set stores tenant store)))))))
 
 (define (kv-serve store)
   "Answer with STORE the operations the supervisor's workers ask, for ever.

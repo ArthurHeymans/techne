@@ -419,7 +419,11 @@ impl Host {
     pub fn unpublish(&self, name: &str) -> bool {
         let mut s = self.state.borrow_mut();
         s.retire_debug(name);
-        s.published.remove(name).is_some()
+        let published = s.published.remove(name).is_some();
+        drop(s);
+        // A request on its debug instance ends now, not when next woken.
+        self.wake.notify_one();
+        published
     }
 
     /// Give the deployment published under `name` a debug instance, in
@@ -764,8 +768,18 @@ impl Host {
                 }
                 Err((instance, e)) => {
                     // A dev world is kept, as after a request that failed,
-                    // and a debug instance.
-                    s.keep(&job.deployment, instance.filter(|i| i.attached.is_some() && i.vm.poisoned().is_none()));
+                    // and a debug instance: one that is not (poisoned as
+                    // the request was given to it) is its deployment's no
+                    // longer, so that none waits for it.
+                    let debug = instance.as_ref().and_then(|i| i.debug);
+                    let kept = instance.filter(|i| i.attached.is_some() && i.vm.poisoned().is_none());
+                    if let (Some(id), None) = (debug, &kept)
+                        && let Some(p) = s.published.get_mut(&job.deployment)
+                        && p.debug.as_ref().is_some_and(|d| d.id == id)
+                    {
+                        p.debug = None;
+                    }
+                    s.keep(&job.deployment, kept);
                     s.fail(job.deployment, id, &job.exchange, 500, e.msg.clone())
                 }
             }

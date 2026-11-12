@@ -192,13 +192,17 @@ runs at a time."
              (seen (%cloud-route name))
              (prepared (%cloud-prepare-directory name entry))
              (id (car prepared)))
-        ;; Read before anything is published: it must be there to add to.
-        (history c)
-        (dict "id" id "previous" seen "output" (cadr prepared)
-              "recorded" (or (equal? id seen)
-                             (begin (keep-bundle! c id)
-                                    (%cloud-publish name id seen)
-                                    (recorded? c id))))))))
+        ;; Read before anything is published: it must be there to add
+        ;; to. One published already and recorded as the last is left
+        ;; so; one published and not recorded (the record could not be
+        ;; written then) is recorded now.
+        (let* ((events (history c))
+               (last (and (pair? events) (caar events))))
+          (dict "id" id "previous" seen "output" (cadr prepared)
+                "recorded" (or (and (equal? id seen) (equal? id last))
+                               (begin (keep-bundle! c id)
+                                      (unless (equal? id seen) (%cloud-publish name id seen))
+                                      (recorded? c id)))))))))
 
 (define (control-rollback! c [id #f])
   "Publish again an earlier deployment of the project of C.

@@ -4,6 +4,9 @@
 (check "a project of a tenant" "acme/shop" (host-target "shop.acme.techne.example" "techne.example"))
 (check "whatever its case, and its port" "acme/shop" (host-target "Shop.ACME.Techne.Example:8443" "techne.example"))
 (check "digits and dashes" "a-1/b-2" (host-target "b-2.a-1.techne.example" "techne.example"))
+(check "the root's dot, on the host" "acme/shop" (host-target "shop.acme.techne.example." "techne.example"))
+(check "on the domain" "acme/shop" (host-target "shop.acme.techne.example" "techne.example."))
+(check "on both, with a port" "acme/shop" (host-target "shop.acme.techne.example.:443" "techne.example."))
 (for-each (lambda (host)
             (check (string-append "no target: " (if (string? host) host "none")) #f (host-target host "techne.example")))
           (list "techne.example" "acme.techne.example" "x.shop.acme.techne.example" "shop.acme.other.example"

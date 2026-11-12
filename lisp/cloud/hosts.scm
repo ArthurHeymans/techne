@@ -8,7 +8,14 @@
 ;;; A host that is none of the domain's, or names no tenant and project,
 ;;; is answered 404 here, before anything is asked of anyone. Names are
 ;;; lowercase letters, digits and `-`, as a host's labels are; a host's
-;;; case does not matter, nor its port.
+;;; case does not matter, nor its port, nor the root's dot after it.
+;;;
+;;; Browsers keep sites apart, not hosts: under an ordinary domain every
+;;; tenant's projects are one site, and one tenant's pages can set
+;;; cookies for the domain that another's are sent, and make requests
+;;; that count as the same site's. Nothing here can change that. Serve a
+;;; cloud under a domain of its own that is on the Public Suffix List,
+;;; as such services do, so that each host under it is a site.
 
 (require "../http/http.scm")
 
@@ -35,14 +42,19 @@ either end."
           ((char=? (string-ref s i) ch) (cons (substring s 0 i) (substring s (+ i 1) (string-length s))))
           (else (loop (+ i 1))))))
 
+;; NAME without the dot of the root after it, if it is written with one.
+(define (without-root name)
+  (let ((n (string-length name)))
+    (if (and (> n 0) (char=? (string-ref name (- n 1)) #\.)) (substring name 0 (- n 1)) name)))
+
 (define (host-target host domain)
   "Return the target HOST names under DOMAIN, `tenant/project`, or #f.
 HOST is a request's host header, `project.tenant.DOMAIN`, with a port or
 without, in any case; #f for a host of another domain, with more or
 fewer labels, or whose labels name no tenant and project."
   (and (string? host)
-       (let* ((host (string-downcase (car (split-first host #\:))))
-              (suffix (string-append "." (string-downcase domain)))
+       (let* ((host (without-root (string-downcase (car (split-first host #\:)))))
+              (suffix (string-append "." (without-root (string-downcase domain))))
               (n (- (string-length host) (string-length suffix))))
          (and (> n 0)
               (string=? (substring host n (string-length host)) suffix)

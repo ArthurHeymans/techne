@@ -79,12 +79,19 @@ fn techne() -> Command {
 /// `techne cloud ARGS`, with `token` if given: whether it succeeded, and
 /// what it said.
 fn cloud(args: &[&str], token: Option<&str>) -> (bool, String) {
+    cloud_given(args, token, "")
+}
+
+/// `cloud`, given `input` on its standard input (a secret's value).
+fn cloud_given(args: &[&str], token: Option<&str>, input: &str) -> (bool, String) {
     let mut command = techne();
-    command.arg("cloud").args(args);
+    command.arg("cloud").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(token) = token {
         command.env("TECHNE_TOKEN", token);
     }
-    let out = command.output().unwrap();
+    let mut child = command.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
     (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
 
@@ -145,7 +152,7 @@ fn a_repl_into_a_project_in_production() {
     let (_child, port, ops, nrepl) = serve(&state);
     let entry = app(dir.path(), "acme", "1");
     let target = ["--to", ops.as_str(), "--tenant", "acme", "--project", "shop"];
-    assert!(cloud(&[&["secret", "KEY", "s3cret"], &target[..]].concat(), Some(&acme)).0);
+    assert!(cloud_given(&[&["secret", "KEY"], &target[..]].concat(), Some(&acme), "s3cret\n").0);
     let (ok, said) = cloud(&[&["deploy", &entry], &target[..]].concat(), Some(&acme));
     assert!(ok, "{said}");
     let host = "shop.acme.cloud.test";
@@ -280,8 +287,14 @@ fn tenants_deploy_by_upload_and_are_served_by_host_name() {
     assert_eq!(get(port, "shop.acme.cloud.test", "/").0, 404);
     // A secret, then a deployment that binds it, uploaded.
     let entry = app(dir.path(), "acme", "1");
-    let (ok, said) = with(&["secret", "KEY", "s3cret"], on("acme", "shop"), Some(&acme));
+    let secret = |target: [&str; 6], token: &str, value: &str| cloud_given(&[&["secret", "KEY"], &target[..]].concat(), Some(token), value);
+    let (ok, said) = secret(on("acme", "shop"), &acme, "s3cret\n");
     assert!(ok, "{said}");
+    // Its value is on no command line, and its token goes to no other
+    // machine in the clear.
+    assert!(!with(&["secret", "KEY", "on-the-command-line"], on("acme", "shop"), Some(&acme)).0);
+    let (ok, said) = cloud(&["deployments", "--to", "http://cloud.example:8788", "--tenant", "acme", "--project", "shop"], Some(&acme));
+    assert!(!ok && said.contains("not on this machine"), "{said}");
     let (ok, said) = with(&["deploy", &entry], on("acme", "shop"), Some(&acme));
     assert!(ok, "{said}");
     assert_eq!(get(port, "shop.acme.cloud.test", "/"), (200, "acme 1".into()));
@@ -305,7 +318,12 @@ fn tenants_deploy_by_upload_and_are_served_by_host_name() {
     // (A secret it has not put is not bound: its deployment is refused.)
     let (ok, said) = with(&["deploy", &bolts], on("bolt", "shop"), Some(&bolt));
     assert!(!ok && said.contains("KEY"), "{said}");
-    assert!(with(&["secret", "KEY", "bolts"], on("bolt", "shop"), Some(&bolt)).0);
+    assert!(secret(on("bolt", "shop"), &bolt, "bolts").0);
+    // A project refused for what was uploaded is not one: nothing of it
+    // is there to attach to, or to take one of the tenant's places.
+    let (ok, said) = with(&["deploy", "/dev/null"], on("bolt", "ghost"), Some(&bolt));
+    assert!(!ok, "{said}");
+    assert!(!state.join("tenants/bolt/ghost").exists());
     let (ok, said) = with(&["deploy", &bolts], on("bolt", "shop"), Some(&bolt));
     assert!(ok, "{said}");
     assert_eq!(get(port, "shop.bolt.cloud.test", "/secret"), (200, "bolts".into()));

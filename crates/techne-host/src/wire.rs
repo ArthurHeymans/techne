@@ -56,6 +56,12 @@ pub enum ToWorker {
     Activate {
         name: String,
     },
+    /// The deployment published as `name` is the one its requests go to
+    /// no longer: those it serves finish, but its debug instance goes
+    /// now, a request waiting on it with it.
+    Deactivate {
+        name: String,
+    },
     /// Serve the deployment published as `name` no more, and forget its
     /// files: requests of it being served finish.
     Retire {
@@ -205,6 +211,7 @@ impl ToWorker {
                 env.clone(),
             ]),
             ToWorker::Activate { name } => Data::List(vec![sym("activate"), Data::String(name.clone())]),
+            ToWorker::Deactivate { name } => Data::List(vec![sym("deactivate"), Data::String(name.clone())]),
             ToWorker::Retire { name } => Data::List(vec![sym("retire"), Data::String(name.clone())]),
             ToWorker::Request { rid, name, request, streams, debug } => Data::List(vec![
                 sym("request"),
@@ -246,6 +253,7 @@ impl ToWorker {
                 ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()?, dev: p.flag()?, env: p.any()? }
             }
             "activate" => ToWorker::Activate { name: p.string()? },
+            "deactivate" => ToWorker::Deactivate { name: p.string()? },
             "retire" => ToWorker::Retire { name: p.string()? },
             "request" => ToWorker::Request { rid: p.uint()?, name: p.string()?, request: p.any()?, streams: p.flag()?, debug: p.flag()? },
             "body" => ToWorker::Body { rid: p.uint()?, bytes: p.chunk()? },

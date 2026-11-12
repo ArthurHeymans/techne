@@ -309,7 +309,9 @@ fn a_repl_into_a_debug_instance() {
     // Another credential routes nothing, and marks nothing.
     let (head, body) = get_routed(port, "/", "0123456789abcdef0123456789abcdef");
     assert_eq!(body, "hello");
-    assert!(!head.contains("techne-debug"), "{head}");
+    // Not marked as a debug instance's, and said to vary with the
+    // routing header, so that no cache answers a routed request with it.
+    assert!(!head.contains("\r\ntechne-debug: ") && head.contains("\r\nvary: techne-debug-route"), "{head}");
     // Deployed again: a new debug instance, which the same connection
     // reaches, of the new deployment.
     std::fs::write(&app, GREETER.replace("GREETING", "bonjour")).unwrap();

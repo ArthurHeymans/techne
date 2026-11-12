@@ -106,7 +106,7 @@ const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--ops PORT] [--
        techne cloud serve --state DIR --domain DOMAIN [--port PORT] [--ops PORT] [--nrepl PORT] [--live N] [--idle SECONDS] [--unconfined]
        techne cloud invite --state DIR TENANT
        techne cloud deploy FILE --to URL --tenant TENANT --project PROJECT
-       techne cloud deployments|rollback [ID]|secret NAME VALUE --to URL --tenant TENANT --project PROJECT
+       techne cloud deployments|rollback [ID]|secret NAME --to URL --tenant TENANT --project PROJECT
 
 Serve the deployment whose entry module is FILE on 127.0.0.1:PORT (8787
 by default; 0 picks one), deploying again whenever a Lisp file under
@@ -124,7 +124,9 @@ serve runs a cloud of tenants, kept in DIR: each project invited tenants
 deploy is served at PROJECT.TENANT.DOMAIN on PORT, by a worker for each
 tenant, stopped when idle. invite gives a tenant a token for its
 projects. With --to, the address of a serve's operations, the commands
-ask it, with the token in TECHNE_TOKEN: deploy uploads FILE's directory.";
+ask it, with the token in TECHNE_TOKEN: deploy uploads FILE's directory,
+secret reads the value of NAME from standard input. URL is on this
+machine: no TLS is spoken, and no token sent in the clear to another.";
 
 /// How long a deployment may take, loading and all.
 const DEPLOYING: Duration = Duration::from_secs(90);
@@ -362,18 +364,28 @@ fn base64(bytes: &[u8]) -> String {
 /// operation `op` asked of the `techne cloud serve` whose operations
 /// are at URL (`http://HOST:PORT`), with the token in `TECHNE_TOKEN`:
 /// `deploy FILE`, the files under FILE's directory uploaded;
-/// `deployments`; `rollback [ID]`; `secret NAME VALUE`.
+/// `deployments`; `rollback [ID]`; `secret NAME`, its value read from
+/// standard input, so that it is on no command line. This speaks no
+/// TLS: URL is on this machine, or it is refused, the token not sent in
+/// the clear to another (reach one through a tunnel).
 fn operate_remote(op: &str, args: &[String]) -> Result<String, String> {
     let mut args = args.to_vec();
     let need = |args: &mut Vec<String>, name: &str| flag(args, name).ok_or(String::new());
     let (to, tenant, project) = (need(&mut args, "--to")?, need(&mut args, "--tenant")?, need(&mut args, "--project")?);
     let addr = to.strip_prefix("http://").ok_or("--to is http://HOST:PORT")?.trim_end_matches('/').to_string();
+    let host = addr.rsplit_once(':').map_or(addr.as_str(), |(host, _)| host);
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return Err(format!("--to {to} is not on this machine, and this speaks no TLS: the token is not sent there (use a tunnel to it)"));
+    }
     let token = std::env::var("TECHNE_TOKEN").map_err(|_| "no token: set TECHNE_TOKEN")?;
     let mut fields = vec![("tenant", json_string(&tenant)), ("project", json_string(&project))];
     match (op, &args[..]) {
         ("deployments", []) | ("rollback", []) => fields.push(("op", json_string(op))),
         ("rollback", [id]) => fields.extend([("op", json_string(op)), ("id", json_string(id))]),
-        ("secret", [name, value]) => {
+        ("secret", [name]) => {
+            let mut value = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut value).map_err(|e| format!("the secret's value: {e}"))?;
+            let value = value.strip_suffix('\n').unwrap_or(&value);
             fields.extend([("op", json_string("secret-put")), ("name", json_string(name)), ("value", json_string(value))])
         }
         ("deploy", [file]) => {
@@ -717,6 +729,15 @@ async fn authenticate(stream: &mut tokio::net::TcpStream, auth: &techne_host::as
     principal.filter(|_| written).map(|p| (p, sent))
 }
 
+/// A new routing credential, which no one can guess: 32 hexadecimal
+/// digits of the system's randomness. None if there is none to read.
+fn credential() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Accept REPL clients of a cloud's projects on `addr`: each
 /// authenticates with a first message, an `authenticate` with its
 /// `token` and the `project` it is for (`tenant/project`), which
@@ -741,41 +762,32 @@ async fn serve_debug_sessions(
             let (fleet, sessions) = (fleet.clone(), sessions.clone());
             tokio::task::spawn_local(async move {
                 let text = |s: &str| Data::String(s.into());
-                let opened = tokio::time::timeout(AUTHENTICATE, async {
-                    let (message, sent) = first_message(&mut stream).await?;
-                    let asked = authenticating(&message, "token").zip(authenticating(&message, "project"));
-                    let session = match &asked {
-                        Some((token, target)) => {
-                            match sessions.ask(Data::List(vec![text("open"), text(token), text(target)]), AUTHENTICATE).await {
-                                Ok(Data::List(session)) => match &session[..] {
-                                    [Data::String(principal), Data::String(credential)] => Some((principal.clone(), credential.clone())),
-                                    _ => None,
-                                },
-                                _ => None,
-                            }
-                        }
-                        None => None,
-                    };
-                    Some((message, sent, asked.map(|(_, target)| target).zip(session)))
-                })
-                .await
-                .ok()
-                .flatten();
-                drop(place);
-                // What is no message is answered nothing; one refused,
-                // that it is.
-                let Some((message, sent, session)) = opened else { return };
-                let Some((target, (principal, credential))) = session else {
+                // What is no message is answered nothing; one that asks
+                // for no session, that it is refused.
+                let first = tokio::time::timeout(AUTHENTICATE, first_message(&mut stream)).await.ok().flatten();
+                let Some((message, sent)) = first else { return };
+                let asked = authenticating(&message, "token").zip(authenticating(&message, "project")).zip(credential());
+                let Some(((token, target), credential)) = asked else {
+                    drop(place);
                     answer_first(&mut stream, Some(&message), false, Vec::new()).await;
                     return;
                 };
-                let close = || sessions.ask(Data::List(vec![text("close"), text(&target), text(&credential)]), AUTHENTICATE);
+                // The credential is made here, before the session is
+                // asked for: whatever becomes of asking (answered late,
+                // or not at all), the session it may have opened is
+                // closed, by the credential, below.
+                let open = Data::List(vec![text("open"), text(&token), text(&target), text(&credential)]);
+                let principal = match sessions.ask(open, AUTHENTICATE).await {
+                    Ok(Data::String(principal)) => Some(principal),
+                    _ => None,
+                };
+                drop(place);
                 let supervisor = target.split_once('/').and_then(|(tenant, project)| Some((fleet.known(tenant)?, project.to_string())));
-                let answered =
-                    answer_first(&mut stream, Some(&message), supervisor.is_some(), vec![("techne-debug-route", B::str(&credential))])
-                        .await;
-                let ended = match supervisor.filter(|_| answered) {
-                    Some((supervisor, project)) => supervisor.attach(&project, stream, principal, sent).await.ok(),
+                let session = principal.zip(supervisor);
+                let shown = if session.is_some() { vec![("techne-debug-route", B::str(&credential))] } else { Vec::new() };
+                let answered = answer_first(&mut stream, Some(&message), session.is_some(), shown).await;
+                let ended = match session.filter(|_| answered) {
+                    Some((principal, (supervisor, project))) => supervisor.attach(&project, stream, principal, sent).await.ok(),
                     None => None,
                 };
                 // Until the connection ends: then the session does, for
@@ -783,6 +795,7 @@ async fn serve_debug_sessions(
                 if let Some(ended) = ended {
                     let _ = ended.await;
                 }
+                let close = || sessions.ask(Data::List(vec![text("close"), text(&target), text(&credential)]), AUTHENTICATE);
                 while close().await.is_err() {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }

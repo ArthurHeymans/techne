@@ -1028,6 +1028,13 @@ impl Supervisor {
                 Ok(s) => format!("the worker ended ({s})"),
                 Err(e) => format!("the worker is gone: {e}"),
             };
+            // One not sandboxed wrote its deployments' files where they
+            // outlast it, in a directory named by its pid: removed, so
+            // that workers started and stopped leave nothing.
+            if !sandbox {
+                let tmp = me.options.env.iter().find(|(k, _)| k == "TMPDIR").map_or("/tmp".into(), |(_, v)| PathBuf::from(v));
+                let _ = std::fs::remove_dir_all(tmp.join(format!("bundles-{pid}")));
+            }
             me.end_worker(generation, &why);
         });
         self.state.borrow_mut().worker = Some(Running { generation, send, pidfd, cgroup });
@@ -1252,7 +1259,12 @@ impl Supervisor {
         }
         let me = self.clone();
         tokio::task::spawn_local(async move {
-            me.restart(false).await;
+            // None could be started: asleep, so that what next needs
+            // one tries again, rather than refused from now on.
+            if !me.restart(false).await {
+                let mut s = me.state.borrow_mut();
+                s.asleep = s.worker.is_none() && !s.waking;
+            }
         });
     }
 
@@ -1584,6 +1596,12 @@ impl Supervisor {
         ready.published = true;
         s.routes.insert(name.into(), id.into());
         if let Some(w) = &s.worker {
+            // The one before serves what it was sent, and no debugging:
+            // its debug instance goes at the deploy, not when its last
+            // request is done.
+            if let Some(before) = now.as_deref().filter(|before| *before != id) {
+                let _ = w.send.send(ToWorker::Deactivate { name: self::served(name, before) });
+            }
             let _ = w.send.send(ToWorker::Activate { name: served });
         }
         drop(s);

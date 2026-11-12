@@ -134,10 +134,11 @@ the credential of a debugging session of that project there is now
 
 (define (cloud-debug-serve cloud #:revoked? [revoked? (lambda (id) #f)])
   "Open and close CLOUD's debugging sessions as asked, for ever.
-Asked (\"open\" token target): a session of the project TARGET, for a
-token that holds and allows `prod` on it, of a tenant invited, answered
-with a list of whom the token is for and the session's credential,
-which routes requests to the project's debug instance while the session
+Asked (\"open\" token target credential): a session of the project
+TARGET, for a token that holds and allows `prod` on it, of a tenant
+invited, answered with whom the token is for; CREDENTIAL, which who
+asks made, 32 hexadecimal digits no one can guess,
+routes requests to the project's debug instance while the session
 lasts; refused otherwise (a token REVOKED? says is revoked does not
 hold, as `verify-token` has it), and past the sessions there may be. Asked
 (\"close\" target credential): that session is over."
@@ -147,12 +148,14 @@ hold, as `verify-token` has it), and past the sessions there may be. Asked
            (what (cadr asked)))
       (guard (e (#t (%debug-reply id #f "refused")))
         (cond
-         ((and (list? what) (= (length what) 3) (equal? (car what) "open"))
+         ((and (list? what) (= (length what) 4) (equal? (car what) "open"))
           (let* ((target (caddr what))
                  (claims (verify-token (cloud-key cloud) (cadr what) #:revoked? revoked?))
                  (named (and (string? target) (host-target (string-append (target-host target) ".x") "x")))
-                 (credential (make-debug-credential)))
+                 (credential (cadddr what)))
             (if (and claims named (equal? named target)
+                     (string? credential) (= (string-length credential) 32)
+                     (guard (e (#t #f)) (= (bytevector-length (hex-decode credential)) 16))
                      (token-allows? claims target "prod")
                      (file-exists? (string-append (cloud-state cloud) "/tenants/" target))
                      (change-sessions! cloud
@@ -160,7 +163,7 @@ hold, as `verify-token` has it), and past the sessions there may be. Asked
                                          (and (< (length now) max-sessions)
                                               (< (length (filter (lambda (s) (equal? (car s) target)) now)) max-sessions-each)
                                               (cons (cons target credential) now)))))
-                (%debug-reply id #t (list (dict-ref claims "sub") credential))
+                (%debug-reply id #t (dict-ref claims "sub"))
                 (%debug-reply id #f "refused"))))
          ((and (list? what) (= (length what) 3) (equal? (car what) "close"))
           (change-sessions! cloud (lambda (now) (remove (lambda (s) (equal? s (cons (cadr what) (caddr what)))) now)))
@@ -295,6 +298,24 @@ the others go on. The targets published, `tenant/project`."
 (define (report e)
   (if (error-object? e) (condition/report-string e) "it failed"))
 
+;; What MESSAGE, an operation OP, is to do, checked: a `deploy`'s entry
+;; and files, a `secret-put`'s name and value, each a pair; #t for
+;; another. An error for what is none.
+(define (check-operation op message)
+  (cond ((equal? op "deploy")
+         (let ((entry (dict-ref message "entry" #f))
+               (files (uploaded message)))
+           (unless (and (file-path? entry) (dict-ref files entry #f)) (error "The entry is one of the files:" entry))
+           ;; Its entry at the top, as a directory deployed is.
+           (when (member #\/ (string->list entry)) (error "The entry is at the top of the files:" entry))
+           (cons entry files)))
+        ((equal? op "secret-put")
+         (let ((name (dict-ref message "name" #f)) (value (dict-ref message "value" #f)))
+           (unless (and (string? name) (<= 1 (string-length name) 128) (string? value) (<= (string-length value) 65536))
+             (error "A secret is a name and a value, strings"))
+           (cons name value)))
+        (else #t)))
+
 (define (bearer request)
   (let ((given (request-header request "authorization")))
     (and given (string-prefix? "Bearer " given) (substring given 7 (string-length given)))))
@@ -340,7 +361,9 @@ without is answered 503, its body unread."
                (reply 403 '("error" "refused" "done")))
               (else
                (%fleet-tenant tenant)
-               (let ((directory (project-directory cloud tenant project)))
+               ;; Checked first: one that is no operation makes no project.
+               (let ((directory (project-directory cloud tenant project))
+                     (checked (check-operation op message)))
                  (cond
                   ((not (project-there? cloud tenant directory (member op '("deploy" "secret-put"))))
                    (reply 404 '("error" "no-such-project" "done")))
@@ -351,20 +374,15 @@ without is answered 503, its body unread."
                      (unless (or (not id) (string? id)) (error "An id is a string:" id))
                      (apply reply 200 '("done") (dict->fields (control-rollback! (control-of cloud tenant project) id)))))
                   ((equal? op "secret-put")
-                   (let ((name (dict-ref message "name" #f)) (value (dict-ref message "value" #f)))
-                     (unless (and (string? name) (<= 1 (string-length name) 128) (string? value) (<= (string-length value) 65536))
-                       (error "A secret is a name and a value, strings"))
+                   (let ((name (car checked)) (value (cdr checked)))
                      (let ((secrets (secrets-of directory)))
                        (unless (or (dict-ref secrets name #f) (< (dict-size secrets) 128)) (error "A project has 128 secrets at most"))
                        (replace-file (string-append directory "/secrets.scm")
                                      (call-with-output-string (lambda (port) (write (dict-set secrets name value) port)))))
                      (reply 200 '("done"))))
                   (else
-                   (let ((entry (dict-ref message "entry" #f))
-                         (files (uploaded message)))
-                     (unless (and (file-path? entry) (dict-ref files entry #f)) (error "The entry is one of the files:" entry))
-                     ;; Its entry at the top, as a directory deployed is.
-                     (when (member #\/ (string->list entry)) (error "The entry is at the top of the files:" entry))
+                   (let ((entry (car checked))
+                         (files (cdr checked)))
                      (apply reply 200 '("done")
                             (dict->fields (control-deploy! (control-of cloud tenant project)
                                                            #:stage (lambda () (stage! directory files))
