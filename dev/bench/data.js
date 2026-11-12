@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794477007818,
+  "lastUpdate": 1794477009565,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -52904,6 +52904,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642897554,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106089,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "72c51ce4d4d3f3925908ca854cfd7ac6597cc557",
+          "message": "Merge pull request #353 from ArthurHeymans/cloud/hosted-fleet\n\ncloud: an nREPL into production, bindings, deploys with rollback, and a fleet of tenants",
+          "timestamp": "2026-11-12T10:42:02+01:00",
+          "tree_id": "1fb47611be0cdfca5facf673a6c86d701fa2f7c3",
+          "url": "https://github.com/ArthurHeymans/techne/commit/72c51ce4d4d3f3925908ca854cfd7ac6597cc557"
+        },
+        "date": 1794477009519,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690662296,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642897891,
             "unit": "instructions"
           },
           {
