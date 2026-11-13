@@ -566,10 +566,13 @@ Recovery says there how to choose what a failure offers."
 A violation is kept for `take-violations!` too, the latest
 `%violations-max`."
   (message! s (string-append (error-text e) (guard (x (#t "")) (%failure-note s e))))
-  (when (violation? e)
-    (let ((kept (or (sget s 'violations) '())))
-      (sset! s 'violations (cons (string-append (symbol->string who) ": " (error-text e))
-                                 (if (< (length kept) %violations-max) kept (take kept (- %violations-max 1))))))))
+  ;; Where it failed goes to *Messages*, not the echo area.
+  (let ((site (string-join (map (lambda (frame) (string-append "\n  in " frame)) (raise-site e)) "")))
+    (unless (string=? site "") (log-message! (string-append (symbol->string who) " failed" site)))
+    (when (violation? e)
+      (let ((kept (or (sget s 'violations) '())))
+        (sset! s 'violations (cons (string-append (symbol->string who) ": " (error-text e) site)
+                                   (if (< (length kept) %violations-max) kept (take kept (- %violations-max 1)))))))))
 
 (define (note-violation! s text)
   (let ((kept (or (sget s 'violations) '())))

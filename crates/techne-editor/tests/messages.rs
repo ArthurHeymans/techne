@@ -31,6 +31,27 @@ fn text(rt: &mut Runtime) -> String {
 }
 
 #[test]
+fn a_failed_command_says_where_it_failed_in_messages() {
+    let mut r = rt("");
+    r.eval(
+        "(define (deep-helper v) (+ 1 (vector-ref v 5)))
+         (define (middle-helper) (+ 1 (deep-helper (vector 1))))
+         (define-command (fails-deeply s n) \"Fail two calls down.\" (middle-helper) #t)",
+    )
+    .unwrap();
+    r.eval("(run-command (current-session) 'fails-deeply 1)").unwrap();
+    // A violation's report has where it was raised, innermost first.
+    let errors = r.take_errors();
+    let report = errors.iter().find(|e| e.starts_with("fails-deeply: ")).unwrap_or_else(|| panic!("{errors:?}"));
+    let frames: Vec<&str> = report.lines().skip(1).map(|f| f.split(" (").next().unwrap()).collect();
+    assert_eq!(frames, ["  in deep-helper", "  in middle-helper", "  in fails-deeply"], "not the machinery that ran it: {report}");
+    let messages = r.eval("(document-string (buffer-document (buffer-named \"*Messages*\")))").unwrap();
+    assert!(messages.contains("fails-deeply failed\\n  in deep-helper ("), "{messages}");
+    // The echo area has the error alone.
+    assert!(!r.snapshot().echo.contains("deep-helper"), "{}", r.snapshot().echo);
+}
+
+#[test]
 fn messages_are_kept() {
     let mut r = rt("");
     keys(&mut r, "C-c C-q C-c C-q C-g");

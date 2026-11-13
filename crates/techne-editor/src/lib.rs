@@ -567,6 +567,14 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         "(make-document text)" => |text: String| Foreign::new(RefCell::new(Document::new(&text)));
     }
     techne_vm::procedures! { vm;
+        /// In a handler procedure (`with-exception-handler`): the frames
+        /// where the condition it runs for was raised, innermost first, as
+        /// "name (file:line:col)". Empty elsewhere. A `guard` unwinds them
+        /// before its clauses run, so only a handler can still see them.
+        #[vm]
+        "(%raise-backtrace)" => |vm: &mut Vm| -> Vec<String> { vm.raise_backtrace().to_vec() };
+    }
+    techne_vm::procedures! { vm;
         /// Keep at most REVISIONS of DOCUMENT's history, or all of it when
         /// REVISIONS is #f: a log's, which would otherwise keep every line
         /// it ever had, deleted ones too. Older revisions are forgotten,

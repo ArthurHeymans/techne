@@ -20,7 +20,7 @@
 ;;; are one operation, counting its runs.
 
 (provide current-operation start-operation! %start-operation! start-invocation! current-principal note-effect! continue-operation! call-in-operation operation-procedure without-operation
-         operation-hold! operation-release! operation-failed! operation-cancelled!
+         operation-hold! operation-release! operation-failed! operation-cancelled! raise-site
          operation? operation-serial operation-runtime operation-parent-serial operation-command
          operation-committed? operation-staged? operation-proposals operation-phase operation-outcome operation-pending?
          set-operation-ended-handler! cancelled-condition?
@@ -299,11 +299,39 @@ shown, and the reading goes on."
        (if fail
            (guard (e (#t (if (cancelled-condition? e) (operation-cancelled! op) (operation-failed! op e))
                          (raise e)))
-             (thunk))
+             ;; Where it was raised, while that is still on the stack:
+             ;; the guard above unwinds it. The condition goes on as raised.
+             (with-exception-handler
+              (lambda (e) (note-raise-site! e) (raise-continuable e))
+              thunk))
            (thunk)))
      (lambda ()
        (%task-local-set! %key old)
        (when p (release! p #f))))))
+
+;; The last condition a failing operation raised, and the frames it was
+;; raised in, for `raise-site`. One is enough: what fails is reported
+;; as soon as it has unwound.
+(define %raise-site (cons #f '()))
+(define (note-raise-site! e)
+  ;; The first raise of E is where it came from; one raising it again
+  ;; on its way out (an outer operation's) is not.
+  (unless (or (eq? (car %raise-site) e) (cancelled-condition? e))
+    (set! %raise-site
+      (cons e (let loop ((frames (%raise-backtrace)) (out '()))
+                ;; This operation's own frames and those running it are
+                ;; the same for every failure: not where it failed. Its
+                ;; dynamic-wind is the last of them.
+                (if (or (null? frames) (string-prefix? "call-in-operation " (car frames))
+                        (string-prefix? "with-exception-handler " (car frames)))
+                    (reverse (if (and (pair? out) (string-prefix? "dynamic-wind " (car out))) (cdr out) out))
+                    (loop (cdr frames) (cons (car frames) out))))))))
+
+(define (raise-site e)
+  "Return the frames condition E was raised in, innermost first, or ().
+They are known for a condition that failed an operation, the last one
+to, as \"name (file:line:col)\"."
+  (if (eq? (car %raise-site) e) (cdr %raise-site) '()))
 
 (define (operation-procedure proc #:fail [fail #t])
   "Return PROC made to run in the operation current now.
