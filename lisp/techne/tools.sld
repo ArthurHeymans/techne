@@ -139,12 +139,27 @@ definition queries. Unsupported languages are an error, not guessed symbols."
 
     (define (tool-read-symbol project path name #:chars [chars 8000])
       "Read the single definition NAME in PATH of PROJECT, within CHARS.
-CHARS is 1 to 16000. An absent or ambiguous name is an error: use
-`tool-symbols` to choose a handle when names are repeated."
-      (let* ((reply (tool-symbols project path #:name name #:limit 2))
-             (items (tool-ref reply 'items)))
-        (unless (= 1 (tool-ref reply 'total))
-          (error "tool-read-symbol: expected one definition; use tool-symbols" name (tool-ref reply 'total)))
+CHARS is 1 to 16000. An absent or ambiguous name is an error. A name
+defined more than once is refused with where each definition is, its
+kind and scope and the handle to read it with `tool-expand`."
+      (let* ((reply (tool-symbols project path #:name name #:limit 5))
+             (items (tool-ref reply 'items)) (total (tool-ref reply 'total)))
+        (cond ((= total 0)
+               (error (string-append "tool-read-symbol: nothing named " name " is defined in " path
+                                     "; (tool-symbols project " (%written path) ") lists what is")))
+              ((> total 1)
+               (error (string-append
+                       "tool-read-symbol: " (number->string total) " definitions of " name " in " path
+                       "; read one with (tool-expand project HANDLE):\n"
+                       (string-join (map (lambda (item)
+                                           (string-append "  line " (number->string (tool-ref item 'line))
+                                                          ", " (tool-ref item 'kind) ", " (tool-ref item 'scope)
+                                                          ": " (%written (tool-ref item 'handle))))
+                                         items)
+                                    "\n")
+                       (if (> total (length items))
+                           (string-append "\n  and " (number->string (- total (length items))) " more: tool-symbols #:name pages them")
+                           "")))))
         (cons (list (quote complete) (tool-ref reply (quote complete)))
               (tool-expand project (tool-ref (car items) (quote handle)) #:chars chars))))
 
