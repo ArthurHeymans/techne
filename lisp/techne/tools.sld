@@ -164,7 +164,8 @@ Invalid arguments, missing paths and non-text files are errors."
       "Apply checked replacements EDITS to PATH in PROJECT at REVISION.
 EDITS is a list of (old new) strings. Every old text must occur exactly
 once in the original file, and replacements must not overlap. Validate
-all edits before writing; stale or invalid requests change nothing.
+all edits before writing; stale or invalid requests change nothing, as
+does leaving a Scheme file that read unreadable (a stray parenthesis).
 Return the new revision and bounded change summaries. Writes use a
 conditional atomic rename, not a lock against other programs."
       (%response (%tool-edit! project path revision edits)))
@@ -494,8 +495,9 @@ Each block is a file line, optionally FILE @REVISION (8 or more hex
 characters of it), then <<<<<<< SEARCH, the old lines, =======, the new
 lines, >>>>>>> REPLACE. A block without a file line uses the previous
 one's file. Each old text must occur exactly once. An empty SEARCH
-creates a new file, refused if it exists. Every file is checked before
-any is written, but writes are not one transaction: a failure part way
+creates a new file, refused if it exists. A Scheme file the patch would
+leave unreadable is refused, with the reader's line. Every file is checked
+before any is written, but writes are not one transaction: a failure part way
 names the files written. From the CLI, pass PATCH on stdin with
 `techne tool --stdin ROOT (tool-apply! project input)`; nothing needs escaping."
       (%response (%tool-apply! project patch)))

@@ -290,6 +290,18 @@ fn reader_nodes(source: &str) -> R<Data> {
     let mut left = 20_000;
     Ok(Data::List(reader::read_syntax(source).map_err(|e| e.message)?.iter().map(|s| node(s, &rope, &mut left)).collect::<R<_>>()?))
 }
+/// Why `source` does not read as Lisp, and the character offset the reader
+/// gives for it (#f when it gives none), or #f when it reads: what an edit
+/// would leave, checked before writing it.
+fn read_problem(source: &str) -> Data {
+    match reader::read_syntax(source) {
+        Ok(_) => Data::Bool(false),
+        Err(e) => Data::List(vec![
+            text(e.message),
+            e.pos.map_or(Data::Bool(false), |at| num(source[..source.floor_char_boundary(at as usize)].chars().count())),
+        ]),
+    }
+}
 pub(crate) fn install(vm: &mut Vm) {
     vm.name_foreign_type::<Parsed>("source-tree");
     techne_vm::procedures! { vm;
@@ -312,6 +324,7 @@ pub(crate) fn install(vm: &mut Vm) {
             Ok(if let Some(n) = if parent { n.parent() } else { n.prev_named_sibling() } { p.node(n) } else { Data::Bool(false) })
         };
         "(%source-reader source)" => |source: String| -> R<Data> { reader_nodes(&source) };
+        "(%source-read-problem source)" => |source: String| -> Data { read_problem(&source) };
     }
     vm.requiring(Capability::Files, |vm| {
         techne_vm::procedures! { vm;
