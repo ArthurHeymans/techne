@@ -14,8 +14,8 @@ path = "src/main.rs"
 default = ["window", "term"]
 # The editor's frontends. A server builds without them: the window pulls in
 # a GPU stack and windowing libraries.
-window = ["dep:techne-window"]
-term = ["dep:techne-term"]
+window = ["dep:techne-window", "dep:techne-editor"]
+term = ["dep:techne-term", "dep:techne-editor"]
 
 [dependencies]
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
@@ -30,6 +30,8 @@ techne-sandbox = { path = "../techne-sandbox" }
 tokio = { version = "1", features = ["rt", "time"] }
 techne-window = { path = "../techne-window", optional = true }
 techne-term = { path = "../techne-term", optional = true }
+# The editor's socket, for `techne eval`.
+techne-editor = { path = "../techne-editor", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

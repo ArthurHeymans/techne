@@ -11,7 +11,7 @@
 (require "keymaps.scm")
 
 (provide make-session make-session-for-view sget sset! current-session set-current-session!
-         attach-session! detach-session! attached-sessions shown-views
+         attach-session! detach-session! attached-sessions shown-views add-unseen-session!
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=? view-point
          session-tree set-session-tree! tree-leaves split-pane! delete-pane! pane-places
          pane-view set-pane-view! document=?)
@@ -202,9 +202,21 @@ When it was current, the first one left is current instead."
   (when (eq? %session s)
     (set-current-session! (and (pair? %sessions) (car %sessions)))))
 
+;; Sessions no frontend shows, which have views of their own as attached
+;; ones do: that of programs evaluating (`techne eval --detached`).
+(define %unseen '())
+
+(define (add-unseen-session! s)
+  "Make S, a session no frontend shows, keep views of its own.
+A view S shows is not shown in another session, as one an attached
+session shows is not: its caret and scrolling are S's."
+  (set! %unseen (cons s %unseen)))
+
 (define (shown-elsewhere? s v)
-  (any (lambda (o) (and (not (eq? o s)) (any (lambda (p) (view=? p v)) (session-panes o)))) %sessions))
+  (any (lambda (o) (and (not (eq? o s)) (any (lambda (p) (view=? p v)) (session-panes o))))
+       (append %sessions %unseen)))
 
 (define (shown-views s)
-  "Return the views shown in the panes of S and of every attached session."
-  (append-map session-panes (cons s (remove (lambda (x) (eq? x s)) %sessions))))
+  "Return the views shown in the panes of S and of every other session.
+Those are the attached sessions and those no frontend shows."
+  (append-map session-panes (cons s (remove (lambda (x) (eq? x s)) (append %sessions %unseen)))))
