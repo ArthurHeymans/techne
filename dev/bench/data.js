@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794684360541,
+  "lastUpdate": 1794684361906,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -54649,6 +54649,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 106271,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f0a208e68a67f4033aaf740e1772111d9f0685a2",
+          "message": "Completion: M-SPC adds another part to match, as Corfu's separator (#360)\n\n* completion: M-SPC puts in a separator, as Corfu's, for parts in any order\n\nA space ended what the popup completed, so it matched one word only:\nthere was no way to give two parts, as Corfu's corfu-insert-separator\nand Orderless give them, to narrow candidates by both.\n\nM-SPC in the popup now puts in a space that keeps it open; what follows\nis another part, and the candidates are those every part matches, in\nany order. After a separator a typed space goes on completing too, and\nthe candidate taken replaces all the parts. Without one a space still\nends it, as corfu-quit-at-boundary's separator setting has it.\n\n* completion: test separator policy in Scheme\n\nMove the separator scenario and assertions from the Rust integration\nsuite to the existing Scheme suite runner. Use a fixed completion source\nto check exact matches, acceptance and separator state reset without\nwall-clock sleeps.\n\nThe completion integration tests and editor Scheme suites pass. Removing\nthe M-SPC binding makes the new suite fail.\n\n* completion: refilter when a separator commits a preview\n\nM-SPC commits the text of a selected candidate, not just the query\nthat opened the popup. Refilter the matcher and update its match count\nbefore resetting selection, so navigation and rendering cannot use the\nold matches.\n\nAdd Scheme regression coverage for the narrowed popup, both directions,\ncycling to the committed prompt and cancellation. The regression fails\non the old code; editor suites, completion integration tests and terminal\npopup tests pass with the fix. Visually checked the headless window's\npreview, separator and next-selection states.",
+          "timestamp": "2026-11-14T20:18:34+01:00",
+          "tree_id": "a7376cab3c766d464e6f45909aacb3a1ea342a98",
+          "url": "https://github.com/ArthurHeymans/techne/commit/f0a208e68a67f4033aaf740e1772111d9f0685a2"
+        },
+        "date": 1794684361862,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 691663979,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 643908514,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106428,
             "unit": "data"
           }
         ]
