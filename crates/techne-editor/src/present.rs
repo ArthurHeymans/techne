@@ -19,12 +19,19 @@
 //! text refers to them by id. A style is partial: an attribute it does
 //! not set is taken from what is under it, in the end from the pane's
 //! default style. Face names never reach a frontend.
+//!
+//! It is all serializable: a frontend in another process gets it over the
+//! editor's socket (`attach`). What is not sent as it is: a pane's text,
+//! sent as what changed since the text sent before; an image, sent once,
+//! then by its id; and instants, which are the frontend's own (it knows
+//! which of its inputs a snapshot answers by how many it does).
 
 use std::{sync::Arc, time::Instant};
 
+use serde::{Deserialize, Serialize};
 use techne_text::ropey::Rope;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorShape {
     Bar,
     Block,
@@ -32,7 +39,7 @@ pub enum CursorShape {
 
 /// A colour: sRGB, with the ANSI colour (0 to 15) a frontend that has
 /// only those should use, when the palette said one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Color {
     pub rgb: [u8; 3],
     pub ansi: Option<u8>,
@@ -44,20 +51,20 @@ impl Color {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Weight {
     Light,
     Normal,
     Bold,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Slant {
     Normal,
     Italic,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Underline {
     /// No underline, in particular: over a style that has one, this
     /// takes it away, where an unset underline would leave it.
@@ -73,7 +80,7 @@ pub enum Underline {
 /// says: every attribute may be unset, meaning what is under it decides.
 /// Frontends realize a style with what they have: a terminal ignores
 /// `family` and `height`, say.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
@@ -119,7 +126,7 @@ pub type StyleId = u32;
 
 /// The styles of what is not buffer text: each the style of the face of
 /// its name (`mode-line`, `line-number`...), resolved by the runtime.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Chrome {
     pub region: StyleId,
     pub cursor: StyleId,
@@ -145,7 +152,7 @@ pub struct Chrome {
 
 /// What a frontend shows: panes, one view each, each in its place, and the
 /// echo area below them.
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Snapshot {
     /// Increases with every snapshot.
     pub id: u64,
@@ -163,6 +170,7 @@ pub struct Snapshot {
     pub key_hints: Vec<KeyHint>,
     /// When the inputs this snapshot answers were made, so the frontend can
     /// measure input to frame.
+    #[serde(skip)]
     pub answers: Vec<Instant>,
     /// The styles the snapshot's text and chrome refer to, by id.
     pub styles: Arc<[Style]>,
@@ -184,11 +192,12 @@ impl Snapshot {
 
 /// One view of a document: its text at a revision, the view's selections
 /// and scroll anchor, its mode line and highlights.
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Pane {
     /// The view, for inputs addressed to it.
     pub view: u64,
     pub revision: u64,
+    #[serde(skip)]
     pub text: Rope,
     /// (anchor, head) byte positions; carets are empty ranges.
     pub selections: Vec<(usize, usize)>,
@@ -231,13 +240,13 @@ pub struct Pane {
 
 /// What a frontend draws beside a pane's text, never in it: line numbers
 /// and a marker on the lines past the end of the text (Vim's `~`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Display {
     pub line_numbers: LineNumbers,
     pub eob_marker: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LineNumbers {
     #[default]
     Off,
@@ -277,7 +286,7 @@ impl Display {
 
 /// A visual operation on a pane (EDITOR.md, section 6: the frontend
 /// resolves it, the runtime applies the semantic positions it gets back).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum ViewRequest {
     /// Scroll by screens (negative: up), keeping `context` lines of the
     /// old screen, the caret keeping its place on the screen; a fraction
@@ -287,7 +296,7 @@ pub enum ViewRequest {
     Recenter(Recenter),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recenter {
     Middle,
     Top,
@@ -295,7 +304,7 @@ pub enum Recenter {
 }
 
 /// A rectangle in fractions (0 to 1) of an area.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Place {
     pub x: f32,
     pub y: f32,
@@ -315,7 +324,7 @@ impl Pane {
 
 /// A range of a pane's text drawn with a style of the snapshot's table,
 /// over the pane's default style.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Highlight {
     pub from: usize,
     pub to: usize,
@@ -325,7 +334,7 @@ pub struct Highlight {
 /// Text drawn before the character at `at` (or at the end of its line),
 /// with a style of the snapshot's table: shown, never in the text. The
 /// caret at `at` is before it; a click on it is at `at`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Inlay {
     pub at: usize,
     pub text: String,
@@ -334,7 +343,7 @@ pub struct Inlay {
 
 /// The wrapped lines of the line starting at `line` start where the
 /// character at `at` (on its first visual line) does: they hang under it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hang {
     pub line: usize,
     pub at: usize,
@@ -343,7 +352,7 @@ pub struct Hang {
 /// An image shown as a block of its own above the line `at` is on, as
 /// wide as the pane allows (EDITOR.md, section 2's embedded blocks). Not
 /// in the text: the caret and clicks are on the line below it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Block {
     pub at: usize,
     pub image: crate::images::Image,
@@ -351,7 +360,7 @@ pub struct Block {
 
 /// The minibuffer (EDITOR.md, section 10): a prompt, the input being
 /// typed and the candidates that match it, as many as the session shows.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Minibuffer {
     pub prompt: String,
     pub input: String,
@@ -367,7 +376,7 @@ pub struct Minibuffer {
 /// What completes the text before a pane's caret (Corfu's popup): rows of
 /// candidates, drawn below the line of `at` (above it when there is no
 /// room), aligned with `at`, the start of the text they complete.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Completion {
     pub view: u64,
     pub at: usize,
@@ -379,7 +388,7 @@ pub struct Completion {
 
 /// A key that can follow a prefix, and what it does: a command's name, or
 /// a prefix's (`+file`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct KeyHint {
     pub key: String,
     pub description: String,
@@ -389,7 +398,7 @@ pub struct KeyHint {
 /// A logical row: columns of styled text. A frontend aligns the columns
 /// of the rows it shows, the first at the left, each next one after the
 /// widest of the one before.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     pub columns: Vec<Vec<Run>>,
 }
@@ -402,19 +411,30 @@ impl Row {
 }
 
 /// Text drawn with a style (as `Highlight`), or plainly.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Run {
     pub text: String,
     pub style: Option<StyleId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Input {
     /// A key in Emacs notation (`"a"`, `"C-x"`, `"M-<"`, `"RET"`, `"<left>"`).
-    Key { key: String, at: Instant },
+    Key {
+        key: String,
+        #[serde(skip, default = "Instant::now")]
+        at: Instant,
+    },
     /// Put the caret of `view` at `pos` of the text at `revision` (a click),
     /// or extend its selection to it; the view gets the focus.
-    Click { view: u64, revision: u64, pos: usize, extend: bool, at: Instant },
+    Click {
+        view: u64,
+        revision: u64,
+        pos: usize,
+        extend: bool,
+        #[serde(skip, default = "Instant::now")]
+        at: Instant,
+    },
     /// Scroll `view` so that `anchor` of the text at `revision` is on its
     /// first visible line; with `caret`, its caret goes there too (paging).
     Scroll { view: u64, revision: u64, anchor: usize, caret: Option<usize> },
@@ -436,15 +456,16 @@ pub enum Input {
 }
 
 /// Pixels captured from a successfully drawn frame, encoded as sRGB PNG.
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CapturedFrame {
     pub snapshot: u64,
     pub width: u32,
     pub height: u32,
+    #[serde(with = "serde_bytes")]
     pub png: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum Output {
     Snapshot(Box<Snapshot>),
     /// Capture a frame showing this snapshot or a newer one. Complete via

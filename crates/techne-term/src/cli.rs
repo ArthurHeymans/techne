@@ -12,7 +12,8 @@
 //!
 //! `--open` and `--wait` are as for `techne`: the file is shown in the
 //! editor running, if there is one, else here; an editor started here opens
-//! files for the next.
+//! files for the next. `--attach` makes this terminal a frontend of the
+//! editor running, as `emacsclient --tty` does (`techne_editor::attach`).
 
 use std::{
     io::{Read, Write},
@@ -24,13 +25,14 @@ use std::{
 
 use crate::{RESTORE, SETUP, Term};
 use techne_editor::{
+    attach::{Link, Remote},
     host::{Event, File, Host},
     present::Output,
     runtime::{Runtime, journal_for},
     server,
 };
 
-const USAGE: &str = "usage: techne term [--modal] [--open] [--wait] [FILE]";
+const USAGE: &str = "usage: techne term [--modal] [--open] [--wait] [FILE]\n       techne term --attach [--modal] [FILE]";
 
 const ESC_WAIT: Duration = Duration::from_millis(25);
 
@@ -58,20 +60,23 @@ struct Args {
     open: bool,
     /// Return once the file opened is done with.
     wait: bool,
+    /// Be a frontend of the editor running, not an editor.
+    attach: bool,
 }
 
 fn args(args: Vec<String>) -> Result<Args, String> {
-    let mut a = Args { path: None, profile: "emacs".into(), open: false, wait: false };
+    let mut a = Args { path: None, profile: "emacs".into(), open: false, wait: false, attach: false };
     for arg in args {
         match arg.as_str() {
             "--modal" => a.profile = "modal".into(),
             "--open" => a.open = true,
             "--wait" => (a.open, a.wait) = (true, true),
+            "--attach" => a.attach = true,
             _ if a.path.is_none() && !arg.starts_with('-') => a.path = Some(PathBuf::from(arg)),
             _ => return Err(USAGE.into()),
         }
     }
-    if a.open && a.path.is_none() {
+    if (a.open && a.path.is_none()) || (a.open && a.attach) {
         return Err(USAGE.into());
     }
     Ok(a)
@@ -102,7 +107,7 @@ fn restore() {
 /// Run the editor in this terminal, with the command line's arguments after
 /// the command's name.
 pub fn main(args: Vec<String>) -> ExitCode {
-    let Args { path, profile, open, wait } = match self::args(args) {
+    let Args { path, profile, open, wait, attach } = match self::args(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -116,27 +121,43 @@ pub fn main(args: Vec<String>) -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    let file = path.map(|path| {
-        let journal = journal_for(&path).unwrap_or_else(|e| {
-            eprintln!("techne: journal: {e}");
-            std::process::exit(1)
-        });
-        File { path, journal }
-    });
     let (tx, rx) = mpsc::channel();
-    let mut host = {
+    let deliver = {
         let tx = tx.clone();
+        move |e| {
+            let _ = tx.send(Msg::Runtime(e));
+        }
+    };
+    let (mut host, _listener) = if attach {
+        let socket = server::socket().ok_or(server::OpenError::NotRunning);
+        match socket.and_then(|socket| Remote::attach(&socket, &profile, path.as_deref(), deliver)) {
+            Ok(remote) => (Link::Remote(remote), None),
+            Err(server::OpenError::NotRunning) => {
+                eprintln!("techne: no editor is running to attach to");
+                return ExitCode::FAILURE;
+            }
+            Err(server::OpenError::Failed(e)) => {
+                eprintln!("techne: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        let file = path.map(|path| {
+            let journal = journal_for(&path).unwrap_or_else(|e| {
+                eprintln!("techne: journal: {e}");
+                std::process::exit(1)
+            });
+            File { path, journal }
+        });
         let keep_histories = |rt: &mut Runtime| {
             if let Err(e) = rt.keep_histories(None) {
                 eprintln!("techne: history: {e}");
             }
         };
-        Host::start(file, profile, keep_histories, move |e| {
-            let _ = tx.send(Msg::Runtime(e));
-        })
+        let host = Host::start(file, profile, keep_histories, deliver);
+        let listener = server::listen_for(&host);
+        (Link::Local(host), listener)
     };
-
-    let _listener = server::listen_for(&host);
     if let Err(e) = crossterm::terminal::enable_raw_mode() {
         eprintln!("techne: {e}");
         std::process::exit(1)
@@ -252,6 +273,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
         let _ = out.flush();
     }
     restore();
+    if let Link::Local(h) = &host
+        && h.attached() > 1
+    {
+        eprintln!("techne: frontends attached from other processes keep the editor running until they close");
+    }
     host.close();
     for p in PANICS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         eprintln!("techne: the runtime crashed: {p}");
