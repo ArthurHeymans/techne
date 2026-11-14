@@ -119,7 +119,12 @@ fn files_and_search_are_bounded_and_honest_about_skips() {
         (check 1 (tool-ref item 'line))
         (check #t (tool-ref (tool-expand p (tool-ref item 'handle) #:chars 10) 'truncated))
         (check #t (fails (lambda () (tool-search p ""))))
-        (check #t (fails (lambda () (tool-files p #:limit 51))))
+        ;; A page wider than the bound is the bound, as a window is: the
+        ;; reply says where the rest is. Below 1 is still an error.
+        (check 5 (length (tool-ref (tool-files p #:limit 51) 'items)))
+        (check 3 (length (tool-ref (tool-search p "needle" #:limit 99) 'items)))
+        (check #t (fails (lambda () (tool-files p #:limit 0))))
+        (check #t (fails (lambda () (tool-search p "needle" #:limit 1.5))))
     "#,
     );
 }
