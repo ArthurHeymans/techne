@@ -223,6 +223,21 @@ fn plain_text_reads_as_it_is() {
 }
 
 #[test]
+fn a_line_break_inside_a_link_or_image_breaks_the_line() {
+    let (_dir, mut rt) = preview("");
+    // As mail's HTML gives <a href="…">one<br>two</a>.
+    rt.eval(
+        "(define b (make-rich-buffer! \"*breaks*\"))
+         (rich-present! b (list (list 'paragraph (list 'link (target 'url \"https://example.org\") \"one\" '(hard-break) \"two\"))
+                                (list 'paragraph (list 'image (target 'url \"https://example.org/x.png\") \"three\" '(hard-break) \"four\"))))",
+    )
+    .unwrap();
+    assert_eq!(rt.eval("(document-string (buffer-document b))").unwrap(), "\"one\\ntwo\\n\\n▣ three\\nfour\\n\"");
+    let link = "(let ((t (target-at (buffer-document b) 4))) (and t (target-value t)))";
+    assert_eq!(rt.eval(link).unwrap(), "\"https://example.org\"", "the text after the break is the link's too");
+}
+
+#[test]
 fn a_killed_preview_stops_following() {
     let (_dir, mut rt) = preview("text\n");
     let live = "(length (filter (lambda (r) (guard (e (#t #f)) (not (task-done? r)))) (scope-resources (package-scope (find-package 'markdown-preview)))))";
