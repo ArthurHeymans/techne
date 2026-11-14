@@ -355,6 +355,47 @@ fn search_replace_blocks_check_every_file_before_writing_any() {
 }
 
 #[test]
+fn an_edit_that_leaves_scheme_unreadable_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.scm"), "(define (f x)\n  (g x))\n(define y 1)\n").unwrap();
+    fs::write(dir.path().join("broken.scm"), "(define (f x)\n").unwrap();
+    fs::write(dir.path().join("notes.txt"), "(not scheme\n").unwrap();
+    let mut vm = world(dir.path());
+    vm.eval_source(
+        r#"(define (block file old new)
+             (string-append file "\n<<<<<<< SEARCH\n" old (if (string=? old "") "" "\n")
+                            "=======\n" new (if (string=? new "") "" "\n") ">>>>>>> REPLACE\n"))
+           (define (message thunk) (guard (e (#t (condition/report-string e))) (thunk) #f))
+           (define (has? text part) (and (string-contains text part) #t))"#,
+    )
+    .unwrap();
+    check(
+        &mut vm,
+        r#"
+        ;; One parenthesis too many: refused, with where, and nothing written.
+        (define extra (message (lambda () (tool-apply! p (block "a.scm" "  (g x))" "  (g x)))")))))
+        (check #t (has? extra "a.scm would not read as Scheme"))
+        (check #t (has? extra "at line 2"))
+        (check "(define (f x)\n  (g x))\n(define y 1)\n" (tool-ref (tool-read p "a.scm") 'text))
+        ;; One too few, with tool-edit! too.
+        (define rev (tool-ref (tool-read p "a.scm") 'revision))
+        (check #t (has? (message (lambda () (tool-edit! p "a.scm" rev '(("(g x))" "(g x)")))))
+                        "a.scm would not read as Scheme"))
+        ;; A new file must read; other files are not Lisp, and one already
+        ;; unreadable may be edited as it is.
+        (check #t (has? (message (lambda () (tool-apply! p (block "new.sld" "" "(define-library (x)")))) "new.sld"))
+        (tool-apply! p (block "notes.txt" "(not scheme" "(still not"))
+        (tool-apply! p (block "broken.scm" "(define (f x)" "(define (g x)"))
+        (check "(define (g x)\n" (tool-ref (tool-read p "broken.scm") 'text))
+        ;; A balanced edit goes through.
+        (tool-apply! p (block "a.scm" "  (g x))" "  (h (g x)))"))
+        (check "(define (f x)\n  (h (g x)))\n(define y 1)\n" (tool-ref (tool-read p "a.scm") 'text))
+    "#,
+    );
+    assert!(!dir.path().join("new.sld").exists());
+}
+
+#[test]
 fn kept_output_is_a_snapshot_to_find_in_and_show() {
     let dir = tempfile::tempdir().unwrap();
     let mut vm = world(dir.path());

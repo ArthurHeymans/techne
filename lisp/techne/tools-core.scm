@@ -186,12 +186,29 @@
           (check (cdr rest))))
       (when (> (fold (lambda (c n) (+ n (%utf8-size (caddr c)) (- (%utf8-size (cadddr c))))) (%bytes s) changes) %file-limit)
         (error (string-append who ": result exceeds 1 MiB") path))
-      (list s changes
-            (apply string-append
-              (let loop ((rest changes) (at 0))
-                (if (null? rest) (list (substring original at (string-length original)))
-                    (cons (substring original at (caar rest))
-                          (cons (caddar rest) (loop (cdr rest) (cadar rest)))))))))))
+      (let ((source (apply string-append
+                      (let loop ((rest changes) (at 0))
+                        (if (null? rest) (list (substring original at (string-length original)))
+                            (cons (substring original at (caar rest))
+                                  (cons (caddar rest) (loop (cdr rest) (cadar rest)))))))))
+        (%readable! path original source who)
+        (list s changes source)))))
+;;; A Scheme file an edit would leave unreadable, a parenthesis too many
+;;; or too few, is refused before anything is written: the reply would
+;;; not say so, and the file would fail only when next loaded, far from
+;;; the edit. One that did not read before may stay so. ORIGINAL is #f
+;;; for a file being made.
+(define (%read-problem path source)
+  (let ((lang (source-language path)))
+    (and lang (eq? (language-value lang 'grammar) 'scheme) (%source-read-problem source))))
+(define (%readable! path original source who)
+  (let ((problem (%read-problem path source)))
+    (when (and problem (not (and original (%read-problem path original))))
+      (error (string-append who ": " path " would not read as Scheme: " (car problem)
+                            (if (cadr problem)
+                                (string-append " at line " (number->string (%line-at (%line-starts source) (cadr problem))))
+                                "")
+                            "; nothing was written")))))
 ;;; Search/replace blocks, the format agents already write: no escaping.
 ;;;   FILE [@REVISION]
 ;;;   <<<<<<< SEARCH
@@ -235,7 +252,8 @@
                (every (lambda (part) (not (member part '("" "." "..")))) (string-split path "/")))
     (error "tool-apply!: expected a relative path without . or .." path))
   (when (> (%utf8-size source) %file-limit) (error "tool-apply!: a new file exceeds 1 MiB" path))
-  (unless (%absent? p path) (error "tool-apply!: an empty SEARCH creates a file, and this one exists" path)))
+  (unless (%absent? p path) (error "tool-apply!: an empty SEARCH creates a file, and this one exists" path))
+  (%readable! path #f source "tool-apply!"))
 (define (%tool-apply! p text)
   (let* ((blocks (%parse-blocks text)) (paths (delete-duplicates (map car blocks))))
     (when (null? blocks) (error "tool-apply!: no SEARCH/REPLACE blocks"))
