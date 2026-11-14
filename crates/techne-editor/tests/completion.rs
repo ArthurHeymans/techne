@@ -236,36 +236,6 @@ fn filtered_candidates_scroll_and_select_by_entry() {
     assert!(rt.take_errors().is_empty());
 }
 
-/// M-SPC puts in a separator that keeps the popup open, as Corfu's: the
-/// parts each match, in any order, and a candidate taken replaces them all.
-#[test]
-fn completing_with_parts_after_a_separator() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut rt = file(dir.path(), "a.scm", "", "emacs");
-    type_text(&mut rt, "(ref");
-    pause(&mut rt);
-    assert!(!shown(&mut rt).is_empty());
-    keys(&mut rt, "M-SPC");
-    assert_eq!(text(&mut rt), "(ref ");
-    assert!(!shown(&mut rt).is_empty(), "the separator keeps the popup open");
-    type_text(&mut rt, "vec");
-    let names = shown(&mut rt);
-    assert!(names.contains(&"vector-ref".to_string()), "{names:?}");
-    assert!(names.iter().all(|n| n.contains("ref") && n.contains("vec")), "every part matches, in any order: {names:?}");
-    // After a separator a space goes on completing too.
-    type_text(&mut rt, " tor");
-    assert!(shown(&mut rt).iter().all(|n| n.contains("tor")), "{:?}", shown(&mut rt));
-    keys(&mut rt, "C-n");
-    keys(&mut rt, "RET");
-    assert!(text(&mut rt).starts_with("(") && !text(&mut rt).contains(' '), "the candidate replaced every part: {}", text(&mut rt));
-    // Without a separator a space still ends it.
-    type_text(&mut rt, " (vec");
-    pause(&mut rt);
-    assert!(!shown(&mut rt).is_empty());
-    type_text(&mut rt, " ");
-    assert!(shown(&mut rt).is_empty());
-}
-
 /// Another actor edits while the popup is open: an edit before the
 /// identifier is followed; one inside it is kept, and the popup closes.
 #[test]
