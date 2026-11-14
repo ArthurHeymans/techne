@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794644739196,
+  "lastUpdate": 1794644740632,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -53600,6 +53600,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 642708532,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106089,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5b213bcc98ecd6863b1b97af70e940e8dea57a4e",
+          "message": "Merge pull request #354 from ArthurHeymans/tool/ambiguous-symbol\n\ntechne tool: an ambiguous or absent name says where to read instead",
+          "timestamp": "2026-11-14T09:19:03+01:00",
+          "tree_id": "72a1f4f279f8a5b67cea027a8ddf1db9885d1a1e",
+          "url": "https://github.com/ArthurHeymans/techne/commit/5b213bcc98ecd6863b1b97af70e940e8dea57a4e"
+        },
+        "date": 1794644740580,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690470562,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 642708525,
             "unit": "instructions"
           },
           {
