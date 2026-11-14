@@ -19,6 +19,7 @@
 //! frontends share to scroll by anchor.
 
 mod access;
+pub mod attach;
 pub mod capture;
 mod deadline;
 pub mod edits;

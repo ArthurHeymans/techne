@@ -418,8 +418,15 @@ attachment from afar waits a network round trip for every key; one over the
 node keeps typing local, and is what to use for editing remote files. Attaching
 is for coming back to a session: its buffers, unsaved edits and processes.
 Built so far: frontends in the runtime's process, and socket requests for
-opening files, evaluating code and capturing the selected session;
-attaching from another process or machine is not.
+opening files, evaluating code and capturing the selected session; and
+attaching from another process on the same machine (`techne window
+--attach`, `techne term --attach`; `crates/techne-editor/src/attach.rs`).
+A pane's text crosses as one splice from the text that view was last sent,
+an image once, and a snapshot waiting behind a newer one not at all. The
+process the runtime started in serves those attached until the last
+detaches, once its own frontend closes. Attaching from another machine
+over ssh, and a runtime started without a frontend (`--daemon`), are not
+built yet.
 
 **The protocol.** Everything in it is serializable data: no native pointers or
 callbacks, even when frontend and runtime share a process.

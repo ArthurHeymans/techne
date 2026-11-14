@@ -3910,6 +3910,7 @@ dependencies = [
  "rmp-serde",
  "rustix 1.1.6",
  "serde",
+ "serde_bytes",
  "serde_json",
  "techne-net",
  "techne-node",
