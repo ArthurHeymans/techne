@@ -20,7 +20,7 @@
 ;;; are one operation, counting its runs.
 
 (provide current-operation start-operation! %start-operation! start-invocation! current-principal note-effect! continue-operation! call-in-operation operation-procedure without-operation
-         operation-hold! operation-release! operation-failed! operation-cancelled! raise-site
+         operation-hold! operation-release! operation-failed! operation-cancelled! operation-abandon! raise-site
          operation? operation-serial operation-runtime operation-parent-serial operation-command
          operation-committed? operation-staged? operation-proposals operation-phase operation-outcome operation-pending?
          set-operation-ended-handler! cancelled-condition?
@@ -117,8 +117,10 @@ inherited from the operation currently running, not an explicit parent."
 
 ;; As `start-operation!`, without keywords, which cost: every key runs it.
 ;; CODE is the code's number (`code-id`). Return the operation's record.
+;; Run for whom the operation it is started in runs for: a command an
+;; agent's evaluation runs is the agent's; one a key runs, the user's.
 (define (%start-operation! command s code document revision prefix)
-  (%begin-operation! command s code document revision prefix "user" #f))
+  (%begin-operation! command s code document revision prefix (current-principal) #f))
 (define (%begin-operation! command s code document revision prefix principal parent)
   (let* ((running (current-operation))
          (op (%make-operation (symbol->string command) (or parent running)))
@@ -278,6 +280,24 @@ OP is ending from then: what it holds is cancelled."
     (when (and p (not (pending-condition p)) (not (pending-cancelled p)))
       (set-pending-cancelled! p #t)
       (ending! p))))
+
+(define (operation-abandon! op)
+  "End OP and the operations started under it that have not ended.
+They end cancelled: the execution running them was killed, so what held
+them never lets go of them."
+  (let* ((parent (lambda (p) (let ((serial (operation-parent-serial (pending-op p))))
+                               (and serial (hash-table-ref/default %pending serial #f)))))
+         (under? (lambda (p) (let loop ((p p)) (and p (or (eq? (pending-op p) op) (loop (parent p)))))))
+         ;; The innermost first: a child's serial is its parent's and more.
+         (abandoned (sort (filter under? (hash-table-values %pending))
+                          (lambda (a b) (> (operation-serial (pending-op a)) (operation-serial (pending-op b)))))))
+    (for-each (lambda (p)
+                (set-pending-cancelled! p #t)
+                (ending! p)
+                (set-pending-count! p 0)
+                (set-pending-holds! p '())
+                (end! p))
+              abandoned)))
 
 (define (cancelled-condition? e)
   "Return #t if E is the condition a cancelled task ends with."

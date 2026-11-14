@@ -397,6 +397,13 @@ A running editor opens files for other programs, as `emacsclient` does:
 `techne --open --wait FILE` shows the file in the attachment used last and
 returns when it is done with (`C-x #`, killing its buffer, or `:wq`), so it
 serves as `$EDITOR`. With no editor running, it starts one on the file.
+`techne eval FORM` evaluates code in it, as `emacsclient --eval` does: in
+the attachment used last, so that what it shows is shown where the user
+looks, or `--detached` in a session no frontend shows; as an operation
+run for the principal the program names, bounded by a deadline and
+stopped by C-g in any attachment. This is how agents look at and act on
+the editor in use; `*Server log*` shows what they evaluated, and the
+option `server-eval` turns it off.
 
 **Transport.** In the runtime's process an attachment is a channel, and the
 protocol's data is passed as it is, not encoded. Out of it, messages use the
@@ -411,8 +418,8 @@ attachment from afar waits a network round trip for every key; one over the
 node keeps typing local, and is what to use for editing remote files. Attaching
 is for coming back to a session: its buffers, unsaved edits and processes.
 Built so far: frontends in the runtime's process, and socket requests for
-opening files and capturing the selected session; attaching from another
-process or machine is not.
+opening files, evaluating code and capturing the selected session;
+attaching from another process or machine is not.
 
 **The protocol.** Everything in it is serializable data: no native pointers or
 callbacks, even when frontend and runtime share a process.

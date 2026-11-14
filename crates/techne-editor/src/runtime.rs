@@ -169,6 +169,19 @@ pub enum Msg {
         id: usize,
         result: Result<crate::present::CapturedFrame, String>,
     },
+    /// Evaluate `source` for another program (`server`): in `module`, in
+    /// the session used last or, `detached`, in one no frontend shows, as
+    /// an operation run for `principal`. Killed past `deadline`, and
+    /// stopped by C-g in any frontend. `reply` gets `Evaluated`,
+    /// `EvalFailed` or `Failed`.
+    Eval {
+        source: String,
+        module: String,
+        detached: bool,
+        principal: String,
+        deadline: Duration,
+        reply: mpsc::Sender<Reply>,
+    },
     /// The program of request `id` stopped waiting (`Open`).
     Gone(usize),
     /// A background task woke. One is queued at a time, however many
@@ -313,6 +326,9 @@ struct Gate {
     before: u64,
     /// The input being handled, its execution, and whether it was broken.
     handling: Option<(u64, ExecId, bool)>,
+    /// What runs for no input that C-g stops too (`hold`), and whether it
+    /// was broken.
+    held: Option<(ExecId, bool)>,
     stop: Option<InterruptHandle>,
 }
 
@@ -320,7 +336,7 @@ impl Interrupts {
     /// Stop the inputs numbered below `n`: the one being handled is broken
     /// (it raises the condition "interrupted", which its command shows as
     /// its error), or killed if it was broken already; those not handled
-    /// yet are discarded.
+    /// yet are discarded. What runs held (`hold`) is stopped so too.
     pub fn interrupt_before(&self, n: u64) {
         self.stop_before(n, false);
     }
@@ -333,12 +349,18 @@ impl Interrupts {
 
     fn stop_before(&self, n: u64, kill: bool) {
         let mut gate = self.0.lock().expect("the gate");
+        let gate = &mut *gate;
         gate.before = gate.before.max(n);
-        let before = gate.before;
-        let stop = gate.stop.clone();
-        if let (Some((k, exec, broken)), Some(stop)) = (&mut gate.handling, stop)
-            && *k < before
+        let Some(stop) = &gate.stop else { return };
+        if let Some((k, exec, broken)) = &mut gate.handling
+            && *k < gate.before
         {
+            stop.stop(*exec, if kill || *broken { Stop::Kill } else { Stop::Break });
+            *broken = true;
+        }
+        // Whatever N is: this is called as C-g is typed, not when the
+        // runtime takes it, so this one was typed while it ran.
+        if let Some((exec, broken)) = &mut gate.held {
             stop.stop(*exec, if kill || *broken { Stop::Kill } else { Stop::Break });
             *broken = true;
         }
@@ -351,6 +373,18 @@ impl Interrupts {
         let go = k >= gate.before;
         gate.handling = go.then_some((k, exec, false));
         go
+    }
+
+    /// Let C-g reach `exec`, which runs no input of this frontend (another
+    /// program's evaluation): a C-g sent from now on breaks it, and a
+    /// second kills it, as they would an input's. Until `release`.
+    fn hold(&self, exec: ExecId) {
+        self.0.lock().expect("the gate").held = Some((exec, false));
+    }
+
+    /// What `hold` held has ended.
+    fn release(&self) {
+        self.0.lock().expect("the gate").held = None;
     }
 
     /// Input `k` was handled.
@@ -810,6 +844,9 @@ impl Runtime {
                         Err(e) => send(client, Output::Refused(e)),
                     },
                     Msg::Open { id, path, wait, reply } => self.open_for(id, &path, wait, reply),
+                    Msg::Eval { source, module, detached, principal, deadline, reply } => {
+                        let _ = reply.send(self.eval_for(source, module, detached, principal, deadline));
+                    }
                     Msg::Capture { path, lease, reply } => {
                         if !lease.active() {
                             let _ = reply.send(Reply::Failed("capture cancelled or expired".into()));
@@ -948,6 +985,37 @@ impl Runtime {
             Err(e) => {
                 let _ = reply.send(Reply::Failed(e.to_string()));
             }
+        }
+    }
+
+    /// Evaluate for another program (`Msg::Eval`), as an execution of its
+    /// own: killed past `deadline`, as what runs between inputs is, but
+    /// not kept from running again; and stopped by a C-g in any frontend,
+    /// as a command is, since the editor waits for it. What it comes to is
+    /// Lisp's to say (`editor-eval!`).
+    fn eval_for(&mut self, source: String, module: String, detached: bool, principal: String, deadline: Duration) -> Reply {
+        let exec = self.vm.new_execution();
+        self.watch.arm(exec, Instant::now() + deadline);
+        let gates: Vec<Arc<Interrupts>> = self.clients.values().map(|a| a.interrupts.clone()).collect();
+        gates.iter().for_each(|g| g.hold(exec));
+        self.vm.enter_execution(exec);
+        let args = [Arg::Str(source), Arg::Str(module), Arg::Bool(detached), Arg::Str(principal)];
+        let result = self.call_now("editor-eval!", &args).and_then(|v| self.vm.get::<Vec<String>>(&v));
+        self.vm.leave_execution(exec);
+        gates.iter().for_each(|g| g.release());
+        match result {
+            Ok(v) => match <[String; 3]>::try_from(v) {
+                Ok([kind, text, output]) if kind == "value" => Reply::Evaluated { value: text, output },
+                Ok([_, error, output]) => Reply::EvalFailed { error, output },
+                Err(v) => Reply::Failed(format!("editor-eval! answered {v:?}")),
+            },
+            // Lisp is told, to end what the evaluation left running.
+            Err(e) if e.is_kill() => {
+                let error = format!("killed: it ran past {} ms, or C-g stopped it", deadline.as_millis());
+                let _ = self.call("editor-eval-ended!", &[Arg::Str(error.clone())]);
+                Reply::EvalFailed { error, output: String::new() }
+            }
+            Err(e) => Reply::Failed(e.to_string()),
         }
     }
 
