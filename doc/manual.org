@@ -24,6 +24,13 @@ buffer, as killing the buffer or =:wq= in the modal profile do. So
 ~EDITOR="techne --wait"~ edits commit messages in the editor you have
 open. With no editor running, the command starts one on the file.
 
+~techne window --attach~ opens another window on the editor running, as
+~emacsclient --create-frame~ opens a frame; ~techne term --attach~ makes
+the terminal one, as ~emacsclient --tty~. Each has panes, a minibuffer and
+a caret of its own, over the same buffers. With a file, the window shows
+it. When the window the editor started in closes, the editor runs on for
+the windows attached to it, until the last closes.
+
 Programs can evaluate code in the editor running too, as with
 emacsclient --eval: ~techne eval '(message! (current-session) "hi")'~
 prints what the code wrote, then its value; an error goes to stderr

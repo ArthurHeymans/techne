@@ -16,6 +16,12 @@
 //! with, so `techne --wait` serves as `$EDITOR`. With no editor running, it
 //! starts one on the file. An editor started opens files for the next.
 //!
+//! `--attach [FILE]` opens a window on the editor running instead, as
+//! `emacsclient --create-frame` does a frame: a session of its own in its
+//! runtime, over its socket (`techne_editor::attach`). The window an editor
+//! started in closing, the editor runs on for those attached, until the
+//! last detaches.
+//!
 //! `--bench N` types N keys by itself and reports the time from each key to
 //! the frame that shows its effect (with `TECHNE_BENCH_SLOW` set, also each
 //! key that took 10 ms or more); `--load` keeps a Lisp task busy in the
@@ -42,6 +48,7 @@ use std::{
 
 use glyphon::Buffer;
 use techne_editor::{
+    attach::{Link, Remote},
     host::{Event, File, Host},
     present::{Color, CursorShape, Input, Output, Slant, Style, StyleId, Underline, Weight},
     runtime::journal_for,
@@ -74,6 +81,8 @@ struct Args {
     open: bool,
     /// Return once the file opened is done with.
     wait: bool,
+    /// Be a window on the editor running, not an editor.
+    attach: bool,
     screenshot: Option<PathBuf>,
     record: Option<PathBuf>,
     stop_recording: bool,
@@ -82,6 +91,7 @@ struct Args {
 }
 
 const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [--open] [--wait] [FILE]\n\
+  techne window --attach [--modal] [--font FAMILY] [--size PT] [FILE]\n\
   techne window --screenshot NEW.png\n\
   techne window --record NEW-DIR [--record-frames 1..300] [--record-interval 50..10000]\n\
   techne window --stop-recording\n\
@@ -98,6 +108,7 @@ fn args(args: Vec<String>) -> Result<Args, String> {
         size: 15.0,
         open: false,
         wait: false,
+        attach: false,
         screenshot: None,
         record: None,
         stop_recording: false,
@@ -116,6 +127,7 @@ fn args(args: Vec<String>) -> Result<Args, String> {
             "--load" => a.load = true,
             "--open" => a.open = true,
             "--wait" => (a.open, a.wait) = (true, true),
+            "--attach" => a.attach = true,
             "--bench" => a.bench = Some(it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?),
             "--font" => a.font = it.next().ok_or(USAGE)?,
             "--size" => a.size = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
@@ -134,6 +146,9 @@ fn args(args: Vec<String>) -> Result<Args, String> {
         return Err(USAGE.into());
     }
     if a.open && a.path.is_none() {
+        return Err(USAGE.into());
+    }
+    if a.attach && (controls > 0 || a.open || a.bench.is_some() || a.load) {
         return Err(USAGE.into());
     }
     Ok(a)
@@ -186,7 +201,8 @@ struct Bench {
 
 struct App {
     args: Args,
-    host: Host,
+    /// The runtime: of this process, or of the editor attached to.
+    host: Link,
     events: mpsc::Receiver<Event>,
     renderer: Option<Renderer>,
     layout: Layout,
@@ -1037,12 +1053,31 @@ pub fn main(args: Vec<String>) -> ExitCode {
     let capture_worker = capture::Worker::new(move |c| {
         let _ = capture_proxy.send_event(Wake::Captured(c));
     });
-    let host = Host::start(file.clone(), args.profile.clone(), setup, move |e| {
+    let deliver = move |e| {
         let _ = tx.send(e);
         let _ = proxy.send_event(Wake::Runtime);
-    });
-    // A benchmark's window opens no files for others.
-    let _listener = args.bench.is_none().then(|| server::listen_for(&host)).flatten();
+    };
+    let (host, _listener) = if args.attach {
+        let attached = server::socket()
+            .ok_or(server::OpenError::NotRunning)
+            .and_then(|socket| Remote::attach(&socket, &args.profile, args.path.as_deref(), deliver));
+        match attached {
+            Ok(remote) => (Link::Remote(remote), None),
+            Err(server::OpenError::NotRunning) => {
+                eprintln!("techne: no editor is running to attach to");
+                return ExitCode::FAILURE;
+            }
+            Err(server::OpenError::Failed(e)) => {
+                eprintln!("techne: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        let host = Host::start(file.clone(), args.profile.clone(), setup, deliver);
+        // A benchmark's window opens no files for others.
+        let listener = args.bench.is_none().then(|| server::listen_for(&host)).flatten();
+        (Link::Local(host), listener)
+    };
     let bench = args.bench.map(|keys| Bench { keys, sent: 0, next: Instant::now() });
     let mut app = App {
         args,
@@ -1066,6 +1101,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, .. } = app;
+    if let Link::Local(h) = &host
+        && h.attached() > 1
+    {
+        eprintln!("techne: windows attached from other processes keep the editor running until they close");
+    }
     host.close();
     if let Some(f) = file.filter(|f| f.journal.starts_with(std::env::temp_dir())) {
         let _ = std::fs::remove_file(&f.journal);

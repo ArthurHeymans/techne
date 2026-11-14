@@ -116,6 +116,8 @@ pub(crate) struct Shared {
     sent: u64,
     frontends: BTreeMap<Client, Frontend>,
     next_client: u64,
+    /// The generation of the runtime whose thread ended last.
+    ended: u64,
 }
 
 struct Frontend {
@@ -158,6 +160,7 @@ impl Host {
             sent: 0,
             frontends: BTreeMap::new(),
             next_client: 0,
+            ended: 0,
         }));
         attach(&shared, file, profile, Arc::new(deliver))
     }
@@ -190,9 +193,15 @@ impl Host {
     /// Send an input. C-g also interrupts the frontend's input the runtime
     /// is handling, and discards those queued before it.
     pub fn send(&mut self, input: Input) {
+        self.sent(input);
+    }
+
+    /// `send`, saying whether the input was sent: not when the backlog was
+    /// full, or the frontend is detached.
+    pub(crate) fn sent(&mut self, input: Input) -> bool {
         let mut s = self.shared.lock().expect("the host");
         let s = &mut *s;
-        let Some(f) = s.frontends.get_mut(&self.client) else { return };
+        let Some(f) = s.frontends.get_mut(&self.client) else { return false };
         if let Input::Key { key, at } = &input
             && key == "C-g"
         {
@@ -207,7 +216,7 @@ impl Host {
         let control = matches!(&input, Input::Key { key, .. } if key == "C-g") || matches!(input, Input::Close);
         if !control && !admits(&f.backlog, &input) {
             f.backlog.discard();
-            return;
+            return false;
         }
         if let Input::Key { at, .. } | Input::Click { at, .. } = &input {
             f.waiting.push_back(*at);
@@ -218,6 +227,18 @@ impl Host {
         if let Some(tx) = &s.inputs {
             let _ = tx.send(Msg::Input(self.client, input, admitted));
         }
+        true
+    }
+
+    /// The runtime this frontend is attached to, by its generation: a new
+    /// one after a restart.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// How many frontends are attached to the runtime, this one included.
+    pub fn attached(&self) -> usize {
+        self.shared.lock().expect("the host").frontends.len()
     }
 
     /// When the runtime is busy, as far as this frontend can tell: then its
@@ -297,8 +318,36 @@ impl Host {
     }
 }
 
+impl Host {
+    /// Detach, as `close`; then, while frontends in other processes are
+    /// attached (`attach`), wait for them to detach, the runtime serving
+    /// them, and for it to end after the last. So closing the window an
+    /// editor was started in leaves the others it serves, as closing an
+    /// Emacs frame leaves the other frames. Once the last has detached, the
+    /// runtime is waited for `CLOSE_WAIT` at most, as `close` waits: one
+    /// stuck in a Rust native, or given up, may never end.
+    pub fn close_outliving(self) {
+        let shared = self.shared.clone();
+        self.close();
+        let mut alone = None;
+        loop {
+            {
+                let s = shared.lock().expect("the host");
+                let ended = s.ended == s.generation || s.given_up == Some(s.generation);
+                if s.frontends.is_empty() {
+                    let since = *alone.get_or_insert_with(Instant::now);
+                    if ended || since.elapsed() >= CLOSE_WAIT {
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 /// Attach a frontend to the runtime of `shared`, started if none runs.
-fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deliver: Deliver) -> Host {
+pub(crate) fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deliver: Deliver) -> Host {
     let mut s = shared.lock().expect("the host");
     let client = Client(s.next_client);
     s.next_client += 1;
@@ -367,6 +416,16 @@ fn spawn(shared: &Arc<Mutex<Shared>>, s: &mut Shared) {
     let thread = std::thread::Builder::new()
         .name("runtime".into())
         .spawn(move || {
+            /// Says the runtime's thread ended, however it ends: dropped
+            /// last, also while a panic unwinds.
+            struct Ended(Arc<Mutex<Shared>>, u64);
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                    s.ended = s.ended.max(self.1);
+                }
+            }
+            let _ended = Ended(shared.clone(), generation);
             let ending = Ending(shared.clone(), generation);
             fence.enter();
             match Runtime::new() {
