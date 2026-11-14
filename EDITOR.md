@@ -581,7 +581,8 @@ annotations, preview, matching and export (`lisp/editor/minibuffer.scm`,
 `targets.scm`, `lens.scm`); its layout follows Vertico's. In-buffer
 completion (`completion.scm`) follows Arthur's Corfu: it opens by itself
 after two characters and a pause, the selected candidate goes in the text,
-and it completes in Scheme buffers and itl. Screenshots of the
+M-SPC puts in a separator after which another part matches (Orderless's
+parts, in any order), and it completes in Scheme buffers and itl. Screenshots of the
 Doom setup, taken in an off-screen session, remain the reference for the
 rest.
 
