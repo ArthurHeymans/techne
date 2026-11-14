@@ -24,6 +24,19 @@ buffer, as killing the buffer or =:wq= in the modal profile do. So
 ~EDITOR="techne --wait"~ edits commit messages in the editor you have
 open. With no editor running, the command starts one on the file.
 
+Programs can evaluate code in the editor running too, as with
+emacsclient --eval: ~techne eval '(message! (current-session) "hi")'~
+prints what the code wrote, then its value; an error goes to stderr
+with the frames it was raised in. It runs in the session you used last,
+so what it shows is shown where you look; with ~--detached~, in a
+session no frontend shows. ~--as NAME~ says who it runs for, as the
+operation records show it, and ~--timeout SECONDS~ (10 by default)
+bounds it; the editor waits for it meanwhile, and C-g stops it. So an
+agent can read =*Messages*=, look at your buffers or reload a package in
+the editor you have open. =*Server log*= shows what programs evaluated
+and what came of it. Any program running as you can do this, as with
+Emacs's server; the option ~server-eval~ turns it off.
+
 * Screenshots and recordings
 
 In the window frontend, =M-x screenshot= saves the next rendered editor
