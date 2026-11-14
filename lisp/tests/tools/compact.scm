@@ -40,7 +40,9 @@
     (for-each (lambda (query) (expect #t (fails query)))
       (list (lambda () (tool-symbols p "defs.scm" #:chars 0))
             (lambda () (tool-symbols p "defs.scm" #:chars 16001))
-            (lambda () (tool-symbols p "defs.scm" #:limit 51))))))
+            (lambda () (tool-symbols p "defs.scm" #:limit 0))))
+    ;; A page past the item ceiling is the ceiling, not an error.
+    (expect 35 (length (tool-ref (tool-symbols p "defs.scm" #:limit 51) 'items)))))
 
 (with-tool-project "known-file bounded defaults and truthful EOF"
   (list (list "small" (apply string-append (make-list 150 "é\n")))
