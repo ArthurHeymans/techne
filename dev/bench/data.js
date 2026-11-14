@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794653390707,
+  "lastUpdate": 1794653392014,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -54301,6 +54301,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 106253,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "41710575eef2f411b16c10403fb347eb683716db",
+          "message": "Merge pull request #357 from ArthurHeymans/rich/break-in-link\n\nrich: a line break inside a link no longer breaks rendering",
+          "timestamp": "2026-11-14T11:42:14+01:00",
+          "tree_id": "d0aeb61816ebbd8f287f0eaff4e697d81345a30b",
+          "url": "https://github.com/ArthurHeymans/techne/commit/41710575eef2f411b16c10403fb347eb683716db"
+        },
+        "date": 1794653391969,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 690977345,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 643205203,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106271,
             "unit": "data"
           }
         ]
