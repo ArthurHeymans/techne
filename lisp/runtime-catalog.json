@@ -881,7 +881,7 @@
       "is_macro": false
     },
     "make-rich-buffer!": {
-      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:444\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
+      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:448\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
       "is_macro": false
     },
     "make-rpc-framer": {
@@ -1601,19 +1601,19 @@
       "is_macro": false
     },
     "rich-code-language": {
-      "description": "(rich-code-language name)  procedure, @lisp@/editor/rich.scm:209\n\nReturn the syntax language a code block naming NAME is in, or #f.\nNAME is what the block says, a fence's info string: its first word, a\nlanguage's name, an alias such as sh, or a file suffix.",
+      "description": "(rich-code-language name)  procedure, @lisp@/editor/rich.scm:213\n\nReturn the syntax language a code block naming NAME is in, or #f.\nNAME is what the block says, a fence's info string: its first word, a\nlanguage's name, an alias such as sh, or a file suffix.",
       "is_macro": false
     },
     "rich-present!": {
-      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:396\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nA row showing the same place of its document as before keeps its key,\nso a caret on it stays. Pictures load in the background when their rows\nare shown, and show when they have.",
+      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:400\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nA row showing the same place of its document as before keeps its key,\nso a caret on it stays. Pictures load in the background when their rows\nare shown, and show when they have.",
       "is_macro": false
     },
     "rich-splice!": {
-      "description": "(rich-splice! b start count units)  procedure, @lisp@/editor/rich.scm:348\n\nShow UNITS in buffer B in place of its COUNT units from index START.\nB is a buffer of `make-rich-buffer!'; UNITS are as `rich-units' gives\nthem. Only their rows are made: the others stay as they are. A row\nshowing the same place of its document as a row replaced takes its key,\nso a caret on it stays.",
+      "description": "(rich-splice! b start count units)  procedure, @lisp@/editor/rich.scm:352\n\nShow UNITS in buffer B in place of its COUNT units from index START.\nB is a buffer of `make-rich-buffer!'; UNITS are as `rich-units' gives\nthem. Only their rows are made: the others stay as they are. A row\nshowing the same place of its document as a row replaced takes its key,\nso a caret on it stays.",
       "is_macro": false
     },
     "rich-units": {
-      "description": "(rich-units blocks)  procedure, @lisp@/editor/rich.scm:319\n\nReturn the units of the rich text BLOCKS, for `rich-splice!'.\nEach top-level block is one, each item of a top-level list another.",
+      "description": "(rich-units blocks)  procedure, @lisp@/editor/rich.scm:323\n\nReturn the units of the rich text BLOCKS, for `rich-splice!'.\nEach top-level block is one, each item of a top-level list another.",
       "is_macro": false
     },
     "row": {

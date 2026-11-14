@@ -97,10 +97,14 @@
       (string-length (run-text r))))
 (define (runs-width runs) (fold (lambda (r n) (+ n (run-width r))) 0 runs))
 (define (utf8-length s) (bytevector-length (string->utf8 s)))
+;; A hard break among a link's or image's runs (`inline-runs`) stays one:
+;; it is where the row is cut, not text to give a target.
 (define (with-target r t)
-  (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) t (vector-ref r 6)))
+  (if (eq? r 'hard-break) r
+      (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) t (vector-ref r 6))))
 (define (with-picture r p)
-  (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) (vector-ref r 5) p))
+  (if (eq? r 'hard-break) r
+      (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) (vector-ref r 5) p)))
 
 ;; The picture an image's target shows: a file of a format decoded.
 (define picture-suffixes '(".png" ".jpg" ".jpeg" ".gif" ".webp" ".bmp" ".svg"))
