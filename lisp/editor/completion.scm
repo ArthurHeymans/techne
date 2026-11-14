@@ -12,7 +12,9 @@
 ;;; place of what was typed (corfu-preview-current); typing on keeps it
 ;;; and goes on completing. RET takes a selected candidate, else does
 ;;; what it does without the popup; C-g puts back what was typed. The
-;;; popup's keys are a keymap over the buffer's while it is open.
+;;; popup's keys are a keymap over the buffer's while it is open. M-SPC
+;;; puts in a space that does not close it, as corfu-insert-separator:
+;;; what follows is another part to match, in any order (Orderless).
 
 (require "session.scm")
 (require "keymaps.scm")
@@ -67,7 +69,7 @@ first, each annotated with its kind."
 ;;; The popup
 
 (define-record-type popup
-  (make-popup view start revision shown candidates matcher typed matches selected offset)
+  (make-popup view start revision shown candidates matcher typed matches selected offset separated)
   popup?
   (view popup-view)
   ;; Where the identifier starts in the document at REVISION, followed
@@ -86,7 +88,10 @@ first, each annotated with its kind."
   (matches popup-matches set-popup-matches!)
   ;; The selected candidate, -1 for none (the prompt); the first shown.
   (selected popup-selected set-popup-selected!)
-  (offset popup-offset set-popup-offset!))
+  (offset popup-offset set-popup-offset!)
+  ;; Whether a separator was put in: then a space goes on completing,
+  ;; else it ends what completes (corfu-quit-at-boundary 'separator).
+  (separated popup-separated set-popup-separated!))
 
 (define (popup s) (sget s 'completion))
 ;; The open popup, for its commands, which M-x can run without one.
@@ -112,7 +117,7 @@ first, each annotated with its kind."
              (if (= matches 0)
                  (when manual (message! s "No match"))
                  (begin
-                   (sset! s 'completion (make-popup v (car found) (document-revision d) typed candidates matcher typed matches -1 0))
+                   (sset! s 'completion (make-popup v (car found) (document-revision d) typed candidates matcher typed matches -1 0 #f))
                    (sset! s 'overlay-map completion-map))))))))
 
 ;; Where the popup's identifier starts now: #f when another actor changed
@@ -162,6 +167,22 @@ first, each annotated with its kind."
   "Select the previous candidate, showing it in the text."
   (select-completion! s (- (popup-selected (open-popup s)) n)))
 
+(define-command (completion-insert-separator s n)
+  "Put a space in that keeps completing: what follows is another part.
+The candidates are those every part matches, in any order, as Corfu's
+separator and Orderless have it."
+  (let* ((pop (open-popup s)) (start (popup-start-now s pop)))
+    (if (not start)
+        (begin (close-completion! s) (message! s "The text completed has changed"))
+        (let ((typed (string-append (document-substring (view-document (popup-view pop)) start (point s)) " ")))
+          (check-editable! (popup-view pop))
+          (view-edit! (popup-view pop) (list (list (point s) (point s) " ")) "extend")
+          (popup-saw! pop start typed)
+          (set-popup-separated! pop #t)
+          (set-popup-typed! pop typed)
+          (set-popup-selected! pop -1)
+          (set-popup-offset! pop 0)))))
+
 (define-command (completion-accept s n)
   "Take the selected candidate.
 With none selected, close the popup and do what RET does without it."
@@ -176,12 +197,12 @@ With none selected, close the popup and do what RET does without it."
 (for-each (lambda (b) (define-key! completion-map (car b) (cadr b)))
           '(("TAB" completion-next) ("C-n" completion-next) ("<down>" completion-next)
             ("S-TAB" completion-previous) ("<backtab>" completion-previous) ("C-p" completion-previous) ("<up>" completion-previous)
-            ("RET" completion-accept)))
+            ("RET" completion-accept) ("M-SPC" completion-insert-separator)))
 
 ;;; After each key: the open popup follows the typing, or closes; else,
 ;;; after typing an identifier's first characters and a pause, it opens.
 
-(define completion-commands '(completion-at-point completion-next completion-previous completion-accept))
+(define completion-commands '(completion-at-point completion-next completion-previous completion-accept completion-insert-separator))
 
 ;; Whether KEY typed or deleted text, so the popup may open.
 (define (typed? s key)
@@ -201,7 +222,7 @@ With none selected, close the popup and do what RET does without it."
           (else
            (let ((p (point s))
                  (start (document-map-position d (popup-start pop) (popup-revision pop))))
-             (if (or (not start) (< p start) (not (= (car (identifier-span d p)) start)))
+             (if (or (not start) (< p start) (not (continues? d start p (popup-separated pop))))
                  (close-completion! s)
                  (let* ((typed (document-substring d start p))
                         (matches (matcher-filter! (popup-matcher pop) typed)))
@@ -212,6 +233,13 @@ With none selected, close the popup and do what RET does without it."
                               (set-popup-matches! pop matches)
                               (set-popup-selected! pop -1)
                               (set-popup-offset! pop 0))))))))))
+
+;; Whether the text from START to P is still what the popup completes:
+;; one identifier, or, after a separator, identifiers and spaces.
+(define (continues? d start p separated)
+  (if separated
+      (every (lambda (c) (or (identifier-char? c) (char=? c #\space))) (string->list (document-substring d start p)))
+      (= (car (identifier-span d p)) start)))
 
 (define (completion-after-key s key)
   (cond ((popup s) (follow! s key))
