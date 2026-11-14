@@ -180,6 +180,7 @@ separator and Orderless have it."
           (popup-saw! pop start typed)
           (set-popup-separated! pop #t)
           (set-popup-typed! pop typed)
+          (set-popup-matches! pop (matcher-filter! (popup-matcher pop) typed))
           (set-popup-selected! pop -1)
           (set-popup-offset! pop 0)))))
 

@@ -58,7 +58,28 @@
 (type-text s " ")
 (check "without a separator a space still ends completion" #f (editor-completion s))
 (check "the ordinary space stays in the document" "(vector-ref (vec " (text))
-(check "no command errors" #f (sget s 'message))
+
+;; M-SPC commits a preview, not the original query: the matcher must
+;; narrow to that committed text before either direction can select again.
+(let ((before (text)))
+  (type-text s "(ref")
+  (press-keys s "C-M-i C-n C-n")
+  (check "the second candidate is previewed" (string-append before "(ref-vector") (text))
+  (press-keys s "M-SPC")
+  (check "the separator commits the preview" (string-append before "(ref-vector ") (text))
+  (check "committing a preview refilters the popup" '("ref-vector") (shown))
+  (press-keys s "C-n")
+  (check "next selects only a match of the committed preview" (string-append before "(ref-vector") (text))
+  (press-keys s "C-n")
+  (check "cycling returns to the committed prompt" (string-append before "(ref-vector ") (text))
+  (press-keys s "C-p")
+  (check "previous selects only a match of the committed preview" (string-append before "(ref-vector") (text))
+  (check "preview navigation reports no command error" #f (sget s 'message))
+  (press-keys s "C-g")
+  (check "cancel restores the committed preview and separator" (string-append before "(ref-vector ") (text))
+  (check "cancel closes the popup" #f (editor-completion s)))
+
+(check "cancellation reports Quit" "Quit" (sget s 'message))
 (check "no contract violations" '() (take-violations! s))
 
 (test-failures)
