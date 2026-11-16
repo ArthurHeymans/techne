@@ -118,6 +118,9 @@ pub(crate) struct Shared {
     next_client: u64,
     /// The generation of the runtime whose thread ended last.
     ended: u64,
+    /// Whether it runs with no frontend attached, as a daemon (`Daemon`):
+    /// the last detaching does not stop it.
+    daemon: bool,
 }
 
 struct Frontend {
@@ -149,19 +152,7 @@ impl Host {
         setup: impl Fn(&mut Runtime) + Send + Sync + 'static,
         deliver: impl Fn(Event) + Send + Sync + 'static,
     ) -> Host {
-        let shared = Arc::new(Mutex::new(Shared {
-            setup: Arc::new(setup),
-            generation: 0,
-            inputs: None,
-            thread: None,
-            fence: Fence::default(),
-            given_up: None,
-            order: Arc::default(),
-            sent: 0,
-            frontends: BTreeMap::new(),
-            next_client: 0,
-            ended: 0,
-        }));
+        let shared = shared(Arc::new(setup), false);
         attach(&shared, file, profile, Arc::new(deliver))
     }
 
@@ -298,7 +289,7 @@ impl Host {
             if let Some(f) = f {
                 f.interrupts.kill_before(f.sent);
             }
-            if !s.frontends.is_empty() {
+            if !s.frontends.is_empty() || s.daemon {
                 return;
             }
             if let Some(tx) = s.inputs.take() {
@@ -342,6 +333,112 @@ impl Host {
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn shared(setup: Setup, daemon: bool) -> Arc<Mutex<Shared>> {
+    Arc::new(Mutex::new(Shared {
+        setup,
+        generation: 0,
+        inputs: None,
+        thread: None,
+        fence: Fence::default(),
+        given_up: None,
+        order: Arc::default(),
+        sent: 0,
+        frontends: BTreeMap::new(),
+        next_client: 0,
+        ended: 0,
+        daemon,
+    }))
+}
+
+/// A runtime run with no frontend attached, as `emacs --daemon` runs:
+/// frontends attach to it over its socket (`listen`, `attach`), and it
+/// runs on when the last detaches, until it is told to stop. One that
+/// crashes with none attached is started again here; with some, they
+/// start it again, as they do a runtime of their own.
+pub struct Daemon {
+    shared: Arc<Mutex<Shared>>,
+}
+
+/// The most times a daemon's runtime is started again within
+/// `RESTARTS_WITHIN` before the daemon gives up.
+const RESTARTS: usize = 5;
+const RESTARTS_WITHIN: Duration = Duration::from_secs(60);
+
+impl Daemon {
+    /// Start a runtime on a new thread, `setup` it, with no frontend.
+    pub fn start(setup: impl Fn(&mut Runtime) + Send + Sync + 'static) -> Daemon {
+        let shared = shared(Arc::new(setup), true);
+        spawn(&shared, &mut shared.lock().expect("the host"));
+        Daemon { shared }
+    }
+
+    /// Serve other programs, and frontends of other processes, on
+    /// `socket`, as `Host::listen`.
+    pub fn listen(&self, socket: &std::path::Path) -> std::io::Result<Option<crate::server::Listener>> {
+        crate::server::listen(self.shared.clone(), socket)
+    }
+
+    /// Run until `stop` says to: start the runtime again when it ended with
+    /// no frontend attached to do it. An error when it keeps ending.
+    pub fn run(&self, stop: impl Fn() -> bool) -> Result<(), String> {
+        let mut restarts: VecDeque<Instant> = VecDeque::new();
+        while !stop() {
+            std::thread::sleep(Duration::from_millis(100));
+            let ended = {
+                let mut s = self.shared.lock().expect("the host");
+                if s.inputs.is_some() || !s.frontends.is_empty() {
+                    continue;
+                }
+                s.thread.take()
+            };
+            // Joined unlocked: it locks as it ends. One given up is left.
+            if let Some(t) = ended.filter(|t| t.is_finished()) {
+                let _ = t.join();
+            }
+            restarts.retain(|at| at.elapsed() < RESTARTS_WITHIN);
+            if restarts.len() >= RESTARTS {
+                return Err(format!("the runtime stopped {RESTARTS} times within {} s", RESTARTS_WITHIN.as_secs()));
+            }
+            restarts.push_back(Instant::now());
+            let mut s = self.shared.lock().expect("the host");
+            if s.inputs.is_none() && s.frontends.is_empty() {
+                spawn(&self.shared, &mut s);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop the runtime, detaching the frontends attached, and wait for it
+    /// `CLOSE_WAIT` at most, as the last frontend closing does.
+    pub fn stop(self) {
+        let thread = {
+            let mut s = self.shared.lock().expect("the host");
+            let frontends = std::mem::take(&mut s.frontends);
+            if let Some(tx) = s.inputs.take() {
+                // Each detaches as it does closing, its session's state
+                // (minibuffer histories) kept, before the runtime stops.
+                for (&client, f) in &frontends {
+                    let _ = tx.send(Msg::Input(client, Input::Close, f.backlog.admit(&Input::Close)));
+                }
+                let _ = tx.send(Msg::Stop);
+            }
+            let delivers: Vec<Deliver> = frontends.into_values().map(|f| f.deliver).collect();
+            drop(s);
+            delivers.iter().for_each(|d| d(Event::Failed("the editor was stopped".into())));
+            self.shared.lock().expect("the host").thread.take()
+        };
+        if let Some(t) = thread {
+            let deadline = Instant::now() + CLOSE_WAIT;
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -531,6 +628,7 @@ fn route(shared: &Mutex<Shared>, generation: u64, client: Client, output: Output
             if detached { s.frontends.remove(&client).map(|f| f.deliver) } else { s.frontends.get(&client).map(|f| f.deliver.clone()) };
         if detached
             && s.frontends.is_empty()
+            && !s.daemon
             && let Some(tx) = s.inputs.take()
         {
             let _ = tx.send(Msg::Stop);

@@ -53,6 +53,10 @@ use crate::{
     server::{OpenError, Request},
 };
 
+/// The version of the protocol below: an editor refuses a frontend that
+/// speaks another, as a techne of another build on another machine may.
+pub const VERSION: u32 = 1;
+
 /// Largest frame of an attachment: an image's pixels and a captured frame
 /// cross it whole. The peer runs as the same user, as the socket's
 /// directory is private: this bounds mistakes, not an adversary.
@@ -216,7 +220,12 @@ fn enqueue(waiting: &Waiting, connection: &UnixStream, event: Event) {
 /// Attach the frontend at the other end of `stream`, which asked to
 /// (`Request::Attach`), to the runtime of `shared`, and serve it until it
 /// detaches or its connection ends.
-pub(crate) fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream, profile: String, path: Option<PathBuf>) {
+pub(crate) fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream, profile: String, path: Option<PathBuf>, version: u32) {
+    if version != VERSION {
+        let why = format!("the editor speaks version {VERSION} of the attachment protocol, the frontend {version}: run the same techne");
+        let _ = write_frame(&mut stream, &Down::Failed(why));
+        return;
+    }
     let file = match path.map(|path| journal_for(&path).map(|journal| File { path, journal })).transpose() {
         Ok(file) => file,
         Err(e) => {
@@ -491,7 +500,10 @@ fn apply(rope: &mut Rope, text: Text) -> Result<(), String> {
 /// An attachment to an editor in another process, through its socket: what
 /// a frontend does with a `Host`, it does with this.
 pub struct Remote {
-    stream: UnixStream,
+    /// To the editor: its socket, or a program relaying to it (`relay`).
+    out: Box<dyn Write + Send>,
+    /// Ends the connection, when dropped: after `out`, declared before.
+    _end: EndOnDrop,
     /// The keys and clicks sent, numbered from 1.
     numbered: u64,
     /// Those sent and not answered yet, by number, with when they were
@@ -526,13 +538,61 @@ impl Remote {
         path: Option<&Path>,
         deliver: impl Fn(Event) + Send + 'static,
     ) -> Result<Remote, OpenError> {
-        let mut stream = UnixStream::connect(socket).map_err(|_| OpenError::NotRunning)?;
+        let stream = UnixStream::connect(socket).map_err(|_| OpenError::NotRunning)?;
         let failed = |e: std::io::Error| OpenError::Failed(e.to_string());
         let path = path.map(std::path::absolute).transpose().map_err(failed)?;
-        crate::server::write_request(&mut stream, &Request::Attach { profile: profile.into(), file: path }).map_err(failed)?;
+        let (input, ender) = (stream.try_clone().map_err(failed)?, stream.try_clone().map_err(failed)?);
+        let end = move || drop(ender.shutdown(std::net::Shutdown::Both));
+        Remote::over(input, stream, end, profile, path, deliver)
+    }
+
+    /// Attach to the editor on the other end of `command`'s standard input
+    /// and output: `techne attach --stdio` there (`relay`), say through
+    /// ssh. `path` is the file's on the editor's machine. What the command
+    /// writes to its standard error goes to this process's.
+    pub fn attach_through(
+        command: &[String],
+        profile: &str,
+        path: Option<PathBuf>,
+        deliver: impl Fn(Event) + Send + 'static,
+    ) -> Result<Remote, OpenError> {
+        let (program, args) = command.split_first().ok_or_else(|| OpenError::Failed("no command to attach through".into()))?;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| OpenError::Failed(format!("{program}: {e}")))?;
+        let (to, from) = (child.stdin.take(), child.stdout.take());
+        // However attaching ends, the command is ended and reaped.
+        let mut end = move || {
+            let _ = child.kill();
+            let _ = child.wait();
+        };
+        let (Some(to), Some(from)) = (to, from) else {
+            end();
+            return Err(OpenError::Failed(format!("{program}: no pipes")));
+        };
+        Remote::over(from, to, end, profile, path, deliver)
+    }
+
+    /// Attach over a connection read from `input` and written to `out`,
+    /// which `end` ends.
+    fn over(
+        input: impl Read + Send + 'static,
+        mut out: impl Write + Send + 'static,
+        end: impl FnOnce() + Send + 'static,
+        profile: &str,
+        path: Option<PathBuf>,
+        deliver: impl Fn(Event) + Send + 'static,
+    ) -> Result<Remote, OpenError> {
+        // Ended if what follows fails, with the guard.
+        let end = EndOnDrop(Some(Box::new(end)));
+        let failed = |e: std::io::Error| OpenError::Failed(e.to_string());
+        let request = Request::Attach { profile: profile.into(), file: path, version: VERSION };
+        crate::server::write_request(&mut out, &request).map_err(failed)?;
         let waiting = Arc::<Mutex<VecDeque<(u64, Instant)>>>::default();
         let captures = Arc::<Mutex<Captures>>::default();
-        let input = stream.try_clone().map_err(failed)?;
         let (w, c) = (waiting.clone(), captures.clone());
         std::thread::Builder::new()
             .name("attachment in".into())
@@ -541,7 +601,7 @@ impl Remote {
                 deliver(Event::Failed(why));
             })
             .map_err(failed)?;
-        Ok(Remote { stream, numbered: 0, waiting, captures })
+        Ok(Remote { out: Box::new(out), _end: end, numbered: 0, waiting, captures })
     }
 
     /// Send an input. C-g interrupts what the runtime does for this
@@ -551,7 +611,7 @@ impl Remote {
             self.numbered += 1;
             self.waiting.lock().expect("the waiting").push_back((self.numbered, *at));
         }
-        let _ = write_frame(&mut self.stream, &Up::Input(input));
+        let _ = write_frame(&mut self.out, &Up::Input(input));
     }
 
     /// When the runtime is busy, as far as this frontend can tell: as
@@ -565,20 +625,32 @@ impl Remote {
     pub fn captured(&mut self, id: usize, result: Result<CapturedFrame, String>) {
         let asked = self.captures.lock().expect("the captures").asked.remove(&id);
         if let Some((generation, id)) = asked {
-            let _ = write_frame(&mut self.stream, &Up::Captured { generation, id, result });
+            let _ = write_frame(&mut self.out, &Up::Captured { generation, id, result });
         }
     }
 
     /// Detach: the connection ends.
     pub fn close(self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        drop(self);
+    }
+}
+
+/// Runs what ends a connection when dropped: when attaching fails part way
+/// as when the frontend detaches, a relay is never left running.
+struct EndOnDrop(Option<Box<dyn FnOnce() + Send>>);
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        if let Some(end) = self.0.take() {
+            end();
+        }
     }
 }
 
 /// Deliver what comes on `input` as outputs, until the connection ends
 /// (Ok) or a message cannot be read or applied (why).
 fn receive(
-    mut input: UnixStream,
+    mut input: impl Read,
     waiting: &Mutex<VecDeque<(u64, Instant)>>,
     captures: &Mutex<Captures>,
     deliver: &impl Fn(Event),
@@ -703,6 +775,148 @@ impl Link {
     }
 }
 
+// Reaching an editor
+
+/// Where a frontend attaches: to the editor running here, or on another
+/// machine through ssh (`ssh_command`).
+pub enum Target {
+    Here,
+    /// An ssh destination, as `ssh` takes it: a host, `user@host`, or an
+    /// alias of its configuration.
+    Ssh(String),
+}
+
+/// Attach a frontend, as `Remote::attach` does, to the editor at `target`;
+/// with `start`, one started there first if none runs (`techne daemon`).
+/// Through ssh, `path` is the file's there, and must be absolute.
+pub fn attach_to(
+    target: &Target,
+    start: bool,
+    profile: &str,
+    path: Option<&Path>,
+    deliver: impl Fn(Event) + Send + 'static,
+) -> Result<Remote, OpenError> {
+    match target {
+        Target::Here => {
+            let socket = crate::server::socket().ok_or(OpenError::NotRunning)?;
+            if start {
+                running(&socket).map_err(OpenError::Failed)?;
+            }
+            Remote::attach(&socket, profile, path, deliver)
+        }
+        Target::Ssh(destination) => {
+            if let Some(p) = path.filter(|p| !p.is_absolute()) {
+                return Err(OpenError::Failed(format!(
+                    "{}: through ssh, the file's path is the editor's, and must be absolute",
+                    p.display()
+                )));
+            }
+            Remote::attach_through(&ssh_command(destination, start), profile, path.map(Path::to_path_buf), deliver)
+        }
+    }
+}
+
+/// The command attaching through ssh to `destination`: `techne attach
+/// --stdio` run there, with `--start` if `start`. `TECHNE_SSH` is the ssh
+/// command (`ssh` by default; words, as `ssh -p 2222`), and
+/// `TECHNE_REMOTE_PROGRAM` techne's name there (`techne` by default, found
+/// in the remote shell's PATH). Authentication and encryption are ssh's;
+/// the escape character is off, so no byte of the protocol is taken for
+/// one.
+pub fn ssh_command(destination: &str, start: bool) -> Vec<String> {
+    let ssh = std::env::var("TECHNE_SSH").unwrap_or_else(|_| "ssh".into());
+    let techne = std::env::var("TECHNE_REMOTE_PROGRAM").unwrap_or_else(|_| "techne".into());
+    ssh_command_with(&ssh, &techne, destination, start)
+}
+
+/// `ssh_command`, with SSH the ssh command and TECHNE techne's name there.
+/// The destination comes after `--`, so that one beginning with `-` is a
+/// destination, never an option (`-oProxyCommand=...` runs a command).
+fn ssh_command_with(ssh: &str, techne: &str, destination: &str, start: bool) -> Vec<String> {
+    let mut command: Vec<String> = ssh.split_whitespace().map(String::from).collect();
+    command.extend(["-T", "-e", "none", "--", destination].map(String::from));
+    command.extend([techne.into(), "attach".into(), "--stdio".into()]);
+    if start {
+        command.push("--start".into());
+    }
+    command
+}
+
+/// Relay this process's standard input and output to the editor running
+/// here, until it ends the connection: `techne attach --stdio`, the other
+/// end of `ssh_command`. With `start`, an editor is started first if none
+/// runs. With none, the frontend is told why, as an editor would tell it.
+pub fn relay(start: bool) -> Result<(), String> {
+    let socket = crate::server::socket().ok_or("no XDG_RUNTIME_DIR for the editor's socket")?;
+    if start {
+        running(&socket)?;
+    }
+    let Ok(stream) = UnixStream::connect(&socket) else {
+        let why = "no editor is running there (attach with --start to start one)".to_string();
+        let _ = read_frame::<Request>(&mut std::io::stdin().lock());
+        let _ = write_frame(&mut std::io::stdout().lock(), &Down::Failed(why.clone()));
+        return Err(why);
+    };
+    let mut to_editor = stream.try_clone().map_err(|e| e.to_string())?;
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_editor);
+        let _ = to_editor.shutdown(std::net::Shutdown::Write);
+    });
+    // Written as it comes: standard output is buffered by lines.
+    let (mut from_editor, mut out) = (stream, std::io::stdout().lock());
+    let mut buf = vec![0; 64 << 10];
+    loop {
+        match from_editor.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => out.write_all(&buf[..n]).and_then(|()| out.flush()).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// How long a daemon started may take to listen.
+const START_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Make sure an editor listens on `socket`: if none does, start `techne
+/// daemon` (this program), in a process group of its own, so that it
+/// outlives what started it, writing what it says to `daemon.log` beside
+/// the socket; and wait until it listens.
+fn running(socket: &Path) -> Result<(), String> {
+    if UnixStream::connect(socket).is_ok() {
+        return Ok(());
+    }
+    let program = std::env::current_exe().map_err(|e| e.to_string())?;
+    let log_path = socket.with_file_name("daemon.log");
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let mut daemon = std::process::Command::new(&program);
+    std::os::unix::process::CommandExt::process_group(&mut daemon, 0);
+    let mut daemon = daemon
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    let deadline = Instant::now() + START_WAIT;
+    loop {
+        if UnixStream::connect(socket).is_ok() {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = daemon.try_wait() {
+            // Another started one meanwhile, and this one found it.
+            if UnixStream::connect(socket).is_ok() {
+                return Ok(());
+            }
+            return Err(format!("techne daemon ended ({status}); see {}", log_path.display()));
+        }
+        if Instant::now() > deadline {
+            return Err(format!("techne daemon did not listen in {} s; see {}", START_WAIT.as_secs(), log_path.display()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +974,23 @@ mod tests {
         let mut rope = Rope::from_str("é");
         assert!(apply(&mut rope, Text::Splice { at: 1, removed: 0, inserted: "x".into() }).is_err());
         assert!(apply(&mut rope, Text::Splice { at: 0, removed: 3, inserted: String::new() }).is_err());
+    }
+
+    /// The command run through ssh: options first, then techne there.
+    #[test]
+    fn the_ssh_command() {
+        assert_eq!(
+            ssh_command_with("ssh", "techne", "me@box", false),
+            ["ssh", "-T", "-e", "none", "--", "me@box", "techne", "attach", "--stdio"]
+        );
+        assert_eq!(
+            ssh_command_with("ssh -p 2222", "/opt/techne", "box", true),
+            ["ssh", "-p", "2222", "-T", "-e", "none", "--", "box", "/opt/techne", "attach", "--stdio", "--start"]
+        );
+        // An option it looks like is the destination's name.
+        let command = ssh_command_with("ssh", "techne", "-oProxyCommand=touch /tmp/x", false);
+        let dashes = command.iter().position(|a| a == "--").unwrap();
+        assert_eq!(command[dashes + 1], "-oProxyCommand=touch /tmp/x");
     }
 
     /// Keys and clicks the runtime refused are answered with those it took

@@ -50,13 +50,15 @@
 (define (start-session view profile-name)
   "Start a session for a frontend attaching, keys read by PROFILE-NAME.
 It shows VIEW; with VIEW #f, it shows what the current session shows,
-or else an empty *scratch*. PROFILE-NAME is \"emacs\" or \"modal\".
-Return the session, now the current one."
+or else what the last session to end showed (a daemon's frontends come
+and go), or else an empty *scratch*. PROFILE-NAME is \"emacs\" or
+\"modal\". Return the session, now the current one."
   ;; *Messages* is a buffer from the start, as in Emacs.
   (unless (buffer-named "*Messages*")
     (make-generated-buffer! "*Messages*" (messages-document) 'log-mode))
   (let* ((view (cond (view view)
                      ((current-session) (view-split (pane-view (current-session))))
+                     ((and %last-shown (document-buffer %last-shown)) (make-view %last-shown "user"))
                      (else (make-view (make-document "") "user"))))
          (s (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile))))
     ;; Attached first: the buffer's hooks run in the session showing it.
@@ -64,10 +66,14 @@ Return the session, now the current one."
     (add-buffer! (view-document view))
     s))
 
+;; The document the last session to end showed, if one did.
+(define %last-shown #f)
+
 (define (editor-detach! s)
   "End the session S of a frontend detaching.
 The buffers it showed stay, with their unsaved edits; the minibuffer
 histories are written where they are kept (`keep-histories!`)."
+  (set! %last-shown (view-document (pane-view s)))
   (detach-session! s)
   (save-histories!))
 

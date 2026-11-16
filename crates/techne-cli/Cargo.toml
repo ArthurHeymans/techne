@@ -28,6 +28,8 @@ techne-lsp = { path = "../techne-lsp", features = ["counting-allocator"] }
 techne-host = { path = "../techne-host" }
 techne-sandbox = { path = "../techne-sandbox" }
 tokio = { version = "1", features = ["rt", "time"] }
+# Stopping `techne daemon` on SIGTERM, SIGINT and SIGHUP.
+signal-hook = "0.4"
 techne-window = { path = "../techne-window", optional = true }
 techne-term = { path = "../techne-term", optional = true }
 # The editor's socket, for `techne eval`.

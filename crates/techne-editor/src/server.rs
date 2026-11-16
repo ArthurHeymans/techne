@@ -56,11 +56,14 @@ pub enum Request {
     StopRecording,
     /// Attach a frontend, its keys read by `profile`, showing the file at
     /// `file` (absolute) or what the session used last shows: what comes
-    /// after on the connection is the attachment's (`attach`).
+    /// after on the connection is the attachment's (`attach`), in the
+    /// protocol's `version` (`attach::VERSION`), refused if not this one's.
     Attach {
         profile: String,
         #[serde(default)]
         file: Option<PathBuf>,
+        #[serde(default)]
+        version: u32,
     },
     /// Evaluate `source` in `module` (`"user"` if none), in the session
     /// used last or, `detached`, in one no frontend shows, for
@@ -351,10 +354,10 @@ fn serve_capture(shared: &Mutex<Shared>, mut stream: UnixStream, path: PathBuf, 
 fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream) {
     let _ = stream.set_read_timeout(Some(REQUEST_WAIT));
     let Ok(Some(request)) = read_frame::<Request>(&mut stream) else { return };
-    if let Request::Attach { profile, file } = request {
+    if let Request::Attach { profile, file, version } = request {
         // Read and written as long as the frontend is attached.
         let _ = stream.set_read_timeout(None);
-        crate::attach::serve(shared, stream, profile, file);
+        crate::attach::serve(shared, stream, profile, file, version);
         return;
     }
     let _ = stream.set_write_timeout(Some(REQUEST_WAIT));

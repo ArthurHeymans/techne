@@ -20,7 +20,9 @@
 //! `emacsclient --create-frame` does a frame: a session of its own in its
 //! runtime, over its socket (`techne_editor::attach`). The window an editor
 //! started in closing, the editor runs on for those attached, until the
-//! last detaches.
+//! last detaches. `--ssh DEST` attaches to the editor running on another
+//! machine, through ssh (`techne attach --stdio` there); `--start` starts
+//! one (`techne daemon`) when none runs, here or there.
 //!
 //! `--bench N` types N keys by itself and reports the time from each key to
 //! the frame that shows its effect (with `TECHNE_BENCH_SLOW` set, also each
@@ -48,7 +50,7 @@ use std::{
 
 use glyphon::Buffer;
 use techne_editor::{
-    attach::{Link, Remote},
+    attach::{Link, Target},
     host::{Event, File, Host},
     present::{Color, CursorShape, Input, Output, Slant, Style, StyleId, Underline, Weight},
     runtime::journal_for,
@@ -83,6 +85,10 @@ struct Args {
     wait: bool,
     /// Be a window on the editor running, not an editor.
     attach: bool,
+    /// The editor's machine, through ssh, when it is not this one.
+    ssh: Option<String>,
+    /// Start an editor to attach to when none runs.
+    start: bool,
     screenshot: Option<PathBuf>,
     record: Option<PathBuf>,
     stop_recording: bool,
@@ -91,7 +97,7 @@ struct Args {
 }
 
 const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [--open] [--wait] [FILE]\n\
-  techne window --attach [--modal] [--font FAMILY] [--size PT] [FILE]\n\
+  techne window --attach [--ssh DEST] [--start] [--modal] [--font FAMILY] [--size PT] [FILE]\n\
   techne window --screenshot NEW.png\n\
   techne window --record NEW-DIR [--record-frames 1..300] [--record-interval 50..10000]\n\
   techne window --stop-recording\n\
@@ -109,6 +115,8 @@ fn args(args: Vec<String>) -> Result<Args, String> {
         open: false,
         wait: false,
         attach: false,
+        ssh: None,
+        start: false,
         screenshot: None,
         record: None,
         stop_recording: false,
@@ -128,6 +136,8 @@ fn args(args: Vec<String>) -> Result<Args, String> {
             "--open" => a.open = true,
             "--wait" => (a.open, a.wait) = (true, true),
             "--attach" => a.attach = true,
+            "--ssh" => (a.attach, a.ssh) = (true, Some(it.next().ok_or(USAGE)?)),
+            "--start" => a.start = true,
             "--bench" => a.bench = Some(it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?),
             "--font" => a.font = it.next().ok_or(USAGE)?,
             "--size" => a.size = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
@@ -148,7 +158,7 @@ fn args(args: Vec<String>) -> Result<Args, String> {
     if a.open && a.path.is_none() {
         return Err(USAGE.into());
     }
-    if a.attach && (controls > 0 || a.open || a.bench.is_some() || a.load) {
+    if (a.attach && (controls > 0 || a.open || a.bench.is_some() || a.load)) || (a.start && !a.attach) {
         return Err(USAGE.into());
     }
     Ok(a)
@@ -213,6 +223,8 @@ struct App {
     mouse: (f32, f32),
     /// The window is closing: the runtime ending is no crash.
     quitting: bool,
+    /// It closes because the runtime failed, or the editor refused it.
+    failed: bool,
     unanswered: Vec<Instant>,
     latency: Latency,
     bench: Option<Bench>,
@@ -317,6 +329,7 @@ impl App {
                 Event::Failed(_) if self.quitting => {}
                 Event::Failed(e) | Event::Output(Output::Refused(e)) => {
                     eprintln!("techne: {e}");
+                    self.failed = true;
                     self.quit(event_loop);
                 }
                 Event::Ended if self.quitting => {}
@@ -1060,13 +1073,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
         let _ = proxy.send_event(Wake::Runtime);
     };
     let (host, _listener) = if args.attach {
-        let attached = server::socket()
-            .ok_or(server::OpenError::NotRunning)
-            .and_then(|socket| Remote::attach(&socket, &args.profile, args.path.as_deref(), deliver));
-        match attached {
+        let target = args.ssh.clone().map_or(Target::Here, Target::Ssh);
+        match techne_editor::attach::attach_to(&target, args.start, &args.profile, args.path.as_deref(), deliver) {
             Ok(remote) => (Link::Remote(remote), None),
             Err(server::OpenError::NotRunning) => {
-                eprintln!("techne: no editor is running to attach to");
+                eprintln!("techne: no editor is running to attach to (--start starts one)");
                 return ExitCode::FAILURE;
             }
             Err(server::OpenError::Failed(e)) => {
@@ -1093,6 +1104,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
         quitting: false,
+        failed: false,
         unanswered: Vec::new(),
         latency: Latency::default(),
         bench,
@@ -1103,7 +1115,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         capture_epoch: 0,
     };
     event_loop.run_app(&mut app).expect("the event loop");
-    let App { host, .. } = app;
+    let App { host, failed, .. } = app;
     let keep_serving = matches!(&host, Link::Local(h) if h.attached() > 1);
     if keep_serving {
         eprintln!("techne: windows attached from other processes keep the editor running until they close");
@@ -1112,5 +1124,5 @@ pub fn main(args: Vec<String>) -> ExitCode {
     if let Some(f) = file.filter(|_| !keep_serving && cleanup_bench) {
         let _ = std::fs::remove_file(&f.journal);
     }
-    ExitCode::SUCCESS
+    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }

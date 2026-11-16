@@ -18,6 +18,8 @@ usage: techne [SUBCOMMAND] [ARGS...]
   window [ARGS]            the editor in a window
   term [ARGS]              the editor in this terminal
   eval [ARGS] FORM         evaluate FORM in the editor running
+  daemon                   the editor with no frontend, for frontends to attach
+  attach --stdio [--start] relay to the editor running here (what ssh runs)
   run FILE [ARGS]          run a Scheme file
   repl                     a Lisp REPL in this terminal
   tool ROOT [FORM [SESSION]] bounded tools for callers; tool --help to begin
@@ -61,6 +63,8 @@ fn main() -> ExitCode {
         "window" => window(rest()),
         "term" => term(rest()),
         "eval" => eval(rest()),
+        "daemon" => daemon(rest()),
+        "attach" => attach(rest()),
         "run" => match rest() {
             file if file.is_empty() => usage(),
             file => techne_vm::cli::main_with(file, install),
@@ -200,6 +204,114 @@ fn eval(args: Vec<String>) -> ExitCode {
 
 #[cfg(not(any(feature = "window", feature = "term")))]
 fn eval(_: Vec<String>) -> ExitCode {
+    eprintln!("techne: built without the editor");
+    ExitCode::from(2)
+}
+
+const DAEMON_USAGE: &str = "\
+usage: techne daemon
+
+Run the editor with no frontend, as emacs --daemon does, until SIGTERM,
+SIGINT or SIGHUP: windows and terminals attach to it (techne window
+--attach, techne term --attach, here or through ssh), and it runs on when
+the last detaches. It listens on the editor's socket, as an editor started
+in a window does; another editor running there already, it ends. What it
+has to say goes to stderr. techne window --attach --start starts one when
+none runs.";
+
+/// `techne daemon`: the editor with no frontend, until a signal stops it.
+#[cfg(any(feature = "window", feature = "term"))]
+fn daemon(args: Vec<String>) -> ExitCode {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use techne_editor::{host::Daemon, server};
+    if !args.is_empty() {
+        eprintln!("{DAEMON_USAGE}");
+        return ExitCode::from(if matches!(args[0].as_str(), "-h" | "--help") { 0 } else { 2 });
+    }
+    let Some(socket) = server::socket() else {
+        eprintln!("techne daemon: no XDG_RUNTIME_DIR for the editor's socket");
+        return ExitCode::FAILURE;
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT, signal_hook::consts::SIGHUP] {
+        if let Err(e) = signal_hook::flag::register(signal, stop.clone()) {
+            eprintln!("techne daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let daemon = Daemon::start(|rt| {
+        if let Err(e) = rt.keep_histories(None) {
+            eprintln!("techne daemon: history: {e}");
+        }
+    });
+    let listener = match daemon.listen(&socket) {
+        Ok(Some(listener)) => listener,
+        Ok(None) => {
+            eprintln!("techne daemon: an editor is running already on {}", socket.display());
+            daemon.stop();
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("techne daemon: {}: {e}", socket.display());
+            daemon.stop();
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("techne daemon: listening on {} (pid {})", socket.display(), std::process::id());
+    let ran = daemon.run(|| stop.load(Ordering::Relaxed));
+    drop(listener);
+    daemon.stop();
+    match ran {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("techne daemon: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(any(feature = "window", feature = "term")))]
+fn daemon(_: Vec<String>) -> ExitCode {
+    eprintln!("techne: built without the editor");
+    ExitCode::from(2)
+}
+
+const ATTACH_USAGE: &str = "\
+usage: techne attach --stdio [--start]
+
+Relay standard input and output to the editor running on this machine:
+what techne window --attach --ssh HOST runs on HOST, through ssh. With
+--start, an editor is started first (techne daemon) if none runs.";
+
+/// `techne attach --stdio`: relay to the editor's socket.
+#[cfg(any(feature = "window", feature = "term"))]
+fn attach(args: Vec<String>) -> ExitCode {
+    let start = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--stdio"] => false,
+        ["--stdio", "--start"] | ["--start", "--stdio"] => true,
+        ["-h" | "--help"] => {
+            println!("{ATTACH_USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        _ => {
+            eprintln!("{ATTACH_USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    match techne_editor::attach::relay(start) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("techne attach: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(any(feature = "window", feature = "term")))]
+fn attach(_: Vec<String>) -> ExitCode {
     eprintln!("techne: built without the editor");
     ExitCode::from(2)
 }
