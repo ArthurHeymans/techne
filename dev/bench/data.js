@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794945050995,
+  "lastUpdate": 1794946212814,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -53045,6 +53045,315 @@ window.BENCHMARK_DATA = {
           {
             "name": "compile: load",
             "value": 59958,
+            "unit": "instructions per form"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8135fedc777eda297f38bf99724fefffdb902573",
+          "message": "editor: techne eval, code other programs evaluate in the running editor (#359)\n\nAn agent asked to look at or act on the editor in use could not: the\nsocket the editor listens on only opened files, so it could not read\n*Messages*, see why a command failed, or reload a package after a\nchange. Emacs has emacsclient --eval for this.\n\n`techne eval FORM` evaluates FORM in the editor running and prints what\nit wrote, then its value; an error goes to stderr with the frames it was\nraised in. As with emacsclient, it runs in the session used last, so\nwhat it shows is shown where you look; with --detached, in a session no\nfrontend shows, so an agent can work without moving your panes. It runs\nas an operation for the principal --as names, is killed past --timeout\n(10 s by default, 300 at most), and C-g in any frontend stops it, as the\neditor waits for it. *Server log* shows what was evaluated, for whom,\nand what came of it. Any program running as you can do this, as with\nEmacs's server; the option server-eval turns it off.\n\nRust carries the request over the socket, runs it as an execution of\nits own under a deadline, and lets C-g reach it (Interrupts::hold), all\nof which is the runtime's; choosing the session, evaluating, reporting\nand logging are Scheme (lisp/editor/server.scm).\n\nWhat an evaluation does is its principal's: commands it runs are\nrecorded as run for the principal, not the user (`%start-operation!`\nnow inherits the principal of the operation it starts in, the user's\nfor a key). One killed leaves no operation open: `operation-abandon!`\nends it and those under it, as cancelled. And the detached session's\nviews are its own, as attached sessions' are: a caret it moves in a\ndocument you also show is not yours.",
+          "timestamp": "2026-11-17T20:30:53+01:00",
+          "tree_id": "550985fcbea4751638ce2ae150f525167e5901bd",
+          "url": "https://github.com/ArthurHeymans/techne/commit/8135fedc777eda297f38bf99724fefffdb902573"
+        },
+        "date": 1794946211479,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "startup (jit)",
+            "value": 13478456,
+            "unit": "instructions"
+          },
+          {
+            "name": "startup (interp)",
+            "value": 13467945,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (jit)",
+            "value": 472086236,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (interp)",
+            "value": 2045805807,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (jit)",
+            "value": 534638494,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (interp)",
+            "value": 2561298483,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (jit)",
+            "value": 918793488,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (interp)",
+            "value": 3179961222,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens GC pause",
+            "value": 276,
+            "unit": "words"
+          },
+          {
+            "name": "bintrees (jit)",
+            "value": 3461546834,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees (interp)",
+            "value": 10389346243,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees GC pause",
+            "value": 393093,
+            "unit": "words"
+          },
+          {
+            "name": "hof (jit)",
+            "value": 813661729,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof (interp)",
+            "value": 3336574400,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof GC pause",
+            "value": 1048549,
+            "unit": "words"
+          },
+          {
+            "name": "qsort (jit)",
+            "value": 651495135,
+            "unit": "instructions"
+          },
+          {
+            "name": "qsort (interp)",
+            "value": 4234925150,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (jit)",
+            "value": 153275287,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (interp)",
+            "value": 2545944749,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (jit)",
+            "value": 534682020,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (interp)",
+            "value": 767921605,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash GC pause",
+            "value": 229418,
+            "unit": "words"
+          },
+          {
+            "name": "orgparse (jit)",
+            "value": 346001159,
+            "unit": "instructions"
+          },
+          {
+            "name": "orgparse (interp)",
+            "value": 1556329914,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (jit)",
+            "value": 437795847,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (interp)",
+            "value": 1725397068,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks GC pause",
+            "value": 327556,
+            "unit": "words"
+          },
+          {
+            "name": "numstr (jit)",
+            "value": 246530839,
+            "unit": "instructions"
+          },
+          {
+            "name": "numstr (interp)",
+            "value": 685351748,
+            "unit": "instructions"
+          },
+          {
+            "name": "tasks (jit)",
+            "value": 241828185,
+            "unit": "instructions"
+          },
+          {
+            "name": "tasks (interp)",
+            "value": 107677411,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor load (jit)",
+            "value": 6481,
+            "unit": "instructions per datum"
+          },
+          {
+            "name": "editor load (interp)",
+            "value": 6035,
+            "unit": "instructions per datum"
+          },
+          {
+            "name": "keys: type (jit)",
+            "value": 960523,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-long-line (jit)",
+            "value": 977530,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-long-word (jit)",
+            "value": 1113351,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-rust (jit)",
+            "value": 32726273,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-rust (jit)",
+            "value": 9410451,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-rust-big (jit)",
+            "value": 32737152,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-rust-big (jit)",
+            "value": 9401337,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: indent-after-long-line (jit)",
+            "value": 16528027,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move (jit)",
+            "value": 920983,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-modal (jit)",
+            "value": 897245,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-open (jit)",
+            "value": 16411956,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-first-key (jit)",
+            "value": 8180746,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-narrow (jit)",
+            "value": 6985001,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-delete (jit)",
+            "value": 1327586,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-yank-line (jit)",
+            "value": 25433731,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: command-first-key (jit)",
+            "value": 1393306,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: completion-filter (jit)",
+            "value": 20683900,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: completion-delete (jit)",
+            "value": 20375293,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "http: plaintext request (jit)",
+            "value": 7145,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: plaintext request (interp)",
+            "value": 8465,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: /work request (jit)",
+            "value": 226734,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: /work request (interp)",
+            "value": 683888,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "compile: read",
+            "value": 19806,
+            "unit": "instructions per form"
+          },
+          {
+            "name": "compile: load",
+            "value": 59951,
             "unit": "instructions per form"
           }
         ]
