@@ -314,6 +314,7 @@ impl App {
                     }
                 }
                 Event::Output(Output::Quit) => self.quit(event_loop),
+                Event::Failed(_) if self.quitting => {}
                 Event::Failed(e) | Event::Output(Output::Refused(e)) => {
                     eprintln!("techne: {e}");
                     self.quit(event_loop);
@@ -1021,7 +1022,8 @@ pub fn main(args: Vec<String>) -> ExitCode {
     }
     // A benchmark's edits are journaled in a temporary file, so they never
     // turn up as unsaved edits of the real one.
-    let file = args.path.clone().map(|path| {
+    // Only the runtime owner resolves the file and touches its journal.
+    let file = args.path.clone().filter(|_| !args.attach).map(|path| {
         let journal = if args.bench.is_some() {
             std::env::temp_dir().join(format!("techne-bench-{}.journal", std::process::id()))
         } else {
@@ -1078,6 +1080,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         let listener = args.bench.is_none().then(|| server::listen_for(&host)).flatten();
         (Link::Local(host), listener)
     };
+    let cleanup_bench = args.bench.is_some();
     let bench = args.bench.map(|keys| Bench { keys, sent: 0, next: Instant::now() });
     let mut app = App {
         args,
@@ -1101,13 +1104,12 @@ pub fn main(args: Vec<String>) -> ExitCode {
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, .. } = app;
-    if let Link::Local(h) = &host
-        && h.attached() > 1
-    {
+    let keep_serving = matches!(&host, Link::Local(h) if h.attached() > 1);
+    if keep_serving {
         eprintln!("techne: windows attached from other processes keep the editor running until they close");
     }
     host.close();
-    if let Some(f) = file.filter(|f| f.journal.starts_with(std::env::temp_dir())) {
+    if let Some(f) = file.filter(|_| !keep_serving && cleanup_bench) {
         let _ = std::fs::remove_file(&f.journal);
     }
     ExitCode::SUCCESS
