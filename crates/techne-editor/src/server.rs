@@ -3,6 +3,11 @@
 //! (`Host::listen`), and `techne --open FILE` asks it to show the file
 //! (`open`), with `--wait` until the file is done with
 //! (`lisp/editor/server.scm`), so that the editor serves as `$EDITOR`.
+//! `techne eval FORM` evaluates code in it (`eval`), as `emacsclient
+//! --eval` does: other programs, agents among them, can look at and act
+//! on the editor you are using. The socket's directory is private, so
+//! only programs running as you reach it; the option `server-eval` turns
+//! evaluation off.
 //!
 //! Messages are framed as the node protocol frames them (`techne-node`):
 //! MessagePack, each preceded by its length as a big-endian `u32`. A
@@ -49,6 +54,23 @@ pub enum Request {
         interval_ms: usize,
     },
     StopRecording,
+    /// Evaluate `source` in `module` (`"user"` if none), in the session
+    /// used last or, `detached`, in one no frontend shows, for
+    /// `principal` (who the operation runs for, as `current-principal`
+    /// says); killed past `timeout_ms` (`EVAL_TIMEOUT` if none, at most
+    /// `EVAL_TIMEOUT_MAX`), or by C-g in a frontend. Replied to with
+    /// `Evaluated` or `EvalFailed`.
+    Eval {
+        source: String,
+        #[serde(default)]
+        module: Option<String>,
+        #[serde(default)]
+        detached: bool,
+        #[serde(default)]
+        principal: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -56,8 +78,56 @@ pub enum Reply {
     Opened,
     Done,
     Failed(String),
-    Captured { path: String, snapshot: u64, width: u32, height: u32 },
-    Recording { path: String },
+    Captured {
+        path: String,
+        snapshot: u64,
+        width: u32,
+        height: u32,
+    },
+    Recording {
+        path: String,
+    },
+    /// The value evaluated, written (empty for none), and what the code
+    /// wrote to its output port.
+    Evaluated {
+        value: String,
+        output: String,
+    },
+    /// What the code raised, with the frames it was raised in, and what it
+    /// wrote before.
+    EvalFailed {
+        error: String,
+        output: String,
+    },
+}
+
+/// How long an evaluation may run unless its request says otherwise.
+pub const EVAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest an evaluation may be given: the editor waits for it.
+pub const EVAL_TIMEOUT_MAX: Duration = Duration::from_secs(300);
+
+/// What an evaluation came to: the value written, or the error with where
+/// it was raised; and its output.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Evaluation {
+    pub result: Result<String, String>,
+    pub output: String,
+}
+
+/// Evaluate as `request`, a `Request::Eval`, asks, in the editor
+/// listening on `socket`.
+pub fn eval(socket: &Path, request: &Request) -> Result<Evaluation, OpenError> {
+    let mut stream = UnixStream::connect(socket).map_err(|_| OpenError::NotRunning)?;
+    let failed = |e: std::io::Error| OpenError::Failed(e.to_string());
+    write_frame(&mut stream, request).map_err(failed)?;
+    match read_frame::<Reply>(&mut stream).map_err(failed)? {
+        Some(Reply::Evaluated { value, output }) => Ok(Evaluation { result: Ok(value), output }),
+        Some(Reply::EvalFailed { error, output }) => Ok(Evaluation { result: Err(error), output }),
+        Some(Reply::Failed(e)) => Err(OpenError::Failed(e)),
+        Some(other) => Err(OpenError::Failed(format!("unexpected reply {other:?}"))),
+        None => Err(OpenError::Failed("the editor stopped before the evaluation ended".into())),
+    }
 }
 
 /// Capture the running editor. The reply is sent only after Scheme saved
@@ -114,7 +184,9 @@ pub fn open(socket: &Path, path: &Path, wait: bool) -> Result<(), OpenError> {
             Some(Reply::Opened) => {}
             Some(Reply::Done) => return Ok(()),
             Some(Reply::Failed(e)) => return Err(OpenError::Failed(e)),
-            Some(Reply::Captured { .. } | Reply::Recording { .. }) => return Err(OpenError::Failed("unexpected capture reply".into())),
+            Some(other @ (Reply::Captured { .. } | Reply::Recording { .. } | Reply::Evaluated { .. } | Reply::EvalFailed { .. })) => {
+                return Err(OpenError::Failed(format!("unexpected reply {other:?}")));
+            }
             None => return Err(OpenError::Failed("the editor stopped before the file was done with".into())),
         }
     }
@@ -276,10 +348,46 @@ fn serve(shared: &Mutex<Shared>, mut stream: UnixStream) {
         serve_capture(shared, stream, path, Duration::from_millis(timeout_ms.unwrap_or(25_000).clamp(1, 25_000)));
         return;
     }
+    if let Request::Eval { source, module, detached, principal, timeout_ms } = request {
+        let deadline = timeout_ms.map_or(EVAL_TIMEOUT, |ms| Duration::from_millis(ms.max(1)).min(EVAL_TIMEOUT_MAX));
+        let module = module.unwrap_or_else(|| "user".into());
+        let principal = principal.unwrap_or_else(|| "techne eval".into());
+        let (tx, replies) = mpsc::channel();
+        let sent = {
+            let s = shared.lock().expect("the host");
+            let msg = Msg::Eval { source, module, detached, principal, deadline, reply: tx };
+            s.inputs.as_ref().is_some_and(|i| i.send(msg).is_ok()).then_some(s.generation)
+        };
+        let Some(generation) = sent else {
+            let _ = write_frame(&mut stream, &Reply::Failed("the editor is not running".into()));
+            return;
+        };
+        // The runtime answers once it has run it, or drops the sender as
+        // it ends; one given up keeps it, and is not waited for. A program
+        // gone is not answered: its evaluation runs to its end anyway.
+        loop {
+            match replies.recv_timeout(GONE_CHECK) {
+                Ok(reply) => {
+                    let _ = write_frame(&mut stream, &reply);
+                    return;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if gone(&stream) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) if shared.lock().expect("the host").given_up == Some(generation) => {
+                    let _ = write_frame(&mut stream, &Reply::Failed("the editor was restarted".into()));
+                    return;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = write_frame(&mut stream, &Reply::Failed("the editor stopped".into()));
+                    return;
+                }
+            }
+        }
+    }
     if !matches!(request, Request::Open { .. }) {
         let (tx, replies) = mpsc::channel();
         let msg = match request {
-            Request::Capture { .. } => unreachable!(),
+            Request::Capture { .. } | Request::Eval { .. } => unreachable!(),
             Request::Record { path, frames, interval_ms } => Msg::Recording { path: Some(path), frames, interval_ms, reply: tx },
             Request::StopRecording => Msg::Recording { path: None, frames: 0, interval_ms: 0, reply: tx },
             Request::Open { .. } => unreachable!(),
