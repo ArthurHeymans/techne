@@ -79,8 +79,10 @@
     (expect (source-head empty) (tool-show empty))
     (define definition (tool-read-symbol p "inline.rs" "one"))
     (expect '(#t #f #f) (map (lambda (key) (tool-ref definition key)) '(region-complete file-eof next-line)))
-    (define range-error (guard (e (#t (condition/report-string e))) (tool-files p #:limit 100)))
+    (define range-error (guard (e (#t (condition/report-string e))) (tool-files p #:limit 0)))
     (expect #t (and (string-contains range-error "expected 1 to 50") #t))
+    ;; A page past its ceiling is the ceiling.
+    (expect 6 (length (tool-ref (tool-files p #:limit 100) 'items)))
     ;; A window wider than its bound is the bound, with its continuation.
     (fixture-write root "tall" (apply string-append (map (lambda (i) "x\n") (iota 250))))
     (define tall (tool-read p "tall" #:lines 1000))

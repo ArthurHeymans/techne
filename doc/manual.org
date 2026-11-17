@@ -476,8 +476,9 @@ bounded 200-line, 16000-character read. For a known definition, use
 ~tool-read-symbol~ directly. Use ~tool-symbols~ to discover names, not as a
 mandatory preliminary read: pages default to an 8000-character rendered-label
 budget with a 50-item ceiling. ~#:chars~ (1 to 16000) and ~#:limit~ (1 to 50)
-can narrow these; ~next~ remains an item offset, not a character offset. A first
-oversized item is returned alone so the cursor advances, marked ~budget-exceeded~.
+can narrow these, and a wider ~#:limit~ gives 50 rather than an error;
+~next~ remains an item offset, not a character offset. A first oversized item
+is returned alone so the cursor advances, marked ~budget-exceeded~.
 ~characters~ counts rendered labels plus their joining newlines; full structured
 metadata and pagination notes are not part of that budget.
 

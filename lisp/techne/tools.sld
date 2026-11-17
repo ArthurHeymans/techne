@@ -44,10 +44,10 @@ Hidden files are listed (`.github/`), version control metadata (`.git`,
 generated directories not otherwise ignored (`.env`, `.direnv/`) in
 `.ignore`. At most 10000 files are walked, before PREFIX selects.
 Return LIMIT names at most, from OFFSET, and total, complete and next.
-LIMIT is 1 to 50. The revision hashes the cached file-name list, not
-file contents. Skipped and problems describe incomplete traversal. Call
-`tool-refresh!` to relist after files change."
-      (%response (%tool-files project prefix limit offset)))
+LIMIT is 1 to 50 (more gives 50). The revision hashes the cached
+file-name list, not file contents. Skipped and problems describe
+incomplete traversal. Call `tool-refresh!` to relist after files change."
+      (%response (%tool-files project prefix (%at-most limit 50) offset)))
 
     (define (tool-read project path #:from [from 1] #:lines [lines 200] #:chars [chars 16000])
       "Read a bounded region of PATH in PROJECT, starting at line FROM.
@@ -85,9 +85,10 @@ or foreign handle is an error; query again."
                          #:before [before 0] #:after [after 0] #:chars [chars 8000] #:group-by [group-by #f]
                          #:enclosing [enclosing 'auto])
       "Find literal QUERY in PROJECT, with context or grouped line counts.
-Search files whose names start with PREFIX. LIMIT is 1 to 50, OFFSET is
-an item offset. Normally items carry paths, revisions, lines and handles.
-Previews center on the match and contain at most 240 characters; inspect
+Search files whose names start with PREFIX. LIMIT is 1 to 50 (more
+gives 50), OFFSET is an item offset. Normally items carry paths,
+revisions, lines and handles. Previews center on the match and contain
+at most 240 characters; inspect
 preview-truncated and preview-offset for clipping, and column for the
 1-based Unicode match column. Each hit's handle still covers one line.
 BEFORE and AFTER, each 0 to 8 (more gives 8), add context from the SAME
@@ -117,16 +118,17 @@ Inspect enclosing-status and enclosing-complete: unavailable or partial
 syntax is not proof that a match has no owner. With partial syntax an
 owner is only a candidate. This is syntactic navigation, not semantic
 reference resolution. Grouped counts cannot request enclosing metadata."
-      (%response (%tool-search project query prefix limit offset (%at-most before 8) (%at-most after 8)
+      (%response (%tool-search project query prefix (%at-most limit 50) offset (%at-most before 8) (%at-most after 8)
                                chars group-by enclosing)))
 
     (define (tool-symbols project path #:name [name ""] #:limit [limit 50] #:offset [offset 0] #:chars [chars 8000])
       "List definitions of PATH in PROJECT with source spans and handles.
 NAME selects an exact name, or all names when empty. Page by CHARS rendered
 label characters (default 8000, 1 to 16000), with LIMIT as an additional item
-ceiling (default 50, 1 to 50), from item OFFSET. A first item exceeding CHARS
-is returned alone for progress, with budget-exceeded true. Characters counts
-the emitted labels and joining newlines. Follow next, not an assumed page size.
+ceiling (default 50, 1 to 50, more gives 50), from item OFFSET. A first
+item exceeding CHARS is returned alone for progress, with budget-exceeded
+true. Characters counts the emitted labels and joining newlines.
+Follow next, not an assumed page size.
 For a known small file prefer tool-read; for a known definition use
 tool-read-symbol directly. Scope distinguishes module, member, local
 and library definitions. Line and end-line are 1-based and inclusive.
@@ -135,7 +137,7 @@ Complete covers syntactic enumeration, not generated runtime bindings or
 conditional-compilation semantics. Scheme uses the exact reader.
 Other source languages reuse the editor language declarations and
 definition queries. Unsupported languages are an error, not guessed symbols."
-      (%response (%tool-symbols project path name limit offset chars)))
+      (%response (%tool-symbols project path name (%at-most limit 50) offset chars)))
 
     (define (tool-read-symbol project path name #:chars [chars 8000])
       "Read the single definition NAME in PATH of PROJECT, within CHARS.
@@ -193,9 +195,10 @@ conditional atomic rename, not a lock against other programs."
     (define (%count n max who)
       (unless (and (integer? n) (exact? n) (<= 1 n max))
         (error who (string-append "count out of range; expected 1 to " (number->string max)) n)))
-    ;; A window wider than its bound is the bound, not an error: the reply
-    ;; says where the rest is, and one wide request in a batch does not
-    ;; lose the batch's other answers. Anything else is checked as before.
+    ;; A window or page wider than its bound is the bound, not an error:
+    ;; the reply says where the rest is (next, truncated), and one wide
+    ;; request in a batch does not lose the batch's other answers.
+    ;; Anything else is checked as before.
     (define (%at-most n max)
       (if (and (integer? n) (exact? n)) (min n max) n))
     (define (%offset n)
@@ -222,11 +225,12 @@ registry: a library's bindings once it is imported. Short of every word,
 libraries lists exports of the libraries shipped in lisp/ whose names
 have more of them, with the library to import for each: 8 at most,
 first by name, of libraries-total. Prefer name matches;
-return signatures, short docs and source locations. LIMIT is 1 to 50;
-OFFSET pages the results. Discovery is a live view, not a stable
-snapshot. Lexical variables inside a CLI form are not module bindings.
-Use `tool-describe` for full docs or signatures; a clipped signature has
-an explicit signature-truncated flag."
+return signatures, short docs and source locations. LIMIT is 1 to 50
+(more gives 50); OFFSET pages the results. Discovery is a live view,
+not a stable snapshot. Lexical variables inside a CLI form are not
+module bindings. Use `tool-describe` for full docs or signatures; a
+clipped signature has an explicit signature-truncated flag."
+      (set! limit (%at-most limit 50))
       (%count limit 50 "tool-discover") (%offset offset)
       (let* ((words (delete-duplicates
                      (remove (lambda (s) (string=? s "")) (string-split (string-downcase query) " "))))
@@ -491,10 +495,11 @@ again, or cancel it. Timed-out says its own timeout killed it."
     (define (tool-find project handle query #:limit [limit 8] #:offset [offset 0])
       "Find lines containing literal QUERY in PROJECT's snapshot HANDLE.
 HANDLE is any reply's: a file read, a search hit, or a process stream
-kept with `tool-run` #:keep. Return at most LIMIT items, 1 to 50, from
-OFFSET, with line numbers in the snapshot's file and a handle per line.
+kept with `tool-run` #:keep. Return at most LIMIT items, 1 to 50 (more
+gives 50), from OFFSET, with line numbers in the snapshot's file and a
+handle per line.
 Unlike `tool-search`, this reads the snapshot, not the disk."
-      (%response (%tool-find project handle query limit offset)))
+      (%response (%tool-find project handle query (%at-most limit 50) offset)))
 
     (define (tool-lines project handle #:from [from 1] #:lines [lines 40] #:chars [chars 8000])
       "Read LINES lines, 1 to 200, from line FROM of PROJECT's snapshot HANDLE.
@@ -525,14 +530,15 @@ names the files written. From the CLI, pass PATCH on stdin with
 It waits for the end. Those are the lines of either stream containing
 any literal of PATTERNS, by default a compiler's errors and a test
 run's failures and results, each once, stdout's first, in order, at
-most LIMIT items, 1 to 50; CONTEXT, 0 to 40, adds that many lines
-after each, a hit among the lines returned shown there. Total counts
-the matching lines; truncated says some are in no item. The first
+most LIMIT items, 1 to 50 (more gives 50); CONTEXT, 0 to 40, adds that
+many lines after each, a hit among the lines returned shown there.
+Total counts the matching lines; truncated says some are in no item. The first
 1048576 characters of each stream are kept and searched: lost and
 complete #f say there was more. The result names both streams' handles
 for `tool-find` and `tool-lines`, and their tails, which `tool-show`
 shows when nothing matched and it failed. TIMEOUT and ENVIRONMENT are
 `tool-run`'s."
+      (set! limit (%at-most limit 50))
       (%count limit 50 "tool-check")
       (unless (and (integer? context) (exact? context) (<= 0 context 40))
         (error "tool-check: context is 0 to 40 lines" context))
