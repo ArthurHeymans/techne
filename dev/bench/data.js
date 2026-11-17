@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794946212814,
+  "lastUpdate": 1794946214679,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -55345,6 +55345,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 106428,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8135fedc777eda297f38bf99724fefffdb902573",
+          "message": "editor: techne eval, code other programs evaluate in the running editor (#359)\n\nAn agent asked to look at or act on the editor in use could not: the\nsocket the editor listens on only opened files, so it could not read\n*Messages*, see why a command failed, or reload a package after a\nchange. Emacs has emacsclient --eval for this.\n\n`techne eval FORM` evaluates FORM in the editor running and prints what\nit wrote, then its value; an error goes to stderr with the frames it was\nraised in. As with emacsclient, it runs in the session used last, so\nwhat it shows is shown where you look; with --detached, in a session no\nfrontend shows, so an agent can work without moving your panes. It runs\nas an operation for the principal --as names, is killed past --timeout\n(10 s by default, 300 at most), and C-g in any frontend stops it, as the\neditor waits for it. *Server log* shows what was evaluated, for whom,\nand what came of it. Any program running as you can do this, as with\nEmacs's server; the option server-eval turns it off.\n\nRust carries the request over the socket, runs it as an execution of\nits own under a deadline, and lets C-g reach it (Interrupts::hold), all\nof which is the runtime's; choosing the session, evaluating, reporting\nand logging are Scheme (lisp/editor/server.scm).\n\nWhat an evaluation does is its principal's: commands it runs are\nrecorded as run for the principal, not the user (`%start-operation!`\nnow inherits the principal of the operation it starts in, the user's\nfor a key). One killed leaves no operation open: `operation-abandon!`\nends it and those under it, as cancelled. And the detached session's\nviews are its own, as attached sessions' are: a caret it moves in a\ndocument you also show is not yours.",
+          "timestamp": "2026-11-17T20:30:53+01:00",
+          "tree_id": "550985fcbea4751638ce2ae150f525167e5901bd",
+          "url": "https://github.com/ArthurHeymans/techne/commit/8135fedc777eda297f38bf99724fefffdb902573"
+        },
+        "date": 1794946214636,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 694059125,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 646244066,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107077,
             "unit": "data"
           }
         ]
