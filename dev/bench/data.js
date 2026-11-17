@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794945049426,
+  "lastUpdate": 1794945050995,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -54992,6 +54992,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 643908514,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106428,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "563c6270545c2c119930513b8fab69787be17891",
+          "message": "techne tool: a page wider than its ceiling is the ceiling (#358)\n\n(tool-search project \"nrepl\" #:group-by 'path #:limit 60) failed with\n\"count out of range; expected 1 to 50\" and lost the answer, and in a\nbatch the other answers with it. Reads already give their bound when\nasked for more (#352); pages did not.\n\n#:limit past 50 now gives 50 in tool-files, tool-search, tool-symbols,\ntool-find, tool-discover and tool-check. Their replies already say\nwhat is left (total, truncated, next). A limit below 1 or not an exact\ninteger is still an error naming the bound.",
+          "timestamp": "2026-11-17T20:30:26+01:00",
+          "tree_id": "600fb6bc5df8e5141f692ff0c3c3bdeaba277227",
+          "url": "https://github.com/ArthurHeymans/techne/commit/563c6270545c2c119930513b8fab69787be17891"
+        },
+        "date": 1794945050949,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 691627886,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 643912203,
             "unit": "instructions"
           },
           {
