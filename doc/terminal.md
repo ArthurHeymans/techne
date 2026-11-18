@@ -50,8 +50,11 @@ reporting, graphics, and OSC clipboard access are not supported.
 
 The Scheme implementation follows the architecture of `el-be-back`: an
 independent cell grid and incremental VT parser, cached row projections
-into a read-only editor document, and asynchronous PTY I/O. The screen,
-parser and key encoder can be used without the editor as `(techne terminal)`.
+into a read-only editor document, and asynchronous PTY I/O. The parser
+works in bounded slices, while a separate Scheme task batches output into
+one projection roughly every 16 ms during a burst. EOF flushes the last
+update immediately. The screen, parser and key encoder can be used
+without the editor as `(techne terminal)`.
 
 ## Compatibility testing
 

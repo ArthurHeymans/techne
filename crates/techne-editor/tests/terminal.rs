@@ -78,6 +78,32 @@ fn terminal_runs_a_pty_projects_styles_and_routes_keys() {
 }
 
 #[test]
+fn redraws_making_progress_during_a_burst_and_flush_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes");
+    std::fs::write(&file, "notes\n").unwrap();
+    let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
+    command(
+        &mut rt,
+        r#"stty -echo; printf 'ready\n'; read -r go; i=0; while [ "$i" -lt 120 ]; do printf 'burst %03d: synthetic kernel log line with some payload\n' "$i"; i=$((i + 1)); sleep .003; done; read -r done; printf '\033[31mfinal tail\033[0m'"#,
+    );
+    let ready = until(&mut rt, |s| s.pane().text.to_string().contains("ready"));
+    key(&mut rt, "RET");
+    until(&mut rt, |s| {
+        let text = s.pane().text.to_string();
+        text.contains("burst 000") && !text.contains("burst 119")
+    });
+    let burst = until(&mut rt, |s| s.pane().text.to_string().contains("burst 119"));
+    // On a quiet host the timer coalesces many individual PTY writes.
+    // We intentionally don't assert a wall-clock frame rate.
+    assert!(burst.pane().revision - ready.pane().revision < 120 * 2);
+    key(&mut rt, "RET");
+    let ended = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
+    assert!(ended.pane().text.to_string().contains("final tail"));
+    assert!(rt.take_errors().is_empty());
+}
+
+#[test]
 fn the_first_child_command_sees_the_pane_size_and_a_tty() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("notes");

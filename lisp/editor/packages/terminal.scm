@@ -5,10 +5,11 @@
 (require "../terminal-render.scm")
 
 (define-record-type terminal-session
-  (%terminal screen projection directory process reader writer pending size status input pane-size)
+  (%terminal screen projection directory process reader drawer writer pending size status input pane-size)
   terminal-session?
   (screen screen) (projection projection) (directory directory)
-  (process process process-set!) (reader reader reader-set!) (writer writer writer-set!)
+  (process process process-set!) (reader reader reader-set!)
+  (drawer drawer drawer-set!) (writer writer writer-set!)
   (pending pending pending-set!) (size size size-set!)
   (status status status-set!) (input input-mode input-mode-set!)
   (pane-size pane-size pane-size-set!))
@@ -30,11 +31,30 @@
            (unless (= (view-scroll v) start) (view-set-scroll! v start))))
        (shown-views s)))))
 
+(define (cancel-draw! state)
+  (let ((task (drawer state)))
+    (drawer-set! state #f)
+    (when (and task (not (task-done? task))) (task-cancel task))))
+
 (define (render! s b state)
+  (cancel-draw! state)
   (terminal-project! (projection state) (screen state))
   (let ((visible (or (copying? state) (terminal-mode? (screen state) 'cursor))))
     (unless (eq? (option b 'cursor-visible) visible) (set-option! 'cursor-visible visible #:buffer b)))
   (follow! s b state))
+
+;; One pending redraw per terminal, measured from the first unshown change.
+;; Later chunks cannot postpone it. Both tasks share the editor VM, so the
+;; drawer sees a consistent grid between parser slices, without IPC.
+(define redraw-delay-ms 16)
+(define (schedule-draw! s b state)
+  (unless (drawer state)
+    (drawer-set! state
+                 (spawn (lambda ()
+                          (sleep redraw-delay-ms)
+                          (drawer-set! state #f)
+                          (guard (e ((not (cancelled-condition? e)) (message! s (error-text e))))
+                            (render! s b state)))))))
 
 ;; Frame dimensions are text-cell estimates in the window frontend. Subtract
 ;; the echo row before tiling, then the mode line and any right divider.
@@ -206,20 +226,25 @@ to resume input, or \\[terminal-char-mode] to pass most keys to the child."
   "Paste the next older kill without erasing any text in the child."
   (paste-kill! s #t))
 
+(define parse-slice-chars 4096)
 (define (read-output! s b state p)
-  (let ((t (screen state)))
-    (let read ()
-      (let ((text (process-read p 'stdout)))
-        (if (eof-object? text) (process-wait p)
-            (begin
-              (let chunk ((from 0))
-                (let ((to (min (+ from 4096) (string-length text))))
-                  (terminal-feed! t text #:start from #:end to)
-                  (render! s b state)
-                  ;; Ready output must not monopolize an editor turn.
-                  (sleep 1)
-                  (when (< to (string-length text)) (chunk to))))
-              (read)))))))
+  (define (parse text from budget)
+    (let* ((end (string-length text)) (to (min (+ from budget) end))
+           (left (- budget (- to from))))
+      (terminal-feed! (screen state) text #:start from #:end to)
+      (schedule-draw! s b state)
+      ;; Count across reads: small writes need not sleep on every read,
+      ;; but a flood cannot monopolize the VM.
+      (when (zero? left) (sleep 1) (set! left parse-slice-chars))
+      (if (= to end) left (parse text to left))))
+  (let read ((budget parse-slice-chars))
+    (let ((text (process-read p 'stdout)))
+      (if (eof-object? text)
+          (begin
+            ;; Publish the final state before leaving live input mode.
+            (when (drawer state) (render! s b state))
+            (process-wait p))
+          (read (parse text 0 budget))))))
 
 (define-option terminal-close-on-exit #t
   "Whether to close an interactive terminal after its shell exits zero.
@@ -238,7 +263,7 @@ Buffers from the terminal-command prompt and unsuccessful exits stay open."
                                       (let ((p (process state)))
                                         (when p (process-resize p rows cols))))))
          (projection (make-terminal-projection d history-limit)))
-    (set! state (%terminal t projection dir #f #f #f '() 0 "Starting" 'semi size))
+    (set! state (%terminal t projection dir #f #f #f #f '() 0 "Starting" 'semi size))
     (let ((b (make-generated-buffer! name d 'terminal-mode #:state state)))
       (document-limit-history! d log-history)
       (show-document! s d)
@@ -269,6 +294,7 @@ Buffers from the terminal-command prompt and unsuccessful exits stay open."
                 (pending-set! state '()) (size-set! state 0)
                 (when (writer state) (task-cancel (writer state)) (writer-set! state #f))
                 (reader-set! state #f)
+                 (cancel-draw! state)
                 (if (and interactive (eqv? exit-status 0) (option b 'terminal-close-on-exit)
                          (any (lambda (other) (not (eq? b other))) (buffer-list)))
                     (drop-buffer! (or (current-session) s) b)
@@ -285,7 +311,8 @@ Buffers from the terminal-command prompt and unsuccessful exits stay open."
                (when state
                  (process-set! state #f)
                  (when (writer state) (task-cancel (writer state)))
-                 (when (and (reader state) (not (task-done? (reader state)))) (task-cancel (reader state)))))))
+                 (cancel-draw! state)
+                  (when (and (reader state) (not (task-done? (reader state)))) (task-cancel (reader state)))))))
 
 (define-command (terminal s n)
   "Open a new terminal running the user's shell.
