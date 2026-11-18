@@ -240,15 +240,37 @@ const GONE_CHECK: Duration = Duration::from_secs(1);
 pub struct Listener {
     socket: PathBuf,
     stop: Arc<AtomicBool>,
+    serving: Arc<AtomicUsize>,
     _lock: std::fs::File,
+}
+
+impl Listener {
+    /// Stop taking new requests, keeping the socket lock until drop.
+    pub fn stop_accepting(&self) {
+        if !self.stop.swap(true, Ordering::Relaxed) {
+            // Wake the accept thread so it can stop even without a client.
+            let _ = UnixStream::connect(&self.socket);
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    /// Give request threads time to send their final replies after the
+    /// runtime stops. Clients that do not read must not hold up process exit.
+    pub fn drain(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.serving.load(Ordering::Acquire) != 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(10)));
+        }
+    }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // Wakes the thread accepting, which sees it is to stop.
-        let _ = UnixStream::connect(&self.socket);
-        let _ = std::fs::remove_file(&self.socket);
+        self.stop_accepting();
     }
 }
 
@@ -268,19 +290,20 @@ pub(crate) fn listen(shared: Arc<Mutex<Shared>>, socket: &Path) -> std::io::Resu
     let stop = Arc::new(AtomicBool::new(false));
     let serving = Arc::new(AtomicUsize::new(0));
     let stopped = stop.clone();
+    let active = serving.clone();
     std::thread::Builder::new().name("editor server".into()).spawn(move || {
         for stream in listener.incoming() {
             if stopped.load(Ordering::Relaxed) {
                 return;
             }
             let Ok(mut stream) = stream else { continue };
-            if serving.fetch_add(1, Ordering::Relaxed) >= MAX_REQUESTS {
-                serving.fetch_sub(1, Ordering::Relaxed);
+            if active.fetch_add(1, Ordering::Relaxed) >= MAX_REQUESTS {
+                active.fetch_sub(1, Ordering::Release);
                 let _ = write_frame(&mut stream, &Reply::Failed("the editor is busy".into()));
                 continue;
             }
             // Counted while the thread runs, or until it fails to start.
-            let counted = Counted(serving.clone());
+            let counted = Counted(active.clone());
             let shared = shared.clone();
             let _ = std::thread::Builder::new().name("editor request".into()).spawn(move || {
                 serve(&shared, stream);
@@ -288,7 +311,7 @@ pub(crate) fn listen(shared: Arc<Mutex<Shared>>, socket: &Path) -> std::io::Resu
             });
         }
     })?;
-    Ok(Some(Listener { socket: socket.to_owned(), stop, _lock: lock }))
+    Ok(Some(Listener { socket: socket.to_owned(), stop, serving, _lock: lock }))
 }
 
 /// A request served, uncounted when dropped.
@@ -296,7 +319,7 @@ struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 

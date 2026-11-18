@@ -262,8 +262,11 @@ fn daemon(args: Vec<String>) -> ExitCode {
     };
     eprintln!("techne daemon: listening on {} (pid {})", socket.display(), std::process::id());
     let ran = daemon.run(|| stop.load(Ordering::Relaxed));
-    drop(listener);
+    listener.stop_accepting();
     daemon.stop();
+    // The runtime enqueued the stop notices; their socket writers live in
+    // the request threads. Let those threads finish before process exit.
+    listener.drain(std::time::Duration::from_secs(1));
     match ran {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
