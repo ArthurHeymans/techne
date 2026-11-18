@@ -583,6 +583,9 @@ scheme-mode does, so buffers without a file are coloured too."
 (define-option cursor-visible #t
   "Whether the buffer shows a text caret."
   #:type 'boolean)
+(define-option inherit-on-attach #t
+  "Whether a frontend attaching without a file may inherit this buffer."
+  #:type 'boolean)
 
 (define-mode special-mode
   "Buffers the editor writes, not you.

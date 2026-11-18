@@ -90,10 +90,9 @@ holding every body of a large mailbox in memory."
                          (else (string>? (vector-ref a 0) (vector-ref b 0))))))))
     (define (maildir-check-root root)
       "Require at least one cur or new directory directly inside ROOT."
-      (let ((base (file-truename root)))
-        (unless (any (lambda (sub)
-                       (let ((a (file-attributes (path-join base sub))))
-                         (and a (eq? (car a) 'directory)))) '("cur" "new"))
+      ;; directory-list adds a slash to directories, following symlinks.
+      (let ((entries (directory-list root)))
+        (unless (or (member "cur/" entries) (member "new/" entries))
           (error "Maildir requires cur or new" root))))
     (define (maildir-keys root)
       "Return Maildir ROOT's message keys and paths without reading bodies.

@@ -265,7 +265,7 @@ R replies. A Maildir message's flags and folder are changed at the
 source, as mu4e changes them."
   #:parent 'listing-mode
   #:layer summary-layer
-  #:options '((line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
+  #:options '((inherit-on-attach . #f) (line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
   #:keys '(("n" mail-next) ("p" mail-previous) ("j" mail-next) ("k" mail-previous)
            ("C-n" mail-next) ("C-p" mail-previous) ("<down>" mail-next) ("<up>" mail-previous) ("RET" mail-read) ("/" mail-search) ("G" mail-groups)
            ("g" mail-sync) ("e" mail-sync-status) ("c" mail-catch-up) ("C" mail-compose) ("D" mail-drafts) ("f" mail-toggle-layout) ("R" mail-reply)
@@ -288,7 +288,7 @@ shows source, b returns to the list and q closes the reader, as mu4e's
 q does. Remote content never loads. r archives and d deletes, marked;
 x does it, at the source, as in the list."
   #:parent 'rich-mode
-  #:options '((read-only . #t) (line-numbers . #f) (eob-marker . ""))
+  #:options '((inherit-on-attach . #f) (read-only . #t) (line-numbers . #f) (eob-marker . ""))
   #:keys '(("n" mail-next) ("p" mail-previous) ("R" mail-reply) ("c" mail-catch-up) ("C" mail-compose) ("v" mail-toggle-body)
            ("TAB" mail-toggle-quotes) ("H" mail-toggle-details) ("s" mail-source) ("b" mail-back) ("q" mail-close-reader)
            ("r" mail-mark-archive) ("!" mail-mark-read) ("?" mail-mark-unread) ("+" mail-mark-star) ("-" mail-mark-unstar)
@@ -603,7 +603,7 @@ the selected row's mail read. / searches all mail, g fetches mail, C
 composes, D opens the drafts, and q leaves mail."
   #:parent 'listing-mode
   #:layer (lambda (d from to) (dashboard-layer d))
-  #:options '((line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
+  #:options '((inherit-on-attach . #f) (line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
   #:keys '(("n" mail-dashboard-next) ("p" mail-dashboard-previous) ("j" mail-dashboard-next) ("k" mail-dashboard-previous)
            ("C-n" mail-dashboard-next) ("C-p" mail-dashboard-previous) ("<down>" mail-dashboard-next) ("<up>" mail-dashboard-previous)
            ("SPC" mail-dashboard-next) ("RET" mail-dashboard-open) ("TAB" mail-dashboard-fold)
@@ -1254,7 +1254,7 @@ all until it runs. The list is then made again, so what left it goes."
   (let ((st (mail-state s))) (put! st 'quotes? (not (get st 'quotes?))) (reader! s)))
 (define-mode mail-info-mode
   "Mail help or setup. b or q returns to the mailbox."
-  #:parent 'rich-mode #:options '((read-only . #t) (line-numbers . #f) (eob-marker . ""))
+  #:parent 'rich-mode #:options '((inherit-on-attach . #f) (read-only . #t) (line-numbers . #f) (eob-marker . ""))
   #:keys '(("b" mail-back) ("q" mail-back) ("C-c C-k" mail-cancel-sync)) #:normal '(("b" mail-back) ("q" mail-back)))
 (define-mode mail-source-mode
   "Cached MIME source as safe text. b or q returns to summaries."
@@ -1642,7 +1642,7 @@ SMTP over TLS. \\[mail-back] returns without discarding.
 Headers end at the first blank line. Bcc is used only in the SMTP envelope.
 In To, Cc and Bcc, the people you write to and who write to you
 complete, after two characters or with \\[completion-at-point]."
-  #:parent 'text-mode #:options '((line-numbers . #f) (eob-marker . ""))
+  #:parent 'text-mode #:options '((inherit-on-attach . #f) (line-numbers . #f) (eob-marker . ""))
   #:complete (lambda (b pos)
                (let ((d (buffer-document b)))
                  (and (address-field? d pos) (cons (word-start d pos) (contacts)))))
@@ -1810,7 +1810,7 @@ a draft to be deleted, u unflags it, x deletes those flagged. C composes
 another; q goes back to the dashboard. Nothing is sent from here."
   #:parent 'listing-mode
   #:layer (lambda (d from to) (drafts-layer d))
-  #:options '((line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
+  #:options '((inherit-on-attach . #f) (line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
   #:keys '(("n" mail-drafts-next) ("p" mail-drafts-previous) ("j" mail-drafts-next) ("k" mail-drafts-previous)
            ("C-n" mail-drafts-next) ("C-p" mail-drafts-previous) ("<down>" mail-drafts-next) ("<up>" mail-drafts-previous)
            ("RET" mail-drafts-open) ("x" mail-drafts-execute) ("C" mail-compose) ("g" mail-drafts) ("q" mail-dashboard))

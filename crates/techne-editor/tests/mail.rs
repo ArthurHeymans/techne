@@ -155,14 +155,46 @@ fn attached_sessions_keep_distinct_listings_and_marks() {
         rt.eval(
             r#"(let* ((one (current-session)) (one-mail (sget one 'mail))
                        (a (hash-table-ref one-mail 'summary)) (two (start-session #f "emacs")))
-                  (run-command two 'mail-all 1)
-                  (let* ((two-mail (sget two 'mail)) (b (hash-table-ref two-mail 'summary)))
-                    (list (not (eq? a b)) (eq? (listing-get a 'mail-state) one-mail)
-                          (eq? (listing-get b 'mail-state) two-mail)
-                          (length (listing-marked a #\D)) (length (listing-marked b #\D)))))"#,
+                  (let ((independent-start? (not (eq? a (current-buffer two)))))
+                    (run-command two 'mail-all 1)
+                    (let* ((two-mail (sget two 'mail)) (b (hash-table-ref two-mail 'summary)))
+                      (list independent-start? (not (eq? a b)) (eq? (listing-get a 'mail-state) one-mail)
+                            (eq? (listing-get b 'mail-state) two-mail)
+                            (length (listing-marked a #\D)) (length (listing-marked b #\D))))))"#,
         )
         .unwrap(),
-        "(#t #t #t 1 0)"
+        "(#t #t #t #t 1 0)"
+    );
+}
+
+#[test]
+fn a_named_maildir_accepts_symlinked_cur_but_does_not_prune_an_unavailable_source() {
+    let (dir, mut rt) = editor();
+    real_accounts(&mut rt, dir.path());
+    let root = dir.path().join("Maildir");
+    let actual_cur = dir.path().join("actual-cur");
+    std::fs::create_dir(&actual_cur).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(actual_cur.join("one:2,S"), "Subject: Symlinked Inbox\n\nbody").unwrap();
+    std::os::unix::fs::symlink(&actual_cur, root.join("cur")).unwrap();
+    rt.eval(&format!(
+        "(set-option! 'mail-accounts '(((id . \"test\") (kind . maildir) (mailbox . \"INBOX\") (path . {:?}))))",
+        root.display().to_string()
+    ))
+    .unwrap();
+    command(&mut rt, "mail");
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| pane(rt, 0).contains("Up to date"));
+    std::fs::remove_dir_all(actual_cur).unwrap();
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| pane(rt, 0).contains("Sync incomplete"));
+    assert_eq!(
+        rt.eval(
+            "(let* ((db (mail-store-open (option #f 'mail-database)))
+                        (count (length (mail-store-query db \"\")))) (mail-store-close db) count)"
+        )
+        .unwrap(),
+        "1"
     );
 }
 
