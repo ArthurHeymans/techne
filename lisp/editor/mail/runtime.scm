@@ -1344,7 +1344,7 @@ Invalid UTF-8 bytes display as replacements; original octets remain in SQLite."
         (lambda () (imap-close connection))))))
 (define (account-id account)
   (guard (e ((not (task-cancelled-condition? e)) "invalid account"))
-    (let ((value (mail-ref account 'id #f))) (if (string? value) (one-line value) "invalid account"))))
+    (let ((value (mail-ref account 'id #f))) (if (string? value) value "invalid account"))))
 (define (sync-jobs accounts listed)
   ;; What a sync does, in order, as (ACCOUNT ID BOX PATH): a Maildir
   ;; folder, or an IMAP account (BOX and PATH #f), all its mailboxes over
@@ -1429,7 +1429,7 @@ gone are removed from it, with their local state; drafts stay."
            (for-each (lambda (a) (hash-table-set! %account-status (account-id a) "waiting to fetch")) accounts)
            ;; Asking for mail makes the list again, as g does in a summary.
            (put! (mail-state s) 'listed #f)
-           (redisplay-mail! s)
+           (redisplay-mail! s #:reader? #f)
            (set! %sync-task
             (spawn
              (lambda ()
@@ -1461,7 +1461,7 @@ gone are removed from it, with their local state; drafts stay."
                                  (hash-table-set! %account-status id
                                                   (string-append "fetching " (if (string=? box "") "" (string-append box " "))
                                                                  "· " (grouped (hash-table-ref/default new id 0)) " new"))
-                                 (set! %sync-status (string-append id " · " (phase-label phase) " · "
+                                 (set! %sync-status (string-append (one-line id) " · " (phase-label phase) " · "
                                                                   (grouped %sync-imported) " cached · C-c C-k cancel"))
                                  (when (> (- (current-milliseconds) painted) 750)
                                    (set! painted (current-milliseconds)) (redisplay-mail! s #:reader? #f)))))
@@ -1495,14 +1495,14 @@ Arbitrary server text, secret-provider errors and credentials are never logged."
                    (list 'paragraph (number->string %sync-imported) " messages processed. Existing cached mail and drafts remain available."))
              (if %sync-task (list (list 'paragraph (mail-link 'cancel-sync "Cancel sync (C-c C-k)"))) '())
              (append-map (lambda (issue)
-                           (list (list 'heading 2 (string-append (mail-ref issue 'account) " / " (mail-ref issue 'mailbox)))
+                           (list (list 'heading 2 (string-append (one-line (mail-ref issue 'account)) " / " (one-line (mail-ref issue 'mailbox))))
                                  (list 'paragraph (list 'strong (mail-ref issue 'phase)) " failed. " (mail-ref issue 'remedy)))) %sync-issues)
              (if (null? %sync-large) '()
                  (list '(heading 2 "Not cached: larger than 16 MiB")
                        (cons 'paragraph
                              (mail-append-map (lambda (l i)
                                                 (append (if (= i 0) '() (list '(hard-break)))
-                                                        (list (string-append (car l) " / " (cadr l) ": " (grouped (caddr l))
+                                                        (list (string-append (one-line (car l)) " / " (one-line (cadr l)) ": " (grouped (caddr l))
                                                                              (if (= (caddr l) 1) " message" " messages")))))
                                               %sync-large (iota (length %sync-large))))
                        '(paragraph "A message over 16 MiB, mostly its attachments, is not read: it is not listed or searched here. Its file is unchanged; mu4e or another reader opens it.")))
@@ -1643,7 +1643,7 @@ complete, after two characters or with \\[completion-at-point]."
                  (and (address-field? d pos) (cons (word-start d pos) (contacts)))))
   #:keys '(("C-c C-d" mail-postpone) ("C-x C-s" mail-save-draft) ("C-c C-c" mail-send) ("C-c C-r" mail-resolve-delivery) ("C-c C-k" mail-discard-draft)
            ("C-M-i" completion-at-point) ("M-TAB" completion-at-point)))
-(define (compose! s account text #:id [id (uuid-v4)] #:reply [reply ""] #:references [references ""] #:delivery-state [delivery-state "draft"])
+(define (compose! s account text #:id [id (uuid-v4)] #:reply [reply ""] #:references [references ""] #:delivery-state [delivery-state "draft"] #:resuming? [resuming? #f])
   (let ((st (make-hash-table)))
     (put! st 'account account) (put! st 'draft-id id) (put! st 'reply reply) (put! st 'references references)
     (put! st 'uncertain? (and (member delivery-state '("sending" "uncertain")) #t))
@@ -1651,7 +1651,7 @@ complete, after two characters or with \\[completion-at-point]."
            (db (database!)) (d (buffer-document b)))
       (put! st 'db db)
       (when (get st 'uncertain?) (set-option! 'read-only #t #:buffer b))
-      (persist-draft! b)
+      (if resuming? (put! st 'saved-revision (document-revision d)) (persist-draft! b))
       (put! st 'autosave
             (let ((initial-revision (get st 'saved-revision (document-revision d))))
               (spawn (lambda ()
@@ -1750,9 +1750,9 @@ Preserve its Message-ID threading headers."
              (when (eq? (buffer-mode b) 'mail-compose-mode)
                (let ((st (buffer-state b)))
                  (when (get st 'autosave) (task-cancel (get st 'autosave)))
-                 ;; A draft discarded is not saved again on its way out.
-                 (unless (get st 'discarded?)
-                   (guard (e (#t (message! s "Draft save failed; check your local cache"))) (persist-draft! b)))))))
+                  ;; Don't rewrite a saved snapshot just by closing its buffer.
+                  (unless (or (get st 'discarded?) (equal? (get st 'saved-revision) (document-revision (buffer-document b))))
+                    (guard (e (#t (message! s "Draft save failed; check your local cache"))) (persist-draft! b)))))))
 (define-command (mail-postpone s n)
   "Save this draft and leave it for later, as message mode's postponing.
 \\[mail-drafts] resumes it."
@@ -1928,20 +1928,24 @@ An uncertain delivery is never retried automatically."
 (define-action mail-draft (mail-resume-draft s d)
   "Open this saved draft to go on writing it.
 A draft of an account no longer configured is sent from one that is."
-  (let* ((parsed (mail-parse (caddr d)))
-         (old (buffer-named (string-append "*mail draft " (substring (car d) 0 8) "*")))
+  (let* ((id (car d)) (db (database!))
+         (current (or (mail-store-draft db id) (error "Draft is gone or already sent; refresh Drafts")))
+         (old (buffer-named (string-append "*mail draft " (substring id 0 8) "*")))
          (from-drafts? (mail-mode? (current-buffer s) '(mail-drafts-mode)))
          (list-view (and from-drafts? (get (mail-state s) 'drafts-view))))
     (define (open! a)
       (if old (begin (note-origin! s) (show-buffer! s old))
-          (compose! s a (with-from (caddr d) parsed a) #:id (car d) #:reply (mail-header parsed "in-reply-to")
-                    #:references (mail-header parsed "references") #:delivery-state (list-ref d 3)))
+          (let* ((latest (or (mail-store-draft db id) (error "Draft is gone or already sent; refresh Drafts")))
+                 (text (caddr latest)) (parsed (mail-parse text)) (state (list-ref latest 3)))
+            (compose! s a (if (equal? state "draft") (with-from text parsed a) text)
+                      #:id id #:reply (mail-header parsed "in-reply-to") #:references (mail-header parsed "references")
+                      #:delivery-state state #:resuming? #t)))
       (when list-view (beside-list! s list-view (or old (current-buffer s)))))
-    (let ((a (account-by-id (cadr d))))
+    (let ((a (account-by-id (cadr current))))
       (if a (open! a)
           (choose-account s (lambda (a)
                               (open! a)
-                              (message! s (string-append "Its account " (cadr d) " is not configured · sent from " (mail-ref a 'id)))))))))
+                              (message! s (string-append "Its account " (one-line (cadr current)) " is not configured · sending from " (one-line (mail-ref a 'id))))))))))
 (define (with-from text parsed account)
   ;; TEXT with ACCOUNT's From when its own is empty, as a draft of an
   ;; account no longer configured may have it.

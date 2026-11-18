@@ -649,6 +649,29 @@ fn narrow_viewport_has_one_pane_and_working_read_back_and_paging() {
 }
 
 #[test]
+fn opening_a_stale_draft_row_reads_the_newer_saved_text_without_writing() {
+    let (dir, mut rt) = editor();
+    real_accounts(&mut rt, dir.path());
+    command(&mut rt, "mail");
+    rt.eval(
+        "(define inspect-db (mail-store-open (option #f 'mail-database)))
+         (mail-store-draft! inspect-db \"draft-fixture\" \"test\" \"From: ada@example.org\\nSubject: Before\\n\\nOld body\")",
+    )
+    .unwrap();
+    command(&mut rt, "mail-drafts");
+    assert!(pane(&mut rt, 0).contains("Before"));
+    rt.eval("(mail-store-draft! inspect-db \"draft-fixture\" \"test\" \"From: ada@example.org\\nSubject: After\\n\\nNew body\")").unwrap();
+    key(&mut rt, "RET");
+    assert!(rt.snapshot().pane().text.to_string().contains("New body"));
+    rt.eval(
+        "(mail-store-draft! inspect-db \"draft-fixture\" \"test\" \"Subject: Newer still\\n\\nNewer body\")
+             (drop-buffer! (current-session) (current-buffer (current-session)))",
+    )
+    .unwrap();
+    assert!(rt.eval("(caddr (mail-store-draft inspect-db \"draft-fixture\"))").unwrap().contains("Newer body"));
+}
+
+#[test]
 fn discarding_a_sent_buffer_keeps_the_delivery_record() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());

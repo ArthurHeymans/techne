@@ -145,10 +145,11 @@ path now, or #f when it is no longer there (moved by another program)."
               (if (and (> end (+ at 3)) (or (= end (string-length key)) (char=? #\, (string-ref key end))))
                   (string-append (substring key 0 at) (substring key end (string-length key)))
                   key)))))
-    (define (maildir-move! path key root)
+    (define (maildir-move! path key root #:before [before (lambda (from to) #t)])
       "Move message KEY, at PATH, into the cur of Maildir folder ROOT.
-Preserve flags and content but drop the old folder's mbsync UID. Return
-its new path, or #f if the source is gone."
+Preserve flags and content but drop the old folder's mbsync UID. Call
+BEFORE with source and destination paths before renaming. Return the new
+path, or #f if the source is gone."
       (let ((current (maildir-locate path key)))
         (and current
              (let* ((dir (path-join root "cur"))
@@ -156,8 +157,8 @@ its new path, or #f if the source is gone."
                     (old-key (maildir-path-key current))
                     (new-key (%without-mbsync-uid old-key))
                     (target (path-join dir (string-append new-key (substring name (string-length old-key) (string-length name))))))
+                (before current target)
                 (%cur! dir)
-                (when (file-exists? target) (error "Maildir message already in that folder" target))
                 (rename-file current target)
                 target))))
     (define (maildir-source-bytes path key)

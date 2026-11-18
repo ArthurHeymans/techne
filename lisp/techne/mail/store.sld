@@ -4,7 +4,7 @@
           mail-store-message mail-store-source-cached? mail-store-state! mail-store-counts mail-store-count mail-store-folders
           mail-store-dedupe! mail-store-copy-mailboxes mail-store-forget! mail-store-senders mail-store-recipients
           mail-store-copies mail-store-move!
-          mail-store-draft! mail-store-drafts mail-store-delete-draft! mail-store-prepare-imap!
+          mail-store-draft! mail-store-draft mail-store-drafts mail-store-delete-draft! mail-store-prepare-imap!
           mail-store-draft-state mail-store-claim-draft! mail-store-finish-draft!
           mail-store-ambiguous-attempt mail-store-resolve-draft! call-with-mail-store-lease
           mail-store-skip-imap! mail-ref)
@@ -427,14 +427,29 @@ Return (MAILBOX PATH) it was in, with its new identity appended if UNDO?."
         (and row (or (not expected) (equal? expected row))
              (let ((path (list-ref row 4)) (key (list-ref row 3)))
                (when (string=? path "") (error "Only a Maildir message can be moved"))
-               (let ((now (and (or (not expected) (file-exists? path)) (maildir-move! path key root))))
-                 (and now
-                      (begin
-                        (let ((new-key (maildir-path-key now)))
-                          (sqlite-execute db "UPDATE mail_messages SET mailbox=?,source_key=?,source_path=? WHERE id=? AND account=? AND mailbox=? AND source_key=? AND source_path=?"
-                                          (append (list mailbox new-key now) row))
-                          (mail-store-dedupe! db (cadr row))
-                          (append (list (caddr row) path) (if undo? (list (list id (cadr row) mailbox new-key now)) '()))))))))))
+                (let* ((original #f)
+                       (now (and (or (not expected) (file-exists? path))
+                                 (maildir-move! path key root #:before
+                                   (lambda (from to)
+                                     (when (pair? (sqlite-query db
+                                                    "SELECT 1 FROM mail_messages WHERE account=? AND mailbox=? AND source_key=? AND id<>? LIMIT 1"
+                                                    (list (cadr row) mailbox (maildir-path-key to) id)))
+                                       (error "Mail cache already has this key in the destination; sync and retry"))
+                                     (set! original from))))))
+                  (and now
+                       (let ((new-key (maildir-path-key now)))
+                         ;; Restore the exact original filename on a rejected
+                         ;; write. Cancellation can race a successful commit.
+                         (guard (e ((not (task-cancelled-condition? e))
+                                    (guard (restore ((not (task-cancelled-condition? restore))
+                                                     (error "Mail cache move failed and could not be undone; file is in the destination" now)))
+                                      (rename-file now original))
+                                    (raise e)))
+                           (unless (= 1 (sqlite-execute db "UPDATE mail_messages SET mailbox=?,source_key=?,source_path=? WHERE id=? AND account=? AND mailbox=? AND source_key=? AND source_path=?"
+                                                       (append (list mailbox new-key now) row)))
+                             (error "Mail cache changed during the move; sync and retry")))
+                         (mail-store-dedupe! db (cadr row))
+                         (append (list (caddr row) original) (if undo? (list (list id (cadr row) mailbox new-key now)) '())))))))))
 
     (define (mail-store-copy-mailboxes db id)
       "Return the mailboxes holding message ID of DB or a copy of it.
@@ -550,6 +565,11 @@ A live runtime's lease prevents recovery, even in another process."
         (lambda ()
           (= 1 (sqlite-execute db "UPDATE mail_drafts SET state=?,attempt='' WHERE id=? AND state=? AND attempt=?"
                                (append (list state id) expected))))))
+
+    (define (mail-store-draft db id)
+      "Return the current saved draft ID in DB, or #f if gone or sent."
+      (let ((rows (sqlite-query db "SELECT id,account,text,state,updated FROM mail_drafts WHERE id=? AND state<>'sent'" (list id))))
+        (and (pair? rows) (car rows))))
 
     (define (mail-store-drafts db)
       "Return saved (id account text state updated) drafts in DB, newest first.
