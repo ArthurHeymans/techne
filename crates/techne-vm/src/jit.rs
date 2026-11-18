@@ -1567,6 +1567,48 @@ struct Flow {
     dirty_in: Vec<Regs>,
 }
 
+/// A repeated GetG cannot see an unbound value on a straight-line path
+/// consisting only of moves, successful vector accesses, and global reads.
+/// None can rebind a global or run Scheme; their slow exits leave native code.
+/// Reset at alternate entries (including OSR) and every other operation.
+fn bound_globals(ops: &[Op], succs: &[Vec<usize>], heads: &[usize]) -> Vec<bool> {
+    let mut entry = vec![false; ops.len()];
+    for &h in heads {
+        entry[h] = true;
+    }
+    for (pc, edges) in succs.iter().enumerate() {
+        for &to in edges {
+            if to != pc + 1 && to < entry.len() {
+                entry[to] = true;
+            }
+        }
+    }
+    let mut seen = Vec::new();
+    ops.iter()
+        .enumerate()
+        .map(|(pc, op)| {
+            if entry[pc] {
+                seen.clear();
+            }
+            match op {
+                Op::GetG { g, .. } if seen.contains(g) => true,
+                Op::GetG { g, .. } => {
+                    if seen.len() == 8 {
+                        seen.clear();
+                    }
+                    seen.push(*g);
+                    false
+                }
+                Op::Mov { .. } | Op::VRef { .. } | Op::VSet { .. } => false,
+                _ => {
+                    seen.clear();
+                    false
+                }
+            }
+        })
+        .collect()
+}
+
 /// The control flow of the instructions compiled (`combine`).
 struct Shape {
     /// Computed once, shared by the kind, liveness and dirtiness analyses.
@@ -2413,7 +2455,9 @@ impl Jit {
             pairs(orig, n, &job.captures, heads, &shape)
         };
         let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline, heads.contains(&0));
+        let bound = bound_globals(&ops, &shape.succs, heads);
         let mut g = Gen {
+            bound,
             vm: p[0],
             ctx: p[1],
             r: p[2],
@@ -2711,6 +2755,7 @@ struct Sigs {
 }
 
 struct Gen {
+    bound: Vec<bool>,
     vm: ir::Value,
     ctx: ir::Value,
     r: ir::Value,
@@ -4459,9 +4504,11 @@ impl Gen {
             }
             Op::GetG { dst, g } => {
                 let v = self.global(b, g);
-                let bound = b.ins().icmp_imm_s(IntCC::NotEqual, v, Value::UNDEFINED.bits() as i64);
-                let slow = self.step(b, pc);
-                Self::guard(b, bound, slow);
+                if !self.bound[pc] {
+                    let bound = b.ins().icmp_imm_s(IntCC::NotEqual, v, Value::UNDEFINED.bits() as i64);
+                    let slow = self.step(b, pc);
+                    Self::guard(b, bound, slow);
+                }
                 self.set(b, dst, v);
                 if let Some(lens) = self.cached.iter().find(|c| c.g == g).and_then(|c| c.lens) {
                     let lens = self.use_lens(b, lens);
