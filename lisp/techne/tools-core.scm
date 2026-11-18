@@ -376,7 +376,10 @@
     (string-append "--- " name " (" (%str (tool-ref stream 'characters)) " characters"
                    (if (tool-ref stream 'truncated) (string-append ", last " (%str (string-length text)) " shown") "")
                    (if (tool-ref stream 'handle)
-                       (string-append "; all " (%str (tool-ref stream 'kept)) " kept: " (%written (tool-ref stream 'handle)))
+                       (string-append "; all " (%str (tool-ref stream 'kept)) " kept: " (%written (tool-ref stream 'handle))
+                                      (if (tool-ref stream 'truncated)
+                                          "; tool-find searches it, tool-expand reads it from #:offset"
+                                          ""))
                        "")
                    ") ---" (if (string=? text "") "" (string-append "\n" (%chomp text))))))
 (define (%numbered-text reply)

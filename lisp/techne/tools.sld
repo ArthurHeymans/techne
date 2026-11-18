@@ -609,10 +609,21 @@ shows when nothing matched and it failed. TIMEOUT and ENVIRONMENT are
     ;; and the same directory named from another are one.
     (define (%tools-stamp)
       (let* ((path (or (get-environment-variable "TECHNE_LIBRARY_PATH") ""))
-             (dirs (cons (%lisp-directory)
-                         (map (lambda (d) (guard (e (#t d)) (%repository-canonical-root d)))
-                              (remove (lambda (d) (string=? d "")) (string-split path ":"))))))
+             (dirs (append (%own-library-directories)
+                           (map (lambda (d) (guard (e (#t d)) (%repository-canonical-root d)))
+                                (remove (lambda (d) (string=? d "")) (string-split path ":"))))))
         (string-join (cons (%program-stamp) (append-map (lambda (d) (list d (%tree-stamp d))) dirs)) " ")))
+    ;; Techne's own library directories, but the editor's and the tests':
+    ;; a tool world loads neither, and they change most when working on
+    ;; Techne, so that a change of them would restart the session at every
+    ;; edit, losing its snapshots and stopping its processes.
+    (define (%own-library-directories)
+      (let ((lisp (%lisp-directory)))
+        ;; Directories are listed with a slash after their names; files
+        ;; at the top are no library's.
+        (map (lambda (name) (string-append lisp "/" name))
+             (filter (lambda (name) (and (string-suffix? "/" name) (not (member name '("editor/" "tests/")))))
+                     (directory-list lisp)))))
     ;; #f in a world not granted files, which has no sessions to compare.
     (define %loaded-stamp (guard (e (#t #f)) (%tools-stamp)))
 
