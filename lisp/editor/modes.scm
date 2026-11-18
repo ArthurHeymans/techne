@@ -330,7 +330,23 @@ in it, a mode for its own options)."
 ;; The value of option NAME in buffer B (#f: what applies to no buffer).
 (define (option b name)
   "Return the value of the option NAME in buffer B, #f meaning no buffer."
-  (cadr (car (explain-option b name))))
+  ;; Same precedence as explain-option, without building provenance rows or
+  ;; looking up settings that cannot win. Entries are pairs even for #f.
+  (define (global-value)
+    (let ((entry (registry-ref %settings (list name))))
+      (if entry (car entry)
+          (let ((o (find-option name))) (and o (option-default o))))))
+  (let ((local (and b (assq name (buffer-settings b)))))
+    (cond (local (cdr local))
+          ((not b) (global-value))
+          (else
+           (let loop ((mode (buffer-mode b)) (seen '()))
+             (let ((m (and mode (not (memq mode seen)) (find-mode mode))))
+               (if (not m) (global-value)
+                   (let ((entry (registry-ref %settings (list name mode))))
+                     (if entry (car entry)
+                         (let ((own (assq name (mode-options m))))
+                           (if own (cdr own) (loop (mode-parent m) (cons mode seen)))))))))))))
 
 ;;; Mode line segments: what a package says of a buffer in its mode
 ;;; line (a language server's state, its diagnostics' count), after the
