@@ -21,7 +21,7 @@
 (provide editor-press editor-viewport! editor-pointer! editor-focus-event! editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays pane-projections cursor-shape
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
-         bound-keys editor-unsendable! editor-take-violations!)
+         editor-insert-text! bound-keys editor-unsendable! editor-take-violations!)
 
 (define-hook viewport-changed
   "After frontend geometry changes: (session columns rows).")
@@ -55,6 +55,14 @@ CODE is an xterm button code, RELEASE true for releases."
 (define (editor-focus-event! s focused)
   "Report whether frontend session S is FOCUSED."
   (run-hook! s 'frontend-focus focused))
+
+(define (editor-insert-text! s text)
+  "Insert committed TEXT in S at its selection, without changing the kill ring."
+  (unless (string=? text "")
+    (message! s #f)
+    (if (minibuffer-open? s)
+        (minibuffer-insert-text! s text)
+        (insert-text! s text "new"))))
 
 (define (editor-click s view pos extend)
   "Handle a click at POS in VIEW, which the frontend resolved, in S.

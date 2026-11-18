@@ -39,6 +39,7 @@
 
 (provide completing-read async-source candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
          minibuffer-map minibuffer-keymaps minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
+         minibuffer-insert-text!
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          minibuffer-history add-history! history-length history-save-interval keep-histories! save-histories!
          take-target pattern-parts matches? match-spans candidate-row)
@@ -797,6 +798,12 @@ The minibuffer closes first, its previews undone."
 ;; The binding of KEYS in MAPS, the first map binding them winning.
 (define (minibuffer-binding maps keys)
   (and (pair? maps) (or (lookup-key (car maps) keys) (minibuffer-binding (cdr maps) keys))))
+
+(define (minibuffer-insert-text! s text)
+  "Insert committed TEXT in S's minibuffer and refresh its candidates."
+  (sset! s 'mb-pending '())
+  (insert-text! s text "new")
+  (preview! s))
 
 (define (minibuffer-key s key)
   (let* ((keys (append (or (sget s 'mb-pending) '()) (list key)))

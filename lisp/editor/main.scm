@@ -44,7 +44,7 @@
 (provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-eval! editor-eval-ended! editor-press editor-viewport! editor-pointer! editor-focus-event! editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers pane-inlays pane-projections face-table face-generation cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
-         bound-keys editor-unsendable! editor-take-violations! keep-histories!
+         editor-insert-text! bound-keys editor-unsendable! editor-take-violations! keep-histories!
          editor-capture-request! editor-take-captures! editor-captured! editor-cancel-capture! editor-cancel-captures! editor-record! editor-stop-record!)
 
 (define (start-session view profile-name)

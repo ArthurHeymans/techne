@@ -179,8 +179,11 @@ fn attached_across_a_crash() {
     assert!(local.link.restart());
     other.event(|e| matches!(e, Event::Ended).then_some(()));
     assert!(other.link.restart());
-    other.keys("b");
-    other.snapshot(|s| s.pane().text.to_string().ends_with('b') && !s.answers.is_empty());
+    let Link::Remote(remote) = &mut other.link else { unreachable!() };
+    remote.send_in_generation(Input::Text { text: "stale".into(), at: Instant::now() }, 0);
+    remote.send_in_generation(Input::Key { key: "b".into(), at: Instant::now() }, 1);
+    let new = other.snapshot(|s| s.pane().text.to_string().ends_with('b') && !s.answers.is_empty());
+    assert!(!new.pane().text.to_string().contains("stale"));
     assert_eq!(other.link.busy_from(), None);
     let Link::Local(h) = local.link else { unreachable!() };
     h.close();

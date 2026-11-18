@@ -59,7 +59,7 @@ use crate::{
 
 /// The version of the protocol below: an editor refuses a frontend that
 /// speaks another, as a techne of another build on another machine may.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Largest frame of an attachment: an image's pixels and a captured frame
 /// cross it whole. The peer runs as the same user, as the socket's
@@ -74,7 +74,10 @@ const MAX_QUEUED: usize = 4096;
 /// What a frontend sends.
 #[derive(Serialize, Deserialize)]
 enum Up {
-    Input(Input),
+    Input {
+        input: Input,
+        generation: Option<u64>,
+    },
     /// A capture's result, for the runtime of `generation`: the number of
     /// `Restarted` the frontend was told before the capture was asked for.
     Captured {
@@ -257,15 +260,19 @@ pub(crate) fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream, profile
     let mut numbered = 0;
     while let Ok(Some(up)) = read_frame::<Up>(&mut stream) {
         match up {
-            Up::Input(input) => {
-                let counted = matches!(input, Input::Key { .. } | Input::Click { .. });
+            Up::Input { input, generation } => {
+                let counted = input.instant().is_some();
                 numbered += counted as u64;
                 // Taken before the runtime has it, so that its answer finds
                 // it; and before a restart, which forgets it.
                 let mut unanswered = served.unanswered.lock().expect("the attachment");
                 let mut attached = served.attached.lock().expect("the attachment");
-                let Some(host) = attached.host.as_mut() else { break };
-                let taken = host.sent(input);
+                let taken = if generation.is_some_and(|g| g != attached.restarts) {
+                    false
+                } else {
+                    let Some(host) = attached.host.as_mut() else { break };
+                    host.sent(input)
+                };
                 if counted {
                     unanswered.push_back((numbered, taken));
                 }
@@ -648,7 +655,17 @@ impl Remote {
     /// Send an input. C-g interrupts what the runtime does for this
     /// frontend as soon as it arrives, as it does for one in its process.
     pub fn send(&mut self, input: Input) {
-        if let Input::Key { at, .. } | Input::Click { at, .. } = &input {
+        self.send_input(input, None);
+    }
+
+    /// Deliver input only to the generation shown by the frontend. The first
+    /// generation is zero; each Event::Ended advances it once.
+    pub fn send_in_generation(&mut self, input: Input, generation: u64) {
+        self.send_input(input, Some(generation));
+    }
+
+    fn send_input(&mut self, input: Input, generation: Option<u64>) {
+        if let Some(at) = input.instant() {
             let mut waiting = self.waiting.lock().expect("the waiting");
             if waiting.len() >= 4096 {
                 drop(waiting);
@@ -656,9 +673,9 @@ impl Remote {
                 return;
             }
             self.numbered += 1;
-            waiting.push_back((self.numbered, *at));
+            waiting.push_back((self.numbered, at));
         }
-        self.enqueue(Up::Input(input));
+        self.enqueue(Up::Input { input, generation });
     }
 
     /// When the runtime is busy, as far as this frontend can tell: as
@@ -678,7 +695,7 @@ impl Remote {
 
     fn enqueue(&self, message: Up) {
         let bytes = match &message {
-            Up::Input(input) => weight(input),
+            Up::Input { input, .. } => weight(input),
             Up::Captured { result, .. } => {
                 std::mem::size_of::<Up>()
                     + match result {
@@ -1053,7 +1070,7 @@ mod tests {
         let (tx, events) = mpsc::channel();
         let mut remote = Remote::attach_through(&["sleep".into(), "20".into()], "emacs", None, move |e| drop(tx.send(e))).unwrap();
         for _ in 0..6 {
-            remote.send(Input::Clipboard { text: "a".repeat(1 << 20) });
+            remote.send(Input::Text { text: "a".repeat(1 << 20), at: Instant::now() });
         }
         assert!(matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), Event::Failed(_)));
         remote.close();
@@ -1187,7 +1204,7 @@ mod tests {
         };
         assert_eq!((generation, id, result.unwrap_err()), (1, 0, "new".to_string()));
         assert!(matches!(read_frame::<Up>(&mut editor).unwrap(),
-            Some(Up::Input(Input::Clipboard { text })) if text == "sentinel"));
+            Some(Up::Input { input: Input::Clipboard { text }, .. }) if text == "sentinel"));
         remote.close();
         assert!(read_frame::<Up>(&mut editor).unwrap().is_none());
     }

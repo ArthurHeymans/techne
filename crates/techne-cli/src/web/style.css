@@ -1,0 +1,29 @@
+:root { color-scheme: dark; background: #1e1e2e; color: #cdd6f4; font: 15px/20px ui-monospace, monospace; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; overflow: hidden; }
+#frame { position: relative; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+#panes { flex: 1 1 auto; min-height: 0; position: relative; }
+.pane { position: absolute; display: flex; flex-direction: column; overflow: hidden; }
+.pane[data-divider] { border-right: 1px solid; }
+.buffer { flex: 1 1 auto; overflow: auto; scrollbar-width: none; min-height: 0; padding: 0 6px; overscroll-behavior: contain; }
+.buffer:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
+.row { display: flex; min-height: 1.25em; }
+.gutter { user-select: none; flex: none; text-align: right; padding-right: 1ch; }
+.source { min-width: 0; flex: auto; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 8; }
+.inlay { user-select: none; }
+.caret { display: inline-block; position: relative; width: 0; height: 1em; vertical-align: -.15em; pointer-events: none; }
+.caret::after { content: ""; display: block; width: 2px; height: 1.2em; background: currentColor; position: absolute; top: -.1em; }
+.caret.block::after { width: 1ch; opacity: .55; }
+.mode, #echo, #prompt-line { padding: 0 6px; min-height: 1.25em; white-space: pre; overflow: hidden; text-overflow: clip; }
+.mode { flex: 0 0 auto; background: #313244; }
+#minibuffer { flex: 0 1 auto; min-height: 0; overflow: hidden; }
+#hints { flex: 0 0 auto; max-height: 25dvh; overflow: hidden; }
+#choices, #completion { display: grid; grid-template-columns: max-content minmax(0, auto); overflow: hidden; }
+.option { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; white-space: pre; }
+.option > span { padding: 0 1ch; overflow: hidden; text-overflow: clip; }
+#completion { position: absolute; z-index: 2; min-width: 15ch; max-width: calc(100% - 12px); max-height: 30dvh; background: #313244; }
+#hints { white-space: pre; padding: 0 6px; display: flex; flex-wrap: wrap; column-gap: 3ch; }
+#keys { position: absolute; z-index: -1; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; margin: 0; padding: 0; border: 0; font: inherit; resize: none; }
+#connection { position: absolute; inset: 0; margin: auto; width: max-content; max-width: calc(100% - 2rem); height: max-content; padding: .75rem 1rem; border: 1px solid; background: #313244; }
+button { font: inherit; }

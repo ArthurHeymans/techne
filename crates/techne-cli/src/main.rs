@@ -8,6 +8,8 @@
 //! `techne FILE` is an error.
 
 mod cloud;
+#[cfg(feature = "web")]
+mod web;
 
 use std::process::ExitCode;
 
@@ -19,6 +21,7 @@ usage: techne [SUBCOMMAND] [ARGS...]
   term [ARGS]              the editor in this terminal
   eval [ARGS] FORM         evaluate FORM in the editor running
   daemon                   the editor with no frontend, for frontends to attach
+  web [FILE]               attach a browser to the editor on this machine
   attach --stdio [--start] relay to the editor running here (what ssh runs)
   run FILE [ARGS]          run a Scheme file
   repl                     a Lisp REPL in this terminal
@@ -31,6 +34,7 @@ usage: techne [SUBCOMMAND] [ARGS...]
 `techne window --help`, `techne term --help`, `techne eval --help` and
 `techne node --help` describe their arguments.";
 
+#[cfg(any(feature = "window", feature = "term", feature = "web"))]
 const EVAL_USAGE: &str = "\
 usage: techne eval [--detached] [--module MODULE] [--as NAME] [--timeout SECONDS] FORM
 
@@ -64,6 +68,7 @@ fn main() -> ExitCode {
         "term" => term(rest()),
         "eval" => eval(rest()),
         "daemon" => daemon(rest()),
+        "web" => web(rest()),
         "attach" => attach(rest()),
         "run" => match rest() {
             file if file.is_empty() => usage(),
@@ -86,6 +91,17 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => editor(args),
+    }
+}
+
+fn web(args: Vec<String>) -> ExitCode {
+    #[cfg(feature = "web")]
+    return web::main(args);
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = args;
+        eprintln!("techne: built without the web frontend");
+        ExitCode::from(2)
     }
 }
 
@@ -132,7 +148,7 @@ fn window(_: Vec<String>) -> ExitCode {
 }
 
 /// `techne eval`: evaluate in the editor running, through its socket.
-#[cfg(any(feature = "window", feature = "term"))]
+#[cfg(any(feature = "window", feature = "term", feature = "web"))]
 fn eval(args: Vec<String>) -> ExitCode {
     use std::io::{Read, Write};
     use techne_editor::server::{self, OpenError, Request};
@@ -202,12 +218,13 @@ fn eval(args: Vec<String>) -> ExitCode {
     }
 }
 
-#[cfg(not(any(feature = "window", feature = "term")))]
+#[cfg(not(any(feature = "window", feature = "term", feature = "web")))]
 fn eval(_: Vec<String>) -> ExitCode {
     eprintln!("techne: built without the editor");
     ExitCode::from(2)
 }
 
+#[cfg(any(feature = "window", feature = "term", feature = "web"))]
 const DAEMON_USAGE: &str = "\
 usage: techne daemon
 
@@ -220,7 +237,7 @@ has to say goes to stderr. techne window --attach --start starts one when
 none runs.";
 
 /// `techne daemon`: the editor with no frontend, until a signal stops it.
-#[cfg(any(feature = "window", feature = "term"))]
+#[cfg(any(feature = "window", feature = "term", feature = "web"))]
 fn daemon(args: Vec<String>) -> ExitCode {
     use std::sync::{
         Arc,
@@ -276,12 +293,13 @@ fn daemon(args: Vec<String>) -> ExitCode {
     }
 }
 
-#[cfg(not(any(feature = "window", feature = "term")))]
+#[cfg(not(any(feature = "window", feature = "term", feature = "web")))]
 fn daemon(_: Vec<String>) -> ExitCode {
     eprintln!("techne: built without the editor");
     ExitCode::from(2)
 }
 
+#[cfg(any(feature = "window", feature = "term", feature = "web"))]
 const ATTACH_USAGE: &str = "\
 usage: techne attach --stdio [--start]
 
@@ -290,7 +308,7 @@ what techne window --attach --ssh HOST runs on HOST, through ssh. With
 --start, an editor is started first (techne daemon) if none runs.";
 
 /// `techne attach --stdio`: relay to the editor's socket.
-#[cfg(any(feature = "window", feature = "term"))]
+#[cfg(any(feature = "window", feature = "term", feature = "web"))]
 fn attach(args: Vec<String>) -> ExitCode {
     let start = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["--stdio"] => false,
@@ -313,7 +331,7 @@ fn attach(args: Vec<String>) -> ExitCode {
     }
 }
 
-#[cfg(not(any(feature = "window", feature = "term")))]
+#[cfg(not(any(feature = "window", feature = "term", feature = "web")))]
 fn attach(_: Vec<String>) -> ExitCode {
     eprintln!("techne: built without the editor");
     ExitCode::from(2)
