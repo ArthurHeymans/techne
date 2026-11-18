@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795030836232,
+  "lastUpdate": 1795030837948,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -57781,6 +57781,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 107260,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "81fdb639f41a33e2d2a1a7eacc8f16912e293c7b",
+          "message": "Merge pull request #369 from ArthurHeymans/editor/native-mail\n\nRead, search, and send mail inside Techne",
+          "timestamp": "2026-11-18T20:31:57+01:00",
+          "tree_id": "dd120e4f80bbfb278c8e7969d9b97c752bd4d8b4",
+          "url": "https://github.com/ArthurHeymans/techne/commit/81fdb639f41a33e2d2a1a7eacc8f16912e293c7b"
+        },
+        "date": 1795030837886,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697422274,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 649643844,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107661,
             "unit": "data"
           }
         ]
