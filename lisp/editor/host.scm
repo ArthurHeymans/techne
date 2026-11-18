@@ -26,7 +26,8 @@
 (define-hook viewport-changed
   "After frontend geometry changes: (session columns rows).")
 (define (editor-viewport! s columns rows . gaps)
-  "Record frontend COLUMNS, ROWS and split GAP in session S."
+  "Record frontend COLUMNS and ROWS in session S.
+The first element of GAPS is the split gap in cells; it defaults to one."
   (let ((cols (max 1 columns)) (rows (max 2 rows)) (gap (max 1 (if (null? gaps) 1 (car gaps)))))
     (unless (and (equal? (sget s (quote viewport-columns)) cols)
                  (equal? (sget s (quote viewport-rows)) rows)
