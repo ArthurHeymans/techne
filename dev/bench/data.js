@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794997667357,
+  "lastUpdate": 1794997669063,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -56041,6 +56041,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 107100,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a0ff36f0b4c930a78692b68f332b95c571d7652a",
+          "message": "Speed up indentation over large selections (#368)\n\n* editor: deduplicate indentation lines in linear time\n\nAfter sorting the selected line positions, remove duplicates by comparing neighbors. A whole-list search for every line made large selections quadratic. The result still contains each selected line once in sorted order.\n\nOn a 7,168-line Scheme buffer, the warmed median fell from 373 ms to 74 ms across seven alternating process pairs.\n\n* editor: refresh indentation source locations",
+          "timestamp": "2026-11-18T11:18:31+01:00",
+          "tree_id": "c745245915d8d77c5d43199a506bd42e0062b5d2",
+          "url": "https://github.com/ArthurHeymans/techne/commit/a0ff36f0b4c930a78692b68f332b95c571d7652a"
+        },
+        "date": 1794997668990,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 694196004,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 646441602,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107151,
             "unit": "data"
           }
         ]
