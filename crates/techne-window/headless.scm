@@ -41,6 +41,18 @@
 ;; Nothing from the desktop's session.
 (define desktop '(("WAYLAND_DISPLAY" . #f) ("DISPLAY" . #f) ("SWAYSOCK" . #f)))
 
+;; What COMMAND needs to draw here whatever the machine has. Without a
+;; render node, Mesa's software Vulkan driver, which the window shell
+;; names (as CI uses it); and the shell's fonts, monospace among them, so
+;; that a screenshot's columns line up as on a desktop. Neither replaces
+;; a choice already made in the environment, and this never runs on the
+;; desktop, so neither overrides its driver or fonts.
+(define (unless-set name value)
+  (if (and value (not (get-environment-variable name))) `((,name . ,value)) '()))
+(define drawing
+  (append (if render '() (unless-set "VK_DRIVER_FILES" (get-environment-variable "TECHNE_SOFTWARE_VULKAN_DRIVER")))
+          (unless-set "FONTCONFIG_FILE" (get-environment-variable "TECHNE_HEADLESS_FONTCONFIG"))))
+
 ;; Sway in DIR, until COMMAND ends: its status. Leaving, however it
 ;; leaves (an error, or this interrupted by Ctrl-C, SIGTERM or SIGHUP),
 ;; kills COMMAND's processes and sway's.
@@ -60,7 +72,7 @@
           (wait (- tries 1))))
       (call-with-process (car command) (cdr command) process-wait
         #:stdin 'inherit #:stdout 'inherit #:stderr 'inherit
-        #:environment (append desktop egl
+        #:environment (append desktop egl drawing
                               `(("XDG_RUNTIME_DIR" . ,dir) ("WAYLAND_DISPLAY" . "wayland-1")))))
     #:stdin 'null #:stdout (in-dir "sway.log") #:stderr (in-dir "sway.err")
     #:environment (append desktop egl

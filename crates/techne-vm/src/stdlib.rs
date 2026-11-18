@@ -521,6 +521,7 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
     let mut out = vec![Value::UNSET; nopt + keywords.len()];
     let mut extra = Vec::new();
     let mut positional = 0;
+    let mut surplus = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         let x = rest[i];
@@ -538,9 +539,22 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
         } else if has_rest {
             extra.push(x);
         } else {
-            return Err(Error::new(format!("{name}: too many arguments")));
+            surplus.push(x);
         }
         i += 1;
+    }
+    if !surplus.is_empty() {
+        // The usual cause: a keyword argument written before a positional
+        // one, which then took the keyword for its value.
+        let mut values = surplus.iter().map(|v| repr(*v)).collect::<Vec<_>>().join(" ");
+        if let Some((cut, _)) = values.char_indices().nth(200) {
+            values.truncate(cut);
+            values.push('…');
+        }
+        return Err(Error::new(format!(
+            "{name}: too many arguments, {} more than it takes: {values}; keyword arguments go after the positional ones",
+            surplus.len()
+        )));
     }
     // Root the collected values: building the rest list may move them.
     let mark = vm.scratch.len();
