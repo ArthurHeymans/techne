@@ -3,8 +3,9 @@
 ;;; Cells are #f (default blank), (text . rendition), or 'tail of a wide cell.
 
 (define-record-type row
-  (make-row cells cache rendition barrier) row?
-  (cells terminal-row-cells)
+  (make-row columns data cache rendition barrier) row?
+  (columns terminal-row-columns)
+  (data row-data row-data-set!)
   (cache terminal-row-cache terminal-row-cache-set!)
   (rendition rendition rendition-set!)
   (barrier barrier? barrier-set!))
@@ -21,13 +22,14 @@
   (wrap wrap? wrap-set!) (saved saved saved-set!))
 
 (define-record-type terminal
-  (%terminal rows cols main alt alternate history first next modes style
+  (%terminal rows cols main alt alternate history first next modes style protected
              g0 g1 shifted tabs title state header reply resize-request level page-length cursor-style ansi-modes dec-modes) terminal?
   (rows terminal-rows rows-set!) (cols terminal-columns columns-set!)
   (main main main-set!) (alt alt alt-set!)
   (alternate terminal-alternate? alternate-set!)
   (history history) (first first first-set!) (next next next-set!)
   (modes modes modes-set!) (style style style-set!)
+  (protected ever-protected? ever-protected-set!)
   (g0 g0 g0-set!) (g1 g1 g1-set!) (shifted shifted? shifted-set!)
   (tabs tabs tabs-set!) (title terminal-title title-set!)
   (state parser-state parser-state-set!) (header header header-set!)
@@ -36,7 +38,32 @@
   (cursor-style cursor-style cursor-style-set!)
   (ansi-modes ansi-modes) (dec-modes dec-modes))
 
-(define (fresh-row cols fill) (make-row (make-vector cols fill) #f 'single #f))
+;; An ASCII prefix with uniform attributes and a blank suffix. Complex
+;; editing materializes the cells; rendering can read this form directly.
+(define (fresh-row cols fill) (make-row cols (if fill (list "" '() fill) "") #f 'single #f))
+
+(define (terminal-row-plain r)
+  "Return R's unstyled ASCII prefix, or #f for other row data."
+  (let ((data (row-data r))) (and (string? data) data)))
+
+(define (terminal-row-ascii r)
+  "Return compact data (text style blank-fill) for row R, or #f."
+  (let ((data (row-data r)))
+    (cond ((string? data) (list data '() #f)) ((pair? data) data) (else #f))))
+
+(define ascii-characters
+  (list->vector (map (lambda (i) (string (integer->char i))) (iota 95 32))))
+
+(define (terminal-row-cells r)
+  "Return the cell vector for row R, materializing it if needed."
+  (let ((data (row-data r)))
+    (if (vector? data) data
+        (let* ((data (terminal-row-ascii r)) (text (car data)) (attrs (cadr data)) (n (string-length text))
+               (cells (make-vector (terminal-row-columns r) (caddr data))))
+          (do ((i 0 (+ i 1))) ((= i n))
+            (vector-set! cells i (cons (vector-ref ascii-characters (- (char->integer (string-ref text i)) 32)) attrs)))
+          (row-data-set! r cells)
+          cells))))
 (define (fresh-screen rows cols)
   (let ((v (make-vector rows)))
     (do ((i 0 (+ i 1))) ((= i rows)) (vector-set! v i (fresh-row cols #f)))
@@ -53,7 +80,7 @@ Call SEND with strings to reply to the process, and RESIZE with the new
 rows and columns after a resize requested by the terminal stream."
   (let ((rows (max 1 rows)) (cols (max 1 cols)))
     (%terminal rows cols (fresh-screen rows cols) (fresh-screen rows cols) #f
-               (make-vector (max 0 limit) #f) 0 0 '(wrap cursor) '()
+               (make-vector (max 0 limit) #f) 0 0 '(wrap cursor) '() #f
                #f #f #f (default-tabs cols) "" 'ground "" send resize 65 #f 2
                (make-hash-table) (make-hash-table))))
 
@@ -71,6 +98,7 @@ rows and columns after a resize requested by the terminal stream."
   "Return whether terminal T has enabled MODE."
   (and (memq mode (modes t)) #t))
 (define (mode-set! t mode on)
+  (when (and on (memq mode '(dec-protect iso-protect))) (ever-protected-set! t #t))
   (unless (eq? (terminal-mode? t mode) on)
     (modes-set! t (if on (cons mode (modes t)) (remove (lambda (m) (eq? m mode)) (modes t))))))
 
@@ -94,6 +122,18 @@ rows and columns after a resize requested by the terminal stream."
   (and (<= (terminal-history-start t) id) (< id (next t))
        (vector-ref (history t) (modulo id (vector-length (history t))))))
 
+(define (terminal-history-slice t from to)
+  "Return a vector of terminal T's scrollback rows from FROM up to TO."
+  (unless (<= (terminal-history-start t) from to (next t)) (error "Invalid scrollback range" from to))
+  (if (= from to) '#()
+      (let* ((ring (history t)) (size (vector-length ring)) (i (modulo from size))
+             (n (- to from)))
+        (if (<= (+ i n) size) (vector-copy ring i (+ i n))
+            (let* ((a (- size i)) (out (make-vector n)))
+              (vector-copy! out 0 ring i size)
+              (vector-copy! out a ring 0 (- n a))
+              out)))))
+
 (define (clip low n high) (max low (min n high)))
 (define (move t x y lo hi)
   (let ((s (active t)))
@@ -113,9 +153,18 @@ rows and columns after a resize requested by the terminal stream."
           (if within (bottom s) (- (terminal-rows t) 1)))
     (when (and (> dx 0) inside) (sx-set! s (min (sx s) (margin-right t (sy s)))))))
 
+(define foreground-styles (list->vector (map (lambda (i) (list (cons 'fg i))) (iota 256))))
+(define background-styles (list->vector (map (lambda (i) (list (cons 'bg i))) (iota 256))))
+
 (define (put-style! t key value)
-  (let ((rest (filter (lambda (p) (not (eq? (car p) key))) (style t))))
-    (style-set! t (if value (cons (cons key value) rest) rest))))
+  (let ((attrs (style t)))
+    (if (or (null? attrs) (and (null? (cdr attrs)) (eq? key (caar attrs))))
+        (style-set! t (cond ((not value) '())
+                            ((and (eq? key 'fg) (integer? value)) (vector-ref foreground-styles value))
+                            ((and (eq? key 'bg) (integer? value)) (vector-ref background-styles value))
+                            (else (list (cons key value)))))
+        (let ((rest (filter (lambda (p) (not (eq? (car p) key))) attrs)))
+          (style-set! t (if value (cons (cons key value) rest) rest))))))
 (define (blank t)
   (let ((bg (assq (if (assq 'inverse (style t)) 'fg 'bg) (style t))))
     (and bg (cons " " (list (cons 'bg (cdr bg)))))))
@@ -136,10 +185,11 @@ rows and columns after a resize requested by the terminal stream."
         (begin
           (when (and save? (not (terminal-alternate? t)) (= lo 0))
             (do ((i lo (+ i 1))) ((= i (+ lo n))) (keep-row! t (vector-ref v i))))
-          (do ((i lo (+ i 1))) ((> i hi))
-            (vector-set! v i (if (<= (+ i n) hi) (vector-ref v (+ i n)) (fresh-row cols fill)))))
-        (do ((i hi (- i 1))) ((< i lo))
-          (vector-set! v i (if (>= (- i n) lo) (vector-ref v (- i n)) (fresh-row cols fill)))))))
+          (vector-copy! v lo v (+ lo n) (+ hi 1))
+          (do ((i (+ 1 (- hi n)) (+ i 1))) ((> i hi)) (vector-set! v i (fresh-row cols fill))))
+        (begin
+          (vector-copy! v (+ lo n) v lo (+ 1 (- hi n)))
+          (do ((i lo (+ i 1))) ((= i (+ lo n))) (vector-set! v i (fresh-row cols fill)))))))
 
 (define (index! t direction)
   (let* ((s (active t)) (y (sy s)))
@@ -209,6 +259,7 @@ rows and columns after a resize requested by the terminal stream."
   (main-set! t (fresh-screen (terminal-rows t) (terminal-columns t)))
   (alt-set! t (fresh-screen (terminal-rows t) (terminal-columns t)))
   (clear-history! t)
+  (ever-protected-set! t #f)
   (modes-set! t '()) (soft-reset! t)
   (level-set! t 65) (page-length-set! t #f) (cursor-style-set! t 2)
   (tabs-set! t (default-tabs (terminal-columns t)))
@@ -240,7 +291,7 @@ rows and columns after a resize requested by the terminal stream."
                              (vector-copy! copy 0 cells 0 (min limit n))
                              (when (and (< limit n) (eq? (vector-ref cells limit) 'tail))
                                (vector-set! copy (- limit 1) #f))
-                             (make-row copy #f (rendition r) (barrier? r)))))))))
+                             (make-row cols copy #f (rendition r) (barrier? r)))))))))
            (lines-set! s v) (sy-set! s (- (sy s) skip))
             (let* ((r (vector-ref v (sy s))) (limit (if (terminal-row-double-width? r) (max 1 (quotient cols 2)) cols)))
               (sx-set! s (min (sx s) (- limit 1))))

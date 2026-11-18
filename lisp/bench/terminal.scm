@@ -51,6 +51,7 @@
      (else (error "Unknown terminal workload" name)))
    size))
 
+
 (define (terminal-bench-iteration data)
   "Measure one fresh terminal parsing DATA and projecting it to a buffer.
 Return elapsed milliseconds; the caller warms up and collects between runs."

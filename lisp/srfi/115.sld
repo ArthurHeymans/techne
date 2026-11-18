@@ -219,6 +219,7 @@ A compiled one is returned as it is."
 
     (define-syntax rx
       (syntax-rules ()
+        "Compile the given SRE forms as a sequence."
         ((_ sre ...) (regexp `(: sre ...)))))
 
     (define (regexp->sre re)
@@ -342,12 +343,12 @@ like it after the last match, with #f for the match."
                start (%end str end))))
 
     (define (regexp-extract re str [start #f] [end #f])
-      "Return the texts of the non-empty matches of RE in STR from START to END."
+      "Return the non-empty matches of RE in STR from START to END."
       (reverse (%fold re (lambda (from m acc) (let ((s (regexp-match-submatch m 0))) (if (string-null? s) acc (cons s acc))))
                       '() str (lambda (from acc) acc) (%start str start) (%end str end))))
 
     (define (regexp-split re str [start #f] [end #f])
-      "Return the texts of STR from START to END between non-empty matches of RE."
+      "Return pieces of STR from START to END between non-empty RE matches."
       (let ((start (%start str start)) (end (%end str end)))
         (%fold re
                (lambda (from m acc)
@@ -358,7 +359,8 @@ like it after the last match, with #f for the match."
                start end)))
 
     (define (regexp-partition re str [start #f] [end #f])
-      "Return the texts of STR from START to END between and of the matches of RE.
+      "Return both matching and unmatched pieces of STR from START to END.
+RE is the pattern to match.
 Texts between matches come first and then every other one, empty if a
 match follows another; a match at the end ends the list."
       (let ((start (%start str start)) (end (%end str end)))

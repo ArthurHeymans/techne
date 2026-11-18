@@ -115,4 +115,35 @@
   (feed t "old" esc "]2;" (make-string 1100 #\x) esc "c" "NEW")
   (check "a new escape cancels even a discarded OSC" "NEW     " (row t 0)))
 
+(define (screen-signature t)
+  (list (terminal-x t) (terminal-y t) (terminal-alternate? t)
+        (terminal-title t) (terminal-history-start t) (terminal-history-end t)
+        (map terminal-row-cells (vector->list (terminal-history-slice t (terminal-history-start t) (terminal-history-end t))))
+        (map (lambda (i) (cells t i)) (iota (terminal-rows t)))))
+
+(define (feed-in-pieces text width history)
+  (let* ((replies '())
+         (t (make-terminal 4 12 #:history history #:reply (lambda (s) (set! replies (cons s replies)))))
+         (length (string-length text)))
+    (do ((from 0 (+ from width))) ((>= from length))
+      (terminal-feed! t text #:start from #:end (min (+ from width) length)))
+    (cons (screen-signature t) (reverse replies))))
+
+(for-each
+ (lambda (text)
+   (for-each
+    (lambda (history)
+      (let ((reference (feed-in-pieces text 1 history)))
+        (check "fast paths agree with single-character input"
+               #t (every (lambda (n) (equal? reference (feed-in-pieces text n history)))
+                         (list 2 5 16 (string-length text))))))
+    '(0 3 80)))
+ (list (string-append "\r\nabc\r\nxyz\r\n" (string-join (map number->string (iota 50)) "\r\n") "\r\npartial")
+       (string-append (csi "38;5;215m") "color one\r\n" (csi "0m") "ordinarymoretext\r\n"
+                      (csi "2;1H") "ab界cd" (csi "44m") (csi "2;3H") "AB"
+                      (csi "3;1H") "界" (csi "3;1H") "Xy" (csi "48;5;7m")
+                      (csi "2J") (csi "H") "Résumé " (csi "7G") "ae\x301;" (csi "6n")
+                      (csi "?7l") "this wraps only once" (dcs "$qm"))
+       (string-append (csi "?1049h") "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8")))
+
 (test-summary)
