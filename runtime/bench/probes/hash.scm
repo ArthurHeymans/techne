@@ -1,0 +1,21 @@
+;; Compare integer lookup, reused string objects, and equal fresh strings.
+;; Run each mode in a fresh process; setup isn't part of the timed loop.
+(define n 200000)
+(define mode (cadr (command-line)))
+(define h (make-hash-table))
+(define key
+  (cond ((string=? mode "integer") (lambda (i) i))
+        ((string=? mode "fresh") number->string)
+        ((string=? mode "reused")
+         (let ((keys (make-vector n)))
+           (do ((i 0 (+ i 1))) ((= i n)) (vector-set! keys i (number->string i)))
+           (lambda (i) (vector-ref keys i))))
+        (else (error "expected integer, fresh or reused"))))
+(do ((i 0 (+ i 1))) ((= i n)) (hash-table-set! h (key i) i))
+(do ((trial 0 (+ trial 1))) ((= trial 10))
+  (let* ((start (current-jiffy))
+         (sum (let loop ((i 0) (acc 0))
+                (if (= i n) acc (loop (+ i 1) (+ acc (hash-table-ref/default h (key i) -1))))))
+         (end (current-jiffy)))
+    (unless (= sum (quotient (* n (- n 1)) 2)) (error "wrong hash result"))
+    (write (- end start)) (newline)))
