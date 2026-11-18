@@ -1324,9 +1324,12 @@ fn keywords_and_match() {
         (define (rest-opt a [b 0] . more) (list a b more)) (displayln (list (rest-opt 1) (rest-opt 1 2 3 4)))
         (displayln (apply greet (list \"d\" #:greeting \"hey\")))
         (define (call who f #:times [times 1]) (list who (f) times))
-        (displayln (guard (e (#t (error-object-message e))) (call 'x #:times 2 (lambda () 1))))",
+        (displayln (guard (e (#t (error-object-message e))) (call 'x #:times 2 (lambda () 1))))
+        (define shared (let loop ((i 0) (v '(a))) (if (= i 60) v (loop (+ i 1) (cons v v)))))
+        (define said (guard (e (#t (error-object-message e))) (call 'x #:times shared shared)))
+        (displayln (list (< (string-length said) 400) (string-suffix? \"keyword arguments go after the positional ones\" said)))",
         "(hello, a! hi, b! yo, c?)\n((1 10 20) (1 2 4) (1 2 3))\nreq: missing required keyword argument #:k\ngreet: unknown keyword argument #:nope\n((1 0 ()) (1 2 (3 4)))\nhey, d!\n\
-         call: too many arguments, 2 more than it takes: 2 #<procedure>; keyword arguments go after the positional ones\n",
+         call: too many arguments, 2 more than it takes: 2 #<procedure>; keyword arguments go after the positional ones\n(#t #t)\n",
     );
     check("match", "(define-record-type point (make-point x y) point? (x point-x) (y point-y))
         (define (classify v) (match v [0 'zero] [(? string? s) (list 'string s)] [(point 0 y) (list 'y-axis y)]
