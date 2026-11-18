@@ -215,6 +215,23 @@ fn family<'a>(name: &'a str, own: &'a str) -> Family<'a> {
     }
 }
 
+/// The fonts installed. Generic monospace is cosmic-text's Noto Sans
+/// Mono; where that is not installed, a query for it took the first
+/// monospaced face loaded, which may be an oblique or bold one. Name an
+/// installed monospaced family instead, so its regular face is found.
+fn fonts() -> FontSystem {
+    let mut fonts = FontSystem::new();
+    let db = fonts.db_mut();
+    let wanted = db.family_name(&Family::Monospace).to_string();
+    if !db.faces().any(|f| f.families.iter().any(|(name, _)| *name == wanted)) {
+        let installed = db.faces().filter(|f| f.monospaced && !f.post_script_name.contains("Emoji")).filter_map(|f| f.families.first());
+        if let Some(name) = installed.map(|(name, _)| name.clone()).min() {
+            db.set_monospace_family(name);
+        }
+    }
+    fonts
+}
+
 /// The metrics of text `height` percent of `size`.
 fn metrics(size: f32, height: u16) -> Metrics {
     let size = size * height as f32 / 100.0;
@@ -249,7 +266,7 @@ pub struct Layout {
 impl Layout {
     pub fn new(font_size: f32, family: &str) -> Layout {
         let mut layout = Layout {
-            fonts: FontSystem::new(),
+            fonts: fonts(),
             metrics: metrics(font_size, 100),
             family: family.to_string(),
             width: 0.0,
