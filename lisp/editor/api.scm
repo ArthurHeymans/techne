@@ -73,7 +73,7 @@
          make-request-slot request! request-pending? cancel-request! append-bounded-output! log-history
          current-operation start-operation! operation? operation-serial operation-runtime operation-parent-serial operation-command
          operation-committed? operation-staged? operation-proposals operation-phase operation-outcome operation-procedure call-in-operation without-operation
-         operation-failed! operation-cancelled! operation-hold! operation-release! command-joins!
+         operation-failed! operation-cancelled! operation-hold! operation-release! command-joins! cancelled-condition?
          operation-record? record-operation record-command record-code code-id record-document record-revision record-prefix
          record-runs record-condition record-pending? operation-record-of find-operation-record
          undo-operation! forget-operation!

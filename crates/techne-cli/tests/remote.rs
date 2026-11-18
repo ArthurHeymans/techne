@@ -84,6 +84,290 @@ fn a_remote_file_is_opened_saved_and_read_again() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_lost_commit_reply_blocks_writes_without_replaying() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").current_dir(root).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.test"]);
+    git(&["config", "commit.gpgSign", "false"]);
+    git(&["config", "core.hooksPath", ".git/hooks"]);
+    let file = root.join("a.txt");
+    std::fs::write(&file, "first\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-qm", "initial"]);
+    std::fs::write(&file, "second\n").unwrap();
+    git(&["add", "a.txt"]);
+    let hook = root.join(".git/hooks/post-commit");
+    let marker = root.join(".git/commit-recorded");
+    std::fs::write(&hook, "#!/bin/sh\n: > .git/commit-recorded\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    // Opt-in OpenSSH loopback: the server must see this machine's temporary
+    // directory. Port-only input cannot direct this test to another host.
+    let ssh_port = std::env::var("TECHNE_VC_SSH_LOOPBACK_PORT").ok().map(|s| s.parse::<u16>().unwrap());
+    let route = ssh_port.map_or_else(|| "/pipe::".to_owned(), |p| format!("/ssh:127.0.0.1#{p}:"));
+    let loc = format!("{route}{}", file.display());
+    let open = Instant::now();
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    let open_ms = open.elapsed().as_millis();
+    let status = Instant::now();
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "staged remote file", |s| s.pane().text.to_string().contains("Staged"));
+    if ssh_port.is_some() {
+        let status_ms = status.elapsed().as_millis();
+        let scratch = root.join("refresh-probe.txt");
+        let mut warm = Vec::new();
+        for i in 0..10 {
+            let exists = i % 2 == 0;
+            if exists {
+                std::fs::write(&scratch, "probe\n").unwrap();
+            } else {
+                std::fs::remove_file(&scratch).unwrap();
+            }
+            let start = Instant::now();
+            keys(&mut rt, "g");
+            until(&mut rt, "new status rows over SSH", |s| s.pane().text.to_string().contains("refresh-probe.txt") == exists);
+            warm.push(start.elapsed().as_millis());
+        }
+        warm.sort_unstable();
+        println!("Loopback SSH: connect+open {open_ms} ms; initial status {status_ms} ms; warm refresh samples {warm:?} ms");
+    }
+    keys(&mut rt, "c c");
+    until(&mut rt, "remote commit draft", |s| s.pane().status.contains("vc-commit"));
+    type_text(&mut rt, "from Techne");
+    keys(&mut rt, "C-c C-c");
+    until(&mut rt, "post-commit hook running", |_| marker.is_file());
+    eval(&mut rt, &format!("(node-close (location-endpoint {loc:?}))"));
+    keys(&mut rt, "C-c C-k");
+    until(&mut rt, "unknown write outcome", |s| s.pane().text.to_string().contains("outcome unknown"));
+    eval(&mut rt, "(drop-buffer! (current-session) (session-buffer (current-session)))");
+    std::fs::write(&file, "third\n").unwrap();
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "reopened with unknown outcome", |s| {
+        s.pane().text.to_string().contains("outcome unknown") && s.pane().text.to_string().contains("Unstaged")
+    });
+    keys(&mut rt, "n n s");
+    until(&mut rt, "second write refused", |s| s.echo.contains("remote write is unresolved"));
+    assert_eq!(git(&["show", ":a.txt"]), "second\n");
+    drop(rt);
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "restarted with unknown outcome", |s| {
+        s.pane().text.to_string().contains("outcome unknown") && s.pane().text.to_string().contains("Unstaged")
+    });
+    keys(&mut rt, "n n s");
+    until(&mut rt, "write refused after restart", |s| s.echo.contains("remote write is unresolved"));
+    assert_eq!(git(&["show", ":a.txt"]), "second\n");
+    let evidence_start = Instant::now();
+    keys(&mut rt, "C-x v !");
+    let inspected =
+        until(&mut rt, "fresh evidence on reconnect", |s| s.pane().text.to_string().contains("Write outcome unknown · writes blocked"));
+    if ssh_port.is_some() {
+        println!("Loopback SSH: evidence on reconnected route {} ms", evidence_start.elapsed().as_millis());
+    }
+    assert!(inspected.minibuffer.is_none());
+    let evidence = inspected.pane().text.to_string();
+    assert!(evidence.contains("Before dispatch") && evidence.contains("Observed after reconnect"));
+    assert!(evidence.contains("HEAD commit changed · index entries unchanged"), "{evidence}");
+    assert_eq!(evidence.matches("index entries SHA-256").count(), 2);
+    let observed = git(&["rev-parse", "HEAD"]);
+    keys(&mut rt, "j");
+    until(&mut rt, "exact observed commit", |s| {
+        s.panes.iter().any(|p| {
+            let patch = p.text.to_string();
+            patch.contains(observed.trim()) && patch.contains("+second")
+        })
+    });
+    keys(&mut rt, "a");
+    assert_eq!(rt.snapshot().minibuffer.unwrap().rows[0].text(0), "no");
+    keys(&mut rt, "RET a");
+    type_text(&mut rt, "yes");
+    keys(&mut rt, "RET");
+    until(&mut rt, "acknowledged without replay", |s| s.echo.contains("no write replayed"));
+    assert_eq!(git(&["log", "-2", "--format=%s"]), "from Techne\ninitial\n");
+    keys(&mut rt, "C-x v !");
+    let s = rt.snapshot();
+    let evidence = s.pane().text.to_string();
+    assert!(evidence.contains("Attempt: Commit staged Git changes"), "{evidence}");
+    assert_eq!(evidence.matches("index entries SHA-256").count(), 2);
+    assert!(evidence.contains("refs/heads/"), "{evidence}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lost_push_reply_shows_the_requested_destination_tip() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    let checkout = tempfile::tempdir().unwrap();
+    let upstream = tempfile::tempdir().unwrap();
+    let fetch_only = tempfile::tempdir().unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let root = checkout.path();
+    let bare = upstream.path();
+    git(bare, &["init", "--bare", "-q"]);
+    git(fetch_only.path(), &["init", "--bare", "-q"]);
+    git(bare, &["config", "core.hooksPath", "hooks"]);
+    git(root, &["init", "-qb", "main"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["config", "user.email", "test@example.test"]);
+    git(root, &["config", "commit.gpgSign", "false"]);
+    git(root, &["remote", "add", "origin", fetch_only.path().to_str().unwrap()]);
+    let file = root.join("a.txt");
+    std::fs::write(&file, "first\n").unwrap();
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-qm", "initial"]);
+    git(root, &["push", "-qu", "origin", "main"]);
+    git(root, &["remote", "set-url", "--push", "origin", bare.to_str().unwrap()]);
+    git(root, &["push", "-q", "origin", "main"]);
+    let before = git(bare, &["rev-parse", "refs/heads/main"]);
+    std::fs::write(&file, "second\n").unwrap();
+    git(root, &["commit", "-qam", "publish this"]);
+    let wanted = git(root, &["rev-parse", "HEAD"]);
+    let hook = bare.join("hooks/post-receive");
+    let marker = bare.join("push-recorded");
+    std::fs::write(&hook, "#!/bin/sh\n: > push-recorded\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    let loc = format!("/pipe::{}", file.display());
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "remote status", |s| s.pane().text.to_string().contains("ahead 1"));
+    keys(&mut rt, "P p");
+    until(&mut rt, "push confirmation", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("origin:refs/heads/main")));
+    git(root, &["remote", "set-url", "--push", "origin", fetch_only.path().to_str().unwrap()]);
+    type_text(&mut rt, "yes");
+    keys(&mut rt, "RET");
+    until(&mut rt, "changed destination refused", |s| s.echo.contains("push destination changed"));
+    assert_eq!(git(fetch_only.path(), &["rev-parse", "refs/heads/main"]), before);
+    assert!(!marker.is_file());
+    git(root, &["remote", "set-url", "--push", "origin", bare.to_str().unwrap()]);
+    keys(&mut rt, "P p");
+    until(&mut rt, "new push confirmation", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("origin:refs/heads/main")));
+    type_text(&mut rt, "yes");
+    keys(&mut rt, "RET");
+    until(&mut rt, "remote ref updated", |_| marker.is_file());
+    eval(&mut rt, &format!("(node-close (location-endpoint {loc:?}))"));
+    until(&mut rt, "unknown push outcome", |s| s.pane().text.to_string().contains("outcome unknown"));
+    keys(&mut rt, "C-x v !");
+    let inspected =
+        until(&mut rt, "inspect push evidence", |s| s.pane().text.to_string().contains("Write outcome unknown · writes blocked"));
+    assert!(inspected.pane().text.to_string().contains("matches requested commit"));
+    keys(&mut rt, "a");
+    type_text(&mut rt, "yes");
+    keys(&mut rt, "RET");
+    until(&mut rt, "acknowledge without replay", |s| s.echo.contains("no write replayed"));
+    keys(&mut rt, "C-x v !");
+    let evidence = rt.snapshot().pane().text.to_string();
+    assert!(evidence.contains("origin:refs/heads/main"), "{evidence}");
+    assert!(evidence.contains(&format!("observed tip {}", before.trim())), "{evidence}");
+    assert!(evidence.contains(&format!("observed tip {} (matches requested commit)", wanted.trim())), "{evidence}");
+    assert_eq!(git(bare, &["rev-parse", "refs/heads/main"]), wanted);
+    assert_eq!(git(fetch_only.path(), &["rev-parse", "refs/heads/main"]), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn jj_publish_recovery_observes_the_bookmark_after_a_lost_node_reply() {
+    use std::{os::unix::fs::PermissionsExt, path::Path, process::Command};
+
+    if !Command::new("jj").arg("version").output().is_ok_and(|out| out.status.success()) {
+        eprintln!("skipping jj fixture: jj is not available");
+        return;
+    }
+    let checkout = tempfile::tempdir().unwrap();
+    let upstream = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let run = |command: &str, dir: &Path, args: &[&str]| {
+        let out = Command::new(command).current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "{command} {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let root = checkout.path();
+    let bare = upstream.path();
+    run("git", bare, &["init", "--bare", "-q"]);
+    run("git", other.path(), &["init", "--bare", "-q"]);
+    run("git", bare, &["config", "core.hooksPath", "hooks"]);
+    let jj = |args: &[&str]| run("jj", root, args);
+    jj(&["git", "init", "--no-colocate"]);
+    jj(&["config", "set", "--repo", "user.name", "Test"]);
+    jj(&["config", "set", "--repo", "user.email", "test@example.test"]);
+    jj(&["git", "remote", "add", "origin", bare.to_str().unwrap()]);
+    let file = root.join("a.txt");
+    std::fs::write(&file, "published through jj\n").unwrap();
+    jj(&["describe", "-m", "Recorded topic"]);
+    jj(&["bookmark", "set", "topic", "-r", "@"]);
+    let tip = jj(&["--ignore-working-copy", "log", "--no-graph", "-r", "topic", "-T", "commit_id"]);
+    let hook = bare.join("hooks/post-receive");
+    let marker = bare.join("push-recorded");
+    std::fs::write(&hook, "#!/bin/sh\n: > push-recorded\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    let loc = format!("/pipe::{}", file.display());
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "jj graph", |s| s.pane().text.to_string().contains("Recorded topic"));
+    for change_endpoint in [true, false] {
+        keys(&mut rt, "M-< n P p");
+        until(&mut rt, "bookmark picker", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Publish bookmark")));
+        keys(&mut rt, "RET");
+        until(&mut rt, "remote picker", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Push to")));
+        keys(&mut rt, "RET");
+        until(&mut rt, "push confirmation", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Push topic")));
+        if change_endpoint {
+            jj(&["git", "remote", "set-url", "origin", other.path().to_str().unwrap()]);
+        }
+        type_text(&mut rt, "yes");
+        keys(&mut rt, "RET");
+        if change_endpoint {
+            until(&mut rt, "changed endpoint refused", |s| s.echo.contains("changed"));
+            assert!(run("git", other.path(), &["for-each-ref"]).is_empty());
+            assert!(!marker.is_file());
+            jj(&["git", "remote", "set-url", "origin", bare.to_str().unwrap()]);
+            keys(&mut rt, "g");
+        }
+    }
+    until(&mut rt, "bookmark reached destination", |_| marker.is_file());
+    eval(&mut rt, &format!("(node-close (location-endpoint {loc:?}))"));
+    until(&mut rt, "publish outcome unknown", |s| s.pane().text.to_string().contains("outcome unknown"));
+    keys(&mut rt, "C-x v !");
+    let inspected =
+        until(&mut rt, "review after reconnect", |s| s.pane().text.to_string().contains("Write outcome unknown · writes blocked"));
+    assert!(inspected.pane().text.to_string().contains("matches requested commit"));
+    keys(&mut rt, "a");
+    type_text(&mut rt, "yes");
+    keys(&mut rt, "RET");
+    until(&mut rt, "acknowledged without replay", |s| s.echo.contains("no write replayed"));
+    keys(&mut rt, "C-x v !");
+    let evidence = rt.snapshot().pane().text.to_string();
+    assert!(evidence.contains("origin:refs/heads/topic"), "{evidence}");
+    assert!(evidence.contains("observed tip missing"), "{evidence}");
+    assert!(evidence.contains(&format!("observed tip {tip} (matches requested commit)")), "{evidence}");
+    assert_eq!(run("git", bare, &["rev-parse", "refs/heads/topic"]).trim(), tip);
+}
+
 /// A save refused on the other machine offers choices that act there:
 /// comparing reads the file there, reverting takes its text.
 #[test]
@@ -406,7 +690,7 @@ fn commands_on_another_machine() {
     keys(&mut rt, "C-x v d");
     let s = until(&mut rt, "the status", |s| s.pane().text.to_string().contains("a.txt"));
     assert!(
-        s.pane().text.to_string().starts_with(&format!("git {repo}").trim_end_matches('/').to_string()),
+        s.pane().text.to_string().starts_with(&format!("Git status\n{}\n", repo.trim_end_matches('/'))),
         "{}",
         s.pane().text.to_string()
     );

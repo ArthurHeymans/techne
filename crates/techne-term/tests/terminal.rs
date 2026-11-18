@@ -96,6 +96,87 @@ fn click(col: usize, row: usize, shift: bool) -> Vec<u8> {
 }
 
 #[test]
+fn version_control_sections_in_the_terminal_grid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.scm");
+    let init = std::process::Command::new("git").current_dir(dir.path()).args(["init", "-q", "-b", "topic/cache"]).output().unwrap();
+    assert!(init.status.success());
+    std::fs::write(&path, "(define cache 0)\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut rt = Runtime::open(&path, &state.path().join("journal"), "emacs").unwrap().0;
+    let mut term = Term::new(72, 24);
+    term.output(Output::Snapshot(Box::new(rt.snapshot())));
+    let bindings = term.output(Output::Bindings(rt.bindings()));
+    let mut t = Tty { grid: term.draw(), rt, term };
+    t.run(bindings.into_iter().collect());
+    t.send(KITTY);
+    t.send(b"\x18vd");
+    let screen = |t: &Tty| (0..t.grid.rows).map(|row| t.grid.row_text(row)).collect::<Vec<_>>().join("\n");
+    let start = std::time::Instant::now();
+    while !screen(&t).contains("▾ Untracked files (1)") {
+        t.rt.run_tasks(Duration::from_millis(5)).unwrap();
+        t.redraw();
+        assert!(start.elapsed() < Duration::from_secs(15), "{}", screen(&t));
+    }
+    assert!(screen(&t).contains("\n  cache.scm"), "{}", screen(&t));
+    assert!(screen(&t).contains("? all commands"), "{}", screen(&t));
+    t.send(b"n\t");
+    assert!(screen(&t).contains("▸ Untracked files (1)"), "{}", screen(&t));
+    assert!(!screen(&t).contains("\n  cache.scm"), "{}", screen(&t));
+    // A menu shows below the status, its keys in columns.
+    t.send(b"c");
+    assert!(screen(&t).contains("c  Commit") && screen(&t).contains("Arguments"), "{}", screen(&t));
+    println!("Commit menu grid:\n{}", screen(&t));
+    t.send(b"\x07");
+    println!("Folded VC grid:\n{}", screen(&t));
+}
+
+#[test]
+fn jj_hunk_selector_in_the_terminal_grid() {
+    use std::process::Command;
+    if !Command::new("jj").arg("version").output().is_ok_and(|o| o.status.success()) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.scm");
+    let jj = |args: &[&str]| {
+        let o = Command::new("jj").current_dir(dir.path()).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    jj(&["git", "init", "--no-colocate"]);
+    jj(&["config", "set", "--repo", "user.name", "Terminal Test"]);
+    jj(&["config", "set", "--repo", "user.email", "test@example.test"]);
+    std::fs::write(&path, "(define cache 0)\n").unwrap();
+    jj(&["commit", "-m", "Baseline"]);
+    std::fs::write(&path, "(define cache 1)\n").unwrap();
+    jj(&["describe", "-m", "Set the cache"]);
+    let mut rt = Runtime::open(&path, &state.path().join("journal"), "emacs").unwrap().0;
+    let mut term = Term::new(100, 16);
+    term.output(Output::Snapshot(Box::new(rt.snapshot())));
+    let bindings = term.output(Output::Bindings(rt.bindings()));
+    let mut t = Tty { grid: term.draw(), rt, term };
+    t.run(bindings.into_iter().collect());
+    t.send(KITTY);
+    let screen = |t: &Tty| (0..t.grid.rows).map(|row| t.grid.row_text(row)).collect::<Vec<_>>().join("\n");
+    for (keys, expected) in [
+        (b"\x18vd".as_slice(), "Set the cache"),
+        (b"nF", "Files of recorded change"),
+        (b"nh", "S split selected hunk"),
+        (b"nS", "Description for selected hunk of cache.scm"),
+    ] {
+        t.send(keys);
+        let start = std::time::Instant::now();
+        while !screen(&t).contains(expected) {
+            t.rt.run_tasks(Duration::from_millis(5)).unwrap();
+            t.redraw();
+            assert!(start.elapsed() < Duration::from_secs(15), "missing {expected}: {}", screen(&t));
+        }
+    }
+    assert!(screen(&t).contains("+ (define cache 1)") || screen(&t).contains("+(define cache 1)"), "{}", screen(&t));
+}
+
+#[test]
 fn completing_after_an_incomplete_form_keeps_prior_definitions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("completion.scm");
