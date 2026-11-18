@@ -53,13 +53,20 @@ takes it. Return #f if the mode does not indent."
 ;; The starts of the lines the ranges of S are on, sorted, each once.
 (define (range-lines s whole)
   (let ((d (doc s)))
-    (delete-duplicates
-     (sort (append-map (lambda (r)
-                         (if whole
-                             (line-starts d (min (car r) (cadr r)) (max (car r) (cadr r)))
-                             (list (line-start d (cadr r)))))
-                       (ranges s))
-           <))))
+    (let loop ((starts
+                (sort (append-map (lambda (r)
+                                    (if whole
+                                        (line-starts d (min (car r) (cadr r)) (max (car r) (cadr r)))
+                                        (list (line-start d (cadr r)))))
+                                  (ranges s))
+                      <))
+               (unique '()))
+      ;; Equal offsets are adjacent after sorting. Scanning all previous
+      ;; offsets for every line would make a large selection quadratic.
+      (cond ((null? starts) (reverse unique))
+            ((and (pair? unique) (= (car starts) (car unique)))
+             (loop (cdr starts) unique))
+            (else (loop (cdr starts) (cons (car starts) unique)))))))
 
 (define (indent-here! s group)
   "Indent the lines of the heads of S's ranges, as the buffer's mode does.
