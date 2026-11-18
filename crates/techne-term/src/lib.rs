@@ -231,7 +231,16 @@ impl Term {
 
     /// The inputs for bytes from the terminal.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Input> {
-        self.decoder.feed(bytes).into_iter().filter_map(|e| self.event(e)).collect()
+        let mut inputs = Vec::new();
+        for event in self.decoder.feed(bytes) {
+            match event {
+                Event::FocusIn => inputs.push(Input::Focus { focused: true }),
+                Event::FocusOut => inputs.push(Input::Focus { focused: false }),
+                _ => {}
+            }
+            inputs.extend(self.event(event));
+        }
+        inputs
     }
 
     /// Whether the input ends in an incomplete sequence: `flush` after a
@@ -276,6 +285,21 @@ impl Term {
     }
 
     fn mouse(&mut self, m: Mouse) -> Option<Input> {
+        if !m.shift
+            && let Some(shown) = self.shown.iter().find(|s| {
+                let a = s.area;
+                (a.top..a.top + a.text_rows()).contains(&m.row) && (a.text_left()..a.text_left() + a.text_cols()).contains(&m.col)
+            })
+            && self.snap.as_ref().is_some_and(|s| s.panes.iter().any(|p| p.view == shown.view && p.display.report_pointer))
+        {
+            return Some(Input::Pointer {
+                view: shown.view,
+                column: m.col - shown.area.text_left(),
+                row: m.row - shown.area.top,
+                code: m.code,
+                release: m.release,
+            });
+        }
         match m.kind {
             MouseKind::Press => {
                 let shown = self.shown.iter().find(|s| {

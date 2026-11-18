@@ -65,7 +65,7 @@
       "is_macro": false
     },
     "buffer-projections": {
-      "description": "(buffer-projections doc from to)  procedure, @lisp@/editor/modes.scm:496\n\nReturn how the modes of DOC's buffer lay out its text from FROM to TO.\nEach is (hang LINE AT), the line starting at LINE wrapping under the\ncharacter at AT, its wrapped lines starting where that character does\n(a list item's under its text, not its bullet); or (block AT IMAGE),\nIMAGE (`image-load') shown as a block of its own above the line AT is\non, fitted to the pane's width. A frontend that cannot draw one\nignores it: a terminal shows no images.",
+      "description": "(buffer-projections doc from to)  procedure, @lisp@/editor/modes.scm:505\n\nReturn how the modes of DOC's buffer lay out its text from FROM to TO.\nEach is (hang LINE AT), the line starting at LINE wrapping under the\ncharacter at AT, its wrapped lines starting where that character does\n(a list item's under its text, not its bullet); or (block AT IMAGE),\nIMAGE (`image-load') shown as a block of its own above the line AT is\non, fitted to the pane's width. A frontend that cannot draw one\nignores it: a terminal shows no images.",
       "is_macro": false
     },
     "buffer-state": {
@@ -289,15 +289,15 @@
       "is_macro": false
     },
     "define-minor-mode": {
-      "description": "define-minor-mode: macro, @lisp@/editor/modes.scm:216\n\nDefine the minor mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-minor-mode!` takes them.",
+      "description": "define-minor-mode: macro, @lisp@/editor/modes.scm:225\n\nDefine the minor mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-minor-mode!` takes them.",
       "is_macro": true
     },
     "define-mode": {
-      "description": "define-mode: macro, @lisp@/editor/modes.scm:192\n\nDefine the major mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-mode!` takes them.",
+      "description": "define-mode: macro, @lisp@/editor/modes.scm:201\n\nDefine the major mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-mode!` takes them.",
       "is_macro": true
     },
     "define-option": {
-      "description": "define-option: macro, @lisp@/editor/modes.scm:278\n\nDeclare the option NAME, its DEFAULT and documentation DOC.\nThe other arguments are keywords, as `register-option!` takes them.",
+      "description": "define-option: macro, @lisp@/editor/modes.scm:287\n\nDeclare the option NAME, its DEFAULT and documentation DOC.\nThe other arguments are keywords, as `register-option!` takes them.",
       "is_macro": true
     },
     "define-reader!": {
@@ -313,7 +313,7 @@
       "is_macro": false
     },
     "derived-mode?": {
-      "description": "(derived-mode? name ancestor)  procedure, @lisp@/editor/modes.scm:228\n\nReturn #t if the mode NAME is ANCESTOR or extends it.",
+      "description": "(derived-mode? name ancestor)  procedure, @lisp@/editor/modes.scm:237\n\nReturn #t if the mode NAME is ANCESTOR or extends it.",
       "is_macro": false
     },
     "directory-entries": {
@@ -501,11 +501,11 @@
       "is_macro": false
     },
     "explain-key": {
-      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:438\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
+      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:447\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
       "is_macro": false
     },
     "explain-option": {
-      "description": "(explain-option b name)  procedure, @lisp@/editor/modes.scm:308\n\nReturn the settings of the option NAME that apply in buffer B.\nB #f means no buffer. Each is (cell value by), the one that wins first:\nCELL is `buffer`, a mode's name, `global` or `default`; BY is who made\nit (a package, `root` for the editor's own code and what is evaluated\nin it, a mode for its own options).",
+      "description": "(explain-option b name)  procedure, @lisp@/editor/modes.scm:317\n\nReturn the settings of the option NAME that apply in buffer B.\nB #f means no buffer. Each is (cell value by), the one that wins first:\nCELL is `buffer`, a mode's name, `global` or `default`; BY is who made\nit (a package, `root` for the editor's own code and what is evaluated\nin it, a mode for its own options).",
       "is_macro": false
     },
     "exposed-command-schemas": {
@@ -624,12 +624,20 @@
       "description": "(image-height image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:413\n\nReturn the height of IMAGE in pixels, as decoded.",
       "is_macro": false
     },
+    "image-inline-png": {
+      "description": "(image-inline-png bytes)  built-in procedure, @source@/crates/techne-editor/src/images.rs:416\n\nDecode an inline PNG, BYTES, at most one megapixel and 2 MiB.\nNo other formats or file references are accepted here.",
+      "is_macro": false
+    },
+    "image-inline-rgba": {
+      "description": "(image-inline-rgba width height bytes)  built-in procedure, @source@/crates/techne-editor/src/images.rs:429\n\nMake an inline image from WIDTH by HEIGHT straight RGBA BYTES.",
+      "is_macro": false
+    },
     "image-load": {
-      "description": "(image-load path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:460\n\nReturn the image of the file at PATH, decoded on a thread of\nits own while the calling task waits: PNG, JPEG, GIF, WebP,\nBMP or SVG, scaled down to 4096 pixels a side at most. A\nfile of more than 64 MiB, or of more than 64 megapixels, is\nrefused; an SVG's references to other files are not\nfollowed. A file loaded before and not changed since is not\ndecoded again. Show it with a projection, `(block AT IMAGE)`.",
+      "description": "(image-load path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:482\n\nReturn the image of the file at PATH, decoded on a thread of\nits own while the calling task waits: PNG, JPEG, GIF, WebP,\nBMP or SVG, scaled down to 4096 pixels a side at most. A\nfile of more than 64 MiB, or of more than 64 megapixels, is\nrefused; an SVG's references to other files are not\nfollowed. A file loaded before and not changed since is not\ndecoded again. Show it with a projection, `(block AT IMAGE)`.",
       "is_macro": false
     },
     "image-loaded": {
-      "description": "(image-loaded path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:420\n\nReturn the image of the file at PATH if it is loaded and\nthe file has not changed since, else #f. It never decodes:\n`image-load` does.",
+      "description": "(image-loaded path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:442\n\nReturn the image of the file at PATH if it is loaded and\nthe file has not changed since, else #f. It never decodes:\n`image-load` does.",
       "is_macro": false
     },
     "image-width": {
@@ -673,7 +681,7 @@
       "is_macro": false
     },
     "keymap-sources": {
-      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:420\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
+      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:429\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
       "is_macro": false
     },
     "kill-ring": {
@@ -969,7 +977,7 @@
       "is_macro": false
     },
     "mode-chain": {
-      "description": "(mode-chain name)  procedure, @lisp@/editor/modes.scm:221\n\nReturn the mode NAME and its parents, nearest first.\nModes no longer defined end the chain.",
+      "description": "(mode-chain name)  procedure, @lisp@/editor/modes.scm:230\n\nReturn the mode NAME and its parents, nearest first.\nModes no longer defined end the chain.",
       "is_macro": false
     },
     "mode-doc": {
@@ -977,7 +985,7 @@
       "is_macro": false
     },
     "mode-for-file": {
-      "description": "(mode-for-file path)  procedure, @lisp@/editor/modes.scm:232\n\nReturn the major mode for a file at PATH.\nThat is the one with the longest suffix of PATH, else\n`fundamental-mode`.",
+      "description": "(mode-for-file path)  procedure, @lisp@/editor/modes.scm:241\n\nReturn the major mode for a file at PATH.\nThat is the one with the longest suffix of PATH, else\n`fundamental-mode`.",
       "is_macro": false
     },
     "mode-map": {
@@ -993,7 +1001,7 @@
       "is_macro": false
     },
     "mode-on?": {
-      "description": "(mode-on? s name)  procedure, @lisp@/editor/modes.scm:389\n\nReturn #t if the minor mode NAME is on in the focused buffer of S.",
+      "description": "(mode-on? s name)  procedure, @lisp@/editor/modes.scm:398\n\nReturn #t if the minor mode NAME is on in the focused buffer of S.",
       "is_macro": false
     },
     "mode-parent": {
@@ -1033,11 +1041,11 @@
       "is_macro": false
     },
     "node-close": {
-      "description": "(node-close node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:783\n\nClose the connection to NODE.",
+      "description": "(node-close node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:786\n\nClose the connection to NODE.",
       "is_macro": false
     },
     "node-connect": {
-      "description": "(node-connect command)  built-in procedure, @source@/crates/techne-node/src/lib.rs:775\n\nStart COMMAND, a list of strings, and return the node it serves.\nCOMMAND runs `techne-node`, here or over ssh.",
+      "description": "(node-connect command)  built-in procedure, @source@/crates/techne-node/src/lib.rs:778\n\nStart COMMAND, a list of strings, and return the node it serves.\nCOMMAND runs `techne-node`, here or over ssh.",
       "is_macro": false
     },
     "node-connect-via": {
@@ -1045,11 +1053,11 @@
       "is_macro": false
     },
     "node-describe": {
-      "description": "(node-describe node what)  built-in procedure, @source@/crates/techne-node/src/lib.rs:991\n\nReturn NODE's description of WHAT, a name or a remote value.",
+      "description": "(node-describe node what)  built-in procedure, @source@/crates/techne-node/src/lib.rs:994\n\nReturn NODE's description of WHAT, a name or a remote value.",
       "is_macro": false
     },
     "node-directory-list": {
-      "description": "(node-directory-list node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1007\n\nReturn the entries of the directory PATH on NODE, sorted.\nSubdirectories have a slash after their name.",
+      "description": "(node-directory-list node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1010\n\nReturn the entries of the directory PATH on NODE, sorted.\nSubdirectories have a slash after their name.",
       "is_macro": false
     },
     "node-end": {
@@ -1065,7 +1073,7 @@
       "is_macro": false
     },
     "node-file-read": {
-      "description": "(node-file-read node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1001\n\nReturn the bytes of the file at PATH on NODE, or #f if there is none.\nPATH is NODE's: `~` and a relative path start at its home.",
+      "description": "(node-file-read node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1004\n\nReturn the bytes of the file at PATH on NODE, or #f if there is none.\nPATH is NODE's: `~` and a relative path start at its home.",
       "is_macro": false
     },
     "node-file-stat": {
@@ -1073,15 +1081,15 @@
       "is_macro": false
     },
     "node-file-write": {
-      "description": "(node-file-write node path bytes)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1004\n\nReplace the file at PATH on NODE with the bytevector BYTES.\nIt is written through a temporary file and a rename.",
+      "description": "(node-file-write node path bytes)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1007\n\nReplace the file at PATH on NODE with the bytevector BYTES.\nIt is written through a temporary file and a rename.",
       "is_macro": false
     },
     "node-find-up": {
-      "description": "(node-find-up node directory names)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1010\n\nReturn the nearest directory on NODE from DIRECTORY up with an entry NAMES names.\nNAMES is a list of strings; #f when no directory has one.",
+      "description": "(node-find-up node directory names)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1013\n\nReturn the nearest directory on NODE from DIRECTORY up with an entry NAMES names.\nNAMES is a list of strings; #f when no directory has one.",
       "is_macro": false
     },
     "node-interrupt": {
-      "description": "(node-interrupt node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:795\n\nInterrupt what NODE is evaluating.",
+      "description": "(node-interrupt node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:798\n\nInterrupt what NODE is evaluating.",
       "is_macro": false
     },
     "node-kind": {
@@ -1089,7 +1097,7 @@
       "is_macro": false
     },
     "node-lost": {
-      "description": "(node-lost node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:787\n\nReturn why NODE's connection is unusable, or #f while it is not.",
+      "description": "(node-lost node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:790\n\nReturn why NODE's connection is unusable, or #f while it is not.",
       "is_macro": false
     },
     "node-named?": {
@@ -1101,7 +1109,7 @@
       "is_macro": false
     },
     "node-process": {
-      "description": "(node-process node id)  built-in procedure, @source@/crates/techne-node/src/lib.rs:994\n\nReturn the process ID that NODE runs, to read from and write to again.",
+      "description": "(node-process node id)  built-in procedure, @source@/crates/techne-node/src/lib.rs:997\n\nReturn the process ID that NODE runs, to read from and write to again.",
       "is_macro": false
     },
     "node-processes": {
@@ -1109,7 +1117,7 @@
       "is_macro": false
     },
     "node-shutdown": {
-      "description": "(node-shutdown node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:799\n\nAsk NODE to end, with its processes.",
+      "description": "(node-shutdown node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:802\n\nAsk NODE to end, with its processes.",
       "is_macro": false
     },
     "node-start": {
@@ -1117,7 +1125,7 @@
       "is_macro": false
     },
     "node-transport-pid": {
-      "description": "(node-transport-pid node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:791\n\nReturn the id of the process carrying NODE's connection, or #f.",
+      "description": "(node-transport-pid node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:794\n\nReturn the id of the process carrying NODE's connection, or #f.",
       "is_macro": false
     },
     "normal-directory": {
@@ -1253,7 +1261,7 @@
       "is_macro": false
     },
     "option": {
-      "description": "(option b name)  procedure, @lisp@/editor/modes.scm:331\n\nReturn the value of the option NAME in buffer B, #f meaning no buffer.",
+      "description": "(option b name)  procedure, @lisp@/editor/modes.scm:340\n\nReturn the value of the option NAME in buffer B, #f meaning no buffer.",
       "is_macro": false
     },
     "palette-color": {
@@ -1341,27 +1349,31 @@
       "is_macro": false
     },
     "process-close-input": {
-      "description": "(process-close-input process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:958\n\nClose the input of PROCESS, which then reads end of file.",
+      "description": "(process-close-input process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1027\n\nClose the input of PROCESS, which then reads end of file.",
       "is_macro": false
     },
     "process-dropped": {
-      "description": "(process-dropped process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:968\n\nReturn how many bytes of PROCESS's output were dropped, unread.",
+      "description": "(process-dropped process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1037\n\nReturn how many bytes of PROCESS's output were dropped, unread.",
       "is_macro": false
     },
     "process-exited?": {
-      "description": "(process-exited? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:970\n\nReturn #t if PROCESS has ended.",
+      "description": "(process-exited? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1039\n\nReturn #t if PROCESS has ended.",
       "is_macro": false
     },
     "process-kill": {
-      "description": "(process-kill process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:918\n\nKill PROCESS and its process group.",
+      "description": "(process-kill process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:982\n\nKill PROCESS and its process group.",
+      "is_macro": false
+    },
+    "process-password-mode?": {
+      "description": "(process-password-mode? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1012\n\nWhether PROCESS's PTY is canonical and has echo disabled.",
       "is_macro": false
     },
     "process-pid": {
-      "description": "(process-pid process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:914\n\nReturn the operating system's id of PROCESS.",
+      "description": "(process-pid process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:978\n\nReturn the operating system's id of PROCESS.",
       "is_macro": false
     },
     "process-read": {
-      "description": "(process-read process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:950\n\nWait for the next output of PROCESS on STREAM, `stdout` or `stderr`.\nReturn it as a string, or the eof object once the stream is closed.",
+      "description": "(process-read process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1019\n\nWait for the next output of PROCESS on STREAM, `stdout` or `stderr`.\nReturn it as a string, or the eof object once the stream is closed.",
       "is_macro": false
     },
     "process-read-all": {
@@ -1373,15 +1385,15 @@
       "is_macro": false
     },
     "process-read-bytes": {
-      "description": "(process-read-bytes process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:953\n\nWait for the next output of PROCESS on STREAM, as a bytevector.\nSTREAM is `stdout` or `stderr`; once it is closed, return the eof object.",
+      "description": "(process-read-bytes process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1022\n\nWait for the next output of PROCESS on STREAM, as a bytevector.\nSTREAM is `stdout` or `stderr`; once it is closed, return the eof object.",
       "is_macro": false
     },
     "process-resize": {
-      "description": "(process-resize process rows columns)  built-in procedure, @source@/crates/techne-process/src/lib.rs:964\n\nTell PROCESS, on a terminal, that it has ROWS and COLUMNS.",
+      "description": "(process-resize process rows columns)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1033\n\nTell PROCESS, on a terminal, that it has ROWS and COLUMNS.",
       "is_macro": false
     },
     "process-signal": {
-      "description": "(process-signal process signal)  built-in procedure, @source@/crates/techne-process/src/lib.rs:962\n\nSend SIGNAL to PROCESS's group.\nSIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and\n`cont`.",
+      "description": "(process-signal process signal)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1031\n\nSend SIGNAL to PROCESS's group.\nSIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and\n`cont`.",
       "is_macro": false
     },
     "process-spawn": {
@@ -1389,11 +1401,11 @@
       "is_macro": false
     },
     "process-wait": {
-      "description": "(process-wait process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:966\n\nWait for PROCESS to end; return its exit code, or (signal N).",
+      "description": "(process-wait process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1035\n\nWait for PROCESS to end; return its exit code, or (signal N).",
       "is_macro": false
     },
     "process-write": {
-      "description": "(process-write process data)  built-in procedure, @source@/crates/techne-process/src/lib.rs:956\n\nWrite DATA, a string or bytevector, to the input of PROCESS.\nIt waits while the input is full.",
+      "description": "(process-write process data)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1025\n\nWrite DATA, a string or bytevector, to the input of PROCESS.\nIt waits while the input is full.",
       "is_macro": false
     },
     "project-root": {
@@ -1553,19 +1565,19 @@
       "is_macro": false
     },
     "register-minor-mode!": {
-      "description": "(register-minor-mode! name doc #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:inlays (inlays #f) #:projections (projections #f))  procedure, @lisp@/editor/modes.scm:197\n\nDefine the minor mode NAME, documented by DOC.\nIt is on where the boolean option NAME is. KEYS and NORMAL are\n(key-description command) bindings for chords and for modal normal\nstate, LAYER a procedure (document from to) giving highlights (from to\nface), INLAYS one (document from to) giving text shown in the line and\nnot in the document (position text face): a type after a name,\nPROJECTIONS one (document from to) giving how the text is laid out\n(`buffer-projections'). It defines the command NAME, which turns the\nmode on and off in the focused buffer.",
+      "description": "(register-minor-mode! name doc #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:inlays (inlays #f) #:projections (projections #f))  procedure, @lisp@/editor/modes.scm:206\n\nDefine the minor mode NAME, documented by DOC.\nIt is on where the boolean option NAME is. KEYS and NORMAL are\n(key-description command) bindings for chords and for modal normal\nstate, LAYER a procedure (document from to) giving highlights (from to\nface), INLAYS one (document from to) giving text shown in the line and\nnot in the document (position text face): a type after a name,\nPROJECTIONS one (document from to) giving how the text is laid out\n(`buffer-projections'). It defines the command NAME, which turns the\nmode on and off in the focused buffer.",
       "is_macro": false
     },
     "register-mode!": {
-      "description": "(register-mode! name doc #:parent (parent (quote fundamental-mode)) #:files (files (quote ())) #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:target-at (target-at #f) #:complete (complete #f) #:indent (indent #f) #:directory (directory #f) #:options (options (quote ())) #:projections (projections #f))  procedure, @lisp@/editor/modes.scm:164\n\nDefine the major mode NAME, documented by DOC, extending PARENT.\nIt has PARENT's keys, layers and options, and its own: KEYS and NORMAL\nare (key-description command) bindings for chords and for modal normal\nstate, a string in place of the command naming a prefix, LAYER a\nprocedure (document from to) giving highlights (from to face),\nTARGET-AT a procedure (buffer position) giving the target there,\nCOMPLETE a procedure (buffer position) giving what completes the text\nbefore it, (start . candidates), INDENT a procedure (document starts)\ngiving the edits (from to text) that indent the lines at STARTS,\nDIRECTORY a procedure (buffer) giving the directory the buffer is in,\nwith its slash, for a buffer of no file (a directory's listing); OPTIONS\nan alist of (option . value) set in the mode, FILES the file name\nsuffixes it is for, PROJECTIONS a procedure (document from to) giving\nhow the text is laid out (`buffer-projections'). It defines the command\nNAME, which gives the focused buffer this mode.",
+      "description": "(register-mode! name doc #:parent (parent (quote fundamental-mode)) #:files (files (quote ())) #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:target-at (target-at #f) #:complete (complete #f) #:indent (indent #f) #:directory (directory #f) #:options (options (quote ())) #:projections (projections #f) #:input (input #f))  procedure, @lisp@/editor/modes.scm:170\n\nDefine the major mode NAME, documented by DOC, extending PARENT.\nIt has PARENT's keys, layers and options, and its own: KEYS and NORMAL\nare (key-description command) bindings for chords and for modal normal\nstate, a string in place of the command naming a prefix, LAYER a\nprocedure (document from to) giving highlights (from to face),\nTARGET-AT a procedure (buffer position) giving the target there,\nCOMPLETE a procedure (buffer position) giving what completes the text\nbefore it, (start . candidates), INDENT a procedure (document starts)\ngiving the edits (from to text) that indent the lines at STARTS,\nDIRECTORY a procedure (buffer) giving the directory the buffer is in,\nwith its slash, for a buffer of no file (a directory's listing); OPTIONS\nan alist of (option . value) set in the mode, FILES the file name\nsuffixes it is for, PROJECTIONS a procedure (document from to) giving\nhow the text is laid out (`buffer-projections'). It defines the command\nNAME, which gives the focused buffer this mode. INPUT is a procedure\n(session key) returning true if it handled the key before the profile.",
       "is_macro": false
     },
     "register-mode-line-segment!": {
-      "description": "(register-mode-line-segment! name proc)  procedure, @lisp@/editor/modes.scm:357\n\nShow (PROC buffer) in the mode line of the buffer's panes, as NAME.\nPROC returns a string, or #f for nothing. Segments are shown in the\norder of their names; one that fails shows nothing.",
+      "description": "(register-mode-line-segment! name proc)  procedure, @lisp@/editor/modes.scm:366\n\nShow (PROC buffer) in the mode line of the buffer's panes, as NAME.\nPROC returns a string, or #f for nothing. Segments are shown in the\norder of their names; one that fails shows nothing.",
       "is_macro": false
     },
     "register-option!": {
-      "description": "(register-option! name default doc #:type (type (quote any)))  procedure, @lisp@/editor/modes.scm:269\n\nDeclare the option NAME, its DEFAULT and its documentation DOC.\nTYPE is the schema of its values, as `valid?` takes it: boolean, natural,\n(one-of value ...), (or schema ...) and so on.",
+      "description": "(register-option! name default doc #:type (type (quote any)))  procedure, @lisp@/editor/modes.scm:278\n\nDeclare the option NAME, its DEFAULT and its documentation DOC.\nTYPE is the schema of its values, as `valid?` takes it: boolean, natural,\n(one-of value ...), (or schema ...) and so on.",
       "is_macro": false
     },
     "reload-document!": {
@@ -1585,11 +1597,11 @@
       "is_macro": false
     },
     "remote-value-written": {
-      "description": "(remote-value-written remote)  built-in procedure, @source@/crates/techne-node/src/lib.rs:809\n\nReturn the node's bounded written preview of REMOTE.\nAt a data limit this is a fixed marker, not a readable datum.",
+      "description": "(remote-value-written remote)  built-in procedure, @source@/crates/techne-node/src/lib.rs:812\n\nReturn the node's bounded written preview of REMOTE.\nAt a data limit this is a fixed marker, not a readable datum.",
       "is_macro": false
     },
     "remote-value?": {
-      "description": "(remote-value? obj)  built-in procedure, @source@/crates/techne-node/src/lib.rs:804\n\nReturn #t if OBJ is a value held by a node.",
+      "description": "(remote-value? obj)  built-in procedure, @source@/crates/techne-node/src/lib.rs:807\n\nReturn #t if OBJ is a value held by a node.",
       "is_macro": false
     },
     "remove-hook!": {
@@ -1829,7 +1841,7 @@
       "is_macro": false
     },
     "set-option!": {
-      "description": "(set-option! name value #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:290\n\nSet the option NAME to VALUE in buffer B or the major mode MODE.\nWithout either, it is set globally.",
+      "description": "(set-option! name value #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:299\n\nSet the option NAME to VALUE in buffer B or the major mode MODE.\nWithout either, it is set globally.",
       "is_macro": false
     },
     "set-palette!": {
@@ -2097,7 +2109,7 @@
       "is_macro": false
     },
     "toggle-mode!": {
-      "description": "(toggle-mode! s name)  procedure, @lisp@/editor/modes.scm:394\n\nTurn the minor mode NAME on or off in the focused buffer of S.",
+      "description": "(toggle-mode! s name)  procedure, @lisp@/editor/modes.scm:403\n\nTurn the minor mode NAME on or off in the focused buffer of S.",
       "is_macro": false
     },
     "traced-operation-records": {
@@ -2121,7 +2133,7 @@
       "is_macro": false
     },
     "unset-option!": {
-      "description": "(unset-option! name #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:300\n\nTake back the setting of the option NAME in buffer B or mode MODE.\nWithout either, the global setting is taken back.",
+      "description": "(unset-option! name #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:309\n\nTake back the setting of the option NAME in buffer B or mode MODE.\nWithout either, the global setting is taken back.",
       "is_macro": false
     },
     "view-document": {
@@ -2318,6 +2330,8 @@
     "event-ring-since",
     "grant-revoke!",
     "image-height",
+    "image-inline-png",
+    "image-inline-rgba",
     "image-load",
     "image-loaded",
     "image-width",
@@ -2398,6 +2412,7 @@
     "process-dropped",
     "process-exited?",
     "process-kill",
+    "process-password-mode?",
     "process-pid",
     "process-read",
     "process-read-all",

@@ -46,6 +46,8 @@ pub struct Mouse {
     pub col: usize,
     pub row: usize,
     pub shift: bool,
+    pub code: usize,
+    pub release: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,7 +311,7 @@ fn sgr_mouse(params: &str, fin: u8) -> Option<Mouse> {
         (65, _) => MouseKind::WheelDown,
         _ => MouseKind::Other,
     };
-    Some(Mouse { kind, col: col.checked_sub(1)?, row: row.checked_sub(1)?, shift: button & 4 != 0 })
+    Some(Mouse { kind, col: col.checked_sub(1)?, row: row.checked_sub(1)?, shift: button & 4 != 0, code: button, release: fin == b'm' })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -443,16 +445,16 @@ mod tests {
     #[test]
     fn mouse() {
         let mut d = Decoder::default();
-        let m = |kind, col, row, shift| Event::Mouse(Mouse { kind, col, row, shift });
+        let m = |kind, col, row, code, release| Event::Mouse(Mouse { kind, col, row, shift: code & 4 != 0, code, release });
         assert_eq!(
             d.feed(b"\x1b[<0;5;2M\x1b[<32;6;2M\x1b[<0;6;2m\x1b[<4;1;1M\x1b[<65;3;3M\x1b[<2;1;1M"),
             [
-                m(MouseKind::Press, 4, 1, false),
-                m(MouseKind::Drag, 5, 1, false),
-                m(MouseKind::Release, 5, 1, false),
-                m(MouseKind::Press, 0, 0, true),
-                m(MouseKind::WheelDown, 2, 2, false),
-                m(MouseKind::Other, 0, 0, false),
+                m(MouseKind::Press, 4, 1, 0, false),
+                m(MouseKind::Drag, 5, 1, 32, false),
+                m(MouseKind::Release, 5, 1, 0, true),
+                m(MouseKind::Press, 0, 0, 4, false),
+                m(MouseKind::WheelDown, 2, 2, 65, false),
+                m(MouseKind::Other, 0, 0, 2, false),
             ]
         );
     }

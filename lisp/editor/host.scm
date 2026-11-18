@@ -18,16 +18,16 @@
 (require "buffers.scm")
 (require "windows.scm")
 
-(provide editor-press editor-viewport! editor-click editor-message! session-quit?
+(provide editor-press editor-viewport! editor-pointer! editor-focus-event! editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays pane-projections cursor-shape
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations!)
 
 (define-hook viewport-changed
   "After frontend geometry changes: (session columns rows).")
-(define (editor-viewport! s columns rows #:optional [gap 1])
+(define (editor-viewport! s columns rows . gaps)
   "Record frontend COLUMNS, ROWS and split GAP in session S."
-  (let ((cols (max 1 columns)) (rows (max 2 rows)) (gap (max 1 gap)))
+  (let ((cols (max 1 columns)) (rows (max 2 rows)) (gap (max 1 (if (null? gaps) 1 (car gaps)))))
     (unless (and (equal? (sget s (quote viewport-columns)) cols)
                  (equal? (sget s (quote viewport-rows)) rows)
                  (equal? (sget s (quote viewport-split-gap)) gap))
@@ -36,13 +36,29 @@
 
 (define (editor-press s key)
   "Handle the key KEY in session S, as the frontend sends it."
-  (let ((input (and (not (sget s 'transient)) (buffer-input (current-buffer s)))))
-    (unless (and input
-                 (guard (e (#t (failed! s 'buffer-input e) #t)) (input s key)))
-      (press s key))))
+  (let ((private (sget s 'private-key)))
+    (if private ((car private) key)
+        (let ((input (and (not (sget s 'transient)) (buffer-input (current-buffer s)))))
+          (unless (and input
+                       (guard (e (#t (failed! s 'buffer-input e) #t)) (input s key)))
+            (press s key))))))
+(define-hook frontend-pointer "A pane grid pointer event: (session view column row code release?).")
+(define-hook frontend-focus "A frontend focus change: (session focused?).")
+
+(define (editor-pointer! s view col row code release)
+  "Deliver a pointer event in VIEW at COL and ROW of session S.
+CODE is an xterm button code, RELEASE true for releases."
+  (unless (or (sget s 'transient) (sget s 'private-key))
+    (run-hook! s 'frontend-pointer view col row code release)))
+
+(define (editor-focus-event! s focused)
+  "Report whether frontend session S is FOCUSED."
+  (run-hook! s 'frontend-focus focused))
+
 (define (editor-click s view pos extend)
   "Handle a click at POS in VIEW, which the frontend resolved, in S.
 With EXTEND, the click extends the selection."
+  (let ((private (sget s 'private-key))) (when private ((cdr private))))
   (focus-view! s view)
   ((profile-click (sget s 'profile)) s pos extend))
 ;; The frontend paged VIEW: its caret goes to POS, extending a region.
@@ -195,8 +211,8 @@ without `syntax-highlight'; the mode's `syntax-language' first, then
 the file's name)."
   (let* ((d (view-document view)) (b (document-buffer d)))
     (list (option b 'line-numbers) (option b 'eob-marker)
-          (and (option b (quote syntax-highlight)) (buffer-language b))
-          (option b (quote word-wrap)) (option b (quote truncate-lines)))))
+          (and (option b 'syntax-highlight) (buffer-language b))
+          (option b (quote word-wrap)) (option b 'truncate-lines) (and (not (sget s 'transient)) (not (sget s 'private-key)) (option b 'report-pointer)))))
 
 (define (echo-line s)
   "Return the echo area of session S.

@@ -581,6 +581,7 @@ impl Layout {
         self.blocks[first..]
             .iter()
             .take_while(|b| b.at <= end)
+            .filter(|b| b.grid.is_none())
             .map(|b| {
                 let (w, h) = b.image.size();
                 let scale = (self.width / w as f32).min(self.block_height / h as f32).min(1.0);
@@ -1101,7 +1102,7 @@ mod tests {
         let image = techne_editor::images::decode(std::path::Path::new("x.svg"), svg).unwrap();
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(200.0);
-        l.set_projections(&[], &[Block { at: 6, image: image.clone() }], 1000.0);
+        l.set_projections(&[], &[Block { at: 6, image: image.clone(), grid: None }], 1000.0);
         let placed = l.frame(&t, 0, 1000.0);
         let (r, shown) = &placed[1].blocks[0];
         assert_eq!(*shown, image);
@@ -1126,7 +1127,7 @@ mod tests {
         let image = techne_editor::images::decode(std::path::Path::new("x.svg"), svg).unwrap();
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(400.0);
-        l.set_projections(&[], &[Block { at: 0, image: image.clone() }, Block { at: 0, image }], 1000.0);
+        l.set_projections(&[], &[Block { at: 0, image: image.clone(), grid: None }, Block { at: 0, image, grid: None }], 1000.0);
         let placed = l.frame(&t, 0, 100.0);
         let c = caret(&l, &placed, &t, 0).unwrap();
         assert!(c.y >= 0.0 && c.y + c.h <= 100.5, "{c:?}");

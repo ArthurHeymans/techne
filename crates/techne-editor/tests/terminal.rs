@@ -78,6 +78,102 @@ fn terminal_runs_a_pty_projects_styles_and_routes_keys() {
 }
 
 #[test]
+fn osc_reports_cwd_prompts_and_links_without_opening_them() {
+    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    command(
+        &mut rt,
+        r#"printf '\033]7;file:///tmp/a%%20b\007\033]133;A\007one\n\033]133;A\007\033]8;;https://example.org/\007two\033]8;;\007\n'; read -r go"#,
+    );
+    let ready = until(&mut rt, |s| s.pane().text.to_string().contains("two"));
+    assert!(ready.pane().text.to_string().starts_with("one"));
+    assert_eq!(rt.eval("(default-directory (current-session))").unwrap(), "\"/tmp/a b/\"");
+    key(&mut rt, "C-c");
+    key(&mut rt, "C-p");
+    assert!(rt.snapshot().pane().status.contains("COPY"));
+    let text = rt.snapshot().pane().text.to_string();
+    assert!(text[rt.snapshot().pane().head()..].starts_with("two"));
+    key(&mut rt, "C-c");
+    key(&mut rt, "C-p");
+    assert_eq!(rt.snapshot().pane().head(), 0);
+    key(&mut rt, "C-c");
+    key(&mut rt, "M-n");
+    assert!(rt.snapshot().echo.contains("https://example.org/"));
+    assert!(rt.take_errors().is_empty());
+}
+
+#[test]
+fn a_password_prompt_bypasses_key_hooks_and_sends_the_answer() {
+    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    rt.eval("(set-option! 'terminal-detect-passwords #t)").unwrap();
+    command(
+        &mut rt,
+        r#"stty -echo; printf 'Password: '; read -r answer; stty echo; test "$answer" = 'hidden'; printf '\nresult:%s\n' "$?""#,
+    );
+    until(&mut rt, |s| s.echo.contains("Terminal password (hidden)"));
+    rt.eval("(begin (define leaked '()) (add-hook! 'after-key 'record-test (lambda (s k) (set! leaked (cons k leaked)))))").unwrap();
+    typing(&mut rt, "hidden");
+    key(&mut rt, "RET");
+    let ended = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
+    let text = ended.pane().text.to_string();
+    assert!(text.contains("result:0") && !text.contains("hidden"), "{text}");
+    assert_eq!(rt.eval("leaked").unwrap(), "()");
+    assert!(rt.take_errors().is_empty());
+}
+
+#[test]
+fn kitty_inline_chunks_produce_a_grid_image() {
+    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    // A one-pixel red RGBA image from two chunks, then a forbidden file transfer.
+    command(
+        &mut rt,
+        r#"printf '\033_Ga=T,i=7,f=32,s=1,v=1,c=5,r=2,C=1,m=1;/wAA\033\\\033_Gm=0;/w==\033\\\033_Ga=T,t=f,i=8;/wAA/w==\033\\'; read -r go"#,
+    );
+    let ready = until(&mut rt, |s| !s.pane().blocks.is_empty());
+    assert_eq!(ready.pane().blocks.len(), 1);
+    let image = &ready.pane().blocks[0];
+    assert_eq!(image.grid, Some((0, 5, 2)));
+    assert_eq!(image.image.0.rgba, [255, 0, 0, 255]);
+    assert!(rt.take_errors().is_empty());
+}
+
+#[test]
+fn kitty_virtual_rectangle_uses_the_origin_placeholder() {
+    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    command(
+        &mut rt,
+        r#"printf '\033_Ga=T,q=2,i=7,f=32,s=1,v=1,c=3,r=2,U=1;/wAA/w==\033\\\033[2;4H\033[38;2;0;0;7m\364\216\273\256\314\205\314\205\033[0m'; read -r go"#,
+    );
+    let ready = until(&mut rt, |s| !s.pane().blocks.is_empty());
+    let image = &ready.pane().blocks[0];
+    assert_eq!(image.grid, Some((3, 3, 2)));
+    assert_eq!(image.at, ready.pane().text.line_to_byte(1));
+    assert!(!ready.pane().text.to_string().contains('\u{10eeee}'));
+    assert!(rt.take_errors().is_empty());
+}
+
+#[test]
+fn mouse_and_focus_reports_reach_the_child() {
+    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    command(
+        &mut rt,
+        r#"stty -icanon -echo min 1 time 0; printf '\033[?1000;1004;1006hready'; head -c 12 | od -An -tu1; printf '\033[?1000;1004;1006l'"#,
+    );
+    let ready = until(&mut rt, |s| s.pane().display.report_pointer);
+    rt.handle(Input::Focus { focused: true });
+    rt.handle(Input::Pointer { view: ready.pane().view, column: 3, row: 4, code: 0, release: false });
+    let ended = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
+    let text = ended.pane().text.to_string();
+    assert!(
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(12)
+            .any(|w| w == ["27", "91", "73", "27", "91", "60", "48", "59", "52", "59", "53", "77"]),
+        "{text}"
+    );
+    assert!(!ended.pane().display.report_pointer);
+}
+
+#[test]
 fn alignment_pattern_is_projected_on_screen_and_in_scrollback() {
     let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
     rt.handle(Input::Viewport { columns: 5, rows: 4, split_gap: 1 });

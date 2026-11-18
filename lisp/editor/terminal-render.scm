@@ -2,7 +2,7 @@
 ;;; so evicting its first row does not move the remaining index entries.
 (require "faces.scm")
 (import (techne terminal))
-(provide make-terminal-projection terminal-project! terminal-layers terminal-live-start terminal-caret)
+(provide make-terminal-projection terminal-project! terminal-layers terminal-live-start terminal-caret terminal-prompt-position terminal-link-position terminal-grid-offset)
 
 (define-record-type projection
   (%projection writer history first end base live screen caret) projection?
@@ -47,7 +47,7 @@
          (fg (color (field (if inverse 'bg 'fg) #f) (if inverse 'base '())))
          (bg (color (field (if inverse 'fg 'bg) #f) (if inverse 'text '())))
          (weight (field 'weight '())) (slant (field 'slant '()))
-         (underline (field 'underline '())) (strike (field 'strike '()))
+         (underline (field 'underline (if (field 'link #f) #t '()))) (strike (field 'strike '()))
          (key (list fg bg weight slant underline strike))
          (known (hash-table-ref/default colors key #f)))
     (if (and known (find-face known)) known
@@ -79,7 +79,7 @@
          (face (and (> n 0) (pair? attrs) (style-face attrs)))
          (blank-face (and (< n cols) fill (pair? (cdr fill)) (style-face (cdr fill))))
          (runs (append (if face (list (list 0 n face)) '()) (if blank-face (list (list n cols blank-face)) '())))
-         (snapshot (vector live history #f runs (+ cols 1))))
+         (snapshot (vector live history #f runs (+ cols 1) (terminal-row-prompt? r) #f)))
     (terminal-row-cache-set! r snapshot)
     snapshot))
 
@@ -92,7 +92,7 @@
           (if (= i visible-cols)
               (let* ((text (get-output-string out))
                      (snapshot (vector (string-append text "\n") (string-append (substring text 0 ink) "\n")
-                                       pos (reverse runs) (+ at 1))))
+                                       pos (reverse runs) (+ at 1) (terminal-row-prompt? r) cells)))
                 (terminal-row-cache-set! r snapshot)
                 snapshot)
               (let ((cell (vector-ref cells i)))
@@ -102,6 +102,7 @@
                     (let* ((style (if cell (cdr cell) '()))
                            (wide (and (< (+ i 1) visible-cols) (eq? (vector-ref cells (+ i 1)) 'tail)))
                            (text (cond ((not cell) " ")
+                                        ((char=? (string-ref (car cell) 0) #\x10eeee) " ")
                                        ((assq 'conceal style)
                                         (if wide "  " " "))
                                        (else (car cell))))
@@ -136,7 +137,7 @@
           (if (= i n)
               (begin (edit p (- live cut) (- live cut) (string-join (reverse pieces) "")) (live-set! p at))
               (let* ((row (vector-ref rows i)) (after (if (= (+ slot 1) size) 0 (+ slot 1)))
-                     (plain (and (not (terminal-row-double-width? row)) (terminal-row-plain row))))
+                     (plain (and (not (terminal-row-prompt? row)) (not (terminal-row-double-width? row)) (terminal-row-plain row))))
                 (if plain
                     (begin (vector-set! ring slot at)
                            (loop (+ i 1) after (+ at (string-length plain) 1) (cons "\n" (cons plain pieces))))
@@ -167,6 +168,58 @@
     (screen-set! p new)
     (let* ((entry (vector-ref new (terminal-y t))) (positions (vector-ref (cdr entry) 2)))
       (caret-set! p (+ start (car entry) (if positions (vector-ref positions (terminal-x t)) (terminal-x t)))))))
+
+(define (terminal-grid-offset p row)
+  "Return the document start of live terminal ROW in projection P."
+  (and (< row (vector-length (screen p)))
+       (+ (terminal-live-start p) (car (vector-ref (screen p) row)))))
+
+(define (terminal-link-position p point direction)
+  "Find a hyperlink in P relative to POINT and return (position . URI).
+DIRECTION is zero at point, negative backwards, positive forwards."
+  (let ((best #f) (base (base p)) (start (terminal-live-start p)))
+    (define (nearer? at)
+      (if (< direction 0)
+          (and (< at point) (or (not best) (> at (car best))))
+          (and (> at point) (or (not best) (< at (car best))))))
+    (define (scan offset r limit)
+      (let ((cells (vector-ref r 6)) (pos (vector-ref r 2)))
+        (when cells
+          (let loop ((i 0) (previous #f))
+            (when (< i (vector-length pos))
+              (let* ((cell (vector-ref cells i)) (at (+ offset (vector-ref pos i)))
+                     (link (cond ((eq? cell 'tail) previous) ((pair? cell) (assq 'link (cdr cell))) (else #f)))
+                     (after (if (< (+ i 1) (vector-length pos)) (+ offset (vector-ref pos (+ i 1))) limit)))
+                (when (and link (< at limit)
+                           (if (zero? direction) (<= at point (- after 1))
+                               (and (not (equal? link previous)) (nearer? at))))
+                  (set! best (cons at (cdr link))))
+                (loop (+ i 1) link)))))))
+    (do ((i (first p) (+ i 1))) ((= i (end p)))
+      (let ((entry (history-at p i)))
+        (when (pair? entry)
+          (let ((offset (- (car entry) base)) (r (cdr entry)))
+            (scan offset r (+ offset (- (width (vector-ref r 1)) 1)))))))
+    (vector-for-each (lambda (entry)
+                       (let ((offset (+ start (car entry))) (r (cdr entry)))
+                         (scan offset r (+ offset (- (vector-ref r 4) 1)))))
+                     (screen p))
+    best))
+
+(define (terminal-prompt-position p point direction)
+  "Return the prompt row before or after POINT in projection P.
+DIRECTION is negative to search backwards, positive to search forwards."
+  (let ((best #f) (base (base p)) (start (terminal-live-start p)))
+    (define (consider offset r)
+      (when (and (vector-ref r 5)
+                 (if (< direction 0) (and (< offset point) (or (not best) (> offset best)))
+                     (and (> offset point) (or (not best) (< offset best)))))
+        (set! best offset)))
+    (do ((i (first p) (+ i 1))) ((= i (end p)))
+      (let ((entry (history-at p i)))
+        (when (pair? entry) (consider (- (car entry) base) (cdr entry)))))
+    (vector-for-each (lambda (entry) (consider (+ start (car entry)) (cdr entry))) (screen p))
+    best))
 
 (define (terminal-layers p from to)
   "Return the face spans of projection P intersecting FROM through TO."

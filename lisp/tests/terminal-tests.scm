@@ -146,4 +146,12 @@
                       (csi "?7l") "this wraps only once" (dcs "$qm"))
        (string-append (csi "?1049h") "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8")))
 
+(let ((t (make-terminal 2 4 #:history 10 #:reflow #t)))
+  (feed t "ab界cd\r\nmore\r\nlast\r\n")
+  (terminal-resize! t 2 8)
+  (let* ((start (terminal-history-start t)) (end (terminal-history-end t))
+         (rows (terminal-history-slice t start end)))
+    (check "saved soft wraps join without splitting wide cells" "ab界cd  " (row-text (vector-ref rows 0)))
+    (check "hard line boundaries survive reflow" "more    " (row-text (vector-ref rows 1)))))
+
 (test-summary)

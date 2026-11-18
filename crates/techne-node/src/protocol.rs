@@ -222,6 +222,9 @@ pub enum Request {
         proc: u64,
         signal: String,
     },
+    PasswordMode {
+        proc: u64,
+    },
     Resize {
         proc: u64,
         rows: u16,

@@ -509,6 +509,9 @@ impl ProcessBackend for RemoteProcess {
     fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()> {
         expect(self.node.conn.request(Request::Resize { proc: self.proc, rows, cols }), unit)
     }
+    fn password_mode(&self) -> LocalFuture<bool> {
+        expect(self.node.conn.request(Request::PasswordMode { proc: self.proc }), |r| if let Reply::Bool(b) = r { Some(b) } else { None })
+    }
     fn dropped(&self) -> LocalFuture<i64> {
         expect(self.node.conn.request(Request::Dropped { proc: self.proc }), |r| if let Reply::Int(n) = r { Some(n) } else { None })
     }

@@ -267,6 +267,8 @@ pub trait ProcessBackend {
     fn signal(&self, signal: String) -> LocalFuture<()>;
     /// Set a pty's size.
     fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()>;
+    /// Whether the PTY uses canonical input with echo off.
+    fn password_mode(&self) -> LocalFuture<bool>;
     /// Output bytes dropped unread (persistent processes on a node).
     fn dropped(&self) -> LocalFuture<i64>;
     fn wait(&self) -> LocalFuture<Exit>;
@@ -357,6 +359,10 @@ impl ProcessBackend for Arc<Process> {
     fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()> {
         let result = Process::resize(self, rows, cols);
         Box::pin(async move { result })
+    }
+    fn password_mode(&self) -> LocalFuture<bool> {
+        let result = Process::password_mode(self);
+        Box::pin(async move { Ok(result) })
     }
     fn dropped(&self) -> LocalFuture<i64> {
         let dropped = Process::dropped(self) as i64;
@@ -686,6 +692,17 @@ impl Process {
         rustix::termios::tcsetwinsize(terminal, size).map_err(|e| format!("process-resize: {e}"))
     }
 
+    /// Whether the PTY is canonical with echo disabled (not a raw-mode TUI).
+    pub fn password_mode(&self) -> bool {
+        use rustix::termios::{LocalModes, tcgetattr};
+        !self.exited()
+            && self
+                .terminal
+                .as_ref()
+                .and_then(|t| tcgetattr(t).ok())
+                .is_some_and(|attrs| attrs.local_modes.contains(LocalModes::ICANON) && !attrs.local_modes.contains(LocalModes::ECHO))
+    }
+
     /// How it ended, once it has.
     pub fn exit(&self) -> Option<Exit> {
         self.status.borrow().map(Exit::from)
@@ -989,6 +1006,11 @@ fn natives(vm: &mut Vm) {
         Ok(p.backend.resize(size(rows)?, size(cols)?))
     });
     process_op(vm, "process-wait", 1, |_, p, _| Ok(p.backend.wait()));
+    process_op(vm, "process-password-mode?", 1, |_, p, _| Ok(p.backend.password_mode()));
+    techne_vm::document! { vm;
+        /// Whether PROCESS's PTY is canonical and has echo disabled.
+        "(process-password-mode? process)";
+    }
     process_op(vm, "process-dropped", 1, |_, p, _| Ok(p.backend.dropped()));
     process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.backend.exited()));
     techne_vm::document! { vm;

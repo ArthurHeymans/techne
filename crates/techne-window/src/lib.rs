@@ -222,6 +222,7 @@ struct App {
     labels: HashMap<String, Buffer>,
     mods: ModifiersState,
     mouse: (f32, f32),
+    mouse_button: Option<usize>,
     /// The window is closing: the runtime ending is no crash.
     quitting: bool,
     /// It closes because the runtime failed, or the editor refused it.
@@ -307,6 +308,19 @@ impl App {
 
     fn send(&mut self, input: Input) {
         self.host.send(input);
+    }
+
+    fn report_pointer(&mut self, code: usize, release: bool) -> bool {
+        // Shift retains editor selection, even in a TUI with mouse reporting.
+        if self.mods.shift_key() {
+            return false;
+        }
+        let mods = 8 * usize::from(self.mods.alt_key()) + 16 * usize::from(self.mods.control_key());
+        let Some(input) = self.screen.pointer(&self.layout, self.mouse.0 - self.pad(), self.mouse.1, code + mods, release) else {
+            return false;
+        };
+        self.send(input);
+        true
     }
 
     fn redraw(&self) {
@@ -606,6 +620,24 @@ impl App {
                 let caret = snap.style(if focused && snap.minibuffer.is_none() { snap.chrome.cursor } else { snap.chrome.cursor_inactive });
                 let color = caret.bg.or(caret.fg).map(rgb).unwrap_or(pane_fg);
                 rects.extend(place(Rect { w, ..c }).map(|r| (r, color)));
+            }
+            for b in &pane.blocks {
+                if let Some((column, cols, rows)) = b.grid {
+                    let cw = self.layout.char_width();
+                    let line = pane.text.byte_to_line(b.at);
+                    if let Some(first) = shown.placed.first() {
+                        let first_line = pane.text.byte_to_line(first.seg.start);
+                        let at = Rect {
+                            x: left + column as f32 * cw,
+                            y: area.top + first.top + (line as f32 - first_line as f32) * lh,
+                            w: cols as f32 * cw,
+                            h: rows as f32 * lh,
+                        };
+                        if let Some(shown) = at.intersect(clip) {
+                            images.push((at, shown, b.image.clone()));
+                        }
+                    }
+                }
             }
             for p in &shown.placed {
                 // Its blocks, above its text.
@@ -950,9 +982,14 @@ impl ApplicationHandler<Wake> for App {
                 self.redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::Focused(true) => {
-                if let Some(text) = self.clipboard.as_ref().and_then(|c| c.load().ok()) {
+            WindowEvent::Focused(focused) => {
+                self.send(Input::Focus { focused });
+                if focused && let Some(text) = self.clipboard.as_ref().and_then(|c| c.load().ok()) {
                     self.send(Input::Clipboard { text });
+                }
+                if !focused {
+                    self.mouse_button = None;
+                    self.screen.release();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && self.bench.is_none() => {
@@ -962,12 +999,28 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x as f32, position.y as f32);
-                if let Some(i) = self.screen.drag(&self.layout, self.mouse.0 - self.pad(), self.mouse.1) {
+                if !self.report_pointer(32 + self.mouse_button.unwrap_or(3), false)
+                    && let Some(i) = self.screen.drag(&self.layout, self.mouse.0 - self.pad(), self.mouse.1)
+                {
                     self.send(i);
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                if state == ElementState::Pressed {
+            WindowEvent::MouseInput { state, button, .. } => {
+                let code = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Middle => 1,
+                    MouseButton::Right => 2,
+                    _ => return,
+                };
+                let pressed = state == ElementState::Pressed;
+                self.mouse_button = pressed.then_some(code);
+                if self.report_pointer(code, !pressed) || code != 0 {
+                    if !pressed {
+                        self.screen.release();
+                    }
+                    return;
+                }
+                if pressed {
                     let (x, y) = (self.mouse.0 - self.pad(), self.mouse.1);
                     if let Some(i) = self.screen.press(&self.layout, x, y, self.mods.shift_key()) {
                         self.send(i);
@@ -981,6 +1034,9 @@ impl ApplicationHandler<Wake> for App {
                     MouseScrollDelta::LineDelta(_, y) => (-y * 3.0).round() as i64,
                     MouseScrollDelta::PixelDelta(p) => (-p.y as f32 / self.layout.line_height()).round() as i64,
                 };
+                if lines != 0 && self.report_pointer(if lines < 0 { 64 } else { 65 }, false) {
+                    return;
+                }
                 if let Some(i) = (lines != 0)
                     .then(|| {
                         let x = self.mouse.0 - self.pad();
@@ -1137,6 +1193,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         labels: HashMap::new(),
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
+        mouse_button: None,
         quitting: false,
         failed: false,
         unanswered: Vec::new(),

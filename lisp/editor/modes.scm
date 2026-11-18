@@ -568,6 +568,10 @@ Oversized words still wrap by grapheme. This changes layout, never source
 text, caret positions or logical rows. Rich prose enables it."
   #:type 'boolean)
 
+(define-option report-pointer #f
+  "Whether the frontend delivers pointer events in text cells."
+  #:type 'boolean)
+
 (define-option truncate-lines #f
   "Whether long lines are clipped instead of wrapped."
   #:type 'boolean)

@@ -33,7 +33,7 @@ use std::{
 };
 
 use techne_vm::{
-    api::{Foreign, Value},
+    api::{Bytes, Foreign, Value},
     vm::Vm,
 };
 
@@ -411,6 +411,28 @@ pub fn install(vm: &mut Vm) {
         "(image-width image)" => |i: Img| i.0.0.width as usize;
         /// Return the height of IMAGE in pixels, as decoded.
         "(image-height image)" => |i: Img| i.0.0.height as usize;
+        /// Decode an inline PNG, BYTES, at most one megapixel and 2 MiB.
+        /// No other formats or file references are accepted here.
+        "(image-inline-png bytes)" => |Bytes(bytes): Bytes| -> Result<Img, String> {
+            if bytes.len() > 2 << 20 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                return Err("expected a bounded inline PNG".into());
+            }
+            let reader = || image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png);
+            let (w, h) = reader().into_dimensions().map_err(|e| e.to_string())?;
+            if w == 0 || h == 0 || u64::from(w) * u64::from(h) > 1_048_576 || w > 4096 || h > 4096 {
+                return Err("inline PNG dimensions exceed limit".into());
+            }
+            let rgba = reader().decode().map_err(|e| e.to_string())?.into_rgba8();
+            Ok(Foreign(Rc::new(image(w, h, rgba.into_raw()))))
+        };
+        /// Make an inline image from WIDTH by HEIGHT straight RGBA BYTES.
+        "(image-inline-rgba width height bytes)" => |w: usize, h: usize, Bytes(bytes): Bytes| -> Result<Img, String> {
+            let n = w.saturating_mul(h) as u64;
+            if n == 0 || n > 1_048_576 || w > 4096 || h > 4096 || bytes.len() as u64 != n * 4 {
+                return Err("inline RGBA size mismatch or exceeds limit".into());
+            }
+            Ok(Foreign(Rc::new(image(w as u32, h as u32, bytes))))
+        };
     }
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
         techne_vm::procedures! { vm;

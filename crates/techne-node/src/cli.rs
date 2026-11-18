@@ -350,6 +350,7 @@ impl Node {
                 self.process(proc)?.signal(sig).map_err(|e| format!("process-signal: {e}"))?;
                 Ok(Reply::Unit)
             }
+            Request::PasswordMode { proc } => Ok(Reply::Bool(self.process(proc)?.password_mode())),
             Request::Resize { proc, rows, cols } => self.process(proc)?.resize(rows, cols).map(|_| Reply::Unit),
             Request::Dropped { proc } => Ok(Reply::Int(self.process(proc)?.dropped() as i64)),
             Request::Wait { proc } => Ok(Reply::Exit(self.process(proc)?.wait().await)),

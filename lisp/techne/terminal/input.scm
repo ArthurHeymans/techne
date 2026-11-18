@@ -1,6 +1,32 @@
 ;;; The frontend sends canonical editor keys; encode xterm input for the
 ;;; modes selected by the child. An unencodable key returns #f.
 
+(define (terminal-mouse? t)
+  "Return whether terminal T wants mouse events."
+  (any (lambda (m) (terminal-mode? t m)) '(mouse-x10 mouse-button mouse-drag mouse-motion)))
+
+(define (terminal-pointer t col row code release)
+  "Encode a pointer event for T at COL and ROW, or return #f.
+CODE is an xterm button code; RELEASE distinguishes button-up from down."
+  (let ((motion (<= 32 code 63)))
+    (and (terminal-mouse? t) (<= 0 code 127)
+         (<= 0 col (- (terminal-columns t) 1)) (<= 0 row (- (terminal-rows t) 1))
+         (cond (motion (or (terminal-mode? t 'mouse-motion)
+                           (and (not (= (modulo code 4) 3)) (terminal-mode? t 'mouse-drag))))
+               ((or release (>= code 64))
+                (any (lambda (m) (terminal-mode? t m)) '(mouse-button mouse-drag mouse-motion)))
+               (else #t))
+         (if (terminal-mode? t 'mouse-sgr)
+             (string-append csi "<" (number->string code) ";" (number->string (+ col 1)) ";"
+                            (number->string (+ row 1)) (if release "m" "M"))
+             (and (< col 223) (< row 223)
+                  (bytevector 27 91 77 (+ 32 (if release (+ (- code (modulo code 4)) 3) code))
+                              (+ 33 col) (+ 33 row)))))))
+
+(define (terminal-focus t focused)
+  "Encode a FOCUSED or unfocused report if terminal T requested it."
+  (and (terminal-mode? t 'focus-events) (string-append csi (if focused "I" "O"))))
+
 (define (terminal-key t key)
   "Encode editor KEY per terminal T's input modes, or return #f."
   (let mods ((k key) (shift #f) (alt #f) (ctrl #f))

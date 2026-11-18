@@ -3,12 +3,14 @@
 ;;; Cells are #f (default blank), (text . rendition), or 'tail of a wide cell.
 
 (define-record-type row
-  (make-row columns data cache rendition barrier) row?
+  (make-row columns data cache rendition barrier prompt continuation) row?
   (columns terminal-row-columns)
   (data row-data row-data-set!)
   (cache terminal-row-cache terminal-row-cache-set!)
   (rendition rendition rendition-set!)
-  (barrier barrier? barrier-set!))
+  (barrier barrier? barrier-set!)
+  (prompt terminal-row-prompt? prompt-set!)
+  (continuation continuation continuation-set!))
 
 (define (terminal-row-double-width? r)
   "Return whether terminal row R has double-width columns."
@@ -23,7 +25,7 @@
 
 (define-record-type terminal
   (%terminal rows cols main alt alternate history first next modes style protected
-             g0 g1 shifted tabs title state header reply resize-request level page-length cursor-style ansi-modes dec-modes) terminal?
+             g0 g1 shifted tabs title state header reply resize-request event level page-length cursor-style ansi-modes dec-modes link apc-size reflow) terminal?
   (rows terminal-rows rows-set!) (cols terminal-columns columns-set!)
   (main main main-set!) (alt alt alt-set!)
   (alternate terminal-alternate? alternate-set!)
@@ -33,14 +35,15 @@
   (g0 g0 g0-set!) (g1 g1 g1-set!) (shifted shifted? shifted-set!)
   (tabs tabs tabs-set!) (title terminal-title title-set!)
   (state parser-state parser-state-set!) (header header header-set!)
-  (reply reply) (resize-request resize-request)
+  (reply reply) (resize-request resize-request) (event terminal-event)
   (level level level-set!) (page-length page-length page-length-set!)
   (cursor-style cursor-style cursor-style-set!)
-  (ansi-modes ansi-modes) (dec-modes dec-modes))
+  (ansi-modes ansi-modes) (dec-modes dec-modes)
+  (link terminal-link link-set!) (apc-size apc-size apc-size-set!) (reflow reflow-history?))
 
 ;; An ASCII prefix with uniform attributes and a blank suffix. Complex
 ;; editing materializes the cells; rendering can read this form directly.
-(define (fresh-row cols fill) (make-row cols (if fill (list "" '() fill) "") #f 'single #f))
+(define (fresh-row cols fill) (make-row cols (if fill (list "" '() fill) "") #f 'single #f #f #f))
 
 (define (terminal-row-plain r)
   "Return R's unstyled ASCII prefix, or #f for other row data."
@@ -74,15 +77,17 @@
     (do ((i 8 (+ i 8))) ((>= i cols) v) (vector-set! v i #t))))
 
 (define (make-terminal rows cols #:history [limit 2000] #:reply [send (lambda (s) #f)]
-                       #:resize [resize (lambda (rows cols) #f)])
+                       #:resize [resize (lambda (rows cols) #f)] #:event [event (lambda (kind value) #f)] #:reflow [reflow #f])
   "Make a terminal with ROWS and COLS, and a scrollback LIMIT.
 Call SEND with strings to reply to the process, and RESIZE with the new
-rows and columns after a resize requested by the terminal stream."
+rows and columns after a resize requested by the terminal stream.
+Call EVENT with a kind and value for shell integration messages.
+With REFLOW, rewrap saved lines on width changes."
   (let ((rows (max 1 rows)) (cols (max 1 cols)))
     (%terminal rows cols (fresh-screen rows cols) (fresh-screen rows cols) #f
                (make-vector (max 0 limit) #f) 0 0 '(wrap cursor) '() #f
-               #f #f #f (default-tabs cols) "" 'ground "" send resize 65 #f 2
-               (make-hash-table) (make-hash-table))))
+               #f #f #f (default-tabs cols) "" 'ground "" send resize event 65 #f 2
+               (make-hash-table) (make-hash-table) #f 0 reflow)))
 
 (define (active t) (if (terminal-alternate? t) (alt t) (main t)))
 (define (terminal-x t)
@@ -259,6 +264,8 @@ rows and columns after a resize requested by the terminal stream."
   (main-set! t (fresh-screen (terminal-rows t) (terminal-columns t)))
   (alt-set! t (fresh-screen (terminal-rows t) (terminal-columns t)))
   (clear-history! t)
+  ((terminal-event t) 'reset-graphics #f)
+  (link-set! t #f)
   (ever-protected-set! t #f)
   (modes-set! t '()) (soft-reset! t)
   (level-set! t 65) (page-length-set! t #f) (cursor-style-set! t 2)
@@ -266,9 +273,9 @@ rows and columns after a resize requested by the terminal stream."
   (title-set! t "") (parser-state-set! t 'ground) (header-set! t ""))
 
 ;; Preserve the cursor and as many rows around it as fit. Rows pushed off
-;; the top of the main screen become history. History is physical, not reflowed.
+;; the top of the main screen become history.
 (define (terminal-resize! t rows cols)
-  "Resize terminal T to ROWS and COLS without reflowing scrollback."
+  "Resize terminal T to ROWS and COLS, optionally rewrapping saved lines."
   (let ((rows (max 1 rows)) (cols (max 1 cols)))
     (unless (and (= rows (terminal-rows t)) (= cols (terminal-columns t)))
       (let ((old-tabs (tabs t)) (new-tabs (default-tabs cols)))
@@ -291,7 +298,7 @@ rows and columns after a resize requested by the terminal stream."
                              (vector-copy! copy 0 cells 0 (min limit n))
                              (when (and (< limit n) (eq? (vector-ref cells limit) 'tail))
                                (vector-set! copy (- limit 1) #f))
-                             (make-row cols copy #f (rendition r) (barrier? r)))))))))
+                             (make-row cols copy #f (rendition r) (barrier? r) (terminal-row-prompt? r) #f))))))))
            (lines-set! s v) (sy-set! s (- (sy s) skip))
             (let* ((r (vector-ref v (sy s))) (limit (if (terminal-row-double-width? r) (max 1 (quotient cols 2)) cols)))
               (sx-set! s (min (sx s) (- limit 1))))
@@ -302,7 +309,9 @@ rows and columns after a resize requested by the terminal stream."
            (top-set! s 0) (bottom-set! s (- rows 1))
             (left-set! s 0) (right-set! s (- cols 1)) (wrap-set! s #f)))
        (list (main t) (alt t)))
-      (rows-set! t rows) (columns-set! t cols))))
+      (when (and (reflow-history? t) (not (= cols (terminal-columns t))))
+         (reflow-scrollback! t cols))
+       (rows-set! t rows) (columns-set! t cols))))
 
 ;; Common zero-width and wide ranges (ambiguous characters are narrow).
 ;; Limiting the cluster length also bounds a stream of combining marks.
@@ -345,7 +354,9 @@ rows and columns after a resize requested by the terminal stream."
             (terminal-row-cache-set! r #f)))
         (let* ((end (+ 1 (print-right t))) (wrapping (terminal-mode? t 'wrap)))
           (when (and wrapping (or (wrap? s) (and (> (+ (sx s) w) end) (> (sx s) (margin-left t)))))
-            (index! t 1) (carriage-return! t))
+            (when (and (reflow-history? t) (not (terminal-mode? t 'horizontal-margins)))
+               (continuation-set! (terminal-row t (sy s)) (if (wrap? s) end (sx s))))
+             (index! t 1) (carriage-return! t))
           (let* ((end (+ 1 (print-right t))) (x (sx s)) (w (if (> (+ x w) end) 1 w))
                  (y (sy s)) (v (terminal-row-cells (terminal-row t y))))
             (when (terminal-mode? t 'insert) (shift-cells! t w))

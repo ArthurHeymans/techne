@@ -41,7 +41,7 @@
 (require "server.scm")
 (require "capture.scm")
 
-(provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-eval! editor-eval-ended! editor-press editor-viewport! editor-click editor-message! session-quit?
+(provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-eval! editor-eval-ended! editor-press editor-viewport! editor-pointer! editor-focus-event! editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers pane-inlays pane-projections face-table face-generation cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations! keep-histories!
@@ -77,6 +77,7 @@ Return the session, now the current one."
 The buffers it showed stay, with their unsaved edits; the minibuffer
 histories are written where they are kept (`keep-histories!`)."
   (set! %last-shown (view-document (pane-view s)))
+  (let ((private (sget s 'private-key))) (when private ((cdr private))))
   (detach-session! s)
   (save-histories!))
 

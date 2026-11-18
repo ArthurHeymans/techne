@@ -289,13 +289,76 @@ fn until(rt: &mut Runtime, what: &str, done: impl Fn(&Snapshot) -> bool) -> Snap
         }
         assert!(
             start.elapsed() < Duration::from_secs(20),
-            "timed out waiting for {what}: {:?} / {} / {:?}",
+            "timed out waiting for {what}: {} / {:?} / {} / {:?}",
+            s.pane().status,
             s.pane().text.to_string(),
             s.echo,
             s.minibuffer
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn terminal_uses_the_remote_directory_and_pty() {
+    state();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("remote.txt");
+    std::fs::write(&file, "remote\n").unwrap();
+    let mut rt = with_methods(Runtime::open(&dir.path().join("local"), &dir.path().join("journal"), "emacs").unwrap().0);
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {:?}))", format!("/pipe::{}", file.display())));
+    rt.handle(Input::Viewport { columns: 42, rows: 12, split_gap: 1 });
+    eval(&mut rt, "(run-command (current-session) 'terminal-command 1)");
+    type_text(&mut rt, "stty -echo; cat remote.txt; stty size; read -r line; printf 'got:%s\\n' \"$line\"; stty size");
+    keys(&mut rt, "RET");
+    let ready = until(&mut rt, "remote PTY output", |s| s.pane().text.to_string().contains("10 42"));
+    assert!(ready.pane().text.to_string().starts_with("remote"));
+    assert!(eval(&mut rt, "(default-directory (current-session))").starts_with("\"/pipe::"));
+    rt.handle(Input::Viewport { columns: 56, rows: 16, split_gap: 1 });
+    type_text(&mut rt, "hello");
+    keys(&mut rt, "RET");
+    let done = until(&mut rt, "remote terminal exits", |s| s.pane().status.contains("Exit 0"));
+    let text = done.pane().text.to_string();
+    assert!(text.contains("got:hello") && text.contains("14 56"), "{text}");
+    assert!(rt.take_errors().is_empty());
+}
+
+#[test]
+fn remote_terminal_keeps_output_after_the_node_disconnects() {
+    state();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("remote.txt");
+    std::fs::write(&file, "remote\n").unwrap();
+    let loc = format!("/pipe::{}", file.display());
+    let mut rt = with_methods(Runtime::open(&dir.path().join("local"), &dir.path().join("journal"), "emacs").unwrap().0);
+    eval(
+        &mut rt,
+        &format!("(begin (define endpoint (location-endpoint {loc:?})) (show-document! (current-session) (file-document {loc:?})))"),
+    );
+    eval(&mut rt, "(run-command (current-session) 'terminal-command 1)");
+    type_text(&mut rt, "printf 'last useful line\\n'; read -r go");
+    keys(&mut rt, "RET");
+    until(&mut rt, "remote terminal ready", |s| s.pane().text.to_string().contains("last useful line"));
+    let pkg = "(package-module (find-package 'terminal))";
+    eval(&mut rt, &format!("(define reader-task (eval '(reader (session-of (current-buffer (current-session)))) {pkg}))"));
+    eval(&mut rt, "(node-close endpoint)");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        rt.run_tasks(Duration::from_millis(10)).unwrap();
+        if eval(&mut rt, "(task-done? reader-task)") == "#t" {
+            eval(&mut rt, "(task-join reader-task)");
+            break;
+        }
+        assert!(Instant::now() < deadline, "reader still waiting: {}", eval(&mut rt, "(node-lost endpoint)"));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let retained = rt.snapshot();
+    assert!(!retained.pane().status.contains("SEMI"));
+    assert!(retained.pane().text.to_string().contains("last useful line"));
+    assert!(
+        eval(&mut rt, "(eval '(process (session-of (current-buffer (current-session)))) (package-module (find-package 'terminal)))")
+            == "#f"
+    );
 }
 
 /// The commands, by their keys, on a repository of another machine, as

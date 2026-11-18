@@ -304,6 +304,22 @@ impl Screen {
             .collect();
     }
 
+    /// A pointer report for the terminal pane under the pointer.
+    pub fn pointer(&self, layout: &Layout, x: f32, y: f32, code: usize, release: bool) -> Option<Input> {
+        let snapshot = self.snap.as_ref()?;
+        let shown = self.shown.iter().find(|s| {
+            let a = s.area;
+            a.top <= y && y < a.top + a.text && a.text_left() <= x && x < a.left + a.width
+        })?;
+        let pane = snapshot.panes.iter().find(|p| p.view == shown.view)?;
+        if !pane.display.report_pointer {
+            return None;
+        }
+        let column = ((x - shown.area.text_left()) / layout.char_width().max(1.0)) as usize;
+        let row = ((y - shown.area.top) / layout.line_height().max(1.0)) as usize;
+        Some(Input::Pointer { view: shown.view, column, row, code, release })
+    }
+
     /// A press of the button at (x, y): a click in the pane there.
     pub fn press(&mut self, layout: &Layout, x: f32, y: f32, extend: bool) -> Option<Input> {
         let shown = self.shown.iter().find(|s| {

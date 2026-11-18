@@ -53,7 +53,7 @@
   (let* ((attrs (style t))
          (attrs (if (terminal-mode? t 'iso-protect) (cons '(iso-protect . #t) attrs) attrs))
          (attrs (if (terminal-mode? t 'dec-protect) (cons '(dec-protect . #t) attrs) attrs)))
-    (cons (string c) attrs)))
+    (cons (string c) (if (terminal-link t) (cons (cons 'link (terminal-link t)) attrs) attrs))))
 
 (define (scroll-rectangle! t lo hi amount)
   (let* ((left (margin-left t)) (end (+ 1 (right (active t))))

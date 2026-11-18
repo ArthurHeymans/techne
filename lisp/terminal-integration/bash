@@ -1,0 +1,9 @@
+# Source from ~/.bashrc to report the cwd and semantic prompts to Techne.
+if [[ $- == *i* && ${TERM_PROGRAM-} == techne && ! ${__techne_installed-} ]]; then
+    __techne_installed=1
+    __techne_precmd() {
+        local path=${PWD//%/%25}
+        printf '\033]7;file://%s%s\033\\\033]133;A\033\\' "${HOSTNAME-}" "$path"
+    }
+    PROMPT_COMMAND+=(__techne_precmd)
+fi

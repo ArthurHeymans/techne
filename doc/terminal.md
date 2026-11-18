@@ -1,9 +1,16 @@
 # Terminal buffers
 
 `M-x terminal` opens a new PTY running `$SHELL` (or `sh`) in the current
-buffer's local directory. `M-x terminal-command` prompts for a command to
-run via `sh -c` on its own PTY. Both commands work in the window and
-terminal frontends, with either editor key profile.
+buffer's directory. `M-x terminal-command` prompts for a command to run via
+`sh -c` on its own PTY. Both work in the window and terminal frontends.
+
+From a remote file such as `/ssh:HOST:/work/notes`, the editor and emulator
+stay local while the shell and PTY run on the node for that route. The
+interactive command uses the endpoint account's shell; Bash, Zsh and Fish
+start as login shells. The usual Techne remote access configuration and
+noninteractive SSH authentication apply. Killing the buffer stops the PTY.
+If the connection is lost, the output remains readable; open a new terminal
+to reconnect rather than expecting a detached session to resume.
 
 Terminals start in **semi-char** mode, as in Ebb. Typing goes to the child;
 editor shortcuts such as `M-x` and `C-x` stay with the active editor profile.
@@ -21,6 +28,10 @@ editor shortcuts such as `M-x` and `C-x` stay with the active editor profile.
 | `C-y`, `S-Insert`, `C-S-v` | In semi-char mode, paste the latest kill or imported clipboard text. |
 | `M-y` | In semi-char mode, paste the next older kill. It does not erase text already sent. |
 | `C-c C-k` | Stop the process without discarding the buffer. |
+| `C-c C-p` / `C-c C-n` | Go to the preceding / following shell prompt. |
+| `C-c M-p` / `C-c M-n` | Go to the preceding / following hyperlink. |
+| `RET` in copy mode | Open the HTTP(S) hyperlink at point with `xdg-open`. |
+| `C-c C-w` | Read a hidden answer for a child already waiting for a password. |
 
 The child can request bracketed paste. In copy mode, `M-x terminal-yank`
 can also send the latest kill to the child. Switching buffers leaves the
@@ -30,8 +41,24 @@ an empty prompt) closes its buffer. Set `terminal-close-on-exit` to `#f`
 to keep it. Failed or interrupted shells and `terminal-command` runs
 retain their output and exit status.
 
-Ebb's prompt and hyperlink navigation shortcuts are not bound: they need
-shell integration or linked cells, which this terminal does not yet track.
+For prompt navigation and current-directory tracking, source the matching
+script in `lisp/terminal-integration/` from your Bash, Zsh or Fish config,
+on the machine running the shell. Techne sets `TERM_PROGRAM=techne`.
+Scripts are not injected into a remote account. OSC 7 can update the path
+of a terminal but cannot change its route or connect to a new host. OSC 133
+marks prompts and OSC 8 marks HTTP(S) hyperlinks in the grid.
+
+Use the hidden password prompt only when the child has disabled echo. It
+bypasses the editor's normal key hooks and does not insert the answer into
+a buffer or command history. `terminal-detect-passwords` is opt-in: it
+checks for canonical input with echo off after output, on both local and
+updated remote nodes. That signal is a heuristic, not proof of a password
+prompt. It is not an SSH askpass or a credential store.
+
+`M-x terminal-serial` opens a local device under `/dev` through `socat`
+(which must be on `PATH`). Set `terminal-serial-baud` to select the speed
+(default 115200). This is a basic raw serial console, not a serial settings
+or reconnect manager.
 
 The terminal uses the existing PTY primitives and advertises
 `xterm-256color` with `COLORTERM=truecolor`. It implements common VT and
@@ -42,11 +69,21 @@ margins, protected cells, rectangular editing, and VT mode, setting, and
 screen checksum reports. Child-requested grid sizes are bounded, and do
 not resize the editor window. A focused terminal follows pane size changes.
 DEC double-width and double-height rows use double-width spacing with
-normal-size glyphs. Scrollback retains up to 2,000 physical rows of the
-main screen; it is not reflowed, and visual wraps copy as separate lines.
-Wide CJK characters and common combining sequences are supported; this is
-not a complete Unicode grapheme or xterm implementation. Mouse and focus
-reporting, graphics, and OSC clipboard access are not supported.
+normal-size glyphs. Scrollback retains up to 2,000 rows of the main screen.
+Saved text reflows on width changes; the live and alternate grids do not.
+Visual wraps copy as separate lines. Wide CJK characters and common
+combining sequences are supported. Applications can request xterm mouse
+and focus reports in both frontends. Shift or copy mode keeps mouse input
+with the editor. OSC clipboard access is not supported.
+
+The window frontend draws traditional Kitty inline placements. The direct
+base64 medium accepts chunked PNG and raw RGB/RGBA within fixed storage
+and pixel limits. File, temporary-file and shared-memory transfers are
+refused, even for local children. Virtual placements support whole rectangles
+with an on-screen origin placeholder, explicit cell dimensions, and a 24-bit
+image ID. Per-cell slices, source cropping, compression, animation, and image
+scrollback are not implemented.
+The text frontend does not draw image overlays.
 
 The Scheme implementation follows the architecture of `el-be-back`: an
 independent cell grid and incremental VT parser, cached row projections
@@ -96,4 +133,4 @@ revision `664be3cf2c1e3f06bc93a8bafb48a0db83c607db`:
 ```
 
 This is VT protocol parity on that selection, not parity with Ebb's
-Emacs-specific renderer, shell integration, graphics, or serial support.
+Emacs-specific features or every graphics and serial extension.
