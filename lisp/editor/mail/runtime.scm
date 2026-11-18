@@ -71,7 +71,16 @@
                                       "/techne/mail/cache.sqlite"))))
         (unless (string=? path ":memory:") (ensure-directory! (path-directory path)))
         (set! %db (mail-store-open path)) %db)))
-(define (mail-state s) (or (sget s 'mail) (let ((st (make-hash-table))) (put! st 'group 'unread) (put! st 'query "") (sset! s 'mail st) st)))
+(define %mail-session-count 0)
+(define (mail-state s)
+  (or (sget s 'mail)
+      (let ((st (make-hash-table)))
+        (set! %mail-session-count (+ %mail-session-count 1))
+        (put! st 'session-number %mail-session-count)
+        (put! st 'group 'unread) (put! st 'query "") (sset! s 'mail st) st)))
+(define (mail-buffer-name st name)
+  (let ((n (get st 'session-number)))
+    (if (= n 1) name (string-append name "<" (number->string n) ">"))))
 (define (configured-accounts)
   (let ((accounts (option #f 'mail-accounts))) (if (list? accounts) accounts '())))
 (define (account-by-id id) (find (lambda (a) (equal? (mail-ref a 'id) id)) (configured-accounts)))
@@ -428,7 +437,7 @@ x does it, at the source, as in the list."
 (define (reader-buffer! st)
   ;; The reader's buffer, made empty the first time: a list opens alone.
   (or (get st 'reader)
-      (let ((b (make-rich-buffer! "*mail reader*" #:mode 'mail-message-mode))) (put! st 'reader b) b)))
+      (let ((b (make-rich-buffer! (mail-buffer-name st "*mail reader*") #:mode 'mail-message-mode))) (put! st 'reader b) b)))
 (define (refresh! s #:reader? [render-reader? #t])
   ;; The list is what its group and search found when it was last made
   ;; (`listed` unset), as a mu4e or Gnus summary is: a message read,
@@ -472,7 +481,7 @@ x does it, at the source, as in the list."
     (put! st 'cached? (or (pair? messages) (> (mail-ref (mail-store-counts (database!)) 'total) 0)))
     (unless (find (lambda (m) (equal? (mail-ref m 'id) id)) messages)
       (put! st 'selected (and (pair? messages) (mail-ref (car messages) 'id))))
-    (let ((b (make-listing-buffer! "*mail summary*" 'mail-summary-mode summary-rows #:state (list (cons 'mail-state st)))))
+    (let ((b (make-listing-buffer! (mail-buffer-name st "*mail summary*") 'mail-summary-mode summary-rows #:state (list (cons 'mail-state st)))))
       (put! st 'summary b))
     ;; The reader is made only while it is shown: a list opens alone,
     ;; and RET opens a message.
@@ -718,7 +727,7 @@ composes, D opens the drafts, and q leaves mail."
     (put! st 'columns (or (sget s 'viewport-columns) 100))
     (put! st 'overview (overview))
     (put! st 'drafts (length (mail-store-drafts (database!))))
-    (let ((b (make-listing-buffer! "*mail*" 'mail-dashboard-mode dashboard-rows #:state (list (cons 'mail-state st)))))
+    (let ((b (make-listing-buffer! (mail-buffer-name st "*mail*") 'mail-dashboard-mode dashboard-rows #:state (list (cons 'mail-state st)))))
       (put! st 'dashboard b)
       (let ((keys (get st 'dash-keys '())))
         (unless (member (get st 'dash-key) keys)
@@ -923,7 +932,8 @@ Set the global mail-reader-position preference for this runtime."
 (define-command (mail-back s n)
   "Return to the selected summary, saving an open draft before leaving it.
 From what the dashboard showed (help, a draft), return to the dashboard."
-  (when (eq? (buffer-mode (current-buffer s)) 'mail-compose-mode) (mail-save-draft s 1))
+  (let ((b (current-buffer s)))
+    (when (and (eq? (buffer-mode b) 'mail-compose-mode) (draft-dirty? b)) (mail-save-draft s 1)))
   (return-from-aside! s))
 (define (return-from-aside! s)
   (let* ((st (mail-state s)) (b (get st 'summary))
@@ -1020,10 +1030,11 @@ Groups are across accounts: Inbox, Unread, Starred, All mail."
     (if named (or (folder-named folders named) (error "The account's trash folder is not there" named))
         (find (lambda (f) (member (string-downcase (car f)) '("trash" "deleted items" "deleted messages" "[gmail]/trash" "[gmail]/bin")))
               folders))))
-(define (dispose! ids how)
-  ;; Archive (HOW archive) or delete (delete) the messages IDS; return
-  ;; how many were, and what undoes them goes to `mail-undo'.
-  (let ((db (database!)) (done 0) (undo '()))
+(define (dispose! ids how #:more? [more? #f])
+  ;; Publish undo entries as moves complete, even if a later move fails.
+  (let ((db (database!)) (done 0) (more? more?))
+    (define (completed! entries)
+      (remember! entries #:more? more?) (set! more? #t) (set! done (+ done 1)))
     (for-each
      (lambda (id)
        (let* ((m (or (mail-store-message db id #:raw? #f) (error "No such message" id)))
@@ -1034,13 +1045,11 @@ Groups are across accounts: Inbox, Unread, Starred, All mail."
          (define (trash! ids)
             ;; T for explicit Inbox-label removal, or cache-only hiding.
             (mail-store-state! db ids 'trashed #t #:copies? #f
-              #:on-change (lambda (entries)
-                            (set! undo (append entries undo))
-                            (set! done (+ done 1)))))
+              #:on-change completed!))
           (define (move! folder)
             (unless (string=? (mail-ref m 'mailbox) (car folder))
               (let ((back (mail-store-move! db id (car folder) (cdr folder) #:undo? #t)))
-                (when back (set! undo (cons (list id 'move back) undo)) (set! done (+ done 1))))))
+                (when back (completed! (list (list id 'move back)))))))
          (hash-table-delete! %kept id)
          (cond
           ;; Kept here only (an IMAP account, or not from a file): hidden here.
@@ -1067,17 +1076,14 @@ Groups are across accounts: Inbox, Unread, Starred, All mail."
                    (unless trash (error "Set trash to an existing Maildir folder; Delete does not expunge messages"))
                    (move! trash)))))))))
      ids)
-    (values done undo)))
+    done))
 (define (dispose-now! s how)
-  (let ((ids (affected-ids s)))
-    (call-with-values (lambda () (dispose! ids how))
-      (lambda (done undo)
-        (remember! undo)
-        (put! (mail-state s) 'listed #f)
-        (refresh! s)
-        (message! s (string-append (grouped done) (if (= done 1) " message " " messages ")
-                                   (if (eq? how 'archive) "archived" "deleted")
-                                   " · a undoes until mbsync runs"))))))
+  (let ((done (dispose! (affected-ids s) how)))
+    (put! (mail-state s) 'listed #f)
+    (refresh! s)
+    (message! s (string-append (grouped done) (if (= done 1) " message " " messages ")
+                               (if (eq? how 'archive) "archived" "deleted")
+                               (if (> done 0) " · a undoes until mbsync runs" "")))))
 (define-command (mail-star s n) "Toggle the star of marked messages, or the current message.
 A Maildir message is given or loses its F flag, as mu4e does." (change! s 'starred))
 (define-command (mail-archive s n) "Archive marked messages, or the current message, now.
@@ -1220,8 +1226,7 @@ all until it runs. The list is then made again, so what left it goes."
           (for-each (lambda (entry)
                       (let ((ids (list (string->number (car entry)))))
                         (case (cdr entry)
-                          ((#\r #\D) (call-with-values (lambda () (dispose! ids (if (eqv? (cdr entry) #\r) 'archive 'delete)))
-                                       (lambda (done undo) (remember! undo #:more? #t))))
+                          ((#\r #\D) (dispose! ids (if (eqv? (cdr entry) #\r) 'archive 'delete) #:more? #t))
                           ((#\!) (remember-state! ids 'unread #f #:more? #t))
                           ((#\?) (remember-state! ids 'unread #t #:more? #t))
                           ((#\+) (remember-state! ids 'starred #t #:more? #t))
@@ -1276,7 +1281,7 @@ Invalid UTF-8 bytes display as replacements; original octets remain in SQLite."
   (let ((root (mail-ref account 'path)) (box (mail-ref account 'mailbox))
         (only (mail-ref account 'folders)) (skip (mail-ref account 'skip '())))
     (unless (string? root) (error "A Maildir account needs a path"))
-    (if box (list (cons box root))
+    (if box (begin (maildir-check-root root) (list (cons box root)))
         (let ((all (account-maildirs account)))
           (when (null? all) (error "No Maildir at or under the account’s path" root))
           (filter (lambda (folder)
@@ -1731,6 +1736,8 @@ Preserve its Message-ID threading headers."
          (string-append "In-Reply-To: " (get st 'reply) "\n"))
      (if (or (string=? (get st 'references "") "") (not (string=? (mail-header parsed "references") ""))) ""
          (string-append "References: " (get st 'references) "\n")) text)))
+(define (draft-dirty? b)
+  (not (equal? (get (buffer-state b) 'saved-revision) (document-revision (buffer-document b)))))
 (define (persist-draft! b)
   (let ((st (buffer-state b)))
     (if (or (get st 'sent?) (get st 'sending?) (get st 'uncertain?)) #f
@@ -1751,7 +1758,7 @@ Preserve its Message-ID threading headers."
                (let ((st (buffer-state b)))
                  (when (get st 'autosave) (task-cancel (get st 'autosave)))
                   ;; Don't rewrite a saved snapshot just by closing its buffer.
-                  (unless (or (get st 'discarded?) (equal? (get st 'saved-revision) (document-revision (buffer-document b))))
+                  (when (and (not (get st 'discarded?)) (draft-dirty? b))
                     (guard (e (#t (message! s "Draft save failed; check your local cache"))) (persist-draft! b)))))))
 (define-command (mail-postpone s n)
   "Save this draft and leave it for later, as message mode's postponing.
@@ -1854,7 +1861,7 @@ another; q goes back to the dashboard. Nothing is sent from here."
   (let ((st (mail-state s)))
     (put! st 'columns (or (sget s 'viewport-columns) 160))
     (put! st 'draft-list (mail-store-drafts (database!)))
-    (let ((b (make-listing-buffer! "*mail drafts*" 'mail-drafts-mode drafts-rows #:state (list (cons 'mail-state st)))))
+    (let ((b (make-listing-buffer! (mail-buffer-name st "*mail drafts*") 'mail-drafts-mode drafts-rows #:state (list (cons 'mail-state st)))))
       (put! st 'drafts-buffer b)
       (put! st 'drafts (length (get st 'draft-list)))
       (unless (member (get st 'draft-key) (get st 'draft-keys '()))

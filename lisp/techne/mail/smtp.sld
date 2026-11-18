@@ -1,7 +1,7 @@
 ;;; SMTP submission is Scheme. TLS is the network host's small mechanism.
 (define-library (techne mail smtp)
   (export mail-submit! mail-compose-message mail-addresses smtp-session smtp-submit!)
-  (import (techne) (techne crypto) (techne uuid) (techne time) (techne mail address))
+  (import (techne) (techne crypto) (techne uuid) (techne time) (techne mail address) (techne task))
   (begin
     (define (clean-header text)
       (unless (every (lambda (c) (let ((n (char->integer c))) (and (or (>= n 32) (= n 9)) (not (= n 127)))))
@@ -137,11 +137,29 @@ only after DATA is accepted. No automatic retries occur."
       ;; DATA acceptance is authoritative: close without another network wait.
       #t)
 
-    (define (mail-submit! host port user password from recipients raw #:security [security 'implicit-tls] #:on-data [on-data (lambda () #t)])
+    (define (mail-submit! host port user password from recipients raw #:security [security 'implicit-tls] #:on-data [on-data (lambda () #t)]
+                          #:timeout-ms [timeout-ms 120000])
       "Submit RAW to HOST on PORT over verified TLS.
 SECURITY is 'implicit-tls (usually 465) or 'starttls (usually 587). There is
 no plaintext fallback. USER and PASSWORD authenticate; FROM and RECIPIENTS
-are envelope addresses. See smtp-submit! for ON-DATA and delivery semantics."
+are envelope addresses. See smtp-submit! for ON-DATA and delivery semantics.
+TIMEOUT-MS bounds the entire network submission, including TLS negotiation."
+      (unless (and (exact-integer? timeout-ms) (> timeout-ms 0)) (error "Invalid SMTP timeout"))
+      (let* ((timed-out? #f)
+             (work (spawn (lambda () (submit-over-tls! host port user password from recipients raw security on-data))))
+             (watch (spawn (lambda ()
+                             (sleep timeout-ms)
+                             (unless (task-done? work) (set! timed-out? #t) (task-cancel work))))))
+        (dynamic-wind
+          (lambda () #f)
+          (lambda ()
+            (guard (e ((and timed-out? (task-cancelled-condition? e)) (error "SMTP submission timed out")))
+              (task-join work)))
+          (lambda ()
+            (task-cancel watch)
+            (unless (task-done? work) (task-cancel work))))))
+
+    (define (submit-over-tls! host port user password from recipients raw security on-data)
       (let ((c (case security
                  ((implicit-tls) (tls-connect host port))
                  ((starttls) (tcp-connect host port))

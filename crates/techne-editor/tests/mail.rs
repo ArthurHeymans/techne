@@ -112,6 +112,61 @@ fn root_inbox_filters_use_the_displayed_name_and_delete_requires_trash() {
 }
 
 #[test]
+fn a_failed_bulk_archive_keeps_undo_for_completed_moves() {
+    let (dir, mut rt) = editor();
+    real_accounts(&mut rt, dir.path());
+    let root = dir.path().join("Maildir");
+    let inbox = root.join("cur");
+    let archive = root.join("Archive/cur");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::create_dir_all(&archive).unwrap();
+    for (name, hour) in [("first", "13"), ("second", "12")] {
+        std::fs::write(inbox.join(format!("{name}:2,S")), format!("Subject: {name}\nDate: Thu, 5 Nov 2026 {hour}:00:00 +0000\n\nbody"))
+            .unwrap();
+    }
+    rt.eval(&format!(
+        "(set-option! 'mail-accounts '(((id . \"test\") (kind . maildir) (path . {:?}) (archive . \"Archive\"))))",
+        root.display().to_string(),
+    ))
+    .unwrap();
+    command(&mut rt, "mail");
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| pane(rt, 0).contains("Up to date"));
+    key(&mut rt, "i");
+    assert_eq!(summary_subjects(&mut rt), "(\"first\" \"second\")");
+    key(&mut rt, "m m");
+    std::fs::write(archive.join("second:2,S"), "existing destination").unwrap();
+    rt.eval("(run-command (current-session) 'mail-archive 1)").unwrap();
+    assert!(archive.join("first:2,S").is_file());
+    assert!(rt.snapshot().echo.contains("already exists"));
+    rt.take_errors();
+    command(&mut rt, "mail-undo");
+    assert!(inbox.join("first:2,S").is_file());
+    assert!(!archive.join("first:2,S").exists());
+    assert_eq!(std::fs::read_to_string(archive.join("second:2,S")).unwrap(), "existing destination");
+}
+
+#[test]
+fn attached_sessions_keep_distinct_listings_and_marks() {
+    let (dir, mut rt) = editor();
+    samples(&mut rt, dir.path());
+    key(&mut rt, "d");
+    assert_eq!(
+        rt.eval(
+            r#"(let* ((one (current-session)) (one-mail (sget one 'mail))
+                       (a (hash-table-ref one-mail 'summary)) (two (start-session #f "emacs")))
+                  (run-command two 'mail-all 1)
+                  (let* ((two-mail (sget two 'mail)) (b (hash-table-ref two-mail 'summary)))
+                    (list (not (eq? a b)) (eq? (listing-get a 'mail-state) one-mail)
+                          (eq? (listing-get b 'mail-state) two-mail)
+                          (length (listing-marked a #\D)) (length (listing-marked b #\D)))))"#,
+        )
+        .unwrap(),
+        "(#t #t #t 1 0)"
+    );
+}
+
+#[test]
 fn a_mark_cannot_delete_the_message_that_replaces_a_cached_row() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
@@ -665,10 +720,14 @@ fn opening_a_stale_draft_row_reads_the_newer_saved_text_without_writing() {
     assert!(rt.snapshot().pane().text.to_string().contains("New body"));
     rt.eval(
         "(mail-store-draft! inspect-db \"draft-fixture\" \"test\" \"Subject: Newer still\\n\\nNewer body\")
-             (drop-buffer! (current-session) (current-buffer (current-session)))",
+             (define stale-buffer (current-buffer (current-session)))",
     )
     .unwrap();
-    assert!(rt.eval("(caddr (mail-store-draft inspect-db \"draft-fixture\"))").unwrap().contains("Newer body"));
+    command(&mut rt, "mail-postpone");
+    let saved = |rt: &mut Runtime| rt.eval("(caddr (mail-store-draft inspect-db \"draft-fixture\"))").unwrap();
+    assert!(saved(&mut rt).contains("Newer body"), "postponing must not rewrite an unchanged draft");
+    rt.eval("(drop-buffer! (current-session) stale-buffer)").unwrap();
+    assert!(saved(&mut rt).contains("Newer body"), "closing must not rewrite an unchanged draft");
 }
 
 #[test]

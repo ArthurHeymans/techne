@@ -9,6 +9,7 @@ fn mail_scheme_suites() {
         "mail-backend-tests.scm",
         "mail-smtp-tests.scm",
         "host/mail-store-tests.scm",
+        "host/mail-smtp-timeout-tests.scm",
         "mail-date-tests.scm",
         "authinfo-tests.scm",
     ] {

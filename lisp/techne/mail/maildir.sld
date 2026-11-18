@@ -4,7 +4,7 @@
 ;;; as mu4e does and mbsync then carries to the server.
 (define-library (techne mail maildir)
   (export maildir-read maildir-for-each maildir-source-bytes maildir-folders maildir-keys
-          maildir-path-key maildir-path-flags maildir-locate maildir-set-flag! maildir-move!)
+          maildir-check-root maildir-path-key maildir-path-flags maildir-locate maildir-set-flag! maildir-move!)
   (import (techne) (techne path) (techne task))
   (begin
     (define (%maildir-flags suffix)
@@ -88,13 +88,17 @@ holding every body of a large mailbox in memory."
                    (cond ((not (eq? (vector-ref a 1) (vector-ref b 1))) (vector-ref a 1))
                          ((not (= (vector-ref a 2) (vector-ref b 2))) (> (vector-ref a 2) (vector-ref b 2)))
                          (else (string>? (vector-ref a 0) (vector-ref b 0))))))))
+    (define (maildir-check-root root)
+      "Require at least one cur or new directory directly inside ROOT."
+      (let ((base (file-truename root)))
+        (unless (any (lambda (sub)
+                       (let ((a (file-attributes (path-join base sub))))
+                         (and a (eq? (car a) 'directory)))) '("cur" "new"))
+          (error "Maildir requires cur or new" root))))
     (define (maildir-keys root)
-      "Return the messages Maildir ROOT holds, a hash table of key to path.
-Only names are read, no message. A ROOT that is not a directory is an
-error, not an empty mailbox: what was cached of it may not be gone."
-      ;; Through a link, as mail trees often are.
-      (let ((a (guard (e ((not (task-cancelled-condition? e)) #f)) (file-attributes (file-truename root)))))
-        (unless (and a (eq? (car a) 'directory)) (error "Maildir folder is missing" root)))
+      "Return Maildir ROOT's message keys and paths without reading bodies.
+An unavailable Maildir is an error, not an empty mailbox."
+      (maildir-check-root root)
       (let ((keys (make-hash-table)))
         (for-each (lambda (path) (hash-table-set! keys (maildir-path-key path) path)) (%maildir-paths root #f))
         keys))

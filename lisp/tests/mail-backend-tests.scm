@@ -214,6 +214,8 @@
       (check "Maildir folders stop at a depth" '("" "Inbox") (map car (maildir-folders root #:depth 1)))
       (check "Maildir folders of a missing root" '() (maildir-folders (string-append root "/absent")))
       (check "Maildir keys of an empty folder" '() (hash-table-keys (maildir-keys (string-append root "/Inbox"))))
+      (check "A directory without cur or new is not an empty Maildir" #t
+             (rejected? (lambda () (maildir-keys (string-append root "/not-mail")))))
       (check "Maildir keys of a missing folder are an error, not none" #t
              (rejected? (lambda () (maildir-keys (string-append root "/absent"))))))
     (lambda () (delete-path root #t))))
