@@ -56,6 +56,32 @@ one projection roughly every 16 ms during a burst. EOF flushes the last
 update immediately. The screen, parser and key encoder can be used
 without the editor as `(techne terminal)`.
 
+## Benchmarks
+
+The `terminal-bench` example runs the Scheme parser and document projection
+on the same four byte streams Ebb uses: plain scrolling text, indexed SGR
+colors, uniform full-screen updates, and per-cell checkerboard colors. Each
+sample starts with a fresh 80×24 grid and document, feeds the entire stream,
+and projects it once. Both runners warm up and report the median of five
+samples by default. No PTY, asynchronous batching, or frontend drawing is
+measured. The projects retain and materialize scrollback differently, so
+these are measurements of their shipped pipelines, not a language benchmark.
+
+Run the two on the same machine, one after the other, without a competing
+build. The arguments are bytes, iterations, and an optional TSV output path:
+
+```sh
+cargo run --release -p techne-editor --example terminal-bench -- 262144 5 /tmp/techne-terminal.tsv
+EBB_BENCH_NATIVE=1 bash ../el-be-back/bench/run-ebb-bench.sh \
+  --size 262144 --iterations 5 --out /tmp/ebb-terminal.tsv
+techne run lisp/bench/compare-terminal.scm /tmp/techne-terminal.tsv /tmp/ebb-terminal.tsv
+```
+
+Use an Emacs with native compilation for the Ebb numbers; omitting
+`EBB_BENCH_NATIVE` measures byte-compiled Elisp instead. The Techne example's
+`--fixtures DIR [BYTES]` mode writes the four input streams without timing
+for checking or replaying them.
+
 ## Compatibility testing
 
 The terminal passes Ebb's focused `esctest2` selection: **258 passed,

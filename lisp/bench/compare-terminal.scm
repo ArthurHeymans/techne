@@ -1,0 +1,35 @@
+;;; Compare the TSVs emitted by the Techne benchmark and Ebb's launcher.
+(import (techne))
+
+(define (read-results path prefix)
+  (let ((table (make-hash-table)))
+    (for-each
+     (lambda (line)
+       (unless (string=? line "")
+         (let ((fields (string-split line "\t")))
+           (unless (and (= (length fields) 3) (string-prefix? prefix (car fields)))
+             (error "Unexpected benchmark result" path line))
+           (let ((name (substring (car fields) (string-length prefix)))
+                 (ms (string->number (cadr fields))))
+             (unless (and (real? ms) (> ms 0) (not (hash-table-ref/default table name #f)))
+               (error "Invalid or duplicate benchmark row" path line))
+             (hash-table-set! table name (list (cadr fields) (caddr fields) ms))))))
+     (string-split (file->string path) "\n"))
+    table))
+
+(define args (cdr (command-line)))
+(unless (= (length args) 2) (error "Usage: techne run lisp/bench/compare-terminal.scm TECHNE.tsv EBB.tsv"))
+(define techne (read-results (car args) "techne/"))
+(define ebb (read-results (cadr args) "ebb/"))
+(define cases '("plain" "sgr" "tui" "checker"))
+
+(display "| Case | Techne ms | Ebb ms | Techne MiB/s | Ebb MiB/s | Techne / Ebb time |\n")
+(display "|---|---:|---:|---:|---:|---:|\n")
+(for-each
+ (lambda (name)
+   (let ((t (hash-table-ref/default techne name #f)) (e (hash-table-ref/default ebb name #f)))
+     (unless (and t e) (error "Missing benchmark case" name))
+     (let ((ratio (/ (caddr t) (caddr e))))
+       (display (string-append "| " (string-join (list name (car t) (car e) (cadr t) (cadr e)
+                                                       (string-append (number->string (/ (round (* ratio 100.0)) 100.0)) "x")) " | ") " |\n")))))
+ cases)
