@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794998739252,
+  "lastUpdate": 1794998740861,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -56384,6 +56384,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 646441602,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107151,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "16369fb12b1878608dec7510aeb80b599847ecf8",
+          "message": "Merge pull request #367 from ArthurHeymans/perf/vm-short-append\n\nAvoid a heap allocation in short append calls",
+          "timestamp": "2026-11-18T11:18:59+01:00",
+          "tree_id": "e80b9aebb8e4442fca21eb6662270805fec7288a",
+          "url": "https://github.com/ArthurHeymans/techne/commit/16369fb12b1878608dec7510aeb80b599847ecf8"
+        },
+        "date": 1794998740817,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 694181887,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 646427639,
             "unit": "instructions"
           },
           {
