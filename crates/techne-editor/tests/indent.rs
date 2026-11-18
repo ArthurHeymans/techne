@@ -61,6 +61,24 @@ fn typing_and_reindenting_scheme() {
     assert_eq!(text(&mut rt), "\t\na\n");
 }
 
+#[test]
+fn indent_region_indents_each_line_once_with_multiple_cursors() {
+    let dir = tempfile::tempdir().unwrap();
+    let flat = "(when #t\n(display 1))\n(when #t\n(display 2))\n";
+    let mut rt = open(dir.path(), "multiple.scm", flat, "emacs");
+    let first = flat.find("(display 1)").unwrap();
+    let second = flat.find("(display 2)").unwrap();
+    rt.eval(&format!(
+        "(view-set-ranges! (session-view (current-session)) '(({first} {first}) ({inside} {inside}) ({second} {second})) 0)",
+        inside = first + 2
+    ))
+    .unwrap();
+    keys(&mut rt, "C-M-\\");
+    assert_eq!(text(&mut rt), "(when #t\n  (display 1))\n(when #t\n  (display 2))\n");
+    keys(&mut rt, "C-/");
+    assert_eq!(text(&mut rt), flat);
+}
+
 /// In the modal profile, o opens an indented line, RET in insert state
 /// indents, and = indents what a motion covers.
 #[test]
