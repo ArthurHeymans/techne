@@ -38,27 +38,23 @@ use mail-toggle-reader-position, or set this option in your mail
 configuration."
   #:type '(one-of bottom side))
 
-(define %mail-runtime (string-append (directory-of (current-module)) "mail-runtime.scm"))
+(define %mail-runtime (string-append (directory-of (current-module)) "../mail/runtime.scm"))
 
-(define-syntax %mail-entry
-  (syntax-rules ()
-    ((_ name doc)
-     (define-command (name s n) doc
-       (unless (find-package 'mail-runtime)
-         (load-package 'mail-runtime %mail-runtime))
-       (let ((implementation (command 'name)))
-         (when (eq? implementation name) (error "Mail command was not loaded" 'name))
-         (with-scope (package-scope (find-package 'mail-runtime)) (implementation s n)))))))
+;; Use one shared command body, not a newly compiled definition for each
+;; entry point. The real commands replace these registry entries on load.
+(define (%register-mail-entry entry)
+  (let ((name (car entry)))
+    (define (autoload s n)
+      (unless (find-package 'mail-runtime)
+        (load-package 'mail-runtime %mail-runtime))
+      (let ((implementation (command name)))
+        (when (eq? implementation autoload) (error "Mail command was not loaded" name))
+        (with-scope (package-scope (find-package 'mail-runtime)) (implementation s n))))
+    (register-command! name (cadr entry) autoload)))
 
-(%mail-entry mail "Open the mail dashboard. Configure accounts with `mail-accounts`.")
-(%mail-entry mail-dashboard "Show the mail dashboard.")
-(%mail-entry mail-inbox "List the Inbox of every mail account.")
-(%mail-entry mail-unread "List the unread mail of every account.")
-(%mail-entry mail-starred "List the starred mail of every account.")
-(%mail-entry mail-all "List all mail of every account.")
-(%mail-entry mail-search "Search the local mail cache.")
-(%mail-entry mail-groups "Choose a mail group, account, or folder to open.")
-(%mail-entry mail-sync "Fetch configured IMAP or Maildir accounts into the local cache.")
-(%mail-entry mail-sync-status "Show progress and problems from the last mail sync.")
-(%mail-entry mail-compose "Compose a new message.")
-(%mail-entry mail-drafts "List the saved mail drafts.")
+(for-each %register-mail-entry
+          '((mail "Open the mail dashboard. Configure accounts with `mail-accounts`.")
+
+            (mail-groups "Choose a mail group, account, or folder to open.")
+            (mail-search "Search the local mail cache.")
+            (mail-compose "Compose a new message.")))

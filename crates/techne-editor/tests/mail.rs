@@ -57,7 +57,7 @@ fn pump_until(rt: &mut Runtime, mut done: impl FnMut(&mut Runtime) -> bool) {
 fn samples(rt: &mut Runtime, dir: &std::path::Path) {
     rt.eval(&format!(
         "(require {:?}) (mail-test-seed-samples! {:?})",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/mail-sample-fixture.scm"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-sample-fixture.scm"),
         dir.join("samples.sqlite").display().to_string()
     ))
     .unwrap();
@@ -251,7 +251,7 @@ fn reader_navigation_tracks_the_unfocused_summary_without_moving_focus() {
         rt.eval(&format!(
             "(require {:?}) (mail-test-seed-navigation! {:?} 100)
              (set-option! 'mail-reader-position '{position})",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/mail-navigation-fixture.scm"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-navigation-fixture.scm"),
             dir.path().join("navigation.sqlite").display().to_string()
         ))
         .unwrap();
@@ -1494,7 +1494,7 @@ fn a_group_chosen_from_outside_mail_opens_as_from_the_dashboard() {
     rt.handle(Input::Viewport { columns: 160, rows: 50 });
     rt.eval(&format!(
         "(require {:?}) (mail-test-seed-samples! {:?})",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/mail-sample-fixture.scm"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-sample-fixture.scm"),
         dir.path().join("samples.sqlite").display().to_string()
     ))
     .unwrap();

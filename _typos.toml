@@ -29,3 +29,5 @@ numer = "numer"
 pn = "pn"
 # The HTTP load generator the benchmarks run.
 wrk = "wrk"
+# The ASCII prefix of café in MIME wire-format and charset fixtures.
+caf = "caf"
