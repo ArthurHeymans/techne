@@ -581,7 +581,7 @@ scheme-mode does, so buffers without a file are coloured too."
             ".java" ".lua" ".zig" ".hs" ".ml" ".rb" ".pl"))
 (define-option read-only #f "Whether the buffer's text can be edited from its views." #:type 'boolean)
 (define-option cursor-visible #t
-  "Whether a buffer shows a text caret. Row-selection interfaces can hide it."
+  "Whether the buffer shows a text caret."
   #:type 'boolean)
 
 (define-mode special-mode

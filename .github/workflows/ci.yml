@@ -173,10 +173,13 @@ jobs:
       # The techne command, which runs icount.scm, needs no frontend.
       - run: cargo build --release -p techne-vm --features counting-allocator --bin techne-vm --example serve --example compile && cargo build --release -p techne-editor --example startup --example keys --example restart && cargo build --release -p techne-cli --no-default-features
       - run: |
+          status=0
           TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup TECHNE_EDITOR_KEYS=$PWD/target/release/examples/keys \
             TECHNE_SERVE=$PWD/target/release/examples/serve TECHNE_COMPILE=$PWD/target/release/examples/compile \
-            target/release/techne run runtime/bench/icount.scm icount.json footprint.json 2> table.txt
+            target/release/techne run runtime/bench/icount.scm icount.json footprint.json 2> table.txt || status=$?
+          cat table.txt
           { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       # Wall time on a shared runner: shown, not compared.
       - run: |
           target/release/examples/keys > keys.txt

@@ -375,7 +375,8 @@ COPIES? #f leaves them out. PATH is a Maildir message's, else empty."
 
     (define (mail-store-state! db ids field value #:copies? [copies? #t]
                               #:expected [expected #f] #:on-change [on-change (lambda (rows) #f)])
-      "Set FIELD (unread, starred or trashed) of IDS and their copies to VALUE.
+      "Set FIELD of IDS in DB to VALUE; COPIES? includes their other copies.
+FIELD is unread, starred, or trashed.
 With EXPECTED, change only exact matching (ID ACCOUNT MAILBOX KEY PATH) rows.
 ON-CHANGE receives undo records after each bounded batch, so prior batches
 remain undoable if a later batch fails. Maildir flags are renamed at source."
@@ -493,12 +494,14 @@ Local reading state on invalidated entries is discarded."
         (caar (sqlite-query db "SELECT max(coalesce((SELECT max(CAST(substr(source_key,?1) AS INTEGER)) FROM mail_messages WHERE account=?2 AND mailbox=?3),0),coalesce((SELECT uid FROM mail_imap_skipped WHERE account=?2 AND mailbox=?3 AND validity=?4),0))"
                             (list (+ 1 (string-length prefix)) account mailbox validity)))))
     (define (mail-store-skip-imap! db account mailbox validity uid)
-      "Checkpoint a deliberately omitted oversized UID, never a failed import."
+      "Checkpoint an oversized UID of ACCOUNT and MAILBOX in DB.
+VALIDITY is the mailbox's UIDVALIDITY. Never checkpoint a failed import."
       (sqlite-execute db "INSERT INTO mail_imap_skipped VALUES(?,?,?,?) ON CONFLICT(account,mailbox) DO UPDATE SET validity=excluded.validity,uid=CASE WHEN validity=excluded.validity THEN max(uid,excluded.uid) ELSE excluded.uid END"
                       (list account mailbox validity uid)))
 
     (define (mail-store-draft! db id account text #:state [state "draft"])
-      "Save a draft snapshot. A live, uncertain or sent snapshot is never replaced."
+      "Save draft ID in DB with ACCOUNT, TEXT and STATE.
+A live, uncertain or sent snapshot is never replaced."
       (unless (member state '("draft" "uncertain")) (error "Invalid draft save state" state))
       (sqlite-execute db (string-append "INSERT INTO mail_drafts(id,account,text,state,updated) VALUES(?,?,?,?,?)"
                                         " ON CONFLICT(id) DO UPDATE SET account=excluded.account,text=excluded.text,state=excluded.state,"
@@ -514,21 +517,24 @@ Local reading state on invalidated entries is discarded."
       "Call PROC with exclusive delivery access to DB, across runtimes."
       (call-with-sqlite-lease db proc))
     (define (mail-store-claim-draft! db id text token)
-      "Claim draft ID for TOKEN if its saved TEXT still matches; hold the delivery lease."
+      "Claim draft ID in DB for TOKEN if its saved TEXT still matches.
+Hold the delivery lease while claiming and submitting."
       (unless (and (string? token) (not (string=? token ""))) (error "Missing delivery token"))
       (= 1 (sqlite-execute db "UPDATE mail_drafts SET state='sending',attempt=? WHERE id=? AND state='draft' AND text=?"
                            (list token id text))))
     (define (mail-store-finish-draft! db id token state)
-      "Complete the live attempt identified by TOKEN; hold the delivery lease."
+      "Set the live attempt with ID and TOKEN in DB to STATE.
+Hold the delivery lease while completing the attempt."
       (unless (member state '("sent" "uncertain" "draft")) (error "Invalid delivery outcome"))
       (= 1 (sqlite-execute db "UPDATE mail_drafts SET state=?,attempt=CASE WHEN ?='draft' THEN '' ELSE attempt END WHERE id=? AND state='sending' AND attempt=?"
                            (list state state id token))))
     (define (mail-store-ambiguous-attempt db id)
-      "Read the ambiguous (STATE TOKEN) snapshot of ID, or #f."
+      "Read the ambiguous (STATE TOKEN) snapshot of ID in DB, or #f."
       (let ((rows (sqlite-query db "SELECT state,attempt FROM mail_drafts WHERE id=? AND state IN ('sending','uncertain')" (list id))))
         (and (pair? rows) (car rows))))
     (define (mail-store-resolve-draft! db id expected state)
-      "Resolve the matching ambiguous attempt after the operator checks delivery.
+      "Set draft ID in DB to STATE if its attempt matches EXPECTED.
+The operator must check delivery before asking to resolve it.
 A live runtime's lease prevents recovery, even in another process."
       (unless (member state '("draft" "sent")) (error "Invalid delivery resolution"))
       (call-with-mail-store-lease db

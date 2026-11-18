@@ -111,8 +111,8 @@ production must use a certificate-verified TLS connection."
 
     (define (smtp-submit! s user password from recipients raw #:starttls [upgrade #f] #:on-data [on-data (lambda () #t)])
       "Submit RAW through SMTP session S as FROM to RECIPIENTS.
-S must use verified TLS, or STARTTLS must be a procedure that upgrades S to
-verified TLS and raises on failure. USER and PASSWORD are sent only over TLS.
+S must use verified TLS, or UPGRADE (passed via STARTTLS) must be a procedure
+that establishes verified TLS or raises. USER and PASSWORD go only over TLS.
 ON-DATA runs immediately before writing the body: a failure before it is
 definitely not submitted; a failure after it may be ambiguous. Return #t
 only after DATA is accepted. No automatic retries occur."

@@ -97,7 +97,7 @@
       "is_macro": false
     },
     "call-with-sqlite-lease": {
-      "description": "(call-with-sqlite-lease db proc)  procedure, <techne-store>:8\n\nCall PROC under an exclusive, nonwaiting application lease of private DB.\nRaise if another user of this cache holds the lease. This is not an SQL\ntransaction. The lease is released on return, failure or cancellation.",
+      "description": "(call-with-sqlite-lease db proc)  procedure, <techne-store>:8\n\nCall PROC under an exclusive application lease of private DB.\nRaise if another user of this cache holds the lease. This is not an SQL\ntransaction. The lease is released on return, failure or cancellation.",
       "is_macro": false
     },
     "call-with-tcp-connection": {
@@ -1865,15 +1865,15 @@
       "is_macro": false
     },
     "sqlite-close": {
-      "description": "(sqlite-close db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:553\n\nClose DB idempotently and interrupt pending work. The handle becomes\nunusable immediately; its worker rolls back and releases OS resources\nasynchronously. No caller transaction can survive cancellation.",
+      "description": "(sqlite-close db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:558\n\nClose DB idempotently and interrupt pending work. The handle becomes\nunusable immediately; its worker rolls back and releases OS resources\nasynchronously. No caller transaction can survive cancellation.",
       "is_macro": false
     },
     "sqlite-closed?": {
-      "description": "(sqlite-closed? db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:555\n\nReturn #t if DB has been closed or its worker has stopped.",
+      "description": "(sqlite-closed? db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:560\n\nReturn #t if DB has been closed or its worker has stopped.",
       "is_macro": false
     },
     "sqlite-execute": {
-      "description": "(sqlite-execute db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:540\n\nExecute one non-row-returning SQL statement in DB with bound PARAMS.\nReturn the affected row count. PARAMS is a list/vector of int64,\nfinite flonums, strings, bytevectors and #f (SQL NULL), at most 256\nvalues and 32 MiB. SQL is at most 64 KiB. Each statement is atomic;\nexplicit transactions, ATTACH, extensions and most PRAGMAs are denied.\nSQLite work has a five-second budget, lock waits 250 ms (not a hard\ndeadline on OS filesystem calls). Cancellation\nrolls back unfinished work, but can race an already completed commit.",
+      "description": "(sqlite-execute db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:545\n\nExecute one non-row-returning SQL statement in DB with bound PARAMS.\nReturn the affected row count. PARAMS is a list/vector of int64,\nfinite flonums, strings, bytevectors and #f (SQL NULL), at most 256\nvalues and 32 MiB. SQL is at most 64 KiB. Each statement is atomic;\nexplicit transactions, ATTACH, extensions and most PRAGMAs are denied.\nSQLite work has a five-second budget, lock waits 250 ms (not a hard\ndeadline on OS filesystem calls). Cancellation\nrolls back unfinished work, but can race an already completed commit.",
       "is_macro": false
     },
     "sqlite-open": {
@@ -1881,7 +1881,7 @@
       "is_macro": false
     },
     "sqlite-query": {
-      "description": "(sqlite-query db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:547\n\nQuery DB with one read-only SQL statement and bound PARAMS.\nReturn a list of row lists: NULL is #f, blobs are bytevectors, and\nother cells are strings or numbers. Parameter limits match\nsqlite-execute. At most 4096 rows / 40 MiB (including cell overhead),\nnever silently truncated; use SQL LIMIT and paging for larger data.\nInvalid UTF-8 TEXT raises an error. A cell is at most 32 MiB.",
+      "description": "(sqlite-query db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:552\n\nQuery DB with one read-only SQL statement and bound PARAMS.\nReturn a list of row lists: NULL is #f, blobs are bytevectors, and\nother cells are strings or numbers. Parameter limits match\nsqlite-execute. At most 4096 rows / 40 MiB (including cell overhead),\nnever silently truncated; use SQL LIMIT and paging for larger data.\nInvalid UTF-8 TEXT raises an error. A cell is at most 32 MiB.",
       "is_macro": false
     },
     "sset!": {

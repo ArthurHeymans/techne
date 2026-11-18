@@ -213,7 +213,7 @@ This never changes mailbox contents. Scope cancellation also closes native TLS."
 (define (make-imap-session read write close #:raw-bytes? [raw-bytes? #f] #:starttls [upgrade #f])
   "Consume a greeting and return a session over a trusted transport.
 READ returns bytevectors or EOF; WRITE accepts a command string; CLOSE closes.
-If STARTTLS is given, it must upgrade the transport to verified TLS or raise.
+If UPGRADE is given via STARTTLS, it must establish verified TLS or raise.
 No LOGIN is sent here. With RAW-BYTES? #t fetched bodies stay bytevectors.
 Commands are serialized; failure/cancellation closes a desynchronized session."
   (let ((s (vector read write close #u8() 0 0 #f #f 0 #f #f raw-bytes?)) (ready? #f))

@@ -784,8 +784,10 @@ fn mail_accounts_can_be_configured_with_eval_buffer() {
 #[test]
 fn unconfigured_mail_stays_on_the_dashboard_and_uses_normal_mode_help() {
     let (_dir, mut rt) = editor();
+    assert_eq!(rt.eval("(not (find-package 'mail-runtime))").unwrap(), "#t");
     rt.eval("(set-option! 'mail-database \":memory:\")").unwrap();
     command(&mut rt, "mail");
+    assert_eq!(rt.eval("(not (find-package 'mail-runtime))").unwrap(), "#f");
     assert!(pane(&mut rt, 0).contains("No accounts yet"));
     key(&mut rt, "g");
     assert!(rt.snapshot().echo.contains("Set mail-accounts"));

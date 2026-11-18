@@ -339,24 +339,29 @@ fn perform(c: &mut Connection, job: &Job, closed: &Arc<AtomicBool>) -> Result<Re
         Some(move || cancel.load(Ordering::SeqCst) || progress_closed.load(Ordering::SeqCst) || Instant::now() >= deadline),
     )
     .map_err(|e| e.to_string())?;
-    // The native owns BEGIN/COMMIT/ROLLBACK; the authorizer only sees caller SQL.
+    // The worker owns the transaction. rusqlite's hooks need mutable access
+    // to the connection, so do not borrow it with a Transaction guard here.
     let result = (|| {
-        let tx = c.transaction().map_err(|e| e.to_string())?;
-        tx.authorizer(Some(authorize)).map_err(|e| e.to_string())?;
-        let result = statement(&tx, job);
-        tx.authorizer(None::<fn(AuthContext<'_>) -> Authorization>).map_err(|e| e.to_string())?;
-        // Always permit cleanup, even after progress cancellation/timeout.
-        tx.progress_handler(0, None::<fn() -> bool>).map_err(|e| e.to_string())?;
-        let reply = result?;
+        c.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        c.authorizer(Some(authorize)).map_err(|e| e.to_string())?;
+        statement(c, job)
+    })();
+    // Cleanup must not be subject to the caller authorizer or cancellation.
+    let authorizer = c.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    let progress = c.progress_handler(0, None::<fn() -> bool>);
+    let result = result.and_then(|reply| {
+        authorizer.map_err(|e| e.to_string())?;
+        progress.map_err(|e| e.to_string())?;
         if closed.load(Ordering::SeqCst) || job.cancel.load(Ordering::SeqCst) || job.reply.is_closed() || Instant::now() >= deadline {
             return Err("sqlite: cancelled or timed out".into());
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        c.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         Ok(reply)
-    })();
-    // Also reset after errors in BEGIN or hook installation.
-    let _ = c.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-    let _ = c.progress_handler(0, None::<fn() -> bool>);
+    });
+    if !c.is_autocommit() {
+        // A worker that cannot roll back is retired by its loop.
+        let _ = c.execute_batch("ROLLBACK");
+    }
     result
 }
 
@@ -431,7 +436,7 @@ The scope owns the handle. Work waits asynchronously on a database worker."
   (scope-own! (%sqlite-open path private?) sqlite-close sqlite-closed?))
 
 (define (call-with-sqlite-lease db proc)
-  "Call PROC under an exclusive, nonwaiting application lease of private DB.
+  "Call PROC under an exclusive application lease of private DB.
 Raise if another user of this cache holds the lease. This is not an SQL
 transaction. The lease is released on return, failure or cancellation."
   (let ((lease (%sqlite-try-lease db)))

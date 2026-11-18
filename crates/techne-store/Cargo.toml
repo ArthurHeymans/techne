@@ -8,7 +8,7 @@ description = "Bounded asynchronous SQLite mechanism for Techne Scheme"
 
 [dependencies]
 techne-vm = { path = "../techne-vm" }
-rusqlite = { version = "0.39", features = ["bundled", "hooks", "limits"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks", "limits"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
 
 rustix = { version = "1", features = ["process"] }
