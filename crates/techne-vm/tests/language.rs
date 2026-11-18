@@ -355,8 +355,10 @@ fn library() {
     );
     check(
         "map-multi",
-        "(displayln (map + '(1 2 3) '(10 20 30))) (for-each (lambda (a b) (display (* a b))) '(1 2) '(3 4)) (newline)",
-        "(11 22 33)\n38\n",
+        "(displayln (map + '(1 2 3) '(10 20 30))) (for-each (lambda (a b) (display (* a b))) '(1 2) '(3 4)) (newline)
+        (displayln (list (append-map list '(1 2) '(a b)) (filter-map (lambda (a b) (and (odd? a) b)) '(1 2 3) '(x y z))
+                         (take-right '(1 2 3) 2) (drop-right '(1 2 3) 2)))",
+        "(11 22 33)\n38\n((1 a 2 b) (x z) (2 3) (1))\n",
     );
     check("hash-tables", "(define h (make-hash-table))
         (for-each (lambda (i) (hash-table-set! h i (* i i))) (iota 100))
@@ -1320,8 +1322,11 @@ fn keywords_and_match() {
         (define (req #:k k) k) (displayln (guard (e (#t (error-object-message e))) (req)))
         (displayln (guard (e (#t (error-object-message e))) (greet \"x\" #:nope 1)))
         (define (rest-opt a [b 0] . more) (list a b more)) (displayln (list (rest-opt 1) (rest-opt 1 2 3 4)))
-        (displayln (apply greet (list \"d\" #:greeting \"hey\")))",
-        "(hello, a! hi, b! yo, c?)\n((1 10 20) (1 2 4) (1 2 3))\nreq: missing required keyword argument #:k\ngreet: unknown keyword argument #:nope\n((1 0 ()) (1 2 (3 4)))\nhey, d!\n",
+        (displayln (apply greet (list \"d\" #:greeting \"hey\")))
+        (define (call who f #:times [times 1]) (list who (f) times))
+        (displayln (guard (e (#t (error-object-message e))) (call 'x #:times 2 (lambda () 1))))",
+        "(hello, a! hi, b! yo, c?)\n((1 10 20) (1 2 4) (1 2 3))\nreq: missing required keyword argument #:k\ngreet: unknown keyword argument #:nope\n((1 0 ()) (1 2 (3 4)))\nhey, d!\n\
+         call: too many arguments, 2 more than it takes: 2 #<procedure>; keyword arguments go after the positional ones\n",
     );
     check("match", "(define-record-type point (make-point x y) point? (x point-x) (y point-y))
         (define (classify v) (match v [0 'zero] [(? string? s) (list 'string s)] [(point 0 y) (list 'y-axis y)]
