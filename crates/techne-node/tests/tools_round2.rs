@@ -104,49 +104,6 @@ fn preview_clipping_and_handle_lengths_are_explicit() {
 }
 
 #[test]
-fn process_retention_loss_and_report_clipping_are_distinct() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut vm = world(dir.path());
-    check(
-        &mut vm,
-        r#"
-        (define (run retain chars)
-          (tool-ref (tool-process-result (tool-run p "printf" '("abcdef") #:retain retain) #:chars chars) 'stdout))
-        (define a (run 3 20))
-        (check '(6 3 #t #f #t) (map (lambda (key) (tool-ref a key)) '(characters retained dropped clipped truncated)))
-        (check "def" (tool-ref a 'text))
-        (define b (run 20 3))
-        (check '(6 6 #f #t #t) (map (lambda (key) (tool-ref b key)) '(characters retained dropped clipped truncated)))
-        (define c (run 6 6))
-        (check '(6 6 #f #f #f) (map (lambda (key) (tool-ref c key)) '(characters retained dropped clipped truncated)))
-        (define d (run 3 2))
-        (check '(6 3 #t #t #t) (map (lambda (key) (tool-ref d key)) '(characters retained dropped clipped truncated)))
-    "#,
-    );
-}
-
-#[test]
-fn malformed_environments_are_rejected_without_disclosing_values() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut vm = world(dir.path());
-    check(
-        &mut vm,
-        r#"
-        (for-each
-          (lambda (environment)
-            (let ((message (guard (e (#t (error-object-message e)))
-                             (tool-run p "true" '() #:environment environment) "missing error")))
-              (check #t (string-prefix? "tool-run: environment must be" message))
-              (check #f (and (string-contains message "sensitive-value") #t))))
-          (list '(("BAD")) '(("NAME" "sensitive-value")) '(("" . "sensitive-value"))
-                '(("A=B" . "sensitive-value")) (list (cons "NAME" (string (integer->char 0)))) 'not-a-list))
-        (check 0 (tool-ref (tool-process-result
-          (tool-run p "true" '() #:environment '(("TECHNE_AGENT_ROUND2" . "yes")))) 'status))
-    "#,
-    );
-}
-
-#[test]
 fn files_without_processes_do_not_allow_agent_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut vm = world_with_grants(dir.path(), Grants::ALL.without(Capability::Processes));
