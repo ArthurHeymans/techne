@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795024061435,
+  "lastUpdate": 1795024063344,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -56737,6 +56737,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 107151,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0aad0033f57de55a0265b00b0628fa63c0d9683b",
+          "message": "Merge pull request #371 from ArthurHeymans/tool/friction\n\nLess friction in techne tool, VM errors and headless screenshots",
+          "timestamp": "2026-11-18T18:35:47+01:00",
+          "tree_id": "8cc67597852171c31acbe6f05ca21287ae35d08b",
+          "url": "https://github.com/ArthurHeymans/techne/commit/0aad0033f57de55a0265b00b0628fa63c0d9683b"
+        },
+        "date": 1795024063298,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 694708064,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 646901969,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107217,
             "unit": "data"
           }
         ]
