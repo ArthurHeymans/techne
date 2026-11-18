@@ -88,6 +88,8 @@ pub enum Event {
 type Deliver = Arc<dyn Fn(Event) + Send + Sync>;
 type Setup = Arc<dyn Fn(&mut Runtime) + Send + Sync>;
 
+pub(crate) const DAEMON_STOPPED: &str = "the editor was stopped";
+
 /// A frontend's attachment to the runtime.
 pub struct Host {
     shared: Arc<Mutex<Shared>>,
@@ -121,6 +123,8 @@ pub(crate) struct Shared {
     /// Whether it runs with no frontend attached, as a daemon (`Daemon`):
     /// the last detaching does not stop it.
     daemon: bool,
+    /// Unlike a missing input sender after a crash, shutdown is final.
+    stopping: bool,
 }
 
 struct Frontend {
@@ -153,14 +157,14 @@ impl Host {
         deliver: impl Fn(Event) + Send + Sync + 'static,
     ) -> Host {
         let shared = shared(Arc::new(setup), false);
-        attach(&shared, file, profile, Arc::new(deliver))
+        attach(&shared, file, profile, Arc::new(deliver)).expect("a new local host is not stopping")
     }
 
     /// Attach another frontend to this one's runtime, as `start` attaches
     /// the first. Without `file`, it shows what the frontend used last
     /// shows.
     pub fn attach(&self, file: Option<File>, profile: String, deliver: impl Fn(Event) + Send + Sync + 'static) -> Host {
-        attach(&self.shared, file, profile, Arc::new(deliver))
+        attach(&self.shared, file, profile, Arc::new(deliver)).expect("a local host is not a daemon")
     }
 
     /// Open files in this runtime for other programs (`server`) that ask
@@ -247,6 +251,9 @@ impl Host {
         // The thread is joined unlocked: it locks as it ends.
         let thread = {
             let mut s = shared.lock().expect("the host");
+            if s.stopping {
+                return false;
+            }
             if s.generation != self.generation {
                 return self.restarted(&s);
             }
@@ -259,7 +266,7 @@ impl Host {
         if s.generation != self.generation {
             return self.restarted(&s);
         }
-        if s.sent == 0 {
+        if s.stopping || s.sent == 0 {
             return false;
         }
         s.inputs = None;
@@ -351,6 +358,7 @@ fn shared(setup: Setup, daemon: bool) -> Arc<Mutex<Shared>> {
         next_client: 0,
         ended: 0,
         daemon,
+        stopping: false,
     }))
 }
 
@@ -417,6 +425,9 @@ impl Daemon {
     pub fn stop(self) {
         let thread = {
             let mut s = self.shared.lock().expect("the host");
+            // Accepted socket requests and restart callbacks can outlive
+            // the listener. Close admission before taking the sender.
+            s.stopping = true;
             let frontends = std::mem::take(&mut s.frontends);
             if let Some(tx) = s.inputs.take() {
                 // Each detaches as it does closing, its session's state
@@ -427,10 +438,12 @@ impl Daemon {
                 }
                 let _ = tx.send(Msg::Stop);
             }
-            let delivers: Vec<Deliver> = frontends.into_values().map(|f| f.deliver).collect();
+            let thread = s.thread.take();
             drop(s);
-            delivers.iter().for_each(|d| d(Event::Failed("the editor was stopped".into())));
-            self.shared.lock().expect("the host").thread.take()
+            for frontend in frontends.into_values() {
+                (frontend.deliver)(Event::Failed(DAEMON_STOPPED.into()));
+            }
+            thread
         };
         if let Some(t) = thread {
             let deadline = Instant::now() + CLOSE_WAIT;
@@ -444,9 +457,12 @@ impl Daemon {
     }
 }
 
-/// Attach a frontend to the runtime of `shared`, started if none runs.
-pub(crate) fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deliver: Deliver) -> Host {
+/// Attach a frontend, starting a runtime if needed, unless the daemon is stopping.
+pub(crate) fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deliver: Deliver) -> Option<Host> {
     let mut s = shared.lock().expect("the host");
+    if s.stopping {
+        return None;
+    }
     let client = Client(s.next_client);
     s.next_client += 1;
     let interrupts = Arc::<Interrupts>::default();
@@ -468,7 +484,7 @@ pub(crate) fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: S
         }
         None => spawn(shared, &mut s),
     }
-    Host { shared: shared.clone(), client, generation: s.generation }
+    Some(Host { shared: shared.clone(), client, generation: s.generation })
 }
 
 /// Start a new runtime, with every frontend in `s` attached to it.

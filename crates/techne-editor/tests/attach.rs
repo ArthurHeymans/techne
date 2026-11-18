@@ -318,6 +318,15 @@ fn a_daemon_runs_with_no_frontend() {
         _ => None,
     });
     assert_eq!(why, "the editor was stopped");
+    // Keep the listener alive to force the same ordering as a request
+    // already accepted by the CLI's listener when it begins shutdown.
+    let late = remote(&socket, None);
+    let why = late.event(|e| match e {
+        Event::Failed(why) => Some(why),
+        Event::Output(Output::Snapshot(_)) => panic!("an attach restarted a stopped daemon"),
+        _ => None,
+    });
+    assert_eq!(why, "the editor was stopped");
     let kept = std::fs::read_to_string(&histories).unwrap_or_default();
     assert!(kept.contains("(+ 1 2)"), "{kept:?}");
     drop(listener);

@@ -241,7 +241,10 @@ pub(crate) fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream, profile
     let waiting = Waiting::default();
     let closing = CloseOnDrop(waiting.clone());
     let deliver = Arc::new(move |e| enqueue(&closing.0, &connection, e));
-    let host = crate::host::attach(shared, file, profile, deliver);
+    let Some(host) = crate::host::attach(shared, file, profile, deliver) else {
+        let _ = write_frame(&mut stream, &Down::Failed(crate::host::DAEMON_STOPPED.into()));
+        return;
+    };
     let served = Arc::new(Served { unanswered: Mutex::default(), attached: Mutex::new(Attached { host: Some(host), restarts: 0 }) });
     let theirs = served.clone();
     let writer = std::thread::Builder::new().name("attachment out".into()).spawn(move || {
