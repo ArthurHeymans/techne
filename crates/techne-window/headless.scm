@@ -51,8 +51,9 @@
   (if (and value (not (get-environment-variable name))) `((,name . ,value)) '()))
 (define drawing
   ;; VK_ICD_FILENAMES is the older name of VK_DRIVER_FILES, which the
-  ;; Vulkan loader prefers: a choice made with either is kept.
-  (append (if (or render (get-environment-variable "VK_ICD_FILENAMES")) '()
+  ;; Vulkan loader prefers, and which would hide drivers VK_ADD_DRIVER_FILES
+  ;; adds: a choice made with any of them is kept.
+  (append (if (or render (get-environment-variable "VK_ICD_FILENAMES") (get-environment-variable "VK_ADD_DRIVER_FILES")) '()
               (unless-set "VK_DRIVER_FILES" (get-environment-variable "TECHNE_SOFTWARE_VULKAN_DRIVER")))
           (unless-set "FONTCONFIG_FILE" (get-environment-variable "TECHNE_HEADLESS_FONTCONFIG"))))
 

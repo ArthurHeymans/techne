@@ -204,6 +204,13 @@ fn a_form_comes_from_stdin_or_a_file_and_a_stale_session_restarts() {
     let (changed, said) = run(&[root, "(begin (import (friction-probe)) probe)", &session.name], "");
     assert!(said.contains("ran older code; restarting it"), "a changed library: {said}");
     assert_eq!(changed, "42");
+    // (techne schema) loads lisp/schema.scm, at the top too.
+    let schema = lisp.join("schema.scm");
+    let mut source = std::fs::read_to_string(&schema).unwrap();
+    source.push_str("\n;; changed\n");
+    std::fs::write(&schema, source).unwrap();
+    let (_, said) = run(&[root, "(tool-files project)", &session.name], "");
+    assert!(said.contains("ran older code; restarting it"), "a changed schema source: {said}");
 }
 
 /// The pid a session's job printed first, and whether a pid has ended.

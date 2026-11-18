@@ -224,16 +224,21 @@ fn fonts() -> FontSystem {
     let db = fonts.db_mut();
     let wanted = db.family_name(&Family::Monospace).to_string();
     if !db.faces().any(|f| f.families.iter().any(|(name, _)| *name == wanted)) {
-        // Families with an upright regular face first, then by name.
         let installed = db.faces().filter(|f| f.monospaced && !f.post_script_name.contains("Emoji")).filter_map(|f| {
-            let regular = f.style == FontStyle::Normal && f.weight == FontWeight::NORMAL;
-            f.families.first().map(|(name, _)| (!regular, name.clone()))
+            f.families.first().map(|(name, _)| (name.clone(), f.style == FontStyle::Normal && f.weight == FontWeight::NORMAL))
         });
-        if let Some((_, name)) = installed.min() {
+        if let Some(name) = monospace_family(installed) {
             db.set_monospace_family(name);
         }
     }
     fonts
+}
+
+/// The family to draw monospace text in, of the monospaced faces
+/// installed, each (family, upright and regular?): one with an upright
+/// regular face before any other, then the first by name.
+fn monospace_family(faces: impl Iterator<Item = (String, bool)>) -> Option<String> {
+    faces.map(|(name, regular)| (!regular, name)).min().map(|(_, name)| name)
 }
 
 /// The metrics of text `height` percent of `size`.
@@ -837,6 +842,21 @@ pub fn inlays(layout: &Layout, placed: &[Placed]) -> Vec<(Rect, StyleId)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn monospace_falls_back_to_a_family_with_an_upright_regular_face() {
+        let faces = |list: &[(&str, bool)]| list.iter().map(|(n, r)| (n.to_string(), *r)).collect::<Vec<_>>().into_iter();
+        // An earlier family with only an oblique face loses to one with a regular face.
+        assert_eq!(
+            super::monospace_family(faces(&[("Aardvark Mono", false), ("DejaVu Sans Mono", false), ("DejaVu Sans Mono", true)])),
+            Some("DejaVu Sans Mono".into())
+        );
+        // Among families with regular faces, the first by name, whatever the order found.
+        assert_eq!(super::monospace_family(faces(&[("Zed Mono", true), ("Fira Mono", true)])), Some("Fira Mono".into()));
+        // None regular: still one, by name.
+        assert_eq!(super::monospace_family(faces(&[("B Mono", false), ("A Mono", false)])), Some("A Mono".into()));
+        assert_eq!(super::monospace_family(faces(&[])), None);
+    }
+
     use super::*;
 
     #[test]
