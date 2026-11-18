@@ -5,4 +5,5 @@
 (require "enclosing.scm")
 (require "search.scm")
 (require "shared.scm")
+(require "process.scm")
 (test-summary)
