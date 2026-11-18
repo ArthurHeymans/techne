@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795025127537,
+  "lastUpdate": 1795025128974,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -57080,6 +57080,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 646901969,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107217,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5c57f2f234cfcfc32cdb6567046a7fa895442de2",
+          "message": "Merge pull request #366 from ArthurHeymans/dependabot/cargo/resvg-0.50.0\n\ndeps: bump resvg from 0.49.0 to 0.50.0",
+          "timestamp": "2026-11-18T18:37:15+01:00",
+          "tree_id": "2784a129a724358f4f7cfb0090cec5cf4be90826",
+          "url": "https://github.com/ArthurHeymans/techne/commit/5c57f2f234cfcfc32cdb6567046a7fa895442de2"
+        },
+        "date": 1795025128929,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 694681239,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 646971874,
             "unit": "instructions"
           },
           {
