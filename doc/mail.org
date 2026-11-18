@@ -165,6 +165,8 @@ mbsync carries that to the server:
   Maildir (including Gmail's Trash or Bin). If no such folder exists, the
   operation is refused. Delete never marks messages for expunge. Other
   cached copies stay in their original folders.
+- Moves between folders keep the flags but drop any folder-specific mbsync
+  UID in the filename. mbsync assigns the UID in the destination folder.
 - =a= undoes a change only while its original cached source and location
   still match. Once mbsync has run, the change may have reached the server.
 
@@ -364,14 +366,16 @@ line distinguishes saving, saved, save failure, submitting, SMTP acceptance
 and uncertain delivery.
 
 Mail above 16 MiB is not cached, listed, or searched. A sync reports newly
-skipped messages and continues. For IMAP, Techne checks the size before
-fetching the body and remembers deliberately skipped UIDs until UIDVALIDITY
-changes or the mailbox is removed from the cache.
+skipped messages and continues. For IMAP, Techne searches in bounded UID
+ranges, checks the size before fetching the body, and remembers skipped UIDs
+until UIDVALIDITY changes or the mailbox is removed from the cache.
 
 =C-c C-c= requires explicit confirmation of the recipient envelope. The
 confirmed text is frozen. A cache allows only one live submission at a time,
 across runtimes. Once the server accepts DATA, Techne records that outcome
-without waiting for a reply to QUIT. Acceptance is not proof of final delivery.
+without waiting for a reply to QUIT. Closing a sent draft leaves its delivery
+record in the cache so another open copy cannot submit it again. Acceptance
+is not proof of final delivery.
 
 A failure before writing DATA normally leaves a retryable draft. A failure
 after DATA, or an interrupted runtime with a pending send, can leave a draft

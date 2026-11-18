@@ -112,6 +112,42 @@ fn root_inbox_filters_use_the_displayed_name_and_delete_requires_trash() {
 }
 
 #[test]
+fn a_mark_cannot_delete_the_message_that_replaces_a_cached_row() {
+    let (dir, mut rt) = editor();
+    real_accounts(&mut rt, dir.path());
+    let root = dir.path().join("Maildir");
+    let inbox = root.join("cur");
+    let trash = root.join("Trash/cur");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::create_dir_all(&trash).unwrap();
+    std::fs::write(inbox.join("old:2,S"), "Subject: Old message\n\nold").unwrap();
+    rt.eval(&format!("(set-option! 'mail-accounts '(((id . \"test\") (kind . maildir) (path . {:?}))))", root.display().to_string()))
+        .unwrap();
+    command(&mut rt, "mail");
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| pane(rt, 0).contains("Up to date"));
+    key(&mut rt, "i");
+    assert_eq!(summary_subjects(&mut rt), "(\"Old message\")");
+    key(&mut rt, "d");
+    let replacement = inbox.join("replacement:2,S");
+    std::fs::remove_file(inbox.join("old:2,S")).unwrap();
+    std::fs::write(&replacement, "Subject: Replacement\n\nnew").unwrap();
+    // Import through a second connection, without refreshing the first view.
+    rt.eval(&format!(
+        "(let ((db (mail-store-open (option #f 'mail-database))))
+           (mail-store-forget! db \"test\")
+           (mail-store-import-maildir! db \"test\" \"INBOX\" {:?})
+           (mail-store-close db))",
+        root.display().to_string()
+    ))
+    .unwrap();
+    rt.eval("(run-command (current-session) 'mail-execute 1)").unwrap();
+    assert!(rt.snapshot().echo.contains("No such message"));
+    assert!(replacement.is_file());
+    assert_eq!(std::fs::read_dir(&trash).unwrap().count(), 0);
+}
+
+#[test]
 fn maildir_sync_skips_oversized_sources_and_loads_binary_mime_on_demand() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
@@ -610,6 +646,28 @@ fn narrow_viewport_has_one_pane_and_working_read_back_and_paging() {
     assert!(pane(&mut rt, 0).contains("Inbox · 7 messages"));
     command(&mut rt, "mail-quit");
     assert!(pane(&mut rt, 0).contains("My previous workspace"));
+}
+
+#[test]
+fn discarding_a_sent_buffer_keeps_the_delivery_record() {
+    let (dir, mut rt) = editor();
+    real_accounts(&mut rt, dir.path());
+    command(&mut rt, "mail-compose");
+    rt.eval(
+        "(define inspect-db (mail-store-open (option #f 'mail-database)))
+         (define saved-draft (car (mail-store-drafts inspect-db)))
+         (define draft-id (car saved-draft))
+         (call-with-mail-store-lease inspect-db
+           (lambda ()
+             (unless (mail-store-claim-draft! inspect-db draft-id (caddr saved-draft) \"token\")
+               (error \"draft claim failed\"))
+             (mail-store-finish-draft! inspect-db draft-id \"token\" \"sent\")))",
+    )
+    .unwrap();
+    command(&mut rt, "mail-discard-draft");
+    assert!(rt.snapshot().echo.contains("delivery record retained"));
+    assert_eq!(rt.eval("(mail-store-draft-state inspect-db draft-id)").unwrap(), "\"sent\"");
+    assert!(rt.snapshot().minibuffer.is_none());
 }
 
 #[test]

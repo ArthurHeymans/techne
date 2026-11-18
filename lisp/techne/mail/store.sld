@@ -29,6 +29,10 @@ state are its flags, read at each sync and written when they change."
            "CREATE TRIGGER IF NOT EXISTS mail_search_insert AFTER INSERT ON mail_messages BEGIN INSERT INTO mail_search(rowid,subject,sender,body) VALUES(new.id,new.subject,new.sender,new.body); END"
            "CREATE TRIGGER IF NOT EXISTS mail_search_delete AFTER DELETE ON mail_messages BEGIN INSERT INTO mail_search(mail_search,rowid,subject,sender,body) VALUES('delete',old.id,old.subject,old.sender,old.body); END"
            "CREATE TRIGGER IF NOT EXISTS mail_search_update AFTER UPDATE OF subject,sender,body ON mail_messages BEGIN INSERT INTO mail_search(mail_search,rowid,subject,sender,body) VALUES('delete',old.id,old.subject,old.sender,old.body); INSERT INTO mail_search(rowid,subject,sender,body) VALUES(new.id,new.subject,new.sender,new.body); END"))
+        ;; Open views and marks may outlive a deletion in another runtime.
+        (sqlite-execute db "CREATE TABLE IF NOT EXISTS mail_message_ids (singleton INTEGER PRIMARY KEY CHECK(singleton=1), high INTEGER NOT NULL)" '())
+        (sqlite-execute db "INSERT OR IGNORE INTO mail_message_ids VALUES(1,0)" '())
+        (sqlite-execute db "CREATE TRIGGER IF NOT EXISTS mail_remember_id BEFORE DELETE ON mail_messages BEGIN UPDATE mail_message_ids SET high=old.id WHERE singleton=1 AND high<old.id; END" '())
         ;; A cache created by an earlier development version lacked chronology.
         (guard (e ((not (task-cancelled-condition? e)) (sqlite-execute db "ALTER TABLE mail_messages ADD COLUMN sent_at INTEGER NOT NULL DEFAULT 0" '())))
           (sqlite-query db "SELECT sent_at FROM mail_messages LIMIT 0" '()))
@@ -112,18 +116,22 @@ Page by cache ID, not OFFSET, keeping each SQLite reply below its row limit."
               (mail-header msg "references") (or (mail-text msg) (mail-html msg) "")
               (if (member "\\Seen" flags) 0 1) (if (member "\\Flagged" flags) 1 0) path
               (if (member "\\Deleted" flags) 1 0))))
-    (define insert-prefix "INSERT INTO mail_messages(account,mailbox,source_key,raw,subject,sender,recipients,date,sent_at,message_id,reply_to,refs,body,unread,starred,source_path,trashed) ")
+    (define insert-prefix "INSERT INTO mail_messages(id,account,mailbox,source_key,raw,subject,sender,recipients,date,sent_at,message_id,reply_to,refs,body,unread,starred,source_path,trashed) ")
+    ;; Allocate in the insertion statement, not in a separate transaction.
+    ;; The primary-key lookup of the largest live id does not scan messages.
+    (define fresh-id "max((SELECT high FROM mail_message_ids WHERE singleton=1),coalesce((SELECT max(id) FROM mail_messages),0))+row_number() OVER ()")
     ;; Both paths keep IDs and all local flags on conflict.
     (define upsert-suffix " ON CONFLICT(account,mailbox,source_key) DO UPDATE SET raw=excluded.raw,subject=excluded.subject,sender=excluded.sender,recipients=excluded.recipients,date=excluded.date,sent_at=excluded.sent_at,message_id=excluded.message_id,reply_to=excluded.reply_to,refs=excluded.refs,body=excluded.body,source_path=excluded.source_path")
     (define (commit-entries! db rows)
       (if (null? rows) 0
           (sqlite-execute db
-            (string-append insert-prefix "VALUES" (string-join (make-list (length rows) "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)") ",") upsert-suffix)
+            (string-append "WITH incoming AS (VALUES " (string-join (make-list (length rows) "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)") ",") ") "
+                           insert-prefix "SELECT " fresh-id ",incoming.* FROM incoming WHERE 1" upsert-suffix)
             (append-map (lambda (r) r) rows))))
     ;; An existing generic codec/table mechanism, not interpolated user SQL.
     ;; Raw-retaining IMAP entries always use the binary-safe parameter path.
     (define maildir-insert
-      (string-append insert-prefix "SELECT "
+      (string-append insert-prefix "SELECT " fresh-id ","
         (string-join (map (lambda (i) (if (= i 3) "X''" (string-append "json_extract(value,'$[" (number->string i) "]')"))) (iota 17)) ",")
         " FROM json_each(?) WHERE 1" upsert-suffix))
     (define (index-row-bound row)
@@ -422,10 +430,11 @@ Return (MAILBOX PATH) it was in, with its new identity appended if UNDO?."
                (let ((now (and (or (not expected) (file-exists? path)) (maildir-move! path key root))))
                  (and now
                       (begin
-                        (sqlite-execute db "UPDATE mail_messages SET mailbox=?,source_path=? WHERE id=? AND account=? AND mailbox=? AND source_key=? AND source_path=?"
-                                        (append (list mailbox now) row))
-                        (mail-store-dedupe! db (cadr row))
-                        (append (list (caddr row) path) (if undo? (list (list id (cadr row) mailbox key now)) '())))))))))
+                        (let ((new-key (maildir-path-key now)))
+                          (sqlite-execute db "UPDATE mail_messages SET mailbox=?,source_key=?,source_path=? WHERE id=? AND account=? AND mailbox=? AND source_key=? AND source_path=?"
+                                          (append (list mailbox new-key now) row))
+                          (mail-store-dedupe! db (cadr row))
+                          (append (list (caddr row) path) (if undo? (list (list id (cadr row) mailbox new-key now)) '()))))))))))
 
     (define (mail-store-copy-mailboxes db id)
       "Return the mailboxes holding message ID of DB or a copy of it.
@@ -548,8 +557,8 @@ UPDATED is when the text was last changed, in milliseconds, 0 if unknown."
       (sqlite-query db "SELECT id,account,text,state,updated FROM mail_drafts WHERE state<>'sent' ORDER BY updated DESC,rowid DESC" '()))
 
     (define (mail-store-delete-draft! db id)
-      "Remove local draft ID from DB unless its delivery is unsettled."
-      (let ((n (sqlite-execute db "DELETE FROM mail_drafts WHERE id=? AND state NOT IN ('sending','uncertain')" (list id))))
+      "Remove editable draft ID from DB, retaining sent delivery records."
+      (let ((n (sqlite-execute db "DELETE FROM mail_drafts WHERE id=? AND state='draft'" (list id))))
         (when (and (= n 0) (mail-store-ambiguous-attempt db id))
           (error "Cannot discard a draft with unsettled delivery"))
         n))))

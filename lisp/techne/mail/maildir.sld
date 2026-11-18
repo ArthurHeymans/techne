@@ -4,7 +4,7 @@
 ;;; as mu4e does and mbsync then carries to the server.
 (define-library (techne mail maildir)
   (export maildir-read maildir-for-each maildir-source-bytes maildir-folders maildir-keys
-          maildir-path-flags maildir-locate maildir-set-flag! maildir-move!)
+          maildir-path-key maildir-path-flags maildir-locate maildir-set-flag! maildir-move!)
   (import (techne) (techne path) (techne task))
   (begin
     (define (%maildir-flags suffix)
@@ -69,7 +69,8 @@ Each message is bounded to 16 MiB. No files change. Concurrent source moves or
 deletes can raise I/O errors; callers may retry. Use maildir-for-each to avoid
 holding every body of a large mailbox in memory."
       (map (lambda (path) (%maildir-message path raw-bytes?)) (%maildir-paths root)))
-    (define (%maildir-key path)
+    (define (maildir-path-key path)
+      "Return the source key of Maildir PATH, without its flag suffix."
       (let* ((name (path-file-name path)) (marker (string-contains name ":2,")))
         (if marker (substring name 0 marker) name)))
     (define (%maildir-priority path)
@@ -95,7 +96,7 @@ error, not an empty mailbox: what was cached of it may not be gone."
       (let ((a (guard (e ((not (task-cancelled-condition? e)) #f)) (file-attributes (file-truename root)))))
         (unless (and a (eq? (car a) 'directory)) (error "Maildir folder is missing" root)))
       (let ((keys (make-hash-table)))
-        (for-each (lambda (path) (hash-table-set! keys (%maildir-key path) path)) (%maildir-paths root #f))
+        (for-each (lambda (path) (hash-table-set! keys (maildir-path-key path) path)) (%maildir-paths root #f))
         keys))
     (define (%maildir-suffix name)
       (let ((marker (string-contains name ":2,")))
@@ -110,7 +111,7 @@ A flag change renames it, and a delivery moves it from new to cur: its
 cur and new siblings are searched for KEY, the whole key, not a prefix."
       (if (file-exists? path) path
           (let ((root (path-directory (path-directory path))))
-            (find (lambda (p) (string=? (%maildir-key p) key))
+            (find (lambda (p) (string=? (maildir-path-key p) key))
                   (guard (e ((not (task-cancelled-condition? e)) '())) (%maildir-paths root #f))))))
     (define (maildir-set-flag! path key letter on?)
       "Set flag LETTER of Maildir message KEY at PATH if ON?, else clear it.
@@ -134,24 +135,37 @@ path now, or #f when it is no longer there (moved by another program)."
       ;; A Maildir has cur; one delivered to new alone gets it when a
       ;; message first moves there.
       (unless (file-exists? dir) (create-directory dir #o700)))
+    (define (%without-mbsync-uid key)
+      ;; With default mbsync UID mapping this infix belongs to the old folder.
+      (let ((at (string-contains key ",U=")))
+        (if (not at) key
+            (let ((end (let loop ((i (+ at 3)))
+                         (if (and (< i (string-length key)) (char<=? #\0 (string-ref key i) #\9))
+                             (loop (+ i 1)) i))))
+              (if (and (> end (+ at 3)) (or (= end (string-length key)) (char=? #\, (string-ref key end))))
+                  (string-append (substring key 0 at) (substring key end (string-length key)))
+                  key)))))
     (define (maildir-move! path key root)
       "Move message KEY, at PATH, into the cur of Maildir folder ROOT.
-Its name, so its flags, is kept; its content is not touched. Return its
-path now, or #f when it is no longer there."
+Preserve flags and content but drop the old folder's mbsync UID. Return
+its new path, or #f if the source is gone."
       (let ((current (maildir-locate path key)))
         (and current
              (let* ((dir (path-join root "cur"))
-                    (target (path-join dir (path-file-name current))))
-               (%cur! dir)
-               (when (file-exists? target) (error "Maildir message already in that folder" target))
-               (rename-file current target)
-               target))))
+                    (name (path-file-name current))
+                    (old-key (maildir-path-key current))
+                    (new-key (%without-mbsync-uid old-key))
+                    (target (path-join dir (string-append new-key (substring name (string-length old-key) (string-length name))))))
+                (%cur! dir)
+                (when (file-exists? target) (error "Maildir message already in that folder" target))
+                (rename-file current target)
+                target))))
     (define (maildir-source-bytes path key)
       "Read immutable source KEY at Maildir PATH, following flag renames.
 Search only its cur/new siblings on a missing path; compare full keys, not
 prefixes. Reject oversized or unavailable sources without changing any file."
       (let ((candidate (maildir-locate path key)))
-        (unless (and candidate (string=? (%maildir-key candidate) key))
+        (unless (and candidate (string=? (maildir-path-key candidate) key))
           (error "Maildir source is no longer available; cached metadata remains"))
         (cdr (assq 'raw (%maildir-message candidate #t)))))
     (define (maildir-for-each root proc #:skip? [skip? #f] #:order [order 'path] #:on-error [on-error #f] #:cached-keys [cached-keys #f])
@@ -168,10 +182,10 @@ CACHED-KEYS, an optional hash set, removes known sources before sorting;
 SKIP? still runs before opening remaining bodies: pending duplicates can skip."
       (unless (memq order '(path unread-newest)) (error "Unknown Maildir order" order))
       (let* ((paths (%maildir-paths root #f))
-             (paths (if cached-keys (filter (lambda (p) (not (hash-table-ref/default cached-keys (%maildir-key p) #f))) paths) paths)))
+             (paths (if cached-keys (filter (lambda (p) (not (hash-table-ref/default cached-keys (maildir-path-key p) #f))) paths) paths)))
         (for-each (lambda (path)
-                    (unless (and skip? (skip? (%maildir-key path)))
-                      (let ((m (guard (e ((not (task-cancelled-condition? e)) (if on-error (begin (on-error (%maildir-key path) e) #f) (raise e))))
+                    (unless (and skip? (skip? (maildir-path-key path)))
+                      (let ((m (guard (e ((not (task-cancelled-condition? e)) (if on-error (begin (on-error (maildir-path-key path) e) #f) (raise e))))
                                  (%maildir-message path #t))))
                         (when m (proc m)))))
                   (if (eq? order 'unread-newest) (%maildir-unread-newest paths) (sort paths string<?)))))))

@@ -216,7 +216,7 @@ READ returns bytevectors or EOF; WRITE accepts a command string; CLOSE closes.
 If UPGRADE is given via STARTTLS, it must establish verified TLS or raise.
 No LOGIN is sent here. With RAW-BYTES? #t fetched bodies stay bytevectors.
 Commands are serialized; failure/cancellation closes a desynchronized session."
-  (let ((s (vector read write close #u8() 0 0 #f #f 0 #f #f raw-bytes?)) (ready? #f))
+  (let ((s (vector read write close #u8() 0 0 #f #f 0 #f #f raw-bytes? #f)) (ready? #f))
     (dynamic-wind
       (lambda () #f)
       (lambda ()
@@ -266,7 +266,7 @@ pass these opaque names back to imap-select!. No mailbox decoding is done."
 The caller must discard cached UIDs if UIDVALIDITY changes. Names are safely
 quoted, not commands; control characters are refused before any bytes go out."
   (let ((responses (%imap-command s (string-append "SELECT " (%imap-quote mailbox))))
-        (validity #f) (count #f))
+        (validity #f) (count #f) (uidnext #f))
     (for-each
      (lambda (r)
        (when (and (>= (length r) 3) (%imap-is? (car r) "*")
@@ -274,15 +274,18 @@ quoted, not commands; control characters are refused before any bytes go out."
          (set! count (%imap-decimal (cadr r))))
        (let scan ((tokens r))
          (when (pair? tokens)
-           (when (and (eq? (car tokens) 'bracket) (>= (length tokens) 4)
-                      (%imap-is? (cadr tokens) "UIDVALIDITY")
-                      (eq? (list-ref tokens 3) 'end-bracket))
-             (set! validity (%imap-decimal (list-ref tokens 2))))
+            (when (and (eq? (car tokens) 'bracket) (>= (length tokens) 4)
+                       (eq? (list-ref tokens 3) 'end-bracket))
+              (cond ((%imap-is? (cadr tokens) "UIDVALIDITY")
+                     (set! validity (%imap-decimal (list-ref tokens 2))))
+                    ((%imap-is? (cadr tokens) "UIDNEXT")
+                     (set! uidnext (%imap-decimal (list-ref tokens 2))))))
            (scan (cdr tokens)))))
      responses)
     (unless (and validity (> validity 0) (<= validity 4294967295) count)
       (imap-close s) (%imap-fail))
     (vector-set! s 9 #t)
+    (vector-set! s 12 (cond ((zero? count) 0) ((%imap-uid? uidnext) (- uidnext 1)) (else #f)))
     `((uidvalidity . ,validity) (count . ,count))))
 
 (define (%imap-uid? n) (and (integer? n) (exact? n) (<= 1 n 4294967295)))
@@ -356,40 +359,62 @@ to UTF-8 text unless constructed with RAW-BYTES? #t. MIME decoding is separate."
                                           (loop (cddr items))))))))) responses)
             (%imap-fail) #f))))
 
+(define (%imap-last-uid s)
+  ;; UIDNEXT is optional; * asks for the last message's metadata only.
+  (or (vector-ref s 12)
+      (apply max 0
+             (filter-map
+              (lambda (r)
+                (and (>= (length r) 4) (%imap-is? (car r) "*") (%imap-is? (caddr r) "FETCH")
+                     (let loop ((items (list-ref r 3)))
+                       (and (pair? items) (pair? (cdr items))
+                            (if (%imap-is? (car items) "UID")
+                                (let ((uid (%imap-decimal (cadr items))))
+                                  (unless (%imap-uid? uid) (%imap-fail)) uid)
+                                (loop (cddr items)))))))
+              (%imap-command s "UID FETCH * (UID)")))))
+
+(define (%imap-uid-page s lo hi)
+  ;; No more than 4096 distinct, 10-digit UIDs: well inside the line cap.
+  (sort (delete-duplicates
+         (append-map
+          (lambda (r)
+            (if (and (>= (length r) 2) (%imap-is? (car r) "*") (%imap-is? (cadr r) "SEARCH"))
+                (filter-map (lambda (token)
+                              (let ((uid (%imap-decimal token)))
+                                (unless (%imap-uid? uid) (%imap-fail))
+                                (and (<= lo uid hi) uid))) (cddr r)) '()))
+          (%imap-command s (string-append "UID SEARCH UID " (number->string lo) ":" (number->string hi))))) <))
+
 (define (imap-for-each-message s proc [since-uid 0] #:max-bytes [max-bytes #f]
                               #:on-oversized [on-oversized (lambda (uid) #f)])
   "Call PROC with each new message of S, after SINCE-UID, in UID order.
 With MAX-BYTES, check RFC822.SIZE first; call ON-OVERSIZED with each UID
-above the limit and continue without fetching its body. Fetch bodies one
-at a time with PEEK. PROC and ON-OVERSIZED may suspend to persist progress."
+above the limit and continue without fetching its body. Search in bounded
+UID ranges and fetch one body at a time with PEEK. PROC and ON-OVERSIZED
+may suspend to persist progress."
+  (define (fetch-one uid)
+    (let ((size (and max-bytes (%imap-message-size s uid))))
+      (cond ((and max-bytes (not size)) #f)
+            ((and max-bytes (> size max-bytes)) (on-oversized uid))
+            (else
+             (for-each (lambda (m)
+                         (if (and max-bytes (> (bytevector-length (cdr (assq 'raw m))) max-bytes))
+                             (on-oversized uid) (proc (%imap-body-mode s m))))
+                       (filter-map (lambda (r)
+                                     (let ((message (%imap-fetch-row r since-uid)))
+                                       (and message (= (cdr (assq 'uid message)) uid) message)))
+                                   (%imap-command s (string-append "UID FETCH " (number->string uid) " (UID FLAGS BODY.PEEK[])"))))))))
   (unless (and (integer? since-uid) (exact? since-uid) (<= 0 since-uid 4294967295))
     (error "imap: invalid since UID"))
   (unless (vector-ref s 9) (error "imap: SELECT a mailbox first"))
   (unless (= since-uid 4294967295)
-    (let ((uids
-           (sort (delete-duplicates
-                  (append-map
-                   (lambda (r)
-                     (if (and (>= (length r) 2) (%imap-is? (car r) "*") (%imap-is? (cadr r) "SEARCH"))
-                         (filter-map (lambda (token)
-                                       (let ((uid (%imap-decimal token)))
-                                         (unless (%imap-uid? uid) (%imap-fail))
-                                         (and (> uid since-uid) uid))) (cddr r)) '()))
-                   (%imap-command s (string-append "UID SEARCH UID " (number->string (+ since-uid 1)) ":*")))) <)))
-      (for-each
-        (lambda (uid)
-          (let ((size (and max-bytes (%imap-message-size s uid))))
-            (cond ((and max-bytes (not size)) #f)
-                  ((and max-bytes (> size max-bytes)) (on-oversized uid))
-                  (else
-                   (for-each (lambda (m)
-                               (if (and max-bytes (> (bytevector-length (cdr (assq 'raw m))) max-bytes))
-                                   (on-oversized uid) (proc (%imap-body-mode s m))))
-                             (filter-map (lambda (r)
-                                           (let ((message (%imap-fetch-row r since-uid)))
-                                             (and message (= (cdr (assq 'uid message)) uid) message)))
-                                         (%imap-command s (string-append "UID FETCH " (number->string uid) " (UID FLAGS BODY.PEEK[])"))))))))
-       uids))))
+    (let ((last (%imap-last-uid s)))
+      (let page ((lo (+ since-uid 1)))
+        (when (<= lo last)
+          (let ((hi (min last (+ lo 4095))))
+            (for-each fetch-one (%imap-uid-page s lo hi))
+            (page (+ hi 1))))))))
 
 (define (%imap-flag flag)
   (unless (and (string? flag) (> (string-length flag) 0)

@@ -140,15 +140,16 @@
     (check "production preserves non-UTF8 octets" body raw)
     (check "MIME charset decodes preserved octets" "café" (mail-text (mail-parse raw)))))
 (let* ((f (fake (string-append "* OK ready\r\n" selected
-                              "* SEARCH 901 900 899\r\nT2 OK searched\r\n"
-                              "* 3 FETCH (UID 999 FLAGS () BODY[] {0}\r\n)\r\n* 1 FETCH (UID 900 FLAGS () BODY[] {0}\r\n)\r\nT3 OK fetched\r\n"
-                              "* 2 FETCH (UID 901 FLAGS () BODY[] {3}\r\nbye)\r\nT4 OK fetched\r\n")))
+                               "* 2 FETCH (UID 901)\r\nT2 OK upper bound\r\n"
+                               "* SEARCH 901 900 899\r\nT3 OK searched\r\n"
+                               "* 3 FETCH (UID 999 FLAGS () BODY[] {0}\r\n)\r\n* 1 FETCH (UID 900 FLAGS () BODY[] {0}\r\n)\r\nT4 OK fetched\r\n"
+                               "* 2 FETCH (UID 901 FLAGS () BODY[] {3}\r\nbye)\r\nT5 OK fetched\r\n")))
        (s (car f)) (rows '()))
   (imap-select! s "INBOX")
   (imap-for-each-message s (lambda (m) (set! rows (append rows (list m)))) 899)
   (check "incremental callback visits sorted new UIDs" '(900 901) (map (lambda (m) (field m 'uid)) rows))
-  (check "one fetch body per command" '("T1 SELECT \"INBOX\"\r\n" "T2 UID SEARCH UID 900:*\r\n"
-                                      "T3 UID FETCH 900 (UID FLAGS BODY.PEEK[])\r\n" "T4 UID FETCH 901 (UID FLAGS BODY.PEEK[])\r\n") ((cadr f))))
+  (check "one fetch body per command" '("T1 SELECT \"INBOX\"\r\n" "T2 UID FETCH * (UID)\r\n" "T3 UID SEARCH UID 900:901\r\n"
+                                      "T4 UID FETCH 900 (UID FLAGS BODY.PEEK[])\r\n" "T5 UID FETCH 901 (UID FLAGS BODY.PEEK[])\r\n") ((cadr f))))
 
 ;; Cancellation closes an in-flight protocol transaction; a second command
 ;; must never consume the first command's tagged reply.
@@ -217,7 +218,7 @@
              (rejected? (lambda () (maildir-keys (string-append root "/absent"))))))
     (lambda () (delete-path root #t))))
 
-(let* ((f (fake (string-append "* OK ready\r\n" selected
+(let* ((f (fake (string-append "* OK ready\r\n* OK [UIDNEXT 13] next\r\n" selected
                                "* SEARCH 10 11 12\r\nT2 OK search\r\n"
                                "* 1 FETCH (RFC822.SIZE 1 UID 10)\r\nT3 OK size\r\n"
                                "* 1 FETCH (UID 10 FLAGS () BODY[] {1}\r\na)\r\nT4 OK body\r\n"
@@ -232,4 +233,19 @@
   (check "IMAP never requests the oversized body" #f (member "T6 UID FETCH 11 (UID FLAGS BODY.PEEK[])\r\n" ((cadr f))))
   (check "IMAP only issues size and body requests for the two small messages and a size request for the large one"
          7 (length ((cadr f)))))
+;; A backlog spanning 10,000 UIDs must not be requested in one SEARCH.
+;; Include empty space and messages at both sides of a page boundary.
+(let* ((f (fake (string-append "* OK ready\r\n* OK [UIDNEXT 110000] next\r\n" selected
+                               "* SEARCH 104095\r\nT2 OK first page\r\n"
+                               "* 1 FETCH (UID 104095 FLAGS () BODY[] {0}\r\n)\r\nT3 OK body\r\n"
+                               "* SEARCH 104096\r\nT4 OK second page\r\n"
+                               "* 2 FETCH (UID 104096 FLAGS () BODY[] {0}\r\n)\r\nT5 OK body\r\n"
+                               "* SEARCH\r\nT6 OK last page\r\n")))
+       (s (car f)) (uids '()))
+  (imap-select! s "INBOX")
+  (imap-for-each-message s (lambda (m) (set! uids (cons (field m 'uid) uids))) 99999)
+  (check "callbacks finish in UID order across pages" '(104095 104096) (reverse uids))
+  (check "searches bound the UID count per response"
+         '("T2 UID SEARCH UID 100000:104095\r\n" "T4 UID SEARCH UID 104096:108191\r\n" "T6 UID SEARCH UID 108192:109999\r\n")
+         (filter (lambda (cmd) (string-contains cmd "UID SEARCH")) ((cadr f)))))
 (test-summary)
