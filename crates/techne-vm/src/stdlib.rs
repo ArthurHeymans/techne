@@ -2,8 +2,8 @@
 //! hash-table views and system access.
 
 use crate::{
-    builtins::{Bulk, error_object_parts, list_values, repr, str_arg, type_error},
-    heap::{Kind, field, header, is_kind, len_of, set_field, str_bytes},
+    builtins::{Bulk, error_object_parts, list_values, range_args, repr, str_arg, type_error},
+    heap::{self, Kind, field, header, is_kind, len_of, set_field, str_bytes},
     reader::{self, symbol_name},
     value::Value,
     vm::{
@@ -664,11 +664,22 @@ fn string_join(vm: &mut Vm, args: usize, n: usize) -> R {
     Ok(vm.make_string_raw(&parts.join(&sep)))
 }
 
-fn string_contains(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = str_arg(vm, arg(vm, args, 0), "string-contains")?;
+fn string_contains(vm: &mut Vm, args: usize, n: usize) -> R {
+    let v = arg(vm, args, 0);
+    let s = str_arg(vm, v, "string-contains")?;
     let sub = str_arg(vm, arg(vm, args, 1), "string-contains")?;
-    Ok(match s.find(sub) {
-        Some(i) => Value::int_unchecked(s[..i].chars().count() as i64),
+    let len = vm.string_length(v).expect("checked string");
+    let (start, end) = range_args(vm, args, n, 2, len, "string-contains")?;
+    let from = vm.string_offset(v, start).expect("checked character range");
+    let to = vm.string_offset(v, end).expect("checked character range");
+    // A bounded search avoids Scheme allocating/scanning a suffix at every
+    // delimiter in multi-megabyte input. Parsing policy remains in Scheme.
+    let slice = &s[from..to];
+    Ok(match slice.find(sub) {
+        Some(i) => {
+            let relative = if heap::is_ascii_string(v) { i } else { slice[..i].chars().count() };
+            Value::int_unchecked((start + relative) as i64)
+        }
         None => Value::FALSE,
     })
 }
@@ -1086,8 +1097,8 @@ pub fn install(vm: &mut Vm) {
         "(string-split string [separator])" => string_split;
         /// Return the STRINGS joined, with SEPARATOR (a space by default) between.
         "(string-join strings [separator])" => string_join;
-        /// Return the index of the first occurrence of PART in STRING, or #f.
-        "(string-contains string part)" => string_contains;
+        /// Return the first index of PART in STRING between character START and END, or #f.
+        "(string-contains string part [start] [end])" => string_contains;
         /// Return the index of the first CHAR in STRING, or #f.
         "(string-index string char)" => string_index;
         /// Return STRING with every occurrence of OLD replaced by NEW.

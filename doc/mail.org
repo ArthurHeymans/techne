@@ -1,0 +1,395 @@
+#+title: Native Scheme mail
+
+* Start
+
+=M-x mail= opens the dashboard, as mu4e's main view or Gnus's group buffer
+are: the groups across accounts (Inbox, Unread, Starred, All mail, Drafts),
+then every configured account and its folders with how many messages each
+has and how many are unread, then what there is to do. =RET= on a row lists
+its messages above a rich reader, the same way whichever row, =G= or search
+it comes from; =q= in the list comes back, and =q= on the dashboard leaves
+mail. Use =C-h m= to describe the current mode or =C-h b= to list its active
+bindings. See [[*Accounts][Accounts]] for configuration.
+
+- =n= / =p= select a row, =RET= opens it. =i=, =u=, =s= and =a= open
+  Inbox, Unread, Starred and All mail from anywhere on it, =D= the drafts.
+- =TAB= folds an account's folders, as Gnus folds a topic.
+- =c= marks all of the selected group, account or folder read; =C-/= undoes it.
+- An account shows what its last sync did ("up to date · 14:32 · 12 new",
+  "fetching Inbox", "incomplete · e details"), or that it was never
+  fetched. An account the cache has mail of but which is no longer
+  configured is listed too, and says so.
+- =/= searches all mail, =g= fetches it, =C= composes, =D= resumes a draft.
+For large Maildirs, use the optimized VM rather than a debug build:
+
+#+begin_src sh
+cargo build --release -p techne-cli
+nix develop .#window --command target/release/techne window
+#+end_src
+
+The application, protocols, MIME parsing, private HTML renderer, schema, search,
+threading and delivery policy are Scheme under =lisp/techne/mail/= and
+=lisp/editor/mail/runtime.scm=, loaded when you first use mail. Rust supplies verified TLS streams and a
+bounded asynchronous SQLite boundary. No mu, external IMAP fetcher or Rust mail
+library is involved.
+
+* Accounts
+
+Mail uses ordinary Techne options. Put =mail-accounts= and
+=mail-credential-provider= in a trusted Scheme file. Open it and run
+=M-x eval-buffer= in each new editor runtime. =M-x describe-option= shows what
+these options do. Evaluating the file does not fetch mail; press =g= in mail
+when you want to sync.
+
+#+begin_src scheme
+(import (techne editor))
+(set-option! 'mail-accounts
+  '(((id . "work") (kind . imap)
+     (host . "imap.example.org") (port . 993)
+     (user . "you@example.org")
+     (mailboxes . ("INBOX" "Sent"))
+     (from . "You <you@example.org>")
+     (smtp-host . "smtp.example.org") (smtp-port . 465)
+     (smtp-user . "you@example.org"))
+    ((id . "local") (kind . maildir)
+     (path . "/home/you/Mail/personal")
+     (skip . ("[Gmail]/Spam" "[Gmail]/Bin")))))
+
+(set-option! 'mail-credential-provider
+  (lambda (account purpose)
+    ;; Return a string from your secret manager.
+    ;; PURPOSE is 'imap or 'smtp; ACCOUNT is the chosen account alist.
+    (my-mail-secret account purpose)))
+#+end_src
+
+=(techne authinfo)= reads the authinfo file Emacs's auth-source reads, so the
+provider can take the same app passwords smtpmail does. Port 465 is implicit
+TLS with the same Gmail app password an entry for 587 has, so leave the port
+out of the lookup:
+
+#+begin_src scheme
+(import (techne authinfo))
+(set-option! 'mail-credential-provider
+  (lambda (account purpose)
+    (authinfo-password #:host (if (eq? purpose 'smtp) (cdr (assq 'smtp-host account)) (cdr (assq 'host account)))
+                       #:user (cdr (assq (if (eq? purpose 'smtp) 'smtp-user 'user) account)))))
+#+end_src
+
+Only a plain file is read (=~/.authinfo= by default, =#:file= another); one
+kept encrypted is decrypted by what keeps it, sops-nix or a gpg agent.
+
+The secret-provider procedure is intentionally yours. Passwords are not persisted
+in SQLite or account settings, requested in a visible minibuffer, or logged in
+sync errors. Do not put actual secrets in a configuration file. Authentication
+supports LOGIN/app passwords for IMAP and SASL PLAIN for SMTP, in both cases
+only over verified TLS. OAuth is not implemented. Mailbox names are opaque IMAP
+wire names; modified UTF-7 decoding is not implemented yet.
+
+Implicit TLS is the default (IMAP 993, SMTP 465). To require STARTTLS, add
+=(imap-security . starttls)= for IMAP and/or =(smtp-security . starttls)= for
+SMTP to the account. If you omit the corresponding =port= or =smtp-port=,
+Techne uses 143 or 587 respectively in STARTTLS mode. Change any explicit port
+to match your server; the port alone does not select the mode. If the server
+cannot upgrade or certificate or hostname verification fails, Techne closes
+the connection without sending credentials or falling back to plaintext.
+
+A Maildir account reads an existing Maildir tree. Only =cur/= and =new/= are
+read, one message body at a time; source files, names and flags are unchanged.
+The importer buffers at most 256 prepared records, 4 MiB of source data and a
+conservative 16 MiB JSON-encoding bound before an atomic SQLite write. Large
+source-backed batches use one bound JSON-table parameter, with the same upsert
+and FTS triggers as ordinary inserts; local flags and cache IDs are preserved.
+A single larger message uses binary-safe parameters, not JSON. Raw-retaining
+IMAP batches remain capped at 15 records. No durability setting is relaxed.
+Cached
+source keys are loaded in bounded pages and removed before priority sorting.
+Progress counts committed records, never pending batches. Interrupted imports
+resume from durable source keys; draft/delivery transactions are unchanged.
+Cancellation propagates through parser and source-recovery guards: it never
+turns interrupted decoding into a successful cache entry with incomplete text.
+A Maildir account's path is a tree of folders, as mbsync or offlineimap keep
+one: every Maildir at and under it (a directory holding =cur= or =new=, at most
+four deep) is a mailbox of the account, named by its place there, as =Inbox=
+or =[Gmail]/All Mail=. =in:= searches by that name. =folders= lists the only
+ones to read, =skip= the ones not to; =mailbox= makes the path one mailbox of
+that name, as before. A conversation is followed across the folders of one
+account, not across accounts.
+
+=g= fetches every account's Inbox first, then the ordinary folders, then
+Gmail's labels and All Mail last, so that each account's new mail comes in
+soon rather than after the whole of the first account. An IMAP account is
+fetched over one connection, its mailboxes in the same order.
+
+=mail-accounts= says what the cache holds, as mu's index follows its
+Maildirs; there is no command to remove an account. After fetching, =g=
+removes from the cache an account no longer configured, a folder an account
+no longer reads (=skip=, =folders=, =mailboxes=) and a Maildir message whose
+file is gone. The dashboard says beforehand which accounts will go. Only
+the cache changes: drafts stay, nothing at the source is touched, and what
+is still there comes back with the next fetch.
+
+It never happens before a configuration is loaded, since =g= needs
+accounts. An account whose path is missing (a disk not mounted, a typo) or
+holds no Maildir is reported and keeps what is cached, and while an account
+is configured wrongly (no string id) no other account is removed.
+
+A message that is in two folders of an account, as everything in Gmail is also
+in All Mail, is one message: rows of one account with one Message-ID are
+copies. One copy is listed and counted (the Inbox's, else an ordinary
+folder's, else a Gmail label's, All Mail's last; never a trashed one), and
+reading or starring it does the same to the others. =in:= still finds a message by any
+folder it is in, and the message details name them all. The same holds for an
+IMAP account whose mailboxes include both. Opening a cache made before this
+finds the copies once, which takes a moment on a large one.
+Unread sources are imported first, then newest filename timestamps; summaries
+are sorted by the message's actual Date. Existing source keys are skipped before
+opening their bodies: Maildir content is immutable under a key, while flag renames
+keep that key. Explicit store imports can still replace content. Progress
+updates do not decode or rebuild the open reader.
+
+* What changes your mail
+
+The Maildirs are the truth and the cache an index of them, as mu's is. A
+Maildir message is never written, only renamed, as mu4e renames it, and
+mbsync carries that to the server:
+
+- Reading and starring set the =S= and =F= flags in its name (in every
+  folder it is in); a sync takes the flags the files have, so what a phone
+  read through Gmail is read here after mbsync.
+- Archiving (=r=, =A=) moves the message to the configured =archive=
+  folder. For a Gmail Maildir, set =(archive-inbox-label? . #t)= instead
+  to mark only the Inbox copy for expunge, and only when a cached All Mail
+  copy still exists on disk. mbsync then removes the Inbox label.
+- Deleting (=d=, then =x=) moves the selected copy to the configured
+  =trash= folder or a recognized Trash, Deleted Items, or Deleted Messages
+  Maildir (including Gmail's Trash or Bin). If no such folder exists, the
+  operation is refused. Delete never marks messages for expunge. Other
+  cached copies stay in their original folders.
+- Moves between folders keep the flags but drop any folder-specific mbsync
+  UID in the filename. mbsync assigns the UID in the destination folder.
+- =a= undoes a change only while its original cached source and location
+  still match. Once mbsync has run, the change may have reached the server.
+
+The Inbox is the Inbox folders of the accounts. A message of an IMAP
+account, or one cached without a file, keeps its state here only.
+Maildir indexing stores searchable text and a source locator, not another raw
+message copy. Opening a reader, Source or an attachment reads MIME on demand,
+following flag renames between =new/= and =cur/=. A message removed or moved
+out of its Maildir stays cached, without source or attachments, until the
+next =g= removes it. IMAP messages retain cached raw octets.
+Existing development caches keep their old raw copies until explicitly rebuilt.
+Oversized/unreadable sources are reported in sync details while healthy siblings
+continue; the 16 MiB MIME limit still applies. A regular-file size preflight
+rejects known-large sources before opening or allocating their bodies. The
+bounded read remains authoritative if a file grows after the metadata check.
+Only body text and relevant headers are decoded for indexing, not attachments or
+transport/spam header payloads. Index-mode header scanning discards unwanted
+fields and their folded continuations before constructing/unfolding values;
+all bytes still count against header limits. Reader/Source parsing retains all
+headers as before. Bulk Latin-1 octet conversion is a generic VM
+mechanism: real-mail profiling found the previous per-byte Scheme conversions
+consumed most parser time. MIME and indexing policy remain entirely in Scheme.
+MIME parsing searches directly for whole-line boundary candidates rather than
+walking every base64 attachment line. Parsing stays in Scheme; the VM's generic
+string search accepts character bounds to avoid per-character scans or repeated
+suffix copies.
+
+* Reading and finding
+
+The list has one row per message, as a Gnus or mu4e summary does: date, sender,
+then the subject. Conversations are ordered by their newest message. Inside one,
+a reply is on a row under the message it answers, oldest first, drawn with
+=├─►= and =╰─►=, and shows its subject only when that differs from its
+parent's. One header row names the group and its counts; sync status takes
+rows below the list only while a sync has something to report. Keys are in the
+mode line and under =?=, not in the list.
+
+A list opens alone in the frame, as mu4e's headers and Gnus's summary do:
+moving through it reads nothing. =RET= opens the message on its row in the
+reader, and =q= there closes the reader again.
+
+The reader is below the message list by default, so rows have the full width
+for subjects. To keep the side-by-side arrangement, add this to your trusted
+mail configuration:
+
+#+begin_src scheme
+(set-option! 'mail-reader-position 'side) ; or 'bottom (the default)
+#+end_src
+
+A message starts two rows under its subject: who sent it and when, then its
+recipients, which open the details (=H=): account, mailbox, headers and the
+whole conversation, including messages the current group or search leaves out
+of the list. Reply, archive, star and source follow the message.
+
+=M-x mail-toggle-reader-position= switches an open workspace immediately without
+marking mail read or losing reader position. =f= still maximizes/restores the
+focused pane, using the configured arrangement when restored. Bottom layout
+uses one pane below 36 viewport rows; side layout uses one pane below 110 columns.
+Automatically collapsed splits return when space permits; manual maximization
+persists across resizing. In one pane, =RET= reads and =b= returns to summaries.
+=q= in the reader closes its pane, as mu4e's =q= closes the message view: the
+list has the frame until =RET= opens a message again (or =f= splits again).
+
+*Unread* with nothing unread shows a quiet empty view, not old read
+messages. Choose =All mail= from the dashboard or =G=, or click =Browse all
+mail=, to open the history explicitly. A folder lists everything in it but
+what is trashed; =in:= and the folder's own list find the same copies.
+
+The list is what its group and search found when it was made, as a mu4e or
+Gnus summary is. A message you read stays on its row, no longer bold; so does
+one you star or mark. The list is made again, and what no longer belongs in it
+goes, when you choose a group (=G=), search (=/=), fetch mail (=g=) or do the
+marks (=x=).
+
+- Arrows, =C-n= / =C-p=, =j= / =k= and =n= / =p= select one row, without
+  marking read or decoding another body. =RET= opens that message. Selection
+  is a row highlight, not a text caret, and does not change the text's faces.
+- In the reader, =n= / =p= follow the list captured when opened, so through a
+  conversation's replies in order and then on; the highlighted row moves along.
+  If the message is still in the results, its summary stays highlighted and is
+  scrolled into view without taking focus from the reader.
+  Reading from Unread therefore keeps the requested message visible even when
+  it leaves the filtered results. =b= returns to summaries.
+- =G=: go to a group (Inbox, Unread, Starred, All mail), an account or one of
+  its folders, by name. Inbox is the accounts' Inbox folders; an account's
+  row is its Inbox.
+- =/= searches what the list lists, or all mail from the dashboard; =C-c C-l=
+  clears the query. Field filters include
+  =from:=, =subject:=, =in:=, =account:=, =is:unread=, =is:read= and
+  =is:starred=. Ordinary words use SQLite FTS5; input is quoted as data, not
+  executed as SQL/FTS operators. Field values match literal substrings.
+- Marks are mu4e's: a key marks the message for what is to be done, shown in
+  the row's first column, and moves on; =x= then does them all. =r= archives,
+  =d= deletes, =!= makes read, =?= unread, =+= stars, =-= removes the star. =u= unmarks,
+  =U= unmarks all. =m= marks several rows with =*=, and one of those keys then
+  marks them all. As in mu4e, =%= puts =*= on the listed rows a search finds
+  (=% from:github RET ! x= makes GitHub's mail read) and =T= on a row's whole
+  conversation. The same keys work in the reader, on the open message.
+  =a= undoes everything the last =x= did, or the last message read. =A= and
+  =S= archive and star at once, without marking.
+- =c= marks every unread message of the group, folder or search read at once
+  and goes back to the dashboard, as Gnus's catch-up does: all of them, not
+  only the 500 listed. On the dashboard, =c= does it to the selected row, a
+  whole folder or account without opening it. =C-/= there undoes it.
+- Moving through the list only moves its highlight; the list is made again
+  when a group is chosen, a search made, mail fetched or the marks done.
+- =h= shows the keys. =R= replies and =C= composes, as in mu4e.
+- =v= switches private HTML/plain parts; =TAB= folds plain-text quotations.
+  =H= or the Message details disclosure shows account, mailbox, To/Cc and
+  Reply-To without opening source. Plain mail is not interpreted as Markdown.
+  =s= shows safe MIME source text.
+- =RET= on an attachment saves its original bytes to an explicitly chosen new
+  file. Attachments are never executed or opened automatically.
+- Narrow frontends automatically use one full-width pane. =RET= reads, =b= goes
+  back, and =SPC= pages the reader. In wide frames =f= maximizes the current pane
+  or restores the split. =q= in a list returns to the dashboard, and =q= there
+  restores the pre-mail workspace.
+
+The reader shares the markdown preview's native rich presentations: headings,
+prose, emphasis, quotations, lists, code and links. Terminal prose uses
+word-aware wrapping, with grapheme fallback for oversized tokens. Wrapping
+changes only visual layout, never message text or caret/source positions. Scripts, CSS, embedded
+content, file resources and remote images never load. HTML is intentionally a
+safe subset, not a web browser. Newsletter layout tables are flattened into
+readable blocks rather than rendered as grids of spacer cells; genuine data
+tables retain their structure. Link opening is explicit; only HTTP, HTTPS and
+mailto links are active. Terminal escapes and directional overrides are rendered
+inert. Binary MIME data and charset decoding remain byte-preserving in the cache.
+
+Messages sort by parsed Date, with deterministic cache-ID fallback for invalid
+or missing dates. Today shows a clock, yesterday is labelled, older mail shows a
+date. Conversations follow Message-ID/References/In-Reply-To within one account;
+subjects alone never merge unrelated mail. The initial summary view is limited
+to 500 results; search narrows large archives. Thread context scans at most 4000
+cached summaries.
+
+* Sync
+
+=g= explicitly syncs configured sources. =e= shows sanitized account/mailbox,
+phase, processed counts, partial success and recovery. =C-c C-k= cancels a sync;
+already-cached messages remain. An account failure does not prevent other
+accounts from syncing.
+
+IMAP uses verified TLS and UID-based =BODY.PEEK[]= reads. New bodies are fetched
+one at a time and cached immediately, so cancellation can resume after the last
+cached UID. An IMAP account's flags are not written yet: read and star stay
+here. UIDVALIDITY changes invalidate that
+mailbox's old local UID cache, including its local reading state; it is rebuilt.
+Remote deletions and flag changes are not mirrored into the local cache yet.
+There is no CLOSE/EXPUNGE, server-side move or deletion in the application.
+
+MIME messages are bounded to 16 MiB, headers to 256 KiB, nesting to 24 and parts
+to 1024. HTML has separate bounds. Malformed parts retain intact siblings and
+show a notice; a limit/import failure is reported with the account and phase.
+A problematic message can stop that account's current sync; cached mail is safe.
+
+* Composing and delivery
+
+=C= composes; =R= replies with threading headers. Drafts are ordinary editable
+text with From, To, Cc, Bcc and Subject headers, then a blank line and the body.
+
+A draft is of the account mail shows, as mu4e's context follows the message:
+the dashboard row's, the folder or account listed, else the message read or
+selected; across accounts with none selected, it is asked for. Its From is
+the account's =from=, else the From the account sends with most, as its
+sent folders hold it. A reply is from the address the message was written
+to, when the account has sent from it.
+
+In To, Cc and Bcc, after two characters (or =C-M-i=), the people of your
+mail complete, as mu4e's contacts do: first those you wrote to, then those
+who wrote to you directly; mailing lists and notifications do not. They are
+learnt from the cache when a draft opens, and again after a sync or a
+message sent.
+Bcc recipients enter only the SMTP envelope, never outgoing message headers.
+Envelope extraction and outgoing header formatting share a Scheme mailbox
+parser: quoted commas, escaped display names, comments and quoted ASCII local
+parts are supported. Replies tokenize the original unfolded address syntax
+before decoding RFC 2047 names, so an encoded comma cannot change recipients.
+Address groups and international (SMTPUTF8) envelope addresses are not supported;
+Unicode display names are encoded safely.
+The initial composer sends plain UTF-8 text; attaching files, HTML composition,
+PGP/S/MIME, OAuth and automatic server Sent-folder copies are not implemented.
+
+Drafts autosave after edits, and =C-c C-d= or =C-x C-s= saves immediately.
+A saved indicator acknowledges the exact captured revision written to SQLite;
+edits arriving during I/O are drained before the writer considers itself caught
+up. Failed writes never acknowledge a revision as saved.
+The keys are message-mode's: =C-c C-d= keeps the draft for later and goes
+back, =C-c C-k= discards it (asking first when anything is written in it),
+=C-x C-s= saves it in place. The drafts are a mailbox as the others are: =D=
+(or the Drafts row of the dashboard) lists them, newest first, with whom
+each is to and its account; =RET= opens one below the list, =d= flags one
+and =x= deletes those flagged, after asking. A draft of an account no longer
+configured opens too, to be sent from one that is. A draft whose delivery
+is not settled cannot be discarded or deleted. The mode
+line distinguishes saving, saved, save failure, submitting, SMTP acceptance
+and uncertain delivery.
+
+Mail above 16 MiB is not cached, listed, or searched. A sync reports newly
+skipped messages and continues. For IMAP, Techne searches in bounded UID
+ranges, checks the size before fetching the body, and remembers skipped UIDs
+until UIDVALIDITY changes or the mailbox is removed from the cache.
+
+=C-c C-c= requires explicit confirmation of the recipient envelope. The
+confirmed text is frozen. A cache allows only one live submission at a time,
+across runtimes. Once the server accepts DATA, Techne records that outcome
+without waiting for a reply to QUIT. Closing a sent draft leaves its delivery
+record in the cache so another open copy cannot submit it again. Acceptance
+is not proof of final delivery.
+
+A failure before writing DATA normally leaves a retryable draft. A failure
+after DATA, or an interrupted runtime with a pending send, can leave a draft
+read-only. No submission is automatically retried. When the live send is no
+longer running, inspect the draft and check server delivery evidence before
+using =C-c C-r= to record delivery or confirm non-delivery. Absence from a
+Sent folder alone does not prove non-delivery.
+
+* Private local data
+
+The default cache is =XDG_DATA_HOME/techne/mail/cache.sqlite=, falling back to
+=~/.local/share/techne/mail/cache.sqlite=. It holds private message bodies and
+drafts. Protect and back it up like a mailbox. For a custom =mail-database=,
+use a directory you own that nobody else can access (=chmod 700 DIRECTORY=).
+Techne refuses shared cache directories and makes cache files private. Do
+not remove the cache's lease file while any editor runtime is using it.
+Set the path before opening mail in a new runtime; it does not switch a live cache.

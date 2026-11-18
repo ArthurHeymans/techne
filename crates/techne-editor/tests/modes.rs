@@ -251,6 +251,26 @@ fn options_and_minor_modes() {
     assert!(rt.eval("(set-option! 'read-only 'yes)").is_err());
 }
 
+#[test]
+fn option_lookup_agrees_with_explanation_at_each_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path(), "a.scm", "; test\n", "emacs");
+    let check = |rt: &mut Runtime, setup: &str, expected: &str| {
+        assert_eq!(
+            rt.eval(&format!(
+                "(let ((b (current-buffer (current-session)))) {setup}
+               (list (option b 'line-numbers) (cadar (explain-option b 'line-numbers))))"
+            ))
+            .unwrap(),
+            expected
+        );
+    };
+    check(&mut rt, "(set-option! 'line-numbers 'relative #:mode 'prog-mode)", "(relative relative)");
+    check(&mut rt, "(set-option! 'line-numbers #f #:mode 'scheme-mode)", "(#f #f)");
+    check(&mut rt, "(set-option! 'line-numbers 'absolute #:buffer b)", "(absolute absolute)");
+    check(&mut rt, "(unset-option! 'line-numbers #:buffer b)", "(#f #f)");
+}
+
 /// describe-option shows the settings that apply, the winner first.
 #[test]
 fn describing_an_option() {

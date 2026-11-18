@@ -376,7 +376,9 @@ percentage of the frontend's size; an attribute not set is #f."
 (define-face eob-marker "The marker below the end of the text." #:inherit 'shadow)
 (define-face completion "In-buffer completion's popup." #:fg 'text #:bg 'surface0)
 (define-face completion.selected "The popup's selected candidate." #:bg '("#00415e" 4))
-(define-face minibuffer.selected "The minibuffer's selected candidate." #:fg 'text #:bg 'surface)
+;; Selection adds a background, not a foreground that erases match/key/help
+;; faces. ANSI blue keeps muted annotations distinct (surface and shadow are 8).
+(define-face minibuffer.selected "The minibuffer's selected candidate." #:bg '(surface 4))
 (define-face prompt "A prompt: the minibuffer's, a REPL's." #:fg 'mauve #:weight 'bold)
 (define-face key "A key, shown beside what it does." #:fg 'teal)
 (define-face which-key.key "A key in which-key's popup." #:inherit 'key)

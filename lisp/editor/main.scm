@@ -41,7 +41,7 @@
 (require "server.scm")
 (require "capture.scm")
 
-(provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-eval! editor-eval-ended! editor-press editor-click editor-message! session-quit?
+(provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-eval! editor-eval-ended! editor-press editor-viewport! editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers pane-inlays pane-projections face-table face-generation cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations! keep-histories!
@@ -49,17 +49,20 @@
 
 (define (start-session view profile-name)
   "Start a session for a frontend attaching, keys read by PROFILE-NAME.
-It shows VIEW; with VIEW #f, it shows what the current session shows,
-or else what the last session to end showed (a daemon's frontends come
-and go), or else an empty *scratch*. PROFILE-NAME is \"emacs\" or
-\"modal\". Return the session, now the current one."
+It shows VIEW; with VIEW #f, it inherits the current or last session's
+buffer unless that buffer opts out via inherit-on-attach. Otherwise it
+starts with an empty *scratch*. PROFILE-NAME is \"emacs\" or \"modal\".
+Return the session, now the current one."
   ;; *Messages* is a buffer from the start, as in Emacs.
   (unless (buffer-named "*Messages*")
     (make-generated-buffer! "*Messages*" (messages-document) 'log-mode))
-  (let* ((view (cond (view view)
-                     ((current-session) (view-split (pane-view (current-session))))
-                     ((and %last-shown (document-buffer %last-shown)) (make-view %last-shown "user"))
-                     (else (make-view (make-document "") "user"))))
+  (let* ((current (and (current-session) (pane-view (current-session))))
+         (inherited (if current (view-document current) %last-shown))
+         (b (and inherited (document-buffer inherited)))
+         (view (or view
+                   (and b (option b 'inherit-on-attach)
+                        (if current (view-split current) (make-view inherited "user")))
+                   (make-view (make-document "") "user")))
          (s (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile))))
     ;; Attached first: the buffer's hooks run in the session showing it.
     (attach-session! s)

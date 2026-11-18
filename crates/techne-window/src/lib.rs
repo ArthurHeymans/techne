@@ -235,6 +235,7 @@ struct App {
     capture_worker: capture::Worker,
     capture_in_flight: bool,
     capture_epoch: u64,
+    reported_viewport: Option<(usize, usize)>,
 }
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
@@ -268,6 +269,11 @@ fn label_key(text: &str, style: &Style) -> String {
     }
 }
 
+fn minibuffer_run_style(snap: &techne_editor::present::Snapshot, run: &techne_editor::present::Run, selected: bool) -> Style {
+    let style = run.style.map(|id| snap.style(id)).unwrap_or_default();
+    if selected { style.patch(&snap.style(snap.chrome.selected)) } else { style }
+}
+
 /// The width of a shaped label.
 fn line_width(b: &Buffer) -> f32 {
     b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
@@ -286,6 +292,14 @@ impl App {
     fn size(&mut self) -> (f32, f32) {
         let (w, h) = self.renderer.as_ref().map_or((800.0, 600.0), |r| r.size());
         self.screen.set_size(w - 2.0 * self.pad(), h);
+        let cells = (
+            ((w - 2.0 * self.pad()) / self.layout.char_width().max(1.0)).max(1.0) as usize,
+            (h / self.layout.line_height().max(1.0)).max(2.0) as usize,
+        );
+        if self.reported_viewport != Some(cells) {
+            self.reported_viewport = Some(cells);
+            self.send(Input::Viewport { columns: cells.0, rows: cells.1 });
+        }
         (w, h)
     }
 
@@ -413,7 +427,15 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, p)| (status_keys[i].clone(), p.status.clone(), mode_line_style(i == snap.focus, p)))
-            .chain(snap.minibuffer.iter().map(|m| (label_key(&m.prompt, &prompt_style), m.prompt.clone(), prompt_style.clone())));
+            .chain(snap.minibuffer.iter().map(|m| (label_key(&m.prompt, &prompt_style), m.prompt.clone(), prompt_style.clone())))
+            .chain(snap.minibuffer.iter().flat_map(|m| {
+                m.rows.iter().enumerate().flat_map(move |(i, row)| {
+                    row.columns.iter().flatten().map(move |run| {
+                        let style = minibuffer_run_style(snap, run, m.selected == Some(i));
+                        (label_key(&run.text, &style), run.text.clone(), style)
+                    })
+                })
+            }));
         let plain = texts.map(|t| (t.clone(), t, Style::default()));
         self.labels = plain
             .chain(styled)
@@ -570,10 +592,13 @@ impl App {
                 });
                 rects.extend(kept.into_iter().filter_map(|r| Some((place(r)?, c))));
             }
-            if let Some(c) = layout::caret(&self.layout, &shown.placed, &pane.text, pane.head()) {
+            if pane.cursor != CursorShape::Hidden
+                && let Some(c) = layout::caret(&self.layout, &shown.placed, &pane.text, pane.head())
+            {
                 let w = match pane.cursor {
                     CursorShape::Bar => 2.0 * scale,
                     CursorShape::Block => c.w,
+                    CursorShape::Hidden => unreachable!("hidden panes have no caret rectangle"),
                 };
                 let caret = snap.style(if focused && snap.minibuffer.is_none() { snap.chrome.cursor } else { snap.chrome.cursor_inactive });
                 let color = caret.bg.or(caret.fg).map(rgb).unwrap_or(pane_fg);
@@ -717,14 +742,18 @@ impl App {
             let lines = ((self.screen.echo_top(&self.layout) - top) / lh).round() as usize;
             let shown = &m.rows[..m.rows.len().min(lines.saturating_sub(1))];
             let columns = shown.iter().map(|r| r.columns.len()).max().unwrap_or(0);
+            let run_width = |i, run: &techne_editor::present::Run| {
+                let style = minibuffer_run_style(snap, run, m.selected == Some(i));
+                w(&label_key(&run.text, &style))
+            };
             let gap = 2.0 * w(" ").max(lh / 3.0);
             let stops: Vec<f32> = (0..columns)
                 .scan(0.0, |x, c| {
                     let stop = *x;
                     *x += shown
                         .iter()
-                        .filter_map(|r| r.columns.get(c))
-                        .map(|runs| runs.iter().map(|r| w(&r.text)).sum::<f32>())
+                        .enumerate()
+                        .filter_map(|(i, row)| row.columns.get(c).map(|runs| runs.iter().map(|run| run_width(i, run)).sum::<f32>()))
                         .fold(0.0, f32::max)
                         + gap;
                     Some(stop)
@@ -737,13 +766,14 @@ impl App {
                 for (runs, &stop) in row.columns.iter().zip(&stops) {
                     let mut x = stop;
                     for run in runs {
-                        let style = run.style.map(|id| snap.style(id)).unwrap_or_default();
-                        let style = if m.selected == Some(i) { style.patch(&selected) } else { style };
+                        let style = minibuffer_run_style(snap, run, m.selected == Some(i));
+                        let shaped = label_key(&run.text, &style);
+                        let (key, _) = self.labels.get_key_value(&shaped).expect("candidate was shaped");
                         if let Some(bg) = style.bg {
-                            rects.push((Rect { x: pad + x, w: w(&run.text), ..line(i + 1) }, rgb(bg)));
+                            rects.push((Rect { x: pad + x, w: w(key), ..line(i + 1) }, rgb(bg)));
                         }
-                        pieces.push(at(&run.text, pad + x, line(i + 1), style.fg.map(rgb).unwrap_or(frame_fg)));
-                        x += w(&run.text);
+                        pieces.push(at(key, pad + x, line(i + 1), style.fg.map(rgb).unwrap_or(frame_fg)));
+                        x += w(key);
                     }
                 }
             }
@@ -1113,6 +1143,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         capture_worker,
         capture_in_flight: false,
         capture_epoch: 0,
+        reported_viewport: None,
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, failed, .. } = app;
@@ -1125,4 +1156,31 @@ pub fn main(args: Vec<String>) -> ExitCode {
         let _ = std::fs::remove_file(&f.journal);
     }
     if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+#[cfg(test)]
+mod chrome_tests {
+    use super::*;
+
+    #[test]
+    fn selected_minibuffer_runs_keep_their_font_and_colour_roles() {
+        let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+        for key in std::iter::once("M-x".to_string()).chain("forward-".chars().map(|c| c.to_string())) {
+            rt.handle(Input::Key { key, at: Instant::now() });
+        }
+        let snap = rt.snapshot();
+        let row = &snap.minibuffer.as_ref().unwrap().rows[0];
+        let command = minibuffer_run_style(&snap, &row.columns[0][0], true);
+        let help = minibuffer_run_style(&snap, &row.columns[1][0], true);
+        assert_eq!(command.weight, Some(Weight::Bold));
+        assert_eq!(help.slant, Some(Slant::Italic));
+        assert_ne!(command.fg, help.fg);
+        for run in row.columns.iter().flatten() {
+            let plain = minibuffer_run_style(&snap, run, false);
+            let selected = minibuffer_run_style(&snap, run, true);
+            assert_eq!(plain.fg, selected.fg, "selection must not flatten command/key/help colours");
+            assert_eq!(label_key(&run.text, &plain), label_key(&run.text, &selected), "selection keeps each shaped font");
+            assert!(selected.bg.is_some());
+        }
+    }
 }

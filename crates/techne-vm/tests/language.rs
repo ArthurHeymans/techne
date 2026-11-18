@@ -331,6 +331,39 @@ fn conditions() {
 }
 
 #[test]
+fn bulk_latin1_round_trips_octets_and_checks_character_ranges() {
+    check(
+        "lossless bulk octet codecs",
+        "(define octets (apply bytevector (iota 256)))
+         (displayln (list (equal? octets (string->latin1 (latin1->string octets)))
+           (string-length (latin1->string octets))
+           (string->latin1 (latin1->string #u8(65 128 255 66)) 1 3)
+           (string->latin1 (latin1->string #u8(65 128 255 66) 1 3))
+           (string->latin1 \"x😀ÿ\" 2 3)
+           (guard (e (#t #t)) (string->latin1 \"😀\") #f)
+           (guard (e (#t #t)) (latin1->string #u8(0) 0 2) #f)
+           (guard (e (#t #t)) (string->latin1 \"a\" 1 0) #f)))",
+        "(#t 256 #u8(128 255) #u8(128 255) #u8(255) #t #t #t)\n",
+    );
+}
+
+#[test]
+fn string_search_ranges_are_character_based_and_checked() {
+    check(
+        "bounded string search",
+        "(displayln (list (string-contains \"a😀b😀c\" \"😀\" 2)
+          (string-contains \"a😀b😀c\" \"😀\" 2 3)
+          (string-contains \"a😀b😀c\" \"😀\" 3 4)
+          (string-contains \"a😀b😀c\" \"\" 5 5)
+          (string-contains \"xyzxyz\" \"yzx\" 0 3)
+          (guard (e (#t #t)) (string-contains \"abc\" \"a\" -1) #f)
+          (guard (e (#t #t)) (string-contains \"abc\" \"a\" 2 1) #f)
+          (guard (e (#t #t)) (string-contains \"abc\" \"a\" 0 4) #f)))",
+        "(3 #f 3 5 #f #t #t #t)\n",
+    );
+}
+
+#[test]
 fn library() {
     check(
         "strings",

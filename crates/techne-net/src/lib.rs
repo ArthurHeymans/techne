@@ -4,12 +4,13 @@
 //!   suspends only the calling task. Cancelling or killing the task drops
 //!   the wait; the socket stays usable (a write cancelled halfway may have
 //!   sent part of its data).
-//! - Nothing is buffered here. A read returns what the kernel has received,
+//! - Plain TCP is not buffered here; TLS retains crypto record state. A read
+//!   returns what the stream has received,
 //!   at most `READ_BYTES`, and admits what it may allocate (`Vm::admit`)
 //!   before it waits. A write waits until the kernel has taken all of its
 //!   data, so a peer that reads slowly makes the writer wait
-//!   (back-pressure); it sends the string or bytevector from where it is,
-//!   without copying it, so a waiting writer holds no memory of its own.
+//!   (back-pressure). Plain TCP sends the string or bytevector from where
+//!   it is without copying; TLS additionally retains bounded crypto buffers.
 //! - Data is bytes. `tcp-read-bytes` returns bytevectors; `tcp-read`
 //!   decodes UTF-8, joining a multi-byte sequence split between two reads,
 //!   with invalid bytes as U+FFFD. The end of the stream is the eof object;
@@ -48,14 +49,14 @@
 //! ```
 
 use std::{
-    cell::RefCell,
-    future::Future,
+    cell::{Cell, RefCell},
+    future::{Future, poll_fn},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr},
     pin::Pin,
     rc::Rc,
     sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    task::{Context, Poll, Wake, Waker},
     time::Duration,
 };
 
@@ -65,6 +66,7 @@ use techne_vm::{
     vm::{Capability, Error, ROOT_MODULE, Vm},
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     runtime::Handle,
 };
@@ -122,14 +124,45 @@ pub struct Listener {
     local: SocketAddr,
 }
 
+// TLS is a crypto/OS stream boundary, not IMAP policy. Keeping its state
+// inside the socket (not a waiting future) makes dropping a read/write wait
+// cancellation-safe. Scheme still owns all application protocols.
+// Tokio's poll_read/poll_write store one waker per direction. Relay that
+// waker to every waiter, so a cancelled reader cannot strand another task.
+struct TlsWake(Arc<tokio::sync::Notify>);
+impl Wake for TlsWake {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_waiters();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.notify_waiters();
+    }
+}
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<RefCell<tokio_rustls::client::TlsStream<TcpStream>>>),
+}
+
+impl Stream {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Self::Plain(s) => socket2::SockRef::from(s).shutdown(how),
+            Self::Tls(s) => socket2::SockRef::from(s.borrow().get_ref().0).shutdown(how),
+        }
+    }
+}
+
 /// A Lisp TCP connection: its socket, `None` once closed, its addresses,
 /// and the start of a UTF-8 sequence `tcp-read` has read but not yet
 /// decoded.
 pub struct Connection {
-    stream: RefCell<Option<Rc<TcpStream>>>,
+    stream: RefCell<Option<Rc<Stream>>>,
     local: SocketAddr,
     peer: SocketAddr,
     carry: RefCell<Vec<u8>>,
+    tls_wake: Arc<tokio::sync::Notify>,
+    upgrading: Cell<bool>,
 }
 
 /// Close `socket` now. A wait on it holds a reference: then shutting it
@@ -182,15 +215,25 @@ impl Connection {
         s.set_nodelay(true).map_err(|e| failure(who, &e))?;
         let (local, peer) = (s.local_addr(), s.peer_addr());
         let (local, peer) = (local.map_err(|e| failure(who, &e))?, peer.map_err(|e| failure(who, &e))?);
-        Ok(Connection { stream: RefCell::new(Some(Rc::new(s))), local, peer, carry: RefCell::default() })
+        Ok(Connection {
+            stream: RefCell::new(Some(Rc::new(Stream::Plain(s)))),
+            local,
+            peer,
+            carry: RefCell::default(),
+            tls_wake: Arc::default(),
+            upgrading: Cell::new(false),
+        })
     }
 
-    fn stream(&self, who: &str) -> Result<Rc<TcpStream>, String> {
+    fn stream(&self, who: &str) -> Result<Rc<Stream>, String> {
+        if self.upgrading.get() {
+            return Err(format!("{who}: TLS handshake in progress"));
+        }
         self.stream.borrow().clone().ok_or_else(|| closed(who))
     }
 
     fn is_closed(&self) -> bool {
-        self.stream.borrow().is_none()
+        !self.upgrading.get() && self.stream.borrow().is_none()
     }
 
     /// The error of `e`, or that the connection was closed meanwhile.
@@ -198,9 +241,41 @@ impl Connection {
         if self.is_closed() { closed(who) } else { failure(who, e) }
     }
 
+    async fn wait_tls<T>(&self, who: &str, mut poll: impl FnMut(&mut Context<'_>) -> Poll<Result<T, String>>) -> Result<T, String> {
+        let waker = Waker::from(Arc::new(TlsWake(self.tls_wake.clone())));
+        let mut notified = std::pin::pin!(self.tls_wake.notified());
+        poll_fn(|cx| {
+            // Register the caller before polling I/O, avoiding a lost wakeup.
+            if notified.as_mut().poll(cx).is_ready() {
+                notified.set(self.tls_wake.notified());
+                let _ = notified.as_mut().poll(cx);
+            }
+            if self.is_closed() {
+                return Poll::Ready(Err(closed(who)));
+            }
+            poll(&mut Context::from_waker(&waker))
+        })
+        .await
+    }
+
     /// Wait for data and return `take` of it; `None` at end of stream.
     async fn read_with<T>(&self, who: &str, mut take: impl FnMut(&[u8]) -> T) -> Result<Option<T>, String> {
         let s = self.stream(who)?;
+        if let Stream::Tls(tls) = &*s {
+            return self
+                .wait_tls(who, |cx| {
+                    SCRATCH.with_borrow_mut(|buf| {
+                        let mut read = ReadBuf::new(buf);
+                        match Pin::new(&mut *tls.borrow_mut()).poll_read(cx, &mut read) {
+                            Poll::Pending => Poll::Pending,
+                            Poll::Ready(Ok(())) => Poll::Ready(Ok((!read.filled().is_empty()).then(|| take(read.filled())))),
+                            Poll::Ready(Err(e)) => Poll::Ready(Err(self.failed(who, &e))),
+                        }
+                    })
+                })
+                .await;
+        }
+        let Stream::Plain(s) = &*s else { unreachable!() };
         loop {
             let read = SCRATCH.with_borrow_mut(|buf| s.try_read(buf).map(|n| (n > 0).then(|| take(&buf[..n]))));
             match read {
@@ -244,16 +319,41 @@ impl Connection {
 
     /// Close it now, and forget what a text read left undecoded.
     fn close(&self) {
-        close(&self.stream);
+        if let Some(s) = self.stream.borrow_mut().take()
+            && Rc::strong_count(&s) > 1
+        {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+        self.upgrading.set(false);
+        self.tls_wake.notify_waiters();
         self.carry.borrow_mut().clear();
     }
 
     /// Write what the kernel takes now of `bytes` from `at` on, moving
     /// `at`; whether all of it is written.
-    fn write_some(&self, s: &TcpStream, bytes: &[u8], at: &mut usize) -> Result<bool, String> {
+    fn write_some(&self, s: &Stream, bytes: &[u8], at: &mut usize) -> Result<bool, String> {
+        if let Stream::Tls(tls) = s {
+            let mut tls = tls.borrow_mut();
+            let mut cx = Context::from_waker(Waker::noop());
+            while *at < bytes.len() {
+                match Pin::new(&mut *tls).poll_write(&mut cx, &bytes[*at..]) {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(Ok(0)) => return Err("tcp-write: write returned zero".into()),
+                    Poll::Ready(Ok(n)) => *at += n,
+                    Poll::Ready(Err(e)) => return Err(self.failed("tcp-write", &e)),
+                }
+            }
+            return match Pin::new(&mut *tls).poll_flush(&mut cx) {
+                Poll::Pending => Ok(false),
+                Poll::Ready(Ok(())) => Ok(true),
+                Poll::Ready(Err(e)) => Err(self.failed("tcp-write", &e)),
+            };
+        }
+        let Stream::Plain(s) = s else { unreachable!() };
         // Shorter than when it began: a string changed meanwhile.
         while *at < bytes.len() {
             match s.try_write(&bytes[*at..]) {
+                Ok(0) => return Err("tcp-write: write returned zero".into()),
                 Ok(n) => *at += n,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
@@ -266,7 +366,22 @@ impl Connection {
     /// Wait until the kernel takes more to send.
     async fn writable(&self) -> Result<(), String> {
         let s = self.stream("tcp-write")?;
-        s.writable().await.map_err(|e| self.failed("tcp-write", &e))?;
+        match &*s {
+            Stream::Plain(s) => s.writable().await.map_err(|e| self.failed("tcp-write", &e))?,
+            Stream::Tls(tls) => {
+                self.wait_tls("tcp-write", |cx| {
+                    let mut tls = tls.borrow_mut();
+                    match Pin::new(&mut *tls).poll_flush(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(self.failed("tcp-write", &e))),
+                        Poll::Ready(Ok(())) => {}
+                    }
+                    // poll_write may not have accepted any bytes yet.
+                    tls.get_ref().0.poll_write_ready(cx).map_err(|e| self.failed("tcp-write", &e))
+                })
+                .await?;
+            }
+        }
         if self.is_closed() { Err(closed("tcp-write")) } else { Ok(()) }
     }
 }
@@ -371,6 +486,75 @@ async fn connect(host: String, port: u16) -> Result<Connection, String> {
     })
 }
 
+/// Both implicit TLS and upgraded connections use the same verified TLS policy.
+fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                    .with_safe_default_protocol_versions()
+                    .expect("TLS versions")
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
+}
+
+async fn tls_connect_with(host: String, port: u16, config: Arc<rustls::ClientConfig>) -> Result<Connection, String> {
+    let c = connect(host.clone(), port).await?;
+    tls_upgrade_with(&c, host, config, "tls-connect").await?;
+    Ok(c)
+}
+
+async fn tls_upgrade_with(c: &Connection, host: String, config: Arc<rustls::ClientConfig>, who: &str) -> Result<(), String> {
+    // Check before taking the stream: a second upgrade must not disrupt an
+    // established TLS stream or a handshake already in progress.
+    let stream = c.stream(who)?;
+    if !matches!(&*stream, Stream::Plain(_)) {
+        return Err(format!("{who}: connection already uses TLS"));
+    }
+    drop(stream);
+    let stream = c.stream.borrow_mut().take().expect("open plain socket");
+    let socket = match Rc::try_unwrap(stream) {
+        Ok(Stream::Plain(socket)) => socket,
+        Ok(Stream::Tls(_)) => unreachable!(),
+        Err(stream) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            c.close();
+            return Err(format!("{who}: connection has pending I/O"));
+        }
+    };
+    if !std::mem::take(&mut *c.carry.borrow_mut()).is_empty() {
+        return Err(format!("{who}: unread plaintext in connection"));
+    }
+    let name = rustls::pki_types::ServerName::try_from(host).map_err(|_| format!("{who}: invalid server name"))?;
+    // Keep the same scope-owned handle. While the future owns the socket,
+    // ordinary I/O cannot use it; closing the handle wakes the handshake.
+    // Dropping the future (including on cancellation) drops the socket.
+    struct Upgrade<'a>(&'a Cell<bool>);
+    impl Drop for Upgrade<'_> {
+        fn drop(&mut self) {
+            self.0.set(false);
+        }
+    }
+    c.upgrading.set(true);
+    let _upgrade = Upgrade(&c.upgrading);
+    let mut closed_signal = std::pin::pin!(c.tls_wake.notified());
+    let mut handshake = std::pin::pin!(tokio_rustls::TlsConnector::from(config).connect(name, socket));
+    let tls = poll_fn(|cx| {
+        if !c.upgrading.get() || closed_signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(closed(who)));
+        }
+        handshake.as_mut().poll(cx).map_err(|e| failure(who, &e))
+    })
+    .await?;
+    *c.stream.borrow_mut() = Some(Rc::new(Stream::Tls(Box::new(RefCell::new(tls)))));
+    Ok(())
+}
+
 /// A chunk read, or (`None`) the end of the stream.
 struct Chunk<T>(Option<T>);
 
@@ -460,11 +644,26 @@ The current scope owns the connection: shutting the scope closes it."
 The current scope owns the connection: shutting the scope closes it."
   (scope-own! (%tcp-connect host port) tcp-close tcp-closed?))
 
+(define (tls-connect host port)
+  "Connect to HOST:PORT using TLS, verifying its certificate and host name.
+Trust anchors are Mozilla's web PKI roots. There is no insecure mode.
+Use tcp-read, tcp-read-bytes, tcp-write and tcp-close on the result.
+The current scope owns the connection. Cancelling the handshake closes it."
+  (scope-own! (%tls-connect host port) tcp-close tcp-closed?))
+
+(define (tls-upgrade! connection host)
+  "Upgrade CONNECTION in place to TLS, verifying the certificate for HOST.
+Call only after a successful protocol upgrade reply, with exclusive use of
+CONNECTION and no unread plaintext buffered by the caller. The current socket
+owner is unchanged. A failed or cancelled handshake closes the connection."
+  (%tls-upgrade! connection host))
+
 (define (tcp-write connection data)
   "Write DATA, a string or a bytevector, to CONNECTION.
 It waits until the kernel has taken all of it, so a peer that reads
 slowly makes it wait. DATA is sent from where it is, not copied:
-changing it meanwhile changes what is sent."
+changing it meanwhile changes what is sent. TLS connections additionally
+retain bounded encrypted-record buffers, flushed before this returns."
   (let loop ((at (%tcp-write-some connection data 0)))
     (when at
       (%tcp-writable connection)
@@ -518,6 +717,30 @@ fn natives(vm: &mut Vm, io: Handle) {
     vm.register_async("%tcp-accept", 1, move |vm: &mut Vm, args: Args<'_>| {
         let l = args.get::<Socket>(vm, 0).and_then(|s| s.listener("tcp-accept")).map_err(|e| e.msg.clone());
         entered(&accept_io, async move { l?.accept().await.map(Foreign::new) })
+    });
+    let tls_io = io.clone();
+    vm.register_async("%tls-connect", 2, move |vm: &mut Vm, args: Args<'_>| {
+        let target = (|| -> Result<(String, u16), Error> {
+            let host = args.inspect(vm, 0, |h| host(h, "tls-connect"))??;
+            let port: i64 = args.get(vm, 1)?;
+            Ok((host, self::port(port, "tls-connect").map_err(Error::new)?))
+        })();
+        entered(&tls_io, async move {
+            let (host, port) = target.map_err(|e| e.msg.clone())?;
+            tls_connect_with(host, port, tls_config()).await.map(Foreign::new)
+        })
+    });
+    let upgrade_io = io.clone();
+    vm.register_async("%tls-upgrade!", 2, move |vm: &mut Vm, args: Args<'_>| {
+        let target = (|| -> Result<(Rc<Connection>, String), Error> {
+            let c = args.get::<Socket>(vm, 0)?.connection("tls-upgrade!")?;
+            let host = args.inspect(vm, 1, |h| host(h, "tls-upgrade!"))??;
+            Ok((c, host))
+        })();
+        entered(&upgrade_io, async move {
+            let (c, host) = target.map_err(|e| e.msg.clone())?;
+            tls_upgrade_with(&c, host, tls_config(), "tls-upgrade!").await
+        })
     });
     vm.register_async("%tcp-connect", 2, move |vm: &mut Vm, args: Args<'_>| {
         let target = (|| -> Result<(String, u16), Error> {
@@ -573,10 +796,14 @@ fn natives(vm: &mut Vm, io: Handle) {
     }
     techne_vm::procedures! { vm;
         /// Close the sending side of CONNECTION: the peer reads end of file.
-        /// Reading from CONNECTION goes on.
+        /// Reading from CONNECTION goes on. TLS does not support half-close;
+        /// use tcp-close instead.
         "(tcp-close-output connection)" => |c: Socket| -> Result<(), Error> {
             let s = c.connection("tcp-close-output")?.stream("tcp-close-output").map_err(Error::new)?;
-            socket2::SockRef::from(&*s).shutdown(Shutdown::Write).map_err(|e| Error::new(failure("tcp-close-output", &e)))
+            if matches!(&*s, Stream::Tls(_)) {
+                return Err(Error::new("tcp-close-output: TLS requires tcp-close"));
+            }
+            s.shutdown(Shutdown::Write).map_err(|e| Error::new(failure("tcp-close-output", &e)))
         };
     }
     techne_vm::procedures! { vm;
@@ -628,6 +855,10 @@ fn natives(vm: &mut Vm, io: Handle) {
         "(tcp-listener? obj)" => |s: Socket| matches!(s, Socket::Listener(_));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/tls/mod.rs"]
+mod tls_tests;
 
 #[cfg(test)]
 mod tests {

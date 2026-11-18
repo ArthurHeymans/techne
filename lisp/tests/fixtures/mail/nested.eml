@@ -1,0 +1,35 @@
+From: =?UTF-8?Q?Zo=C3=AB?= <zoe@example.test>
+Subject: =?UTF-8?B?4pyT?= 
+ =?ISO-8859-1?Q?_caf=E9?=
+Message-ID: <one@example.test>
+In-Reply-To: <zero@example.test>
+References: <older@example.test>
+ <zero@example.test>
+Content-Type: multipart/mixed; boundary="outer"
+
+This preamble is not a body.
+--outer
+Content-Type: multipart/alternative; boundary=inner
+
+--inner
+Content-Type: text/plain; charset=iso-8859-1
+Content-Transfer-Encoding: quoted-printable
+
+Ol=E1, caf=E9.
+line=
+ joined
+--inner
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+<h1>Ol=C3=A1</h1><p>A <strong>native</strong> letter.</p>
+--inner--
+--outer
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename="report; \"final\".bin"
+Content-Transfer-Encoding: base64
+
+AA0K
+//4=
+--outer--
+Epilogue is ignored.

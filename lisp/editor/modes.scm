@@ -330,7 +330,23 @@ in it, a mode for its own options)."
 ;; The value of option NAME in buffer B (#f: what applies to no buffer).
 (define (option b name)
   "Return the value of the option NAME in buffer B, #f meaning no buffer."
-  (cadr (car (explain-option b name))))
+  ;; Same precedence as explain-option, without building provenance rows or
+  ;; looking up settings that cannot win. Entries are pairs even for #f.
+  (define (global-value)
+    (let ((entry (registry-ref %settings (list name))))
+      (if entry (car entry)
+          (let ((o (find-option name))) (and o (option-default o))))))
+  (let ((local (and b (assq name (buffer-settings b)))))
+    (cond (local (cdr local))
+          ((not b) (global-value))
+          (else
+           (let loop ((mode (buffer-mode b)) (seen '()))
+             (let ((m (and mode (not (memq mode seen)) (find-mode mode))))
+               (if (not m) (global-value)
+                   (let ((entry (registry-ref %settings (list name mode))))
+                     (if entry (car entry)
+                         (let ((own (assq name (mode-options m))))
+                           (if own (cdr own) (loop (mode-parent m) (cons mode seen)))))))))))))
 
 ;;; Mode line segments: what a package says of a buffer in its mode
 ;;; line (a language server's state, its diagnostics' count), after the
@@ -537,6 +553,12 @@ The nearest mode of B that completes says: (start . candidates)."
 Relative numbers count from the caret's line, which shows its own."
   #:type '(one-of #f absolute relative))
 
+(define-option word-wrap #f
+  "Whether terminal visual lines wrap at spaces rather than within words.
+Oversized words still wrap by grapheme. This changes layout, never source
+text, caret positions or logical rows. Rich prose enables it."
+  #:type 'boolean)
+
 (define-option eob-marker #f
   "What is drawn on the lines past the end of the text, or nothing.
 Vim draws a ~."
@@ -574,6 +596,12 @@ scheme-mode does, so buffers without a file are coloured too."
   #:files '(".rs" ".c" ".h" ".cc" ".cpp" ".hpp" ".py" ".sh" ".bash" ".nix" ".el" ".js" ".ts" ".json" ".go"
             ".java" ".lua" ".zig" ".hs" ".ml" ".rb" ".pl"))
 (define-option read-only #f "Whether the buffer's text can be edited from its views." #:type 'boolean)
+(define-option cursor-visible #t
+  "Whether the buffer shows a text caret."
+  #:type 'boolean)
+(define-option inherit-on-attach #t
+  "Whether a frontend attaching without a file may inherit this buffer."
+  #:type 'boolean)
 
 (define-mode special-mode
   "Buffers the editor writes, not you.

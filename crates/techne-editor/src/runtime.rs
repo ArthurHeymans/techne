@@ -455,13 +455,13 @@ pub(crate) fn weight(input: &Input) -> usize {
                 keys.capacity() * std::mem::size_of::<String>() + keys.iter().map(String::capacity).sum::<usize>()
             }
             Input::Unrecognized { input: text } | Input::Clipboard { text } => text.capacity(),
-            Input::Click { .. } | Input::Scroll { .. } | Input::Edge { .. } | Input::Close => 0,
+            Input::Viewport { .. } | Input::Click { .. } | Input::Scroll { .. } | Input::Edge { .. } | Input::Close => 0,
         }
 }
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 41] = [
+const PROCS: [&str; 42] = [
     "editor-cancel-capture!",
     "editor-cancel-captures!",
     "editor-record!",
@@ -478,6 +478,7 @@ const PROCS: [&str; 41] = [
     "editor-completion",
     "pane-display",
     "editor-press",
+    "editor-viewport!",
     "editor-click",
     "editor-panes",
     "editor-focus",
@@ -736,6 +737,9 @@ impl Runtime {
                 Some(_) => self.message(if end { "End of buffer" } else { "Beginning of buffer" }),
                 None => Ok(()),
             },
+            Input::Viewport { columns, rows } => {
+                self.call("editor-viewport!", &[Arg::Session, Arg::Int(columns), Arg::Int(rows)]).map(drop)
+            }
             Input::Unsendable { keys } => self.call("editor-unsendable!", &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
             Input::Clipboard { text } => self.call("editor-clipboard!", &[Arg::Session, Arg::Str(text)]).map(drop),
@@ -1304,11 +1308,10 @@ impl Runtime {
     fn pane(&mut self, view: &Rc<RefCell<View>>, was: Option<&Pane>) -> Pane {
         let status = self.call("pane-status", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.get::<String>(&v));
         let status = part(self.noted("pane-status", status), was.map(|p| p.status.clone()), |e| format!("pane-status: {e}"));
-        let cursor = self.call("cursor-shape", &[Arg::Session, Arg::View(view.clone())]).map(|v| {
-            match v.symbol_name().as_deref() == Some("block") {
-                true => CursorShape::Block,
-                false => CursorShape::Bar,
-            }
+        let cursor = self.call("cursor-shape", &[Arg::Session, Arg::View(view.clone())]).map(|v| match v.symbol_name().as_deref() {
+            Some("block") => CursorShape::Block,
+            Some("hidden") => CursorShape::Hidden,
+            _ => CursorShape::Bar,
         });
         let cursor = part(self.noted("cursor-shape", cursor), was.map(|p| p.cursor), |_| CursorShape::Bar);
         let view_id = view.borrow().id();
@@ -1771,15 +1774,15 @@ fn face_table(v: Val<'_>) -> Result<Vec<(String, Style)>, Error> {
 /// The language is the runtime's, not a frontend's: `Display` (in the
 /// snapshot) does not carry it.
 fn display(v: Val<'_>) -> Result<(Display, Option<String>), Error> {
-    let [numbers, marker, language] = list(v)?[..] else {
-        return Err(Error::new("a display is (line-numbers eob-marker language)"));
+    let [numbers, marker, language, word_wrap] = list(v)?[..] else {
+        return Err(Error::new("a display is (line-numbers eob-marker language word-wrap)"));
     };
     let line_numbers = match name(numbers).as_deref() {
         Some("absolute") => LineNumbers::Absolute,
         Some("relative") => LineNumbers::Relative,
         _ => LineNumbers::Off,
     };
-    Ok((Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)? }, name(language)))
+    Ok((Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)?, word_wrap: !word_wrap.is_false() }, name(language)))
 }
 
 /// A view request from Lisp: `(page screens context)`, `(recenter where)`,

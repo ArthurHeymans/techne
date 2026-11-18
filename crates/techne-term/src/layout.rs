@@ -22,11 +22,12 @@ pub const TAB_STOP: usize = 8;
 pub struct Projected<'a> {
     pub inlays: &'a [Inlay],
     pub hangs: &'a [Hang],
+    pub word_wrap: bool,
 }
 
 impl<'a> Projected<'a> {
     pub fn of(p: &'a Pane) -> Projected<'a> {
-        Projected { inlays: &p.inlays, hangs: &p.hangs }
+        Projected { inlays: &p.inlays, hangs: &p.hangs, word_wrap: p.display.word_wrap }
     }
 }
 
@@ -81,10 +82,23 @@ fn cells(g: &str, col: usize, cols: usize) -> (String, usize) {
 /// Place a grapheme `g` at `pos` (an inlay's when `inlay`), wrapping
 /// before it when it does not fit, the wrapped line starting `indent`
 /// cells in.
-fn place(lines: &mut Vec<Line>, g: &str, pos: usize, len: usize, cols: usize, inlay: Option<StyleId>, (lead, indent): (usize, usize)) {
-    let used = lines.last().expect("a line").width;
+fn place(
+    lines: &mut Vec<Line>,
+    g: &str,
+    pos: usize,
+    len: usize,
+    cols: usize,
+    inlay: Option<StyleId>,
+    (lead, indent, word_wrap): (usize, usize, bool),
+) {
+    let mut used = lines.last().expect("a line").width;
     let (mut shown, mut width) = cells(g, used, cols);
     let start = if lines.len() == 1 { lead } else { indent };
+    if word_wrap && used > start && (used >= cols || used + width > cols) {
+        break_word(lines, cols, indent, width.max(1));
+        used = lines.last().expect("a line").width;
+        (shown, width) = cells(g, used, cols);
+    }
     if used > start && (used >= cols || used + width > cols) {
         lines.last_mut().expect("a line").continued = true;
         lines.push(Line { start: pos, end: pos, width: indent, continued: false, glyphs: Vec::new() });
@@ -94,6 +108,34 @@ fn place(lines: &mut Vec<Line>, g: &str, pos: usize, len: usize, cols: usize, in
     line.glyphs.push(Glyph { pos, len, col: line.width, width, shown, inlay });
     line.width += width;
     line.end = pos + len;
+}
+
+// Cell layout, hit testing and scrolling share these exact glyph positions.
+// Scheme chooses word-wrap; realizing it here avoids changing logical rows or
+// guessing native Unicode cell widths in the mail/markdown Scheme renderer.
+fn break_word(lines: &mut Vec<Line>, cols: usize, indent: usize, next_width: usize) {
+    let line = lines.last_mut().expect("a line");
+    let space = |g: &Glyph| !g.shown.is_empty() && g.shown.chars().all(|c| c == ' ' || c == '\t');
+    let Some(at) = line.glyphs.iter().rposition(space) else { return };
+    if at + 1 == line.glyphs.len() || !line.glyphs[..at].iter().any(|g| !space(g)) {
+        return;
+    }
+    let width: usize = line.glyphs[at + 1..].iter().map(|g| g.width).sum();
+    if width + next_width > cols.saturating_sub(indent) {
+        return; // oversized token: retain grapheme fallback
+    }
+    let mut tail = line.glyphs.split_off(at + 1);
+    let start = tail[0].pos;
+    line.end = start;
+    line.width = line.glyphs.last().map_or(0, |g| g.col + g.width);
+    line.continued = true;
+    let mut col = indent;
+    for glyph in &mut tail {
+        glyph.col = col;
+        col += glyph.width;
+    }
+    let end = tail.iter().map(|g| g.pos + g.len).max().unwrap_or(start);
+    lines.push(Line { start, end, width: col, continued: false, glyphs: tail });
 }
 
 /// The visual lines of a segment in `cols` cells, with the inlays in it
@@ -110,7 +152,8 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec
     // all: a later piece's lines start there.
     let lead = match hang {
         Some(at) if line < seg.start && at <= seg.start => {
-            let first = wrap(text, segment_at(text, line), cols, Projected { inlays: shown.inlays, hangs: &[] });
+            let first =
+                wrap(text, segment_at(text, line), cols, Projected { inlays: shown.inlays, hangs: &[], word_wrap: shown.word_wrap });
             first[0].glyphs.iter().find(|g| g.pos == at && g.inlay.is_none()).map(|g| g.col).filter(|&c| c < cols / 2).unwrap_or(0)
         }
         _ => 0,
@@ -124,7 +167,7 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec
     let mut inlays_before = |lines: &mut Vec<Line>, pos: usize, indent: usize| {
         while let Some(i) = inlays.next_if(|i| i.at <= pos) {
             for g in i.text.graphemes(true) {
-                place(lines, g, i.at, 0, cols, Some(i.style), (lead, indent));
+                place(lines, g, i.at, 0, cols, Some(i.style), (lead, indent, shown.word_wrap));
             }
         }
     };
@@ -133,7 +176,7 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec
         if line == seg.start && hang == Some(seg.start + i) && lines.len() == 1 && lines[0].width < cols / 2 {
             indent = lines[0].width;
         }
-        place(&mut lines, g, seg.start + i, g.len(), cols, None, (lead, indent));
+        place(&mut lines, g, seg.start + i, g.len(), cols, None, (lead, indent, shown.word_wrap));
     }
     inlays_before(&mut lines, seg.end, indent);
     let last = lines.last_mut().expect("a line");
@@ -208,6 +251,27 @@ mod tests {
     }
 
     #[test]
+    fn word_wrap_preserves_text_and_positions_and_long_tokens_fall_back() {
+        let t = Rope::from_str("alpha beta gamma");
+        let prose = Projected { word_wrap: true, ..Projected::default() };
+        let lines = wrap(&t, segment_at(&t, 0), 10, prose);
+        assert_eq!(shown(&lines), ["alpha ", "beta gamma"]);
+        assert_eq!(shown(&lines).concat(), t.to_string());
+        assert_eq!(caret(&lines, 11), Some((1, 5)));
+        assert_eq!(hit(&lines, 7, 1), Some(13));
+        assert_eq!(scroll_lines(&t, 0, 1, 10, prose), 6);
+        assert_eq!(frame(&t, 6, 1, 10, prose), lines[1..]);
+        let long = Rope::from_str("abcdefghijk z");
+        assert_eq!(shown(&wrap(&long, segment_at(&long, 0), 5, prose)), ["abcde", "fghij", "k z"]);
+        let quote = Rope::from_str("- alpha beta gamma");
+        let hangs = [Hang { line: 0, at: 2 }];
+        let lines = wrap(&quote, segment_at(&quote, 0), 10, Projected { hangs: &hangs, ..prose });
+        assert_eq!(shown(&lines), ["- alpha ", "beta ", "gamma"]);
+        assert!(lines[1..].iter().all(|l| l.glyphs[0].col == 2));
+        assert_eq!(shown(&lines).concat(), quote.to_string());
+    }
+
+    #[test]
     fn widths_tabs_and_controls() {
         let t = Rope::from_str("a\tb名\r\u{200b}e\u{301}x\u{1F600}");
         let lines = wrap(&t, segment_at(&t, 0), 80, Projected::default());
@@ -237,11 +301,11 @@ mod tests {
     fn an_inlay_wrapping_over_lines_scrolls_as_it_is_drawn() {
         let t = Rope::from_str("ab\n");
         let inlays = [Inlay { at: 1, text: "123456789012".into(), style: 1 }];
-        let lines = frame(&t, 0, 3, 4, Projected { inlays: &inlays, hangs: &[] });
+        let lines = frame(&t, 0, 3, 4, Projected { inlays: &inlays, hangs: &[], ..Projected::default() });
         let shown: Vec<String> = lines.iter().map(|l| l.glyphs.iter().map(|g| g.shown.as_str()).collect()).collect();
         assert_eq!(shown, ["a123", "4567", "8901"]);
         // "b" is on the fourth line, below: scrolled to.
-        assert!(keep_visible(&t, 0, 2, 3, 4, Projected { inlays: &inlays, hangs: &[] }).is_some());
+        assert!(keep_visible(&t, 0, 2, 3, 4, Projected { inlays: &inlays, hangs: &[], ..Projected::default() }).is_some());
     }
 
     #[test]
@@ -266,7 +330,7 @@ mod tests {
     fn a_hanging_line_wraps_under_its_hang_point() {
         let t = Rope::from_str("- one two three four five\nnext\n");
         let hangs = [Hang { line: 0, at: 2 }];
-        let lines = wrap(&t, segment_at(&t, 0), 10, Projected { inlays: &[], hangs: &hangs });
+        let lines = wrap(&t, segment_at(&t, 0), 10, Projected { inlays: &[], hangs: &hangs, ..Projected::default() });
         assert!(lines.len() > 2);
         assert!(lines[1..].iter().all(|l| l.glyphs[0].col == 2), "{lines:?}");
         // A click left of the hang point is on the line's first character.
@@ -278,7 +342,7 @@ mod tests {
     fn every_piece_of_a_long_line_hangs() {
         let t = Rope::from_str(&format!("- {}\n", "word ".repeat(2000)));
         let hangs = [Hang { line: 0, at: 2 }];
-        let shown = Projected { inlays: &[], hangs: &hangs };
+        let shown = Projected { inlays: &[], hangs: &hangs, ..Projected::default() };
         let later = segment_at(&t, 6000);
         assert!(later.start > 0, "a later piece");
         let lines = wrap(&t, later, 20, shown);
@@ -290,7 +354,7 @@ mod tests {
         let t = Rope::from_str(&format!("- {}\n", "word ".repeat(2000)));
         let hangs = [Hang { line: 0, at: 2 }];
         let inlays = [Inlay { at: 1, text: "hint".into(), style: 1 }];
-        let shown = Projected { inlays: &inlays, hangs: &hangs };
+        let shown = Projected { inlays: &inlays, hangs: &hangs, ..Projected::default() };
         let first = wrap(&t, segment_at(&t, 0), 20, shown);
         let indent = first[1].glyphs[0].col;
         assert_eq!(indent, 6, "under the first word, past the inlay");

@@ -26,6 +26,7 @@ techne-syntax = { path = "../techne-syntax" }
 tree-sitter-md = "0.5.4"
 techne-vm = { path = "../techne-vm" }
 techne-process = { path = "../techne-process" }
+techne-store = { path = "../techne-store" }
 techne-text = { path = "../techne-text" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

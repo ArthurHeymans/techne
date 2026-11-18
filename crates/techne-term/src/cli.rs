@@ -29,7 +29,7 @@ use crate::{RESTORE, SETUP, Term};
 use techne_editor::{
     attach::{Link, Target},
     host::{Event, File, Host},
-    present::Output,
+    present::{Input, Output},
     runtime::{Runtime, journal_for},
     server,
 };
@@ -268,7 +268,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
                 Msg::Resize => {
                     let (cols, rows) = size();
                     term.resize(cols, rows);
-                    vec![]
+                    vec![Input::Viewport { columns: cols, rows }]
                 }
                 Msg::Hangup => break 'run,
             };

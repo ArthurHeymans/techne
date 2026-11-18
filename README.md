@@ -7,6 +7,9 @@ later the desktop, extended and inspected in its own Lisp while it runs.
 editor, [doc/remote.md](doc/remote.md) how it reaches other machines,
 [doc/operations.md](doc/operations.md) commands, the operations they leave and recovery. [doc/manual.org](doc/manual.org) says how to use it, and the
 editor itself, under C-h, what each command, procedure and option does.
+[Native mail](doc/mail.org) reads IMAP or Maildir, caches/searches with SQLite,
+and presents messages with the markdown preview's rich reader; `M-x mail`
+opens its dashboard of groups, accounts and folders.
 
 The Lisp is meant to be a general-purpose language in its own right,
 embeddable from Rust. Its runtime is described in
@@ -33,7 +36,8 @@ other file outside its own.
 | `techne-term` | `techne term`: the editor in a terminal, in cells, with the kitty keyboard protocol where there is one |
 | `techne-lsp` | `techne lsp`: language server for other editors (Techne's own asks the running VM) |
 | `techne-process` | child processes with pipes or a pty |
-| `techne-net` | TCP listeners and connections for the Lisp |
+| `techne-net` | TCP listeners and connections, including verified TLS streams, for the Lisp |
+| `techne-store` | bounded asynchronous SQLite/FTS5 primitives; schema and application policy stay Scheme |
 | `techne-node` | `techne node`: remote evaluation and processes, sessions, nREPL server |
 | `techne-host` | serving deployments from worlds: instances started from snapshots, each request under a lifetime (doc/serverless.md) |
 | `techne-sandbox` | a worker process confining itself before it reads tenant code (namespaces, Landlock, seccomp), and the cgroups its supervisor puts workers in |

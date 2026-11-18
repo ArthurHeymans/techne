@@ -737,6 +737,21 @@ fn natives_admit_what_they_make() {
     }
 }
 
+#[test]
+fn bulk_latin1_codecs_refuse_temporary_growth_and_recover() {
+    for (name, mut vm) in vms() {
+        eval(&mut vm, "(define octets (make-bytevector 1048576 255)) (define latin (make-string 1048576 #\\ÿ))");
+        vm.full_collect();
+        vm.set_memory_limit(vm.held().total() + 2 * MB);
+        for src in ["(latin1->string octets)", "(string->latin1 latin)"] {
+            let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {src} 'made)"));
+            assert!(caught.contains("more would pass the limit"), "{name}: {src}: {caught}");
+        }
+        vm.set_memory_limit(vm.held().total() + 32 * MB);
+        assert_eq!(eval(&mut vm, "(equal? octets (string->latin1 (latin1->string octets)))"), "#t", "{name}");
+    }
+}
+
 /// An error names the values it is about briefly, however large they are
 /// or however many.
 #[test]
