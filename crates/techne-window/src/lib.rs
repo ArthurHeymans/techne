@@ -217,6 +217,7 @@ struct App {
     renderer: Option<Renderer>,
     layout: Layout,
     screen: Screen,
+    reported_viewport: Option<(usize, usize, usize)>,
     /// Mode lines and the echo area, shaped, by their text.
     labels: HashMap<String, Buffer>,
     mods: ModifiersState,
@@ -235,7 +236,6 @@ struct App {
     capture_worker: capture::Worker,
     capture_in_flight: bool,
     capture_epoch: u64,
-    reported_viewport: Option<(usize, usize)>,
 }
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
@@ -291,14 +291,16 @@ impl App {
     /// The window's size, and the screen's: text wraps inside the padding.
     fn size(&mut self) -> (f32, f32) {
         let (w, h) = self.renderer.as_ref().map_or((800.0, 600.0), |r| r.size());
-        self.screen.set_size(w - 2.0 * self.pad(), h);
-        let cells = (
-            ((w - 2.0 * self.pad()) / self.layout.char_width().max(1.0)).max(1.0) as usize,
-            (h / self.layout.line_height().max(1.0)).max(2.0) as usize,
-        );
-        if self.reported_viewport != Some(cells) {
-            self.reported_viewport = Some(cells);
-            self.send(Input::Viewport { columns: cells.0, rows: cells.1 });
+        let width = w - 2.0 * self.pad();
+        self.screen.set_size(width, h);
+        let cw = self.layout.char_width().max(1.0);
+        let lh = self.layout.line_height().max(1.0);
+        // Allow a cell of rounding at split boundaries in addition to
+        // the window's full line-height divider (not a one-cell divider).
+        let viewport = ((width / cw).max(1.0) as usize, (h / lh).max(2.0) as usize, (Screen::gap(&self.layout) / cw).ceil() as usize + 1);
+        if self.reported_viewport != Some(viewport) {
+            self.reported_viewport = Some(viewport);
+            self.send(Input::Viewport { columns: viewport.0, rows: viewport.1, split_gap: viewport.2 });
         }
         (w, h)
     }
@@ -348,6 +350,7 @@ impl App {
                 }
                 Event::Ended if self.quitting => {}
                 Event::Ended if self.host.restart() => {
+                    self.reported_viewport = None;
                     self.captures.clear();
                     self.capture_epoch += 1;
                     eprintln!("techne: the runtime stopped; a new one has the unsaved edits");
@@ -1130,6 +1133,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         renderer: None,
         layout: Layout::new(15.0, "monospace"),
         screen: Screen::default(),
+        reported_viewport: None,
         labels: HashMap::new(),
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
@@ -1143,7 +1147,6 @@ pub fn main(args: Vec<String>) -> ExitCode {
         capture_worker,
         capture_in_flight: false,
         capture_epoch: 0,
-        reported_viewport: None,
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, failed, .. } = app;

@@ -24,19 +24,22 @@
          bound-keys editor-unsendable! editor-take-violations!)
 
 (define-hook viewport-changed
-  "After frontend geometry changes: (session columns rows).
-Dimensions are text-cell estimates (exact terminal cells). Packages decide
-responsive policy in Scheme, reading viewport-columns and viewport-rows in S.")
-(define (editor-viewport! s columns rows)
-  "Record frontend COLUMNS and ROWS in S and run viewport-changed."
-  (unless (and (equal? (sget s 'viewport-columns) columns) (equal? (sget s 'viewport-rows) rows))
-    (sset! s 'viewport-columns (max 1 columns))
-    (sset! s 'viewport-rows (max 2 rows))
-    (run-hook! s 'viewport-changed columns rows)))
+  "After frontend geometry changes: (session columns rows).")
+(define (editor-viewport! s columns rows #:optional [gap 1])
+  "Record frontend COLUMNS, ROWS and split GAP in session S."
+  (let ((cols (max 1 columns)) (rows (max 2 rows)) (gap (max 1 gap)))
+    (unless (and (equal? (sget s (quote viewport-columns)) cols)
+                 (equal? (sget s (quote viewport-rows)) rows)
+                 (equal? (sget s (quote viewport-split-gap)) gap))
+      (sset! s (quote viewport-columns) cols) (sset! s (quote viewport-rows) rows)
+      (sset! s (quote viewport-split-gap) gap) (run-hook! s (quote viewport-changed) cols rows))))
 
 (define (editor-press s key)
   "Handle the key KEY in session S, as the frontend sends it."
-  (press s key))
+  (let ((input (and (not (sget s 'transient)) (buffer-input (current-buffer s)))))
+    (unless (and input
+                 (guard (e (#t (failed! s 'buffer-input e) #t)) (input s key)))
+      (press s key))))
 (define (editor-click s view pos extend)
   "Handle a click at POS in VIEW, which the frontend resolved, in S.
 With EXTEND, the click extends the selection."
@@ -186,13 +189,14 @@ what the mode line segments say of the buffer."
 
 (define (pane-display s view)
   "Return what is drawn beside VIEW's text in session S, and its syntax.
-That is (line-numbers eob-marker language word-wrap), from buffer options:
+That is (line-numbers eob-marker language word-wrap truncate-lines).
 LANGUAGE the syntax language to colour it by, or #f for none (never
 without `syntax-highlight'; the mode's `syntax-language' first, then
 the file's name)."
   (let* ((d (view-document view)) (b (document-buffer d)))
     (list (option b 'line-numbers) (option b 'eob-marker)
-          (and (option b 'syntax-highlight) (buffer-language b)) (option b 'word-wrap))))
+          (and (option b (quote syntax-highlight)) (buffer-language b))
+          (option b (quote word-wrap)) (option b (quote truncate-lines)))))
 
 (define (echo-line s)
   "Return the echo area of session S.

@@ -147,6 +147,7 @@ fn a_command_on_the_region() {
 #[test]
 fn a_minor_mode_with_a_keymap_and_a_layer() {
     let mut rt = Runtime::with_document(Document::new("a TODO\nb\nc TODO\n"), "emacs").unwrap();
+    let builtins = rt.eval("(map scope-name (scope-children %root-scope))").unwrap();
     let path = example("todo-mode.scm");
     for _ in 0..100 {
         rt.eval(&format!("(load-package 'todo {path:?})")).unwrap();
@@ -170,11 +171,7 @@ fn a_minor_mode_with_a_keymap_and_a_layer() {
     assert_eq!(rt.eval("(list (find-mode 'todo-mode) (memq 'next-todo (command-names)))").unwrap(), "(#f #f)");
     keys(&mut rt, "M-< C-c t");
     assert_eq!(rt.snapshot().pane().head(), 0);
-    assert_eq!(
-        rt.eval("(map scope-name (scope-children %root-scope))").unwrap(),
-        "(mail vc ibuffer dired compile)",
-        "only the built-in packages are left"
-    );
+    assert_eq!(rt.eval("(map scope-name (scope-children %root-scope))").unwrap(), builtins, "only the built-in packages are left");
 }
 
 /// C-x 2 and C-x 3 split the focused pane in two, as Emacs splits a

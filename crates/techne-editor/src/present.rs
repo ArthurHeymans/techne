@@ -248,6 +248,9 @@ pub struct Display {
     pub eob_marker: Option<String>,
     /// Prefer whitespace breaks; oversized tokens still wrap by grapheme.
     pub word_wrap: bool,
+    /// Keep prelaid rows on one visual line, clipping any excess.
+    #[serde(default)]
+    pub truncate_lines: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -425,7 +428,7 @@ pub struct Run {
 pub enum Input {
     /// Frontend geometry in approximate fixed-width text cells. Scheme owns
     /// responsive layout policy; native frontends only report the boundary.
-    Viewport { columns: usize, rows: usize },
+    Viewport { columns: usize, rows: usize, split_gap: usize },
     /// A key in Emacs notation (`"a"`, `"C-x"`, `"M-<"`, `"RET"`, `"<left>"`).
     Key {
         key: String,

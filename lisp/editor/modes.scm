@@ -39,7 +39,7 @@
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
-         buffer-directory)
+         buffer-directory buffer-input)
 
 ;;; Buffers
 
@@ -161,10 +161,16 @@ STATE is `chord` (the default) or `normal`."
                                (owned layer) (owned target-at) (owned complete) (owned indent) (owned directory)
                                options files))))
 
+(define %mode-inputs (make-registry 'mode-inputs))
+
+(define (buffer-input b)
+  "Return the direct key handler for buffer B, or #f."
+  (and b (any (lambda (m) (registry-ref %mode-inputs (mode-name m))) (mode-chain (buffer-mode b)))))
+
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
                         #:complete [complete #f] #:indent [indent #f] #:directory [directory #f] #:options [options '()]
-                        #:projections [projections #f])
+                        #:projections [projections #f] #:input [input #f])
   "Define the major mode NAME, documented by DOC, extending PARENT.
 It has PARENT's keys, layers and options, and its own: KEYS and NORMAL
 are (key-description command) bindings for chords and for modal normal
@@ -179,10 +185,13 @@ with its slash, for a buffer of no file (a directory's listing); OPTIONS
 an alist of (option . value) set in the mode, FILES the file name
 suffixes it is for, PROJECTIONS a procedure (document from to) giving
 how the text is laid out (`buffer-projections'). It defines the command
-NAME, which gives the focused buffer this mode."
+NAME, which gives the focused buffer this mode. INPUT is a procedure
+(session key) returning true if it handled the key before the profile."
   (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete indent directory
              options files)
   (projections! name projections)
+  ;; INPUT gets (session key) and returns true if it consumed the key.
+  (registry-add! %mode-inputs name (and input (scope-procedure input)))
   (register-command! name doc (lambda (s n)
                                 (set-buffer-mode! (or (current-buffer s) (error "No buffer")) name)
                                 (message! s (symbol->string name))))
@@ -557,6 +566,10 @@ Relative numbers count from the caret's line, which shows its own."
   "Whether terminal visual lines wrap at spaces rather than within words.
 Oversized words still wrap by grapheme. This changes layout, never source
 text, caret positions or logical rows. Rich prose enables it."
+  #:type 'boolean)
+
+(define-option truncate-lines #f
+  "Whether long lines are clipped instead of wrapped."
   #:type 'boolean)
 
 (define-option eob-marker #f

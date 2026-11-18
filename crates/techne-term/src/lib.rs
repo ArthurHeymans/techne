@@ -358,7 +358,7 @@ impl Term {
                 inputs.extend(requests.into_iter().filter_map(|(i, r)| self.resolve(i, r)));
                 if self.reported_viewport != Some((self.cols, self.rows)) {
                     self.reported_viewport = Some((self.cols, self.rows));
-                    inputs.push(Input::Viewport { columns: self.cols, rows: self.rows });
+                    inputs.push(Input::Viewport { columns: self.cols, rows: self.rows, split_gap: 1 });
                 }
                 inputs
             }

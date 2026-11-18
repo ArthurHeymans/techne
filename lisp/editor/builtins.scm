@@ -6,7 +6,7 @@
 (require "files.scm")
 (require "dispatch.scm")
 
-(define builtin-packages '(compile dired ibuffer vc markdown-preview mail)
+(define builtin-packages (quote (compile dired ibuffer vc markdown-preview mail terminal))
   "The editor's own packages, loaded at start in this order.")
 
 ;; This file, which packages/ is beside.

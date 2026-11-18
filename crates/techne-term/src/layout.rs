@@ -23,11 +23,12 @@ pub struct Projected<'a> {
     pub inlays: &'a [Inlay],
     pub hangs: &'a [Hang],
     pub word_wrap: bool,
+    pub truncate_lines: bool,
 }
 
 impl<'a> Projected<'a> {
     pub fn of(p: &'a Pane) -> Projected<'a> {
-        Projected { inlays: &p.inlays, hangs: &p.hangs, word_wrap: p.display.word_wrap }
+        Projected { inlays: &p.inlays, hangs: &p.hangs, word_wrap: p.display.word_wrap, truncate_lines: p.display.truncate_lines }
     }
 }
 
@@ -144,6 +145,7 @@ fn break_word(lines: &mut Vec<Line>, cols: usize, indent: usize, next_width: usi
 /// its hang point is at, when that is within the first half.
 pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec<Line> {
     let (inlays, cols) = (shown.inlays, cols.max(1));
+    let wrap_at = if shown.truncate_lines { usize::MAX } else { cols };
     // The hang of the line the segment is of: a later piece of a long
     // line starts under the hang point already.
     let line = text.line_to_byte(text.byte_to_line(seg.start));
@@ -152,8 +154,7 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec
     // all: a later piece's lines start there.
     let lead = match hang {
         Some(at) if line < seg.start && at <= seg.start => {
-            let first =
-                wrap(text, segment_at(text, line), cols, Projected { inlays: shown.inlays, hangs: &[], word_wrap: shown.word_wrap });
+            let first = wrap(text, segment_at(text, line), cols, Projected { hangs: &[], ..shown });
             first[0].glyphs.iter().find(|g| g.pos == at && g.inlay.is_none()).map(|g| g.col).filter(|&c| c < cols / 2).unwrap_or(0)
         }
         _ => 0,
@@ -167,7 +168,7 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec
     let mut inlays_before = |lines: &mut Vec<Line>, pos: usize, indent: usize| {
         while let Some(i) = inlays.next_if(|i| i.at <= pos) {
             for g in i.text.graphemes(true) {
-                place(lines, g, i.at, 0, cols, Some(i.style), (lead, indent, shown.word_wrap));
+                place(lines, g, i.at, 0, wrap_at, Some(i.style), (lead, indent, shown.word_wrap));
             }
         }
     };
@@ -176,14 +177,26 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec
         if line == seg.start && hang == Some(seg.start + i) && lines.len() == 1 && lines[0].width < cols / 2 {
             indent = lines[0].width;
         }
-        place(&mut lines, g, seg.start + i, g.len(), cols, None, (lead, indent, shown.word_wrap));
+        place(&mut lines, g, seg.start + i, g.len(), wrap_at, None, (lead, indent, shown.word_wrap));
     }
     inlays_before(&mut lines, seg.end, indent);
     let last = lines.last_mut().expect("a line");
     // The line's end is the text's, not past an inlay there.
     last.end = last.end.max(seg.end).min(seg.end);
     last.continued = !ends_line;
+    if shown.truncate_lines {
+        last.glyphs.retain(|g| g.col + g.width <= cols);
+        last.width = last.width.min(cols);
+    }
     lines
+}
+
+#[test]
+fn a_wider_terminal_grid_clips_instead_of_wrapping() {
+    let t = Rope::from_str(&format!("{}\nnext\n", "x".repeat(100)));
+    let lines = frame(&t, 0, 2, 80, Projected { truncate_lines: true, ..Projected::default() });
+    assert_eq!((lines[0].width, lines[0].end, lines[1].start), (80, 100, 101));
+    assert!(!lines[0].continued);
 }
 
 /// The cells a line of text takes.
@@ -301,11 +314,11 @@ mod tests {
     fn an_inlay_wrapping_over_lines_scrolls_as_it_is_drawn() {
         let t = Rope::from_str("ab\n");
         let inlays = [Inlay { at: 1, text: "123456789012".into(), style: 1 }];
-        let lines = frame(&t, 0, 3, 4, Projected { inlays: &inlays, hangs: &[], ..Projected::default() });
+        let lines = frame(&t, 0, 3, 4, Projected { inlays: &inlays, ..Projected::default() });
         let shown: Vec<String> = lines.iter().map(|l| l.glyphs.iter().map(|g| g.shown.as_str()).collect()).collect();
         assert_eq!(shown, ["a123", "4567", "8901"]);
         // "b" is on the fourth line, below: scrolled to.
-        assert!(keep_visible(&t, 0, 2, 3, 4, Projected { inlays: &inlays, hangs: &[], ..Projected::default() }).is_some());
+        assert!(keep_visible(&t, 0, 2, 3, 4, Projected { inlays: &inlays, ..Projected::default() }).is_some());
     }
 
     #[test]
@@ -330,7 +343,7 @@ mod tests {
     fn a_hanging_line_wraps_under_its_hang_point() {
         let t = Rope::from_str("- one two three four five\nnext\n");
         let hangs = [Hang { line: 0, at: 2 }];
-        let lines = wrap(&t, segment_at(&t, 0), 10, Projected { inlays: &[], hangs: &hangs, ..Projected::default() });
+        let lines = wrap(&t, segment_at(&t, 0), 10, Projected { hangs: &hangs, ..Projected::default() });
         assert!(lines.len() > 2);
         assert!(lines[1..].iter().all(|l| l.glyphs[0].col == 2), "{lines:?}");
         // A click left of the hang point is on the line's first character.
@@ -342,7 +355,7 @@ mod tests {
     fn every_piece_of_a_long_line_hangs() {
         let t = Rope::from_str(&format!("- {}\n", "word ".repeat(2000)));
         let hangs = [Hang { line: 0, at: 2 }];
-        let shown = Projected { inlays: &[], hangs: &hangs, ..Projected::default() };
+        let shown = Projected { hangs: &hangs, ..Projected::default() };
         let later = segment_at(&t, 6000);
         assert!(later.start > 0, "a later piece");
         let lines = wrap(&t, later, 20, shown);

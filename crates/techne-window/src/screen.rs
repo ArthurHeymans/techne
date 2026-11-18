@@ -54,6 +54,7 @@ fn shape_runs(s: &Snapshot, p: &Pane) -> (Shape, Vec<ShapeRun>) {
 /// counting (scrolling, the caret) and drawing shape it alike.
 fn prepare(layout: &mut Layout, s: &Snapshot, p: &Pane, area: Area) {
     layout.set_width(area.text_width());
+    layout.set_truncate_lines(p.display.truncate_lines);
     layout.set_inlays(&p.inlays, |id| inlay_shape(Some(s), id));
     let (base, runs) = shape_runs(s, p);
     layout.set_shape(base, runs);

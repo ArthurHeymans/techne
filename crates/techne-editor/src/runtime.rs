@@ -455,7 +455,7 @@ pub(crate) fn weight(input: &Input) -> usize {
                 keys.capacity() * std::mem::size_of::<String>() + keys.iter().map(String::capacity).sum::<usize>()
             }
             Input::Unrecognized { input: text } | Input::Clipboard { text } => text.capacity(),
-            Input::Viewport { .. } | Input::Click { .. } | Input::Scroll { .. } | Input::Edge { .. } | Input::Close => 0,
+            Input::Click { .. } | Input::Scroll { .. } | Input::Edge { .. } | Input::Viewport { .. } | Input::Close => 0,
         }
 }
 
@@ -737,12 +737,12 @@ impl Runtime {
                 Some(_) => self.message(if end { "End of buffer" } else { "Beginning of buffer" }),
                 None => Ok(()),
             },
-            Input::Viewport { columns, rows } => {
-                self.call("editor-viewport!", &[Arg::Session, Arg::Int(columns), Arg::Int(rows)]).map(drop)
-            }
             Input::Unsendable { keys } => self.call("editor-unsendable!", &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
             Input::Clipboard { text } => self.call("editor-clipboard!", &[Arg::Session, Arg::Str(text)]).map(drop),
+            Input::Viewport { columns, rows, split_gap } => {
+                self.call("editor-viewport!", &[Arg::Session, Arg::Int(columns), Arg::Int(rows), Arg::Int(split_gap)]).map(drop)
+            }
             Input::Close => Ok(()),
         }
     }
@@ -1769,20 +1769,23 @@ fn face_table(v: Val<'_>) -> Result<Vec<(String, Style)>, Error> {
 }
 
 /// A pane's display options and syntax language from Lisp:
-/// `(line-numbers eob-marker language)`, the first #f, `absolute` or
-/// `relative`, the second a string or #f, the third a symbol or #f.
+/// `(line-numbers eob-marker language truncate-lines)`.
 /// The language is the runtime's, not a frontend's: `Display` (in the
 /// snapshot) does not carry it.
 fn display(v: Val<'_>) -> Result<(Display, Option<String>), Error> {
-    let [numbers, marker, language, word_wrap] = list(v)?[..] else {
-        return Err(Error::new("a display is (line-numbers eob-marker language word-wrap)"));
+    let fields = list(v)?;
+    let (numbers, marker, language, word_wrap, truncate_lines) = match fields.as_slice() {
+        [n, m, l, w, t] => (*n, *m, *l, !w.is_false(), !t.is_false()),
+        [n, m, l, w] => (*n, *m, *l, !w.is_false(), false),
+        [n, m, l] => (*n, *m, *l, false, false),
+        _ => return Err(Error::new("expected (line-numbers eob-marker language [word-wrap [truncate-lines]])")),
     };
     let line_numbers = match name(numbers).as_deref() {
         Some("absolute") => LineNumbers::Absolute,
         Some("relative") => LineNumbers::Relative,
         _ => LineNumbers::Off,
     };
-    Ok((Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)?, word_wrap: !word_wrap.is_false() }, name(language)))
+    Ok((Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)?, word_wrap, truncate_lines }, name(language)))
 }
 
 /// A view request from Lisp: `(page screens context)`, `(recenter where)`,

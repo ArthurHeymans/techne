@@ -223,6 +223,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
 
     let (cols, rows) = size();
     let mut term = Term::new(cols, rows);
+    host.send(Input::Viewport { columns: cols, rows, split_gap: 1 });
     term.read_clipboard_with(paste);
     let mut failed = None;
     'run: loop {
@@ -263,12 +264,13 @@ pub fn main(args: Vec<String>) -> ExitCode {
                         break 'run;
                     }
                     term.restarted();
-                    vec![]
+                    let (cols, rows) = size();
+                    vec![Input::Viewport { columns: cols, rows, split_gap: 1 }]
                 }
                 Msg::Resize => {
                     let (cols, rows) = size();
                     term.resize(cols, rows);
-                    vec![Input::Viewport { columns: cols, rows }]
+                    vec![Input::Viewport { columns: cols, rows, split_gap: 1 }]
                 }
                 Msg::Hangup => break 'run,
             };

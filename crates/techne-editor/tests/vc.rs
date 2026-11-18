@@ -106,6 +106,8 @@ fn a_status_view_from_a_process() {
 #[test]
 fn reloading_while_a_refresh_is_in_flight() {
     let (_dir, _state, root, mut rt) = repository();
+    let scopes = "(sort (map (lambda (s) (symbol->string (scope-name s))) (scope-children %root-scope)) string<?)";
+    let builtins = rt.eval(scopes).unwrap();
     let path = lisp_dir().join("packages/vc.scm").display().to_string();
     keys(&mut rt, "C-x v d");
     until(&mut rt, "the status", |s| text(s).contains("a.txt"));
@@ -130,11 +132,7 @@ fn reloading_while_a_refresh_is_in_flight() {
     let live =
         "(length (filter (lambda (r) (guard (e (#t #f)) (not (task-done? r)))) (scope-resources (package-scope (find-package 'vc)))))";
     assert_eq!(rt.eval(live).unwrap(), "1", "the package runs its timer, nothing more");
-    assert_eq!(
-        rt.eval("(map scope-name (scope-children %root-scope))").unwrap(),
-        "(vc mail ibuffer dired compile)",
-        "the old generation is gone"
-    );
+    assert_eq!(rt.eval(scopes).unwrap(), builtins, "the old generation is gone");
     // Unloaded, its keys and commands go; the buffer stays, inert.
     rt.eval("(unload-package 'vc)").unwrap();
     assert_eq!(rt.eval("(memq 'vc-status (command-names))").unwrap(), "#f");
