@@ -725,7 +725,7 @@ fn ordinary_quoted_and_encoded_reply_names_reach_envelope_confirmation() {
 }
 
 #[test]
-fn trusted_configuration_can_be_loaded_through_the_file_prompt() {
+fn mail_accounts_can_be_configured_with_eval_buffer() {
     let (dir, mut rt) = editor();
     let config = dir.path().join("mail-config.scm");
     std::fs::write(
@@ -733,11 +733,28 @@ fn trusted_configuration_can_be_loaded_through_the_file_prompt() {
         "(import (techne editor)) (set-option! 'mail-accounts '(((id . \"loaded-fixture\") (kind . maildir) (path . \"/not-used\"))))",
     )
     .unwrap();
-    command(&mut rt, "mail-load-config");
+    command(&mut rt, "find-file");
     key(&mut rt, "C-a");
     key(&mut rt, "C-k");
     enter(&mut rt, &config.display().to_string());
-    assert!(rt.eval("(option #f 'mail-accounts)").unwrap().contains("loaded-fixture"));
+    command(&mut rt, "eval-buffer");
+    pump_until(&mut rt, |rt| rt.eval("(option #f 'mail-accounts)").unwrap().contains("loaded-fixture"));
+}
+
+#[test]
+fn unconfigured_mail_stays_on_the_dashboard_and_uses_normal_mode_help() {
+    let (_dir, mut rt) = editor();
+    rt.eval("(set-option! 'mail-database \":memory:\")").unwrap();
+    command(&mut rt, "mail");
+    assert!(pane(&mut rt, 0).contains("No accounts yet"));
+    key(&mut rt, "g");
+    assert!(rt.snapshot().echo.contains("Set mail-accounts"));
+    assert!(pane(&mut rt, 0).contains("No accounts yet"));
+    key(&mut rt, "C-h m");
+    let snapshot = rt.snapshot();
+    let help = snapshot.pane().text.to_string();
+    assert!(help.contains("mail-dashboard-mode"), "{}\n{help}", snapshot.echo);
+    assert!(help.contains("mail-sync"), "{help}");
 }
 
 #[test]

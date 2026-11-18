@@ -22,8 +22,8 @@ No password is read in the visible minibuffer."
   #:type 'any)
 (define-option mail-database #f
   "Local mail SQLite file, or #f for the XDG data directory.
-The default is XDG_DATA_HOME/techne/mail/cache.sqlite. It contains private
-message bodies and drafts. Keep its directory private."
+The default is XDG_DATA_HOME/techne/mail/cache.sqlite. Set this before
+opening mail in a new runtime. This file holds private messages and drafts."
   #:type 'any)
 (define-option mail-prefer-html #t
   "Whether messages with HTML use the private rich reader by default.
@@ -111,7 +111,7 @@ configuration."
 (define (account-by-id id) (find (lambda (a) (equal? (mail-ref a 'id) id)) (configured-accounts)))
 (define (secret account purpose)
   (let ((provider (option #f 'mail-credential-provider)))
-    (unless (procedure? provider) (error "Configure mail-credential-provider; see M-x mail-setup"))
+    (unless (procedure? provider) (error "Set mail-credential-provider in your Scheme configuration"))
     (let ((value (provider account purpose)))
       (unless (string? value) (error "The mail credential provider returned no secret")) value)))
 (define (selected-message s)
@@ -241,8 +241,8 @@ configuration."
                                             (caught-up? "Nothing is unread. q goes back to the dashboard.")
                                             (cached? "q goes back to the dashboard of views and folders.")
                                             (else "Configure mail-accounts, then g fetches mail.")))
-                 (row #:key "empty-action" #:target (target 'mail-control (cond (caught-up? '(all)) (cached? '(dashboard)) (else '(setup))))
-                      (list (list (cond (caught-up? "Browse all mail →") (cached? "Mail dashboard →") (else "Set up mail →")) 'link)))))
+                  (row #:key "empty-action" #:target (target 'mail-control (if caught-up? '(all) '(dashboard)))
+                       (list (list (if caught-up? "Browse all mail →" "Mail dashboard →") 'link)))))
          (map
           (lambda (m)
             (let* ((id (mail-ref m 'id)) (key (number->string id))
@@ -287,7 +287,7 @@ mu4e, then x does it: r archive, d delete, ! read, ? unread, + star,
 a undoes, until mbsync runs. c marks all of the group read. / searches,
 G selects a group, g fetches mail and makes the list again, C composes,
 R replies. A Maildir message's flags and folder are changed at the
-source, as mu4e changes them. h shows all mail commands."
+source, as mu4e changes them."
   #:parent 'listing-mode
   #:layer summary-layer
   #:options '((line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
@@ -296,13 +296,13 @@ source, as mu4e changes them. h shows all mail commands."
            ("g" mail-sync) ("e" mail-sync-status) ("c" mail-catch-up) ("C" mail-compose) ("D" mail-drafts) ("f" mail-toggle-layout) ("R" mail-reply)
            ("r" mail-mark-archive) ("!" mail-mark-read) ("?" mail-mark-unread) ("+" mail-mark-star) ("-" mail-mark-unstar)
            ("x" mail-execute) ("d" mail-mark-delete) ("S" mail-star) ("A" mail-archive) ("%" mail-mark-pattern) ("T" mail-mark-thread)
-           ("a" mail-undo) ("q" mail-dashboard) ("h" mail-help) ("C-c C-l" mail-clear-search) ("C-c C-k" mail-cancel-sync))
+           ("a" mail-undo) ("q" mail-dashboard) ("C-c C-l" mail-clear-search) ("C-c C-k" mail-cancel-sync))
   #:normal '(("j" mail-next) ("k" mail-previous) ("n" mail-next) ("p" mail-previous)
              ("C-n" mail-next) ("C-p" mail-previous) ("<down>" mail-next) ("<up>" mail-previous) ("RET" mail-read)
              ("/" mail-search) ("G" mail-groups) ("g r" mail-sync) ("c" mail-catch-up) ("C" mail-compose) ("R" mail-reply)
              ("r" mail-mark-archive) ("!" mail-mark-read) ("?" mail-mark-unread) ("+" mail-mark-star) ("-" mail-mark-unstar)
              ("x" mail-execute) ("d" mail-mark-delete) ("S" mail-star) ("A" mail-archive) ("%" mail-mark-pattern) ("T" mail-mark-thread)
-             ("a" mail-undo) ("q" mail-dashboard) ("f" mail-toggle-layout) ("D" mail-drafts) ("h" mail-help)))
+             ("a" mail-undo) ("q" mail-dashboard) ("f" mail-toggle-layout) ("D" mail-drafts)))
 
 (define-mode mail-message-mode
   "Private rich email reader. n/p read adjacent messages; R replies.
@@ -318,12 +318,12 @@ x does it, at the source, as in the list."
            ("TAB" mail-toggle-quotes) ("H" mail-toggle-details) ("s" mail-source) ("b" mail-back) ("q" mail-close-reader)
            ("r" mail-mark-archive) ("!" mail-mark-read) ("?" mail-mark-unread) ("+" mail-mark-star) ("-" mail-mark-unstar)
            ("u" mail-unmark) ("x" mail-execute) ("d" mail-mark-delete) ("S" mail-star) ("A" mail-archive) ("a" mail-undo)
-           ("/" mail-search) ("G" mail-groups) ("e" mail-sync-status) ("f" mail-toggle-layout) ("D" mail-drafts) ("h" mail-help) ("SPC" scroll-up-command))
+           ("/" mail-search) ("G" mail-groups) ("e" mail-sync-status) ("f" mail-toggle-layout) ("D" mail-drafts) ("SPC" scroll-up-command))
   #:normal '(("n" mail-next) ("p" mail-previous) ("R" mail-reply) ("v" mail-toggle-body)
              ("TAB" mail-toggle-quotes) ("H" mail-toggle-details) ("s" mail-source) ("b" mail-back) ("q" mail-close-reader)
              ("r" mail-mark-archive) ("!" mail-mark-read) ("?" mail-mark-unread) ("+" mail-mark-star) ("-" mail-mark-unstar)
              ("u" mail-unmark) ("x" mail-execute) ("d" mail-mark-delete) ("S" mail-star) ("A" mail-archive) ("a" mail-undo)
-             ("f" mail-toggle-layout) ("D" mail-drafts) ("h" mail-help)))
+             ("f" mail-toggle-layout) ("D" mail-drafts)))
 
 (define (plain-rich text quotes?)
   ;; Literal plain text, not Markdown. Consecutive quoted lines fold as a unit.
@@ -431,8 +431,7 @@ x does it, at the source, as in the list."
               (list 'paragraph (mail-link 'dashboard "Views, accounts and folders →"))
               (list 'paragraph (mail-link 'sync-status "Sync status →")))
         (list '(heading 1 "No mail yet")
-              '(paragraph "Configure your IMAP accounts and Maildirs in mail-accounts, then g fetches mail. Nothing is fetched until you ask, and nothing is sent without confirmation.")
-              (list 'paragraph (mail-link 'setup "How to set up accounts →"))))))
+              '(paragraph "Set mail-accounts in your Scheme configuration, then g fetches mail. See doc/mail.org for examples. Nothing is fetched until you ask, and nothing is sent without confirmation.")))))
 
 (define (reader! s)
   (let* ((st (mail-state s)) (b (reader-buffer! st))
@@ -589,7 +588,7 @@ x does it, at the source, as in the list."
   (lambda (b)
     (case (buffer-mode b)
       ((mail-dashboard-mode) "RET open · i u a views · / search · g fetch · C compose · q quit")
-      ((mail-summary-mode) "RET read · r d ! ? + mark · % T several · x do · c all read · q dashboard · h help")
+      ((mail-summary-mode) "RET read · r d ! ? + mark · % T several · x do · c all read · q dashboard")
       ((mail-drafts-mode) "RET open · d flag · x delete · C compose · q dashboard")
       ((mail-message-mode) "n/p next · R reply · r archive · x do · b back")
       ((mail-compose-mode)
@@ -604,8 +603,8 @@ x does it, at the source, as in the list."
 (define-command (mail s n)
   "Open mail at its dashboard: views, then each account and its folders.
 RET on one lists its messages; RET on a message opens it in a private
-rich reader below or beside the list. \\[mail-setup] explains how to
-configure accounts."
+rich reader below or beside the list. Set `mail-accounts` in your Scheme
+configuration; see doc/mail.org for examples."
   (database!) (show-dashboard! s))
 
 (define (open-view! s view #:query [query ""])
@@ -626,7 +625,7 @@ n/p select a row and RET opens it: a group or folder as a list of its
 messages above the reader. i, u, s and a open Inbox, Unread, Starred
 and All mail. TAB folds an account's folders; c marks all of
 the selected row's mail read. / searches all mail, g fetches mail, C
-composes, D resumes a draft, h shows the keys, q leaves mail."
+composes, D opens the drafts, and q leaves mail."
   #:parent 'listing-mode
   #:layer (lambda (d from to) (dashboard-layer d))
   #:options '((line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
@@ -635,14 +634,14 @@ composes, D resumes a draft, h shows the keys, q leaves mail."
            ("SPC" mail-dashboard-next) ("RET" mail-dashboard-open) ("TAB" mail-dashboard-fold)
            ("i" mail-inbox) ("u" mail-unread) ("s" mail-starred) ("a" mail-all)
            ("/" mail-search) ("G" mail-groups) ("g" mail-sync) ("e" mail-sync-status) ("c" mail-catch-up)
-           ("C" mail-compose) ("D" mail-drafts) ("h" mail-help) ("q" mail-quit) ("C-c C-k" mail-cancel-sync)
+           ("C" mail-compose) ("D" mail-drafts) ("q" mail-quit) ("C-c C-k" mail-cancel-sync)
            ("C-/" mail-undo) ("C-_" mail-undo))
   #:normal '(("j" mail-dashboard-next) ("k" mail-dashboard-previous) ("n" mail-dashboard-next) ("p" mail-dashboard-previous)
              ("C-n" mail-dashboard-next) ("C-p" mail-dashboard-previous) ("<down>" mail-dashboard-next) ("<up>" mail-dashboard-previous)
              ("RET" mail-dashboard-open) ("TAB" mail-dashboard-fold)
              ("i" mail-inbox) ("u" mail-unread) ("s" mail-starred) ("a" mail-all)
              ("/" mail-search) ("G" mail-groups) ("g r" mail-sync) ("e" mail-sync-status) ("c" mail-catch-up)
-             ("C" mail-compose) ("D" mail-drafts) ("h" mail-help) ("q" mail-quit)))
+             ("C" mail-compose) ("D" mail-drafts) ("q" mail-quit)))
 
 (define (overview)
   ;; (ID FOLDER ...) for every account: configured ones in the order of
@@ -714,8 +713,7 @@ composes, D resumes a draft, h shows the keys, q leaves mail."
                   (row #:key "gap-2" "")
                   (heading "accounts" "Accounts" #:counts? #t))
             (if (null? accounts)
-                (list (line "setup" (target 'mail-control '(setup)) "" "No accounts yet: how to set one up" 0 #f
-                            "mail-accounts in your configuration"))
+                (list (row #:key "no-accounts" (list (list "  No accounts yet. Set mail-accounts in your Scheme configuration." (quote mail.preview)))))
                 (append-map
                  (lambda (account)
                    (let* ((id (car account)) (cached (cdr account)) (open? (not (member id folded))))
@@ -738,8 +736,6 @@ composes, D resumes a draft, h shows the keys, q leaves mail."
 
                   (line "sync" (target 'mail-control '(sync)) "g" "Fetch mail" 0 #f
                         (if %sync-task "running · C-c C-k cancels" #f))
-                  (line "help" (target 'mail-control '(help)) "h" "Keys and search syntax" 0 #f #f)
-                  (line "setup-accounts" (target 'mail-control '(setup)) "" "Set up accounts" 0 #f #f)
                   (line "quit" (target 'mail-control '(quit)) "q" "Leave mail" 0 #f #f)))))
       (put! st 'dash-keys (reverse keys))
       rows)))
@@ -977,10 +973,11 @@ From what the dashboard showed (help, a draft), return to the dashboard."
     (when before (set-session-panes! s (car before) (caddr before)) (set-session-tree! s (cadr before)) (put! st 'before #f))))
 
 (define-command (mail-search s n)
-  "Search cached mail. Use from:, subject:, in:, account: and is:unread.
-Ordinary words match sender, subject and body literally. Search is offline.
-From the dashboard, or outside mail, all mail is searched; from a list,
-what it lists."
+  "Search cached mail. Use from:, subject:, in:, account: and is:unread,
+is:read or is:starred. Bare words search sender, subject and body; field
+filters match literal substrings. All terms must match. For example, use
+from:ada subject:release is:unread. From a mail list, search within that
+list; from the dashboard or outside mail, search all cached mail."
   (let* ((st (mail-state s))
          (within? (mail-mode? (current-buffer s) '(mail-summary-mode mail-message-mode)))
          (view (if within? (view-of st) '(all #f #f))))
@@ -1438,7 +1435,7 @@ Invalid UTF-8 bytes display as replacements; original octets remain in SQLite."
         ((fetch) "Check server connectivity and message limits; g resumes after cached UIDs.")
         ((maildir) "Check that the Maildir path exists and cur/new files are readable; retry after concurrent moves.")
         ((cache) "Check cache permissions/free space and the 16 MiB MIME limit; already-cached messages are safe.")
-        (else "Check the account alist in M-x mail-setup.")))
+        (else "Check the account alist in mail-accounts; see doc/mail.org.")))
 (define-command (mail-sync s n)
   "Fetch configured IMAP or Maildir accounts into the local cache.
 Runs in a task. IMAP uses BODY.PEEK; source flags and messages stay untouched.
@@ -1447,7 +1444,7 @@ configured, a folder no longer read and a Maildir message whose file is
 gone are removed from it, with their local state; drafts stay."
   (cond (%sync-task (message! s "Mail sync is already running"))
         ((not (list? (option #f 'mail-accounts))) (error "mail-accounts must be a list of account alists"))
-        ((null? (option #f 'mail-accounts)) (mail-setup s 1))
+        ((null? (option #f (quote mail-accounts))) (message! s "No mail accounts. Set mail-accounts; see doc/mail.org."))
         (else
          (database!)
          (set! %sync-imported 0) (set! %sync-removed 0) (set! %sync-issues '()) (set! %sync-large '())
@@ -1720,7 +1717,7 @@ complete, after two characters or with \\[completion-at-point]."
   ;; first, so RET takes it.
   (let* ((accounts (configured-accounts)) (here (context-account s))
          (ordered (if here (cons here (remove (lambda (a) (eq? a here)) accounts)) accounts)))
-    (cond ((null? accounts) (error "Configure an account first: M-x mail-setup"))
+    (cond ((null? accounts) (error "Set mail-accounts in your Scheme configuration first"))
           ((null? (cdr accounts)) (accept (car accounts)))
           (else (completing-read s "From account: "
                                  (map (lambda (a) (candidate (mail-ref a 'id) #:annotation (default-from a)
@@ -1830,10 +1827,10 @@ another; q goes back to the dashboard. Nothing is sent from here."
   #:options '((line-numbers . #f) (eob-marker . "") (cursor-visible . #f))
   #:keys '(("n" mail-drafts-next) ("p" mail-drafts-previous) ("j" mail-drafts-next) ("k" mail-drafts-previous)
            ("C-n" mail-drafts-next) ("C-p" mail-drafts-previous) ("<down>" mail-drafts-next) ("<up>" mail-drafts-previous)
-           ("RET" mail-drafts-open) ("x" mail-drafts-execute) ("C" mail-compose) ("g" mail-drafts) ("q" mail-dashboard) ("h" mail-help))
+           ("RET" mail-drafts-open) ("x" mail-drafts-execute) ("C" mail-compose) ("g" mail-drafts) ("q" mail-dashboard))
   #:normal '(("j" mail-drafts-next) ("k" mail-drafts-previous) ("n" mail-drafts-next) ("p" mail-drafts-previous)
              ("C-n" mail-drafts-next) ("C-p" mail-drafts-previous) ("<down>" mail-drafts-next) ("<up>" mail-drafts-previous)
-             ("RET" mail-drafts-open) ("x" mail-drafts-execute) ("C" mail-compose) ("g r" mail-drafts) ("q" mail-dashboard) ("h" mail-help)))
+             ("RET" mail-drafts-open) ("x" mail-drafts-execute) ("C" mail-compose) ("g r" mail-drafts) ("q" mail-dashboard)))
 
 (define (draft-label ms)
   ;; When a draft was last written: a clock today, else a date; blank
@@ -2023,7 +2020,7 @@ automatically retried; check the server's Sent mail before sending again."
     (when (get st 'uncertain?) (error "Delivery is uncertain; inspect it and use C-c C-r after checking server delivery"))
     (unless (equal? (mail-store-draft-state db id) "draft") (error "Durable delivery state blocks another send; inspect saved drafts"))
     (unless (and (pair? recipients) (not (string=? subject ""))) (error "Provide recipients and a subject first"))
-    (unless (mail-ref a 'smtp-host) (error "Configure smtp-host for this account; see M-x mail-setup"))
+    (unless (mail-ref a 'smtp-host) (error "Set smtp-host for this account in mail-accounts"))
     (let ((raw (mail-compose-message from to subject (or (mail-text parsed) "") #:cc cc
                                      #:reply-to (get st 'reply (mail-header parsed "in-reply-to"))
                                      #:references (get st 'references (mail-header parsed "references")))))
@@ -2076,10 +2073,9 @@ automatically retried; check the server's Sent mail before sending again."
       ((source) (mail-source s 1)) ((back) (mail-back s 1)) ((groups) (mail-groups s 1))
       ((all) (open-view! s '(all #f #f))) ((dashboard) (mail-dashboard s 1))
       ((sync-status) (mail-sync-status s 1)) ((cancel-sync) (mail-cancel-sync s 1))
-      ((config) (mail-load-config s 1)) ((details) (mail-toggle-details s 1))
-      ((quotes) (mail-toggle-quotes s 1)) ((setup) (mail-setup s 1))
+      ((details) (mail-toggle-details s 1)) ((quotes) (mail-toggle-quotes s 1))
       ((search) (mail-search s 1)) ((compose) (mail-compose s 1)) ((drafts) (mail-drafts s 1))
-      ((sync) (mail-sync s 1)) ((help) (mail-help s 1)) ((quit) (mail-quit s 1))
+      ((sync) (mail-sync s 1)) ((quit) (mail-quit s 1))
       ((attachment)
        (let* ((m (selected-message s)) (attachments (mail-attachments (mail-parse (mail-ref m 'raw))))
               (a (list-ref attachments (cadr args)))
@@ -2089,118 +2085,3 @@ automatically retried; check the server's Sent mail before sending again."
                            (when (file-exists? path) (error "Refusing to overwrite an existing file"))
                            (call-with-port (open-binary-output-file path) (lambda (p) (write-bytevector (mail-ref a 'bytes) p)))
                            (message! s (string-append "Saved attachment: " path)))))))))
-
-(define-command (mail-help s n)
-  "Show mail's keys, search syntax and what stays local."
-  (define (keys . pairs)
-    ;; One key and what it does per row.
-    (cons 'paragraph
-          (mail-append-map (lambda (pair i)
-                             (append (if (= i 0) '() (list '(hard-break)))
-                                     (list (list 'code (car pair)) "   " (cadr pair))))
-                           pairs (iota (length pairs)))))
-  (let ((b (make-rich-buffer! "*mail help*" #:mode 'mail-info-mode)))
-    (rich-present! b
-     (list '(heading 1 "Mail")
-           '(heading 2 "Dashboard")
-           '(paragraph "M-x mail starts here, as mu4e's main view or Gnus's group buffer do: the groups across accounts, then each account and its folders with how much is unread, then what there is to do. A list's q comes back here.")
-           (keys '("RET" "List the selected group, account or folder, above the reader")
-                 '("i  u  s  a" "Inbox, Unread, Starred, All mail")
-                 '("TAB" "Show or hide an account's folders")
-                 '("c" "Mark all of the selected group or folder read")
-                 '("g" "Fetch mail: every account's Inbox first, then the other folders")
-                 '("q" "Leave mail"))
-           '(heading 2 "Read")
-           (keys '("RET" "Open the message")
-                 '("n  p" "Next and previous, through a conversation's replies in order")
-                 '("SPC" "Page the reader")
-                 '("b" "Back to the list")
-                 '("f" "Give this pane the whole frame, or split again")
-                 '("q" "Back to the dashboard"))
-           '(heading 2 "Triage")
-           '(paragraph "Mark messages, then do it all at once, as in mu4e. A message read stays on its row until the list is made again (g, G or a search).")
-           (keys '("r" "Mark to archive: out of the Inbox (Gmail), or to the account's archive folder")
-                 '("d" "Mark to delete: to the account's trash")
-                 '("!  ?" "Mark to make read, or unread")
-                 '("+  -" "Mark to star, or to remove the star")
-                 '("m" "Mark several rows, then one of the keys above for them all")
-                 '("%" "Mark the rows a search finds (from:github), as mu4e's %")
-                 '("T" "Mark this row's whole conversation, as mu4e's T")
-                 '("u  U" "Unmark this message, or all")
-                 '("x" "Do what is marked")
-                 '("c" "Mark all of this group, folder or search read now, and go back to the dashboard (Gnus's catch-up)")
-                 '("a" "Undo that, or the last message read")
-                 '("A  S" "Archive or star now, without marking"))
-
-           '(heading 2 "Find")
-           (keys '("/" "Search") '("C-c C-l" "Clear the search") '("G" "Go to a group, an account or a folder by name"))
-           '(code-block "" "from:ada subject:release is:unread" "in:INBOX account:work design" "is:starred")
-           '(paragraph "Words search sender, subject and body; field filters match literal substrings, and all must match. In a list, the search is within what it lists; on the dashboard, all mail. Up to 500 messages are listed.")
-           '(heading 2 "Write")
-           (keys '("C" "Compose") '("R" "Reply") '("C-c C-c" "Confirm and send")
-                 '("C-c C-d" "Keep the draft for later and go back") '("C-c C-k" "Discard the draft")
-                 '("D" "The drafts, as a mailbox: RET opens one, d flags it and x deletes"))
-           '(heading 2 "In a message")
-           (keys '("q" "Close the reader; the list has the frame until RET")
-                 '("v" "HTML or plain text") '("TAB" "Show or fold quoted text") '("H" "Recipients, account and the whole conversation")
-                 '("s" "MIME source") '("RET" "On an attachment, save it"))
-           '(heading 2 "Sync")
-           (keys '("g" "Fetch new mail and make the list again") '("e" "Progress and problems") '("C-c C-k" "Cancel") '("h" "This page"))
-           '(heading 2 "What changes your mail")
-           '(paragraph "As in mu4e, a Maildir message is renamed, never written: read and star are its S and F flags, archive gives its Inbox copy the T flag (Gmail) or moves it to the account's archive folder, delete moves it to the trash or, in Gmail, gives every copy T. mbsync then carries that to the server. Until mbsync runs, a undoes it. Remote images and scripts never load. Sending asks first, and an uncertain delivery is never retried on its own.")
-           '(paragraph "Accounts use password authentication over verified TLS. Implicit TLS is the default; STARTTLS is opt-in. OAuth and Sent-folder copies are not implemented.")
-           '(paragraph "The reader is below the list; M-x mail-toggle-reader-position puts it beside, and the option mail-reader-position keeps your choice.")))
-    (show-aside! s b)))
-
-(define-command (mail-load-config s n)
-  "Load an explicitly chosen, trusted Scheme mail configuration file.
-The file imports (techne editor) and sets account/credential options. Nothing
-is fetched automatically. A changed cache path closes the idle old cache."
-  (when (or %sync-task (> %deliveries 0)
-            (any (lambda (b) (eq? (buffer-mode b) 'mail-compose-mode)) (buffer-list)))
-    (error "Finish background mail work and close saved draft buffers before loading configuration"))
-  (read-file-name s "Load trusted mail configuration: " (default-directory s)
-    (lambda (s path)
-      (let ((before (option #f 'mail-database)))
-        (load-package 'mail-user-config path)
-        (unless (equal? before (option #f 'mail-database))
-          (when %db (mail-store-close %db)) (set! %db #f)
-          (set! %last-change #f) (set! %last-before '())
-          (put! (mail-state s) 'selected #f) (put! (mail-state s) 'reader-id #f))
-        (message! s "Mail configuration loaded · M-x mail opens the cache; g explicitly syncs")))))
-
-(define-command (mail-setup s n)
-  "Show native IMAP, Maildir, credentials and SMTP configuration."
-  (let ((b (make-rich-buffer! "*mail setup*" #:mode 'mail-info-mode)))
-    (rich-present! b
-     (list '(heading 1 "Set up mail")
-           '(paragraph "Connect directly to IMAP, or read the Maildirs mbsync or offlineimap keep. SQLite keeps an offline cache, reading state and drafts. No mu, external IMAP fetcher or mail server library is needed.")
-           '(heading 2 "Configure accounts in Scheme")
-           '(paragraph "Save the example in a .scm file, then load it explicitly below. You can also open the file and use M-x eval-buffer. Configuration is trusted code, not automatically discovered or executed.")
-           (list 'paragraph (mail-link 'config "Load a trusted configuration file →"))
-           '(code-block "scheme"
-                        "(import (techne editor))"
-                        "(set-option! 'mail-accounts"
-                        "  '(((id . \"work\") (kind . imap)"
-                        "     (host . \"imap.example.org\") (port . 993)"
-                        "     (user . \"you@example.org\")"
-                        "     (mailboxes . (\"INBOX\" \"Sent\"))"
-                        "     (from . \"you@example.org\")"
-                        "     (smtp-host . \"smtp.example.org\")"
-                        "     (smtp-port . 465))"
-                        "    ;; A tree of Maildir folders, as mbsync keeps one."
-                        "    ((id . \"personal\") (kind . maildir)"
-                        "     (path . \"/home/you/.mail/personal\")"
-                        "     (skip . (\"[Gmail]/Spam\" \"[Gmail]/Bin\")))))")
-           '(paragraph "Every Maildir at and under a Maildir account's path is one of its folders, named by its place there: Inbox, [Gmail]/All Mail. folders lists the only ones to read and skip the ones not to; mailbox makes the path one folder of that name.")
-           '(paragraph "Set mail-credential-provider to a procedure (account purpose) that returns a secret from your secret manager. Purpose is imap or smtp. Do not put passwords in your account alists or paste them into visible minibuffer input.")
-           '(code-block "scheme" "(set-option! 'mail-credential-provider"
-                        "  (lambda (account purpose)"
-                        "    ;; Return a secret using your own secret manager."
-                        "    (my-mail-secret account purpose)))")
-           '(heading 2 "Start gently")
-           '(paragraph "M-x mail, then g to sync. Every account's Inbox is fetched first, then the other folders. Sync reads source mail and its flags; what you read, star, archive or delete changes your Maildir, as mu4e does, and mbsync takes it to the server. IMAP and SMTP verify certificates and hostnames. To require STARTTLS, set imap-security or smtp-security to starttls and omit the corresponding port to use 143 or 587. There is no plaintext fallback. Use a password or app password; OAuth is not supported.")
-           '(paragraph "Account settings last for this runtime. Keep them in your configuration file and use M-x mail-load-config in a new runtime.")
-           '(paragraph "The cache contains private mail and drafts under XDG_DATA_HOME/techne/mail (or mail-database). Protect it like your mailbox. SMTP acceptance is reported distinctly from local draft saving; no automatic retries and no automatic server Sent-folder copy.")
-           (list 'paragraph (mail-link 'back "← Back"))))
-    (show-aside! s b)))

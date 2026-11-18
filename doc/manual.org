@@ -309,14 +309,15 @@ shows the settings that apply and which one wins.
 
 \[mail] opens a dashboard of accounts and folders, with quick views for
 unread and starred mail and drafts. Techne reads IMAP and Maildir, keeps a
-local searchable cache, and renders messages in the rich reader. Use
-\[mail-setup] or [[file:mail.org][the mail guide]] to configure an account,
-and \[mail-load-config] to load a trusted Scheme configuration file.
+local searchable cache, and renders messages in the rich reader. Set
+=mail-accounts= and =mail-credential-provider= in your Scheme configuration;
+[[file:mail.org][the mail guide]] has examples, and \[describe-option] describes each option.
 
 Use =g= to sync, =C= to compose and =D= to resume a draft. SMTP submission
 uses verified TLS, with optional STARTTLS for servers that require it.
 Techne does not automatically retry delivery if the server may already
-have accepted the message. See \[mail-help] for keys and limitations.
+have accepted the message. Use \[describe-mode] for the current mail mode
+and \[describe-bindings] for its active keys.
 
 * Lisp
 

@@ -8,8 +8,8 @@ then every configured account and its folders with how many messages each
 has and how many are unread, then what there is to do. =RET= on a row lists
 its messages above a rich reader, the same way whichever row, =G= or search
 it comes from; =q= in the list comes back, and =q= on the dashboard leaves
-mail. =M-x mail-setup= explains configuration, and =M-x mail-help= shows the
-workflow.
+mail. Use =C-h m= to describe the current mode or =C-h b= to list its active
+bindings. See [[*Accounts][Accounts]] for configuration.
 
 - =n= / =p= select a row, =RET= opens it. =i=, =u=, =s= and =a= open
   Inbox, Unread, Starred and All mail from anywhere on it, =D= the drafts.
@@ -35,9 +35,11 @@ library is involved.
 
 * Accounts
 
-Save a trusted Scheme file and load it with =M-x mail-load-config= in each new
-runtime (or evaluate it with =M-x eval-buffer=). Configuration is not implicitly
-discovered or executed. Settings added interactively last for the runtime.
+Mail uses ordinary Techne options. Put =mail-accounts= and
+=mail-credential-provider= in a trusted Scheme file. Open it and run
+=M-x eval-buffer= in each new editor runtime. =M-x describe-option= shows what
+these options do. Evaluating the file does not fetch mail; press =g= in mail
+when you want to sync.
 
 #+begin_src scheme
 (import (techne editor))
@@ -387,6 +389,6 @@ The default cache is =XDG_DATA_HOME/techne/mail/cache.sqlite=, falling back to
 =~/.local/share/techne/mail/cache.sqlite=. Its directory is created with mode
 0700. It contains private bodies, attachments, reading state and drafts, not
 just a disposable search index. Protect and back it up like a mailbox. Set
-=mail-database= in configuration to choose another file. An explicitly loaded
-configuration can switch an idle cache; background work and open drafts must
-finish first. There is no automatic live-account access or account test.
+=mail-database= in configuration to choose another file. Set it before opening
+mail in a new runtime; changing it does not switch an already-open cache.
+There is no automatic live-account access or account test.
