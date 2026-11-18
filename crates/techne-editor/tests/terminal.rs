@@ -78,27 +78,29 @@ fn terminal_runs_a_pty_projects_styles_and_routes_keys() {
 }
 
 #[test]
-fn osc_reports_cwd_prompts_and_links_without_opening_them() {
-    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
-    command(
-        &mut rt,
-        r#"printf '\033]7;file:///tmp/a%%20b\007\033]133;A\007one\n\033]133;A\007\033]8;;https://example.org/\007two\033]8;;\007\n'; read -r go"#,
-    );
-    let ready = until(&mut rt, |s| s.pane().text.to_string().contains("two"));
-    assert!(ready.pane().text.to_string().starts_with("one"));
-    assert_eq!(rt.eval("(default-directory (current-session))").unwrap(), "\"/tmp/a b/\"");
-    key(&mut rt, "C-c");
-    key(&mut rt, "C-p");
-    assert!(rt.snapshot().pane().status.contains("COPY"));
-    let text = rt.snapshot().pane().text.to_string();
-    assert!(text[rt.snapshot().pane().head()..].starts_with("two"));
-    key(&mut rt, "C-c");
-    key(&mut rt, "C-p");
-    assert_eq!(rt.snapshot().pane().head(), 0);
-    key(&mut rt, "C-c");
-    key(&mut rt, "M-n");
-    assert!(rt.snapshot().echo.contains("https://example.org/"));
-    assert!(rt.take_errors().is_empty());
+fn scheme_terminal_scenarios() {
+    let suite = techne_editor::runtime::lisp_dir().join("tests/pty/scenarios.scm");
+    for scenario in [
+        "(osc-prompts)",
+        "(alignment)",
+        "(initial-size)",
+        "(split-size)",
+        "(resize)",
+        "(shell-exit #f)",
+        "(shell-exit #t)",
+        "(redraw-retry)",
+        "(burst)",
+        "(paste)",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes");
+        std::fs::write(&file, "notes\n").unwrap();
+        let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
+        rt.eval(&format!("(require {:?})", suite.display().to_string())).unwrap();
+        let result = rt.eval(&format!("(begin {scenario} (test-failures))")).unwrap_or_else(|e| panic!("{scenario}: {e}"));
+        assert_eq!(result, "0", "{scenario}");
+        assert!(rt.take_errors().is_empty(), "{scenario}");
+    }
 }
 
 #[test]
@@ -171,172 +173,6 @@ fn mouse_and_focus_reports_reach_the_child() {
         "{text}"
     );
     assert!(!ended.pane().display.report_pointer);
-}
-
-#[test]
-fn alignment_pattern_is_projected_on_screen_and_in_scrollback() {
-    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
-    rt.handle(Input::Viewport { columns: 5, rows: 4, split_gap: 1 });
-    command(&mut rt, r#"stty -echo; printf '\033#8'; read -r go; printf '\033[2;1H\n'"#);
-    let live = until(&mut rt, |s| s.pane().text.to_string() == "EEEEE\nEEEEE\n");
-    assert_eq!(live.pane().scroll, 0);
-    key(&mut rt, "RET");
-    let done = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
-    assert_eq!(done.pane().text.to_string(), "EEEEE\nEEEEE\n     \n");
-    assert!(rt.take_errors().is_empty());
-}
-
-#[test]
-fn eof_retries_output_after_a_timed_draw_fails() {
-    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
-    rt.eval(
-        r#"(eval '(begin
-                    (define original-render! render!)
-                    (define live-draws 0)
-                    (set! render!
-                      (lambda (s b state)
-                        (when (process state)
-                          (set! live-draws (+ 1 live-draws))
-                          (when (= live-draws 1) (error "injected draw failure")))
-                        (original-render! s b state))))
-                 (package-module (find-package 'terminal)))"#,
-    )
-    .unwrap();
-    // No more output after the injected failure. Keep the PTY open until
-    // we see that failure, then let the child exit without printing again.
-    command(&mut rt, "stty -echo; printf 'unshown tail'; read -r finish");
-    let attempts = "(eval 'live-draws (package-module (find-package 'terminal)))";
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while rt.eval(attempts).unwrap() == "0" {
-        assert!(Instant::now() < deadline, "timed draw was not attempted");
-        rt.run_tasks(Duration::from_millis(5)).unwrap();
-    }
-    assert!(!rt.snapshot().pane().text.to_string().contains("unshown tail"));
-    key(&mut rt, "RET");
-    let done = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
-    assert!(done.pane().text.to_string().contains("unshown tail"));
-    // The retry must happen before process state is cleared, not as a
-    // side effect of rendering the retained buffer in copy mode.
-    assert_eq!(rt.eval(attempts).unwrap(), "2");
-}
-
-#[test]
-fn redraws_making_progress_during_a_burst_and_flush_the_end() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("notes");
-    std::fs::write(&file, "notes\n").unwrap();
-    let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
-    command(
-        &mut rt,
-        r#"stty -echo; printf 'ready\n'; read -r go; i=0; while [ "$i" -lt 120 ]; do printf 'burst %03d: synthetic kernel log line with some payload\n' "$i"; i=$((i + 1)); sleep .003; done; read -r done; printf '\033[31mfinal tail\033[0m'"#,
-    );
-    let ready = until(&mut rt, |s| s.pane().text.to_string().contains("ready"));
-    key(&mut rt, "RET");
-    until(&mut rt, |s| {
-        let text = s.pane().text.to_string();
-        text.contains("burst 000") && !text.contains("burst 119")
-    });
-    let burst = until(&mut rt, |s| s.pane().text.to_string().contains("burst 119"));
-    // On a quiet host the timer coalesces many individual PTY writes.
-    // We intentionally don't assert a wall-clock frame rate.
-    assert!(burst.pane().revision - ready.pane().revision < 120 * 2);
-    key(&mut rt, "RET");
-    let ended = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
-    assert!(ended.pane().text.to_string().contains("final tail"));
-    assert!(rt.take_errors().is_empty());
-}
-
-#[test]
-fn the_first_child_command_sees_the_pane_size_and_a_tty() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("notes");
-    std::fs::write(&file, "notes\n").unwrap();
-    let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
-    rt.handle(Input::Viewport { columns: 37, rows: 10, split_gap: 1 });
-    command(&mut rt, r#"test -t 1 && test -z "${COLUMNS+x}${LINES+x}" && stty size"#);
-    let done = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
-    assert!(done.pane().text.to_string().starts_with("8 37"));
-    assert!(rt.take_errors().is_empty());
-}
-
-#[test]
-fn a_left_hand_terminal_uses_the_frontends_split_gap() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("notes");
-    std::fs::write(&file, "notes\n").unwrap();
-    let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
-    rt.handle(Input::Viewport { columns: 100, rows: 24, split_gap: 4 });
-    key(&mut rt, "C-x");
-    key(&mut rt, "3");
-    assert_eq!(rt.snapshot().panes.len(), 2);
-    if rt.snapshot().focus != 0 {
-        key(&mut rt, "C-x");
-        key(&mut rt, "o");
-    }
-    command(&mut rt, "stty size");
-    let done = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
-    assert!(done.pane().display.truncate_lines);
-    assert!(done.pane().text.to_string().starts_with("22 46"));
-}
-
-#[test]
-fn successful_shell_exit_closes_the_terminal_unless_it_is_the_last_buffer() {
-    for only in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("notes");
-        std::fs::write(&file, "notes\n").unwrap();
-        let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
-        rt.eval("(run-command (current-session) 'terminal 1)").unwrap();
-        until(&mut rt, |s| s.pane().status.contains("SEMI"));
-        if only {
-            rt.eval("(let* ((s (current-session)) (b (current-buffer s))) (for-each (lambda (other) (unless (eq? b other) (drop-buffer! s other))) (buffer-list)))").unwrap();
-        }
-        typing(&mut rt, "exit 0");
-        key(&mut rt, "RET");
-        let result = until(&mut rt, |s| s.pane().status.contains("Exit 0") || !s.pane().status.contains("*terminal*"));
-        assert_eq!(result.pane().status.contains("*terminal*"), only);
-        assert!(rt.take_errors().is_empty());
-    }
-}
-
-#[test]
-fn child_resize_reaches_the_pty_and_survives_editor_keys() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("notes");
-    std::fs::write(&file, "notes\n").unwrap();
-    let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
-    rt.handle(Input::Viewport { columns: 80, rows: 27, split_gap: 1 });
-    command(&mut rt, r#"stty -echo; printf '\033[8;12;34tready\n'; read -r line; stty size"#);
-    until(&mut rt, |s| s.pane().text.to_string().contains("ready"));
-    key(&mut rt, "RET");
-    let done = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
-    assert!(done.pane().text.to_string().contains("12 34"));
-    assert!(rt.take_errors().is_empty());
-}
-
-#[test]
-fn alternate_screen_hides_scrollback_and_restores_it_on_exit() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("notes");
-    std::fs::write(&file, "notes\n").unwrap();
-    let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
-    rt.handle(Input::Viewport { columns: 40, rows: 6, split_gap: 1 });
-    command(
-        &mut rt,
-        r#"stty -echo; printf 'old\na\nb\nc\nd\nlive\n\033[?1049h\033[?2004h\033[?25lALT'; read -r line; printf '\033[?1049l\033[?25h\n'; test "$line" = "$(printf '\033[200~pasted\033[201~')" || exit 3; printf 'received:pasted\n'"#,
-    );
-    let alt = until(&mut rt, |s| s.pane().text.to_string().contains("ALT"));
-    assert!(!alt.pane().text.to_string().contains("old"));
-    rt.handle(Input::Clipboard { text: "pasted".into() });
-    key(&mut rt, "C-S-v");
-    key(&mut rt, "RET");
-    let result = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
-    let text = result.pane().text.to_string();
-    assert!(text.starts_with("old\na\nb\n"), "{text}");
-
-    assert!(text.contains("received:pasted"), "{text}");
-    assert!(!text.contains("ALT"));
-    assert!(rt.take_errors().is_empty());
 }
 
 #[test]
