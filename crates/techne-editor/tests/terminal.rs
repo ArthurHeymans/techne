@@ -80,7 +80,7 @@ fn terminal_runs_a_pty_projects_styles_and_routes_keys() {
 #[test]
 fn scheme_terminal_scenarios() {
     let suite = techne_editor::runtime::lisp_dir().join("tests/pty/scenarios.scm");
-    for scenario in [
+    for (scenario, profile) in [
         "(osc-prompts)",
         "(alignment)",
         "(initial-size)",
@@ -91,35 +91,22 @@ fn scheme_terminal_scenarios() {
         "(redraw-retry)",
         "(burst)",
         "(paste)",
-    ] {
+        "(private-prompt)",
+        "(profile-keys #t)",
+    ]
+    .into_iter()
+    .map(|s| (s, "emacs"))
+    .chain([("(profile-keys #f)", "modal")])
+    {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("notes");
         std::fs::write(&file, "notes\n").unwrap();
-        let mut rt = Runtime::open(&file, &dir.path().join("journal"), "emacs").unwrap().0;
+        let mut rt = Runtime::open(&file, &dir.path().join("journal"), profile).unwrap().0;
         rt.eval(&format!("(require {:?})", suite.display().to_string())).unwrap();
         let result = rt.eval(&format!("(begin {scenario} (test-failures))")).unwrap_or_else(|e| panic!("{scenario}: {e}"));
         assert_eq!(result, "0", "{scenario}");
         assert!(rt.take_errors().is_empty(), "{scenario}");
     }
-}
-
-#[test]
-fn a_password_prompt_bypasses_key_hooks_and_sends_the_answer() {
-    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
-    rt.eval("(set-option! 'terminal-detect-passwords #t)").unwrap();
-    command(
-        &mut rt,
-        r#"stty -echo; printf 'Password: '; read -r answer; stty echo; test "$answer" = 'hidden'; printf '\nresult:%s\n' "$?""#,
-    );
-    until(&mut rt, |s| s.echo.contains("Terminal password (hidden)"));
-    rt.eval("(begin (define leaked '()) (add-hook! 'after-key 'record-test (lambda (s k) (set! leaked (cons k leaked)))))").unwrap();
-    typing(&mut rt, "hidden");
-    key(&mut rt, "RET");
-    let ended = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
-    let text = ended.pane().text.to_string();
-    assert!(text.contains("result:0") && !text.contains("hidden"), "{text}");
-    assert_eq!(rt.eval("leaked").unwrap(), "()");
-    assert!(rt.take_errors().is_empty());
 }
 
 #[test]
@@ -173,69 +160,6 @@ fn mouse_and_focus_reports_reach_the_child() {
         "{text}"
     );
     assert!(!ended.pane().display.report_pointer);
-}
-
-#[test]
-fn ebb_keys_leave_editor_prefixes_and_allow_literal_terminal_input() {
-    for profile in ["emacs", "modal"] {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("notes");
-        std::fs::write(&file, "notes\n").unwrap();
-        let mut rt = Runtime::open(&file, &dir.path().join("journal"), profile).unwrap().0;
-        let script = r#"stty -echo -icanon -isig -ixon; printf 'ready\n'; od -An -t u1 -N 7; printf 'done\n'; read -r line"#;
-        if profile == "emacs" {
-            command(&mut rt, script);
-        } else {
-            rt.eval("(run-command (current-session) 'terminal-command 1)").unwrap();
-            enter_command(&mut rt, script);
-        }
-        let ready = until(&mut rt, |s| s.pane().text.to_string().starts_with("ready"));
-        assert!(ready.pane().status.contains("SEMI"));
-        if profile == "emacs" {
-            key(&mut rt, "C-x");
-            key(&mut rt, "b");
-            let snap = rt.snapshot();
-            assert!(
-                snap.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Switch to buffer:")),
-                "{:?}: {} {:?}",
-                snap.minibuffer,
-                snap.echo,
-                rt.take_errors()
-            );
-            key(&mut rt, "C-g");
-        }
-        key(&mut rt, "M-x");
-        assert!(rt.snapshot().minibuffer.is_some());
-        key(&mut rt, "C-g");
-        key(&mut rt, "C-c");
-        key(&mut rt, "C-e");
-        assert!(rt.snapshot().pane().status.contains("COPY"));
-        key(&mut rt, "C-c");
-        key(&mut rt, "C-j");
-        assert!(rt.snapshot().pane().status.contains("SEMI"));
-        key(&mut rt, "C-c");
-        key(&mut rt, "M-d");
-        assert!(rt.snapshot().pane().status.contains("CHAR"));
-        for k in ["C-x", "C-y", "C-c", "C-q"] {
-            key(&mut rt, k);
-        }
-        key(&mut rt, if profile == "emacs" { "C-M-m" } else { "M-RET" });
-        assert!(rt.snapshot().pane().status.contains("SEMI"));
-        key(&mut rt, "C-q");
-        key(&mut rt, "C-x");
-        rt.handle(Input::Clipboard { text: "B".into() });
-        rt.handle(Input::Clipboard { text: "A".into() });
-        key(&mut rt, "C-y");
-        key(&mut rt, "M-y");
-        let done = until(&mut rt, |s| s.pane().text.to_string().contains("done"));
-        let text = done.pane().text.to_string();
-        assert!(text.lines().any(|line| line.split_whitespace().eq(["24", "25", "3", "17", "24", "65", "66"])), "{text}");
-        key(&mut rt, "C-c");
-        key(&mut rt, "C-k");
-        let stopped = until(&mut rt, |s| s.pane().status.contains("Child exited"));
-        assert!(stopped.pane().text.to_string().contains("done"));
-        assert!(rt.take_errors().is_empty());
-    }
 }
 
 #[test]
