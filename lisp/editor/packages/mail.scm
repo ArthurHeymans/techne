@@ -1,7 +1,7 @@
 ;;; Keep options and entry points available without loading the mail runtime.
 (import (techne editor))
 (require "../files.scm")
-(require "../dispatch.scm")
+
 
 (define-option mail-accounts '()
   "Mail accounts, as a list of alists, configured in Scheme.
@@ -40,21 +40,11 @@ configuration."
 
 (define %mail-runtime (string-append (directory-of (current-module)) "../mail/runtime.scm"))
 
-;; Use one shared command body, not a newly compiled definition for each
-;; entry point. The real commands replace these registry entries on load.
-(define (%register-mail-entry entry)
-  (let ((name (car entry)))
-    (define (autoload s n)
-      (unless (find-package 'mail-runtime)
-        (load-package 'mail-runtime %mail-runtime))
-      (let ((implementation (command name)))
-        (when (eq? implementation autoload) (error "Mail command was not loaded" name))
-        (with-scope (package-scope (find-package 'mail-runtime)) (implementation s n))))
-    (register-command! name (cadr entry) autoload)))
-
-(for-each %register-mail-entry
-          '((mail "Open the mail dashboard. Configure accounts with `mail-accounts`.")
-
-            (mail-groups "Choose a mail group, account, or folder to open.")
-            (mail-search "Search the local mail cache.")
-            (mail-compose "Compose a new message.")))
+;; Only M-x mail is needed before visiting mail. The runtime publishes the
+;; remaining commands and replaces this entry when it loads.
+(define-command (mail s n)
+  "Open the mail dashboard. Configure accounts with `mail-accounts`."
+  (load-package 'mail-runtime %mail-runtime)
+  (let ((implementation (command 'mail)))
+    (when (eq? implementation mail) (error "Mail command was not loaded"))
+    (with-scope (package-scope (find-package 'mail-runtime)) (implementation s n))))

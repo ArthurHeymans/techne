@@ -329,6 +329,7 @@ fn cancelling_maildir_sync_does_not_turn_into_a_cached_partial_message() {
 fn autosave_drains_an_edit_arriving_during_a_delayed_sqlite_write() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
+    command(&mut rt, "mail");
     command(&mut rt, "mail-compose");
     rt.eval("(define draft-state (buffer-state (current-buffer (current-session))))
       (define draft-db (hash-table-ref draft-state 'db))
@@ -766,6 +767,7 @@ fn opening_a_stale_draft_row_reads_the_newer_saved_text_without_writing() {
 fn discarding_a_sent_buffer_keeps_the_delivery_record() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
+    command(&mut rt, "mail");
     command(&mut rt, "mail-compose");
     rt.eval(
         "(define inspect-db (mail-store-open (option #f 'mail-database)))
@@ -788,6 +790,7 @@ fn discarding_a_sent_buffer_keeps_the_delivery_record() {
 fn ambiguous_draft_is_inspectable_and_ordinary_save_reopen_cannot_reset_it() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
+    command(&mut rt, "mail");
     command(&mut rt, "mail-compose");
     rt.eval("(define inspect-db (mail-store-open (option #f 'mail-database)))
       (define draft-id (caar (mail-store-drafts inspect-db)))
@@ -814,6 +817,7 @@ fn ambiguous_draft_is_inspectable_and_ordinary_save_reopen_cannot_reset_it() {
 fn credential_failure_before_submission_remains_retryable_and_secret_free() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
+    command(&mut rt, "mail");
     command(&mut rt, "mail-compose");
     rt.eval(
         "(view-edit! (session-view (current-session))
@@ -845,6 +849,7 @@ fn credential_failure_before_submission_remains_retryable_and_secret_free() {
 fn pasted_encoded_from_to_cc_bcc_preserve_mailbox_boundaries() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
+    command(&mut rt, "mail");
     command(&mut rt, "mail-compose");
     rt.eval("(view-edit! (session-view (current-session))
       (list (list 0 (document-length (doc (current-session)))
@@ -886,6 +891,7 @@ fn real_mail_opens_unread_not_old_read_messages() {
 fn new_composition_starts_in_the_recipient_field() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
+    command(&mut rt, "mail");
     command(&mut rt, "mail-compose");
     assert_eq!(
         rt.eval("(let* ((s (current-session)) (d (doc s)) (p (point s))) (document-substring d (line-start d p) p))").unwrap(),
@@ -1344,6 +1350,7 @@ fn composing_is_from_the_account_shown_and_completes_whom_you_write_to() {
     ))
     .unwrap();
     // From a folder of an account: that account, and the From it sends with.
+    command(&mut rt, "mail");
     command(&mut rt, "mail-groups");
     enter(&mut rt, "home · [Gmail]/Sent Mail");
     command(&mut rt, "mail-compose");
@@ -1417,6 +1424,7 @@ fn drafts_are_kept_for_later_discarded_or_deleted_as_in_message_mode() {
             .unwrap()
     };
     // Nothing written: C-c C-k discards it at once.
+    command(&mut rt, "mail");
     command(&mut rt, "mail-compose");
     assert_eq!(drafts(&mut rt), "1");
     key(&mut rt, "C-c C-k");
@@ -1670,6 +1678,8 @@ fn a_group_chosen_from_outside_mail_opens_as_from_the_dashboard() {
         dir.path().join("samples.sqlite").display().to_string()
     ))
     .unwrap();
+    command(&mut rt, "mail");
+    key(&mut rt, "q");
     command(&mut rt, "mail-groups");
     enter(&mut rt, "Starred");
     assert_eq!(rt.snapshot().panes.len(), 1, "the list, as from the dashboard");
