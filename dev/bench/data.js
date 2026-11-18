@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795029439139,
+  "lastUpdate": 1795029441500,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -57433,6 +57433,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 107217,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d67cc33dc1ab0e577c12369d096008d45a4a0a03",
+          "message": "Merge pull request #372 from ArthurHeymans/tool/friction-review\n\nFixes from the reviews of #371",
+          "timestamp": "2026-11-18T20:09:57+01:00",
+          "tree_id": "5689fb86bab6005e21e269b347813866be0f911c",
+          "url": "https://github.com/ArthurHeymans/techne/commit/d67cc33dc1ab0e577c12369d096008d45a4a0a03"
+        },
+        "date": 1795029441439,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 694738974,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 646987349,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107260,
             "unit": "data"
           }
         ]
