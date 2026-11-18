@@ -31,6 +31,17 @@ a caret of its own, over the same buffers. With a file, the window shows
 it. When the window the editor started in closes, the editor runs on for
 the windows attached to it, until the last closes.
 
+The editor can run on another machine: ~techne window --ssh HOST~ opens
+a window here on the editor running there, through ssh, which
+authenticates and encrypts; no port is opened. FILE is then a path on
+that machine, and must be absolute. ~techne daemon~ runs an editor with
+no window, as ~emacs --daemon~ does, until it is sent SIGTERM; windows
+come and go, and it keeps their buffers, unsaved edits and processes.
+~--start~ (~techne window --ssh HOST --start~) starts one when none
+runs. Typing waits a network round trip for each key: for editing a
+remote file with local typing, open it from a local editor instead
+(TRAMP's syntax, =/ssh:HOST:/path=).
+
 Programs can evaluate code in the editor running too, as with
 emacsclient --eval: ~techne eval '(message! (current-session) "hi")'~
 prints what the code wrote, then its value; an error goes to stderr

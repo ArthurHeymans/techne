@@ -13,7 +13,9 @@
 //! `--open` and `--wait` are as for `techne`: the file is shown in the
 //! editor running, if there is one, else here; an editor started here opens
 //! files for the next. `--attach` makes this terminal a frontend of the
-//! editor running, as `emacsclient --tty` does (`techne_editor::attach`).
+//! editor running, as `emacsclient --tty` does (`techne_editor::attach`);
+//! `--ssh DEST`, of the one running on another machine, through ssh; with
+//! `--start`, one started when none runs.
 
 use std::{
     io::{Read, Write},
@@ -25,14 +27,15 @@ use std::{
 
 use crate::{RESTORE, SETUP, Term};
 use techne_editor::{
-    attach::{Link, Remote},
+    attach::{Link, Target},
     host::{Event, File, Host},
     present::Output,
     runtime::{Runtime, journal_for},
     server,
 };
 
-const USAGE: &str = "usage: techne term [--modal] [--open] [--wait] [FILE]\n       techne term --attach [--modal] [FILE]";
+const USAGE: &str =
+    "usage: techne term [--modal] [--open] [--wait] [FILE]\n       techne term --attach [--ssh DEST] [--start] [--modal] [FILE]";
 
 const ESC_WAIT: Duration = Duration::from_millis(25);
 
@@ -62,21 +65,28 @@ struct Args {
     wait: bool,
     /// Be a frontend of the editor running, not an editor.
     attach: bool,
+    /// The editor's machine, through ssh, when it is not this one.
+    ssh: Option<String>,
+    /// Start an editor to attach to when none runs.
+    start: bool,
 }
 
 fn args(args: Vec<String>) -> Result<Args, String> {
-    let mut a = Args { path: None, profile: "emacs".into(), open: false, wait: false, attach: false };
-    for arg in args {
+    let mut a = Args { path: None, profile: "emacs".into(), open: false, wait: false, attach: false, ssh: None, start: false };
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "--modal" => a.profile = "modal".into(),
             "--open" => a.open = true,
             "--wait" => (a.open, a.wait) = (true, true),
             "--attach" => a.attach = true,
+            "--ssh" => (a.attach, a.ssh) = (true, Some(it.next().ok_or(USAGE)?)),
+            "--start" => a.start = true,
             _ if a.path.is_none() && !arg.starts_with('-') => a.path = Some(PathBuf::from(arg)),
             _ => return Err(USAGE.into()),
         }
     }
-    if (a.open && a.path.is_none()) || (a.open && a.attach) {
+    if (a.open && a.path.is_none()) || (a.open && a.attach) || (a.start && !a.attach) {
         return Err(USAGE.into());
     }
     Ok(a)
@@ -107,7 +117,7 @@ fn restore() {
 /// Run the editor in this terminal, with the command line's arguments after
 /// the command's name.
 pub fn main(args: Vec<String>) -> ExitCode {
-    let Args { path, profile, open, wait, attach } = match self::args(args) {
+    let Args { path, profile, open, wait, attach, ssh, start } = match self::args(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -129,11 +139,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
         }
     };
     let (mut host, _listener) = if attach {
-        let socket = server::socket().ok_or(server::OpenError::NotRunning);
-        match socket.and_then(|socket| Remote::attach(&socket, &profile, path.as_deref(), deliver)) {
+        let target = ssh.map_or(Target::Here, Target::Ssh);
+        match techne_editor::attach::attach_to(&target, start, &profile, path.as_deref(), deliver) {
             Ok(remote) => (Link::Remote(remote), None),
             Err(server::OpenError::NotRunning) => {
-                eprintln!("techne: no editor is running to attach to");
+                eprintln!("techne: no editor is running to attach to (--start starts one)");
                 return ExitCode::FAILURE;
             }
             Err(server::OpenError::Failed(e)) => {

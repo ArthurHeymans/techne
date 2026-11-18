@@ -258,6 +258,80 @@ fn the_runtime_outlives_the_frontend_it_started_with() {
     assert!(matches!(Remote::attach(&socket, "emacs", None, move |e| drop(tx.send(e))), Err(OpenError::NotRunning)));
 }
 
+/// A daemon: a runtime no frontend started, which runs on as frontends
+/// attach and detach, is started again when it crashes with none
+/// attached, with the unsaved edits of files from their journals, and
+/// detaches those attached when stopped, keeping what they keep when they
+/// close (minibuffer histories).
+#[test]
+fn a_daemon_runs_with_no_frontend() {
+    state();
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, file, histories) = (dir.path().join("socket"), dir.path().join("f.txt"), dir.path().join("histories"));
+    std::fs::write(&file, "file\n").unwrap();
+    let kept = histories.clone();
+    let daemon = techne_editor::host::Daemon::start(move |rt| rt.keep_histories(Some(&kept)).unwrap());
+    let listener = daemon.listen(&socket).unwrap().expect("no other editor listens");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let theirs = stop.clone();
+    let daemon = std::thread::spawn(move || {
+        let ran = daemon.run(|| theirs.load(std::sync::atomic::Ordering::Relaxed));
+        daemon.stop();
+        ran
+    });
+    assert_eq!(attached(&socket), "0");
+    let mut first = remote(&socket, Some(&file));
+    first.snapshot(|s| s.pane().text == "file\n");
+    first.keys("k e p t SPC");
+    first.snapshot(|s| s.pane().text == "kept file\n");
+    let Link::Remote(r) = first.link else { unreachable!() };
+    r.close();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while attached(&socket) != "0" {
+        assert!(Instant::now() < deadline, "the frontend was not detached");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The next one finds what the last left.
+    let second = remote(&socket, None);
+    second.snapshot(|s| s.pane().text == "kept file\n");
+    let Link::Remote(r) = second.link else { unreachable!() };
+    r.close();
+    while attached(&socket) != "0" {
+        assert!(Instant::now() < deadline, "the frontend was not detached");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Crashed with none attached, it is started again, with the edits.
+    let _ = eval(&socket, "(%crash-runtime)", true);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while eval(&socket, "(+ 1 1)", true).ok().as_deref() != Some("2") {
+        assert!(Instant::now() < deadline, "the runtime was not started again");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut third = remote(&socket, Some(&file));
+    third.snapshot(|s| s.pane().text == "kept file\n");
+    third.keys("M-: ( + SPC 1 SPC 2 ) RET");
+    third.snapshot(|s| s.echo == "3");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    daemon.join().unwrap().unwrap();
+    let why = third.event(|e| match e {
+        Event::Failed(why) => Some(why),
+        _ => None,
+    });
+    assert_eq!(why, "the editor was stopped");
+    // Keep the listener alive to force the same ordering as a request
+    // already accepted by the CLI's listener when it begins shutdown.
+    let late = remote(&socket, None);
+    let why = late.event(|e| match e {
+        Event::Failed(why) => Some(why),
+        Event::Output(Output::Snapshot(_)) => panic!("an attach restarted a stopped daemon"),
+        _ => None,
+    });
+    assert_eq!(why, "the editor was stopped");
+    let kept = std::fs::read_to_string(&histories).unwrap_or_default();
+    assert!(kept.contains("(+ 1 2)"), "{kept:?}");
+    drop(listener);
+}
+
 /// A frontend whose editor goes (its process ended, and the connection
 /// with it) is told so.
 #[test]

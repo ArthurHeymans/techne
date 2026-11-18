@@ -88,6 +88,8 @@ pub enum Event {
 type Deliver = Arc<dyn Fn(Event) + Send + Sync>;
 type Setup = Arc<dyn Fn(&mut Runtime) + Send + Sync>;
 
+pub(crate) const DAEMON_STOPPED: &str = "the editor was stopped";
+
 /// A frontend's attachment to the runtime.
 pub struct Host {
     shared: Arc<Mutex<Shared>>,
@@ -118,6 +120,11 @@ pub(crate) struct Shared {
     next_client: u64,
     /// The generation of the runtime whose thread ended last.
     ended: u64,
+    /// Whether it runs with no frontend attached, as a daemon (`Daemon`):
+    /// the last detaching does not stop it.
+    daemon: bool,
+    /// Unlike a missing input sender after a crash, shutdown is final.
+    stopping: bool,
 }
 
 struct Frontend {
@@ -149,27 +156,15 @@ impl Host {
         setup: impl Fn(&mut Runtime) + Send + Sync + 'static,
         deliver: impl Fn(Event) + Send + Sync + 'static,
     ) -> Host {
-        let shared = Arc::new(Mutex::new(Shared {
-            setup: Arc::new(setup),
-            generation: 0,
-            inputs: None,
-            thread: None,
-            fence: Fence::default(),
-            given_up: None,
-            order: Arc::default(),
-            sent: 0,
-            frontends: BTreeMap::new(),
-            next_client: 0,
-            ended: 0,
-        }));
-        attach(&shared, file, profile, Arc::new(deliver))
+        let shared = shared(Arc::new(setup), false);
+        attach(&shared, file, profile, Arc::new(deliver)).expect("a new local host is not stopping")
     }
 
     /// Attach another frontend to this one's runtime, as `start` attaches
     /// the first. Without `file`, it shows what the frontend used last
     /// shows.
     pub fn attach(&self, file: Option<File>, profile: String, deliver: impl Fn(Event) + Send + Sync + 'static) -> Host {
-        attach(&self.shared, file, profile, Arc::new(deliver))
+        attach(&self.shared, file, profile, Arc::new(deliver)).expect("a local host is not a daemon")
     }
 
     /// Open files in this runtime for other programs (`server`) that ask
@@ -256,6 +251,9 @@ impl Host {
         // The thread is joined unlocked: it locks as it ends.
         let thread = {
             let mut s = shared.lock().expect("the host");
+            if s.stopping {
+                return false;
+            }
             if s.generation != self.generation {
                 return self.restarted(&s);
             }
@@ -268,7 +266,7 @@ impl Host {
         if s.generation != self.generation {
             return self.restarted(&s);
         }
-        if s.sent == 0 {
+        if s.stopping || s.sent == 0 {
             return false;
         }
         s.inputs = None;
@@ -298,7 +296,7 @@ impl Host {
             if let Some(f) = f {
                 f.interrupts.kill_before(f.sent);
             }
-            if !s.frontends.is_empty() {
+            if !s.frontends.is_empty() || s.daemon {
                 return;
             }
             if let Some(tx) = s.inputs.take() {
@@ -346,9 +344,125 @@ impl Host {
     }
 }
 
-/// Attach a frontend to the runtime of `shared`, started if none runs.
-pub(crate) fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deliver: Deliver) -> Host {
+fn shared(setup: Setup, daemon: bool) -> Arc<Mutex<Shared>> {
+    Arc::new(Mutex::new(Shared {
+        setup,
+        generation: 0,
+        inputs: None,
+        thread: None,
+        fence: Fence::default(),
+        given_up: None,
+        order: Arc::default(),
+        sent: 0,
+        frontends: BTreeMap::new(),
+        next_client: 0,
+        ended: 0,
+        daemon,
+        stopping: false,
+    }))
+}
+
+/// A runtime run with no frontend attached, as `emacs --daemon` runs:
+/// frontends attach to it over its socket (`listen`, `attach`), and it
+/// runs on when the last detaches, until it is told to stop. One that
+/// crashes with none attached is started again here; with some, they
+/// start it again, as they do a runtime of their own.
+pub struct Daemon {
+    shared: Arc<Mutex<Shared>>,
+}
+
+/// The most times a daemon's runtime is started again within
+/// `RESTARTS_WITHIN` before the daemon gives up.
+const RESTARTS: usize = 5;
+const RESTARTS_WITHIN: Duration = Duration::from_secs(60);
+
+impl Daemon {
+    /// Start a runtime on a new thread, `setup` it, with no frontend.
+    pub fn start(setup: impl Fn(&mut Runtime) + Send + Sync + 'static) -> Daemon {
+        let shared = shared(Arc::new(setup), true);
+        spawn(&shared, &mut shared.lock().expect("the host"));
+        Daemon { shared }
+    }
+
+    /// Serve other programs, and frontends of other processes, on
+    /// `socket`, as `Host::listen`.
+    pub fn listen(&self, socket: &std::path::Path) -> std::io::Result<Option<crate::server::Listener>> {
+        crate::server::listen(self.shared.clone(), socket)
+    }
+
+    /// Run until `stop` says to: start the runtime again when it ended with
+    /// no frontend attached to do it. An error when it keeps ending.
+    pub fn run(&self, stop: impl Fn() -> bool) -> Result<(), String> {
+        let mut restarts: VecDeque<Instant> = VecDeque::new();
+        while !stop() {
+            std::thread::sleep(Duration::from_millis(100));
+            let ended = {
+                let mut s = self.shared.lock().expect("the host");
+                if s.inputs.is_some() || !s.frontends.is_empty() {
+                    continue;
+                }
+                s.thread.take()
+            };
+            // Joined unlocked: it locks as it ends. One given up is left.
+            if let Some(t) = ended.filter(|t| t.is_finished()) {
+                let _ = t.join();
+            }
+            restarts.retain(|at| at.elapsed() < RESTARTS_WITHIN);
+            if restarts.len() >= RESTARTS {
+                return Err(format!("the runtime stopped {RESTARTS} times within {} s", RESTARTS_WITHIN.as_secs()));
+            }
+            restarts.push_back(Instant::now());
+            let mut s = self.shared.lock().expect("the host");
+            if s.inputs.is_none() && s.frontends.is_empty() {
+                spawn(&self.shared, &mut s);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop the runtime, detaching the frontends attached, and wait for it
+    /// `CLOSE_WAIT` at most, as the last frontend closing does.
+    pub fn stop(self) {
+        let thread = {
+            let mut s = self.shared.lock().expect("the host");
+            // Accepted socket requests and restart callbacks can outlive
+            // the listener. Close admission before taking the sender.
+            s.stopping = true;
+            let frontends = std::mem::take(&mut s.frontends);
+            if let Some(tx) = s.inputs.take() {
+                // Each detaches as it does closing, its session's state
+                // (minibuffer histories) kept, before the runtime stops.
+                for (&client, f) in &frontends {
+                    f.interrupts.kill_before(f.sent);
+                    let _ = tx.send(Msg::Input(client, Input::Close, f.backlog.admit(&Input::Close)));
+                }
+                let _ = tx.send(Msg::Stop);
+            }
+            let thread = s.thread.take();
+            drop(s);
+            for frontend in frontends.into_values() {
+                (frontend.deliver)(Event::Failed(DAEMON_STOPPED.into()));
+            }
+            thread
+        };
+        if let Some(t) = thread {
+            let deadline = Instant::now() + CLOSE_WAIT;
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
+    }
+}
+
+/// Attach a frontend, starting a runtime if needed, unless the daemon is stopping.
+pub(crate) fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deliver: Deliver) -> Option<Host> {
     let mut s = shared.lock().expect("the host");
+    if s.stopping {
+        return None;
+    }
     let client = Client(s.next_client);
     s.next_client += 1;
     let interrupts = Arc::<Interrupts>::default();
@@ -370,7 +484,7 @@ pub(crate) fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: S
         }
         None => spawn(shared, &mut s),
     }
-    Host { shared: shared.clone(), client, generation: s.generation }
+    Some(Host { shared: shared.clone(), client, generation: s.generation })
 }
 
 /// Start a new runtime, with every frontend in `s` attached to it.
@@ -531,6 +645,7 @@ fn route(shared: &Mutex<Shared>, generation: u64, client: Client, output: Output
             if detached { s.frontends.remove(&client).map(|f| f.deliver) } else { s.frontends.get(&client).map(|f| f.deliver.clone()) };
         if detached
             && s.frontends.is_empty()
+            && !s.daemon
             && let Some(tx) = s.inputs.take()
         {
             let _ = tx.send(Msg::Stop);

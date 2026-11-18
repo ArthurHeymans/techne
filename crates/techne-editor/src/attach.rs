@@ -38,7 +38,11 @@ use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::Instant,
 };
 
@@ -46,12 +50,16 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use techne_text::ropey::Rope;
 
 use crate::{
-    host::{BUSY_AFTER, Event, Host, Shared},
+    host::{BACKLOG_BYTES, BACKLOG_INPUTS, BUSY_AFTER, Event, Host, Shared},
     images::{Image, ImageData},
     present::{CapturedFrame, Input, Output, Snapshot},
-    runtime::{File, journal_for},
+    runtime::{File, journal_for, weight},
     server::{OpenError, Request},
 };
+
+/// The version of the protocol below: an editor refuses a frontend that
+/// speaks another, as a techne of another build on another machine may.
+pub const VERSION: u32 = 1;
 
 /// Largest frame of an attachment: an image's pixels and a captured frame
 /// cross it whole. The peer runs as the same user, as the socket's
@@ -216,7 +224,12 @@ fn enqueue(waiting: &Waiting, connection: &UnixStream, event: Event) {
 /// Attach the frontend at the other end of `stream`, which asked to
 /// (`Request::Attach`), to the runtime of `shared`, and serve it until it
 /// detaches or its connection ends.
-pub(crate) fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream, profile: String, path: Option<PathBuf>) {
+pub(crate) fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream, profile: String, path: Option<PathBuf>, version: u32) {
+    if version != VERSION {
+        let why = format!("the editor speaks version {VERSION} of the attachment protocol, the frontend {version}: run the same techne");
+        let _ = write_frame(&mut stream, &Down::Failed(why));
+        return;
+    }
     let file = match path.map(|path| journal_for(&path).map(|journal| File { path, journal })).transpose() {
         Ok(file) => file,
         Err(e) => {
@@ -228,7 +241,10 @@ pub(crate) fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream, profile
     let waiting = Waiting::default();
     let closing = CloseOnDrop(waiting.clone());
     let deliver = Arc::new(move |e| enqueue(&closing.0, &connection, e));
-    let host = crate::host::attach(shared, file, profile, deliver);
+    let Some(host) = crate::host::attach(shared, file, profile, deliver) else {
+        let _ = write_frame(&mut stream, &Down::Failed(crate::host::DAEMON_STOPPED.into()));
+        return;
+    };
     let served = Arc::new(Served { unanswered: Mutex::default(), attached: Mutex::new(Attached { host: Some(host), restarts: 0 }) });
     let theirs = served.clone();
     let writer = std::thread::Builder::new().name("attachment out".into()).spawn(move || {
@@ -491,7 +507,10 @@ fn apply(rope: &mut Rope, text: Text) -> Result<(), String> {
 /// An attachment to an editor in another process, through its socket: what
 /// a frontend does with a `Host`, it does with this.
 pub struct Remote {
-    stream: UnixStream,
+    /// One writer owns the socket or child pipe. No frontend thread writes to it.
+    out: mpsc::SyncSender<(Up, usize)>,
+    out_bytes: Arc<AtomicUsize>,
+    end: Arc<ConnectionEnd>,
     /// The keys and clicks sent, numbered from 1.
     numbered: u64,
     /// Those sent and not answered yet, by number, with when they were
@@ -526,32 +545,120 @@ impl Remote {
         path: Option<&Path>,
         deliver: impl Fn(Event) + Send + 'static,
     ) -> Result<Remote, OpenError> {
-        let mut stream = UnixStream::connect(socket).map_err(|_| OpenError::NotRunning)?;
+        let stream = UnixStream::connect(socket).map_err(|_| OpenError::NotRunning)?;
         let failed = |e: std::io::Error| OpenError::Failed(e.to_string());
         let path = path.map(std::path::absolute).transpose().map_err(failed)?;
-        crate::server::write_request(&mut stream, &Request::Attach { profile: profile.into(), file: path }).map_err(failed)?;
+        let (input, ender) = (stream.try_clone().map_err(failed)?, stream.try_clone().map_err(failed)?);
+        let end = move || drop(ender.shutdown(std::net::Shutdown::Both));
+        Remote::over(input, stream, end, profile, path, deliver)
+    }
+
+    /// Attach to the editor on the other end of `command`'s standard input
+    /// and output: `techne attach --stdio` there (`relay`), say through
+    /// ssh. `path` is the file's on the editor's machine. What the command
+    /// writes to its standard error goes to this process's.
+    pub fn attach_through(
+        command: &[String],
+        profile: &str,
+        path: Option<PathBuf>,
+        deliver: impl Fn(Event) + Send + 'static,
+    ) -> Result<Remote, OpenError> {
+        let (program, args) = command.split_first().ok_or_else(|| OpenError::Failed("no command to attach through".into()))?;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| OpenError::Failed(format!("{program}: {e}")))?;
+        let (to, from) = (child.stdin.take(), child.stdout.take());
+        let (Some(to), Some(from)) = (to, from) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(OpenError::Failed(format!("{program}: no pipes")));
+        };
+        // End the relay by dropping the sender. Reaping must not happen on
+        // the frontend thread, including when an input overruns the queue.
+        let (keep, ended) = mpsc::channel::<()>();
+        let child = Arc::new(Mutex::new(child));
+        let relay = child.clone();
+        if let Err(e) = std::thread::Builder::new().name("attachment relay".into()).spawn(move || {
+            let _ = ended.recv();
+            let mut relay = relay.lock().expect("the relay");
+            let _ = relay.kill();
+            let _ = relay.wait();
+        }) {
+            let mut child = child.lock().expect("the relay");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(OpenError::Failed(format!("{program}: {e}")));
+        }
+        Remote::over(from, to, move || drop(keep), profile, path, deliver)
+    }
+
+    /// Attach over a connection read from `input` and written to `out`,
+    /// which `end` ends.
+    fn over(
+        input: impl Read + Send + 'static,
+        mut out: impl Write + Send + 'static,
+        end: impl FnOnce() + Send + 'static,
+        profile: &str,
+        path: Option<PathBuf>,
+        deliver: impl Fn(Event) + Send + 'static,
+    ) -> Result<Remote, OpenError> {
+        // Ended if what follows fails, with the guard.
+        let end = Arc::new(ConnectionEnd(Mutex::new(Some(Box::new(end)))));
+        let failed = |e: std::io::Error| OpenError::Failed(e.to_string());
+        let request = Request::Attach { profile: profile.into(), file: path, version: VERSION };
         let waiting = Arc::<Mutex<VecDeque<(u64, Instant)>>>::default();
         let captures = Arc::<Mutex<Captures>>::default();
-        let input = stream.try_clone().map_err(failed)?;
         let (w, c) = (waiting.clone(), captures.clone());
+        // Absorb normal key bursts, including when the server is busy, but
+        // limit retained clipboard/capture bytes separately from the count.
+        let (send, recv) = mpsc::sync_channel(2 * BACKLOG_INPUTS);
+        let out_bytes = Arc::new(AtomicUsize::new(0));
+        let writer_bytes = out_bytes.clone();
+        let writer_end = end.clone();
         std::thread::Builder::new()
-            .name("attachment in".into())
+            .name("attachment out".into())
             .spawn(move || {
-                let why = receive(input, &w, &c, &deliver).err().unwrap_or_else(|| "the editor went away".into());
-                deliver(Event::Failed(why));
+                let write = || -> std::io::Result<()> {
+                    crate::server::write_request(&mut out, &request)?;
+                    for (message, bytes) in recv {
+                        write_frame(&mut out, &message)?;
+                        writer_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                    }
+                    Ok(())
+                };
+                let _ = write();
+                writer_end.stop();
             })
             .map_err(failed)?;
-        Ok(Remote { stream, numbered: 0, waiting, captures })
+        let reader_end = end.clone();
+        if let Err(e) = std::thread::Builder::new().name("attachment in".into()).spawn(move || {
+            let why = receive(input, &w, &c, &deliver).err().unwrap_or_else(|| "the editor went away".into());
+            deliver(Event::Failed(why));
+            reader_end.stop();
+        }) {
+            end.stop();
+            return Err(failed(e));
+        }
+        Ok(Remote { out: send, out_bytes, end, numbered: 0, waiting, captures })
     }
 
     /// Send an input. C-g interrupts what the runtime does for this
     /// frontend as soon as it arrives, as it does for one in its process.
     pub fn send(&mut self, input: Input) {
         if let Input::Key { at, .. } | Input::Click { at, .. } = &input {
+            let mut waiting = self.waiting.lock().expect("the waiting");
+            if waiting.len() >= 4096 {
+                drop(waiting);
+                self.end.stop();
+                return;
+            }
             self.numbered += 1;
-            self.waiting.lock().expect("the waiting").push_back((self.numbered, *at));
+            waiting.push_back((self.numbered, *at));
         }
-        let _ = write_frame(&mut self.stream, &Up::Input(input));
+        self.enqueue(Up::Input(input));
     }
 
     /// When the runtime is busy, as far as this frontend can tell: as
@@ -565,20 +672,70 @@ impl Remote {
     pub fn captured(&mut self, id: usize, result: Result<CapturedFrame, String>) {
         let asked = self.captures.lock().expect("the captures").asked.remove(&id);
         if let Some((generation, id)) = asked {
-            let _ = write_frame(&mut self.stream, &Up::Captured { generation, id, result });
+            self.enqueue(Up::Captured { generation, id, result });
+        }
+    }
+
+    fn enqueue(&self, message: Up) {
+        let bytes = match &message {
+            Up::Input(input) => weight(input),
+            Up::Captured { result, .. } => {
+                std::mem::size_of::<Up>()
+                    + match result {
+                        Ok(frame) => frame.png.capacity(),
+                        Err(error) => error.capacity(),
+                    }
+            }
+        };
+        let Ok(_) = self.out_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            let total = held.saturating_add(bytes);
+            // As with the runtime backlog, one larger frame may go alone.
+            ((held == 0 && bytes <= MAX_FRAME) || total <= BACKLOG_BYTES).then_some(total)
+        }) else {
+            self.end.stop();
+            return;
+        };
+        if self.out.try_send((message, bytes)).is_err() {
+            self.out_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            // A stalled peer must not accumulate input or block the event loop.
+            self.end.stop();
         }
     }
 
     /// Detach: the connection ends.
     pub fn close(self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        drop(self);
+    }
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        self.end.stop();
+    }
+}
+
+/// Interrupts a blocked read or write by shutting down the transport once.
+struct ConnectionEnd(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl ConnectionEnd {
+    fn stop(&self) {
+        let end = self.0.lock().expect("attachment shutdown").take();
+        if let Some(end) = end {
+            end();
+        }
+    }
+}
+
+impl Drop for ConnectionEnd {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
 /// Deliver what comes on `input` as outputs, until the connection ends
 /// (Ok) or a message cannot be read or applied (why).
 fn receive(
-    mut input: UnixStream,
+    mut input: impl Read,
     waiting: &Mutex<VecDeque<(u64, Instant)>>,
     captures: &Mutex<Captures>,
     deliver: &impl Fn(Event),
@@ -703,9 +860,204 @@ impl Link {
     }
 }
 
+// Reaching an editor
+
+/// Where a frontend attaches: to the editor running here, or on another
+/// machine through ssh (`ssh_command`).
+pub enum Target {
+    Here,
+    /// An ssh destination, as `ssh` takes it: a host, `user@host`, or an
+    /// alias of its configuration.
+    Ssh(String),
+}
+
+/// Attach a frontend, as `Remote::attach` does, to the editor at `target`;
+/// with `start`, one started there first if none runs (`techne daemon`).
+/// Through ssh, `path` is the file's there, and must be absolute.
+pub fn attach_to(
+    target: &Target,
+    start: bool,
+    profile: &str,
+    path: Option<&Path>,
+    deliver: impl Fn(Event) + Send + 'static,
+) -> Result<Remote, OpenError> {
+    match target {
+        Target::Here => {
+            let socket = crate::server::socket().ok_or(OpenError::NotRunning)?;
+            if start {
+                running(&socket).map_err(OpenError::Failed)?;
+            }
+            Remote::attach(&socket, profile, path, deliver)
+        }
+        Target::Ssh(destination) => {
+            if let Some(p) = path.filter(|p| !p.is_absolute()) {
+                return Err(OpenError::Failed(format!(
+                    "{}: through ssh, the file's path is the editor's, and must be absolute",
+                    p.display()
+                )));
+            }
+            Remote::attach_through(&ssh_command(destination, start), profile, path.map(Path::to_path_buf), deliver)
+        }
+    }
+}
+
+/// The command attaching through ssh to `destination`: `techne attach
+/// --stdio` run there, with `--start` if `start`. `TECHNE_SSH` is the ssh
+/// command (`ssh` by default; words, as `ssh -p 2222`), and
+/// `TECHNE_REMOTE_PROGRAM` techne's name there (`techne` by default, found
+/// in the remote shell's PATH). Authentication and encryption are ssh's;
+/// the escape character is off, so no byte of the protocol is taken for
+/// one.
+pub fn ssh_command(destination: &str, start: bool) -> Vec<String> {
+    let ssh = std::env::var("TECHNE_SSH").unwrap_or_else(|_| "ssh".into());
+    let techne = std::env::var("TECHNE_REMOTE_PROGRAM").unwrap_or_else(|_| "techne".into());
+    ssh_command_with(&ssh, &techne, destination, start)
+}
+
+/// `ssh_command`, with SSH the ssh command and TECHNE techne's name there.
+/// The destination comes after `--`, so that one beginning with `-` is a
+/// destination, never an option (`-oProxyCommand=...` runs a command).
+fn ssh_command_with(ssh: &str, techne: &str, destination: &str, start: bool) -> Vec<String> {
+    let mut command: Vec<String> = ssh.split_whitespace().map(String::from).collect();
+    command.extend(["-T", "-e", "none", "--", destination].map(String::from));
+    command.extend([techne.into(), "attach".into(), "--stdio".into()]);
+    if start {
+        command.push("--start".into());
+    }
+    command
+}
+
+/// Relay this process's standard input and output to the editor running
+/// here, until it ends the connection: `techne attach --stdio`, the other
+/// end of `ssh_command`. With `start`, an editor is started first if none
+/// runs. With none, the frontend is told why, as an editor would tell it.
+pub fn relay(start: bool) -> Result<(), String> {
+    let socket = crate::server::socket().ok_or("no XDG_RUNTIME_DIR for the editor's socket")?;
+    if start {
+        running(&socket)?;
+    }
+    let Ok(stream) = UnixStream::connect(&socket) else {
+        let why = "no editor is running there (attach with --start to start one)".to_string();
+        let _ = read_frame::<Request>(&mut std::io::stdin().lock());
+        let _ = write_frame(&mut std::io::stdout().lock(), &Down::Failed(why.clone()));
+        return Err(why);
+    };
+    let mut to_editor = stream.try_clone().map_err(|e| e.to_string())?;
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_editor);
+        let _ = to_editor.shutdown(std::net::Shutdown::Write);
+    });
+    // Written as it comes: standard output is buffered by lines.
+    let (mut from_editor, mut out) = (stream, std::io::stdout().lock());
+    let mut buf = vec![0; 64 << 10];
+    loop {
+        match from_editor.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => out.write_all(&buf[..n]).and_then(|()| out.flush()).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// How long a daemon started may take to listen.
+const START_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Make sure an editor listens on `socket`: if none does, start `techne
+/// daemon` (this program), in a process group of its own, so that it
+/// outlives what started it, writing what it says to `daemon.log` beside
+/// the socket; and wait until it listens.
+fn running(socket: &Path) -> Result<(), String> {
+    if UnixStream::connect(socket).is_ok() {
+        return Ok(());
+    }
+    let program = std::env::current_exe().map_err(|e| e.to_string())?;
+    let log_path = socket.with_file_name("daemon.log");
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let mut daemon = std::process::Command::new(&program);
+    std::os::unix::process::CommandExt::process_group(&mut daemon, 0);
+    let mut daemon = daemon
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    let deadline = Instant::now() + START_WAIT;
+    loop {
+        if UnixStream::connect(socket).is_ok() {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = daemon.try_wait() {
+            // Another started one meanwhile, and this one found it.
+            if UnixStream::connect(socket).is_ok() {
+                return Ok(());
+            }
+            return Err(format!("techne daemon ended ({status}); see {}", log_path.display()));
+        }
+        if Instant::now() > deadline {
+            return Err(format!("techne daemon did not listen in {} s; see {}", START_WAIT.as_secs(), log_path.display()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blocked_transport_does_not_block_input_or_detach() {
+        use std::time::Duration;
+
+        let (peer, writer) = UnixStream::pair().unwrap();
+        let input = writer.try_clone().unwrap();
+        let ender = writer.try_clone().unwrap();
+        let (ended, end) = mpsc::channel();
+        let mut remote = Remote::over(
+            input,
+            writer,
+            move || {
+                let _ = ender.shutdown(std::net::Shutdown::Both);
+                let _ = ended.send(());
+            },
+            "emacs",
+            None,
+            |_| {},
+        )
+        .unwrap();
+        // The peer deliberately never reads. One frame exceeds the socket's
+        // send buffer; the following frames fill the frontend's bounded queue.
+        let (returned, done) = mpsc::channel();
+        let send = std::thread::spawn(move || {
+            let text = "a".repeat(1 << 20);
+            for _ in 0..64 {
+                remote.send(Input::Clipboard { text: text.clone() });
+            }
+            returned.send(()).unwrap();
+            remote.close();
+        });
+        let result = done.recv_timeout(Duration::from_secs(5));
+        drop(peer); // Even on a regression, let the test's writer exit.
+        send.join().unwrap();
+        result.expect("the frontend did not block on a stalled writer");
+        end.recv_timeout(Duration::from_secs(2)).expect("shutdown cancels the transport");
+    }
+
+    #[test]
+    fn a_stalled_child_relay_is_cancelled_when_its_queue_fills() {
+        use std::time::Duration;
+
+        // Like an SSH pipe whose peer has stopped draining, this process
+        // keeps both pipes open without reading or writing them.
+        let (tx, events) = mpsc::channel();
+        let mut remote = Remote::attach_through(&["sleep".into(), "20".into()], "emacs", None, move |e| drop(tx.send(e))).unwrap();
+        for _ in 0..6 {
+            remote.send(Input::Clipboard { text: "a".repeat(1 << 20) });
+        }
+        assert!(matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), Event::Failed(_)));
+        remote.close();
+    }
 
     /// The splice from `a` to `b`, checked to make `b` of `a`.
     fn check(a: &str, b: &str) -> Text {
@@ -762,6 +1114,23 @@ mod tests {
         assert!(apply(&mut rope, Text::Splice { at: 0, removed: 3, inserted: String::new() }).is_err());
     }
 
+    /// The command run through ssh: options first, then techne there.
+    #[test]
+    fn the_ssh_command() {
+        assert_eq!(
+            ssh_command_with("ssh", "techne", "me@box", false),
+            ["ssh", "-T", "-e", "none", "--", "me@box", "techne", "attach", "--stdio"]
+        );
+        assert_eq!(
+            ssh_command_with("ssh -p 2222", "/opt/techne", "box", true),
+            ["ssh", "-p", "2222", "-T", "-e", "none", "--", "box", "/opt/techne", "attach", "--stdio", "--start"]
+        );
+        // An option it looks like is the destination's name.
+        let command = ssh_command_with("ssh", "techne", "-oProxyCommand=touch /tmp/x", false);
+        let dashes = command.iter().position(|a| a == "--").unwrap();
+        assert_eq!(command[dashes + 1], "-oProxyCommand=touch /tmp/x");
+    }
+
     /// Keys and clicks the runtime refused are answered with those it took
     /// before and after them; a snapshot answering none answers those
     /// refused before anything taken.
@@ -809,13 +1178,17 @@ mod tests {
         remote.captured(after, Err("new".into()));
         // Answered once only.
         remote.captured(after, Err("again".into()));
+        // Read through a sentinel before closing. An unexpected queued
+        // reply cannot disappear when the asynchronous writer is cancelled.
+        remote.send(Input::Clipboard { text: "sentinel".into() });
+        editor.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let Some(Up::Captured { generation, id, result }) = read_frame::<Up>(&mut editor).unwrap() else {
+            panic!("expected a capture reply");
+        };
+        assert_eq!((generation, id, result.unwrap_err()), (1, 0, "new".to_string()));
+        assert!(matches!(read_frame::<Up>(&mut editor).unwrap(),
+            Some(Up::Input(Input::Clipboard { text })) if text == "sentinel"));
         remote.close();
-        let mut answers = Vec::new();
-        while let Some(up) = read_frame::<Up>(&mut editor).unwrap() {
-            if let Up::Captured { generation, id, result } = up {
-                answers.push((generation, id, result.unwrap_err()));
-            }
-        }
-        assert_eq!(answers, [(1, 0, "new".to_string())]);
+        assert!(read_frame::<Up>(&mut editor).unwrap().is_none());
     }
 }

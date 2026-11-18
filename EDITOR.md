@@ -424,9 +424,12 @@ attaching from another process on the same machine (`techne window
 A pane's text crosses as one splice from the text that view was last sent,
 an image once, and a snapshot waiting behind a newer one not at all. The
 process the runtime started in serves those attached until the last
-detaches, once its own frontend closes. Attaching from another machine
-over ssh, and a runtime started without a frontend (`--daemon`), are not
-built yet.
+detaches, once its own frontend closes. From another machine, a frontend
+attaches through ssh (`--ssh DEST`): `ssh DEST techne attach --stdio`
+relays the protocol to the socket there, and the version both speak is
+checked first. `techne daemon` runs a runtime with no frontend, as
+`emacs --daemon` does, started again here when it crashes with none
+attached; `--start` starts one where a frontend attaches, if none runs.
 
 **The protocol.** Everything in it is serializable data: no native pointers or
 callbacks, even when frontend and runtime share a process.
