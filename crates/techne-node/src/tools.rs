@@ -147,26 +147,43 @@ fn program_stamp() -> R<String> {
 }
 
 /// What identifies the Scheme sources under DIRECTORY as they are: how
-/// many `.scm` and `.sld` files, their bytes, and the newest change, so
-/// that a changed, added or removed library changes it. A directory that
-/// is not there is "none".
-fn tree_stamp(dir: &str) -> R<String> {
-    use std::os::unix::fs::MetadataExt;
+/// many `.scm` and `.sld` files, their bytes, and a digest of each one's
+/// path, size and last change, so that a changed, added, removed or moved
+/// library changes it, whatever the other files' times. A directory that
+/// is not there is "none". The directories of DIRECTORY named in EXCLUDED
+/// are left out, with all they hold.
+fn tree_stamp(dir: &str, excluded: &[String]) -> R<String> {
+    use std::{hash::Hasher, os::unix::fs::MetadataExt};
     if !Path::new(dir).is_dir() {
         return Ok("none".into());
     }
-    let (mut count, mut bytes, mut newest) = (0u64, 0u64, (0i64, 0i64));
-    for entry in ignore::WalkBuilder::new(dir).standard_filters(false).follow_links(true).build().flatten() {
-        let path = entry.path();
-        if !matches!(path.extension().and_then(|e| e.to_str()), Some("scm" | "sld")) {
-            continue;
-        }
-        let Ok(m) = std::fs::metadata(path) else { continue };
-        count += 1;
-        bytes += m.size();
-        newest = newest.max((m.mtime(), m.mtime_nsec()));
+    let root = Path::new(dir).to_path_buf();
+    let skipped: Vec<_> = excluded.iter().map(|name| root.join(name)).collect();
+    let walk = ignore::WalkBuilder::new(dir)
+        .standard_filters(false)
+        .follow_links(true)
+        .filter_entry(move |entry| !skipped.iter().any(|path| entry.path() == path))
+        .build();
+    let mut files: Vec<_> = walk
+        .flatten()
+        .filter(|entry| matches!(entry.path().extension().and_then(|e| e.to_str()), Some("scm" | "sld")))
+        .filter_map(|entry| {
+            let m = std::fs::metadata(entry.path()).ok()?;
+            let path = entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_path_buf();
+            Some((path, m.size(), m.mtime(), m.mtime_nsec()))
+        })
+        .collect();
+    // The walk's order is the file system's: sorted, the same files make
+    // the same digest.
+    files.sort();
+    // SipHash with its fixed keys: a client and its session, the same
+    // program, digest alike.
+    let mut digest = std::hash::DefaultHasher::new();
+    for file in &files {
+        std::hash::Hash::hash(file, &mut digest);
     }
-    Ok(format!("{count}:{bytes}:{}.{}", newest.0, newest.1))
+    let bytes: u64 = files.iter().map(|f| f.1).sum();
+    Ok(format!("{}:{bytes}:{:016x}", files.len(), digest.finish()))
 }
 
 /// Create NAME under ROOT with SOURCE, refused if anything is there, a
@@ -335,7 +352,8 @@ pub(crate) fn install(vm: &mut Vm) {
             "(%repository-write root path revision source)" => |root: String, path: String, revision: String, source: String| -> R<String> { write_file(&root, &path, &revision, &source) };
             "(%repository-create root path source)" => |root: String, path: String, source: String| -> R<String> { create_file(&root, &path, &source) };
             "(%program-stamp)" => || -> R<String> { program_stamp() };
-            "(%tree-stamp directory)" => |dir: String| -> R<String> { tree_stamp(&dir) };
+            "(%tree-stamp directory)" => |dir: String| -> R<String> { tree_stamp(&dir, &[]) };
+            "(%tree-stamp-except directory excluded)" => |dir: String, excluded: Vec<String>| -> R<String> { tree_stamp(&dir, &excluded) };
             "(%lisp-directory)" => || -> R<String> {
                 Ok(techne_vm::library::lisp_dir().canonicalize().map_err(|e| e.to_string())?.to_string_lossy().into_owned())
             };

@@ -2223,6 +2223,7 @@
     "%tcp-writable",
     "%tcp-write-some",
     "%tree-stamp",
+    "%tree-stamp-except",
     "call-with-process",
     "call-with-socket",
     "call-with-tcp-connection",
