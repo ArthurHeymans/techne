@@ -167,6 +167,14 @@ fn a_form_comes_from_stdin_or_a_file_and_a_stale_session_restarts() {
     let form = format!("@{}", dir.path().join("form.scm").display());
     assert_eq!(run(&[root, &form, &session.name], "").0, "\"text\"", "the same session, its snapshot");
     // The tools change: the session ran older code, and is restarted.
+    // The editor's Lisp is no tool's: changing it keeps the session.
+    let editor = lisp.join("editor/api.scm");
+    let mut source = std::fs::read_to_string(&editor).unwrap();
+    source.push_str("\n;; changed\n");
+    std::fs::write(&editor, source).unwrap();
+    let (kept, said) = run(&[root, &form, &session.name], "");
+    assert_eq!((kept.as_str(), said.as_str()), ("\"text\"", ""), "an editor change keeps the session and its snapshot");
+    assert!(!gone(lasting), "and its processes: {lasting}");
     let help = lisp.join("techne/tools-help.scm");
     let mut source = std::fs::read_to_string(&help).unwrap();
     source.push_str("\n;; changed\n");

@@ -441,14 +441,18 @@ F is called as (F element accumulated)."
   "Fold L with F from its first element, or return RIDENTITY if empty."
   (if (null? l) ridentity (fold f (car l) (cdr l))))
 
-(define (append-map f l)
-  "Return the lists F gives for the elements of L, appended."
-  (apply append (map f l)))
-(define (filter-map f l)
-  "Return the true results of calling F on the elements of L."
-  (let loop ((l l) (acc '()))
-    (if (null? l) (reverse acc)
-        (let ((v (f (car l)))) (loop (cdr l) (if v (cons v acc) acc))))))
+(define (append-map f l . more)
+  "Return the lists F gives for the elements of L, appended.
+With MORE lists, F takes an element of each, as `map` calls it."
+  (if (null? more) (apply append (map f l)) (apply append (apply map f l more))))
+(define (filter-map f l . more)
+  "Return the true results of calling F on the elements of L.
+With MORE lists, F takes an element of each, as `map` calls it."
+  (if (null? more)
+      (let loop ((l l) (acc '()))
+        (if (null? l) (reverse acc)
+            (let ((v (f (car l)))) (loop (cdr l) (if v (cons v acc) acc)))))
+      (filter (lambda (v) v) (apply map f l more))))
 (define (find p l)
   "Return the first element of L for which P holds, or #f."
   (let loop ((l l))
@@ -493,6 +497,12 @@ For an empty L, return #t."
 (define (drop l n)
   "Return L without its first N elements."
   (if (= n 0) l (drop (cdr l) (- n 1))))
+(define (take-right l n)
+  "Return the last N elements of L."
+  (drop l (- (length l) n)))
+(define (drop-right l n)
+  "Return L without its last N elements."
+  (take l (- (length l) n)))
 (define (list-copy l)
   "Return a copy of the pairs of the list L."
   (if (pair? l)
