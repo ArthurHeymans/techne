@@ -224,8 +224,12 @@ fn fonts() -> FontSystem {
     let db = fonts.db_mut();
     let wanted = db.family_name(&Family::Monospace).to_string();
     if !db.faces().any(|f| f.families.iter().any(|(name, _)| *name == wanted)) {
-        let installed = db.faces().filter(|f| f.monospaced && !f.post_script_name.contains("Emoji")).filter_map(|f| f.families.first());
-        if let Some(name) = installed.map(|(name, _)| name.clone()).min() {
+        // Families with an upright regular face first, then by name.
+        let installed = db.faces().filter(|f| f.monospaced && !f.post_script_name.contains("Emoji")).filter_map(|f| {
+            let regular = f.style == FontStyle::Normal && f.weight == FontWeight::NORMAL;
+            f.families.first().map(|(name, _)| (!regular, name.clone()))
+        });
+        if let Some((_, name)) = installed.min() {
             db.set_monospace_family(name);
         }
     }

@@ -166,7 +166,6 @@ fn a_form_comes_from_stdin_or_a_file_and_a_stale_session_restarts() {
     std::fs::write(dir.path().join("form.scm"), format!("(guard (e (#t #f)) (tool-ref (tool-expand project {handle}) 'text))")).unwrap();
     let form = format!("@{}", dir.path().join("form.scm").display());
     assert_eq!(run(&[root, &form, &session.name], "").0, "\"text\"", "the same session, its snapshot");
-    // The tools change: the session ran older code, and is restarted.
     // The editor's Lisp is no tool's: changing it keeps the session.
     let editor = lisp.join("editor/api.scm");
     let mut source = std::fs::read_to_string(&editor).unwrap();
@@ -175,6 +174,7 @@ fn a_form_comes_from_stdin_or_a_file_and_a_stale_session_restarts() {
     let (kept, said) = run(&[root, &form, &session.name], "");
     assert_eq!((kept.as_str(), said.as_str()), ("\"text\"", ""), "an editor change keeps the session and its snapshot");
     assert!(!gone(lasting), "and its processes: {lasting}");
+    // The tools change: the session ran older code, and is restarted.
     let help = lisp.join("techne/tools-help.scm");
     let mut source = std::fs::read_to_string(&help).unwrap();
     source.push_str("\n;; changed\n");
@@ -185,6 +185,25 @@ fn a_form_comes_from_stdin_or_a_file_and_a_stale_session_restarts() {
     assert_eq!(expired, "#f", "a new session: the old snapshot is gone");
     let (_, said) = run(&[root, "(tool-files project)", &session.name], "");
     assert!(said.is_empty(), "restarted once: {said}");
+    // A library at the top of Techne's Lisp is one an import finds: a
+    // change of it, even of the same size within a second, restarts, and
+    // even when another library's time is later than both of its.
+    let probe = lisp.join("friction-probe.sld");
+    let at = |path: &Path, time: SystemTime| std::fs::File::options().write(true).open(path).unwrap().set_modified(time).unwrap();
+    let second = UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+    at(&lisp.join("techne/tools.sld"), second + std::time::Duration::from_secs(60));
+    std::fs::write(&probe, "(define-library (friction-probe) (export probe) (import (techne)) (begin (define probe 41)))\n").unwrap();
+    at(&probe, second + std::time::Duration::from_millis(100));
+    let (_, said) = run(&[root, "(tool-files project)", &session.name], "");
+    assert!(said.contains("ran older code; restarting it"), "a new library: {said}");
+    assert_eq!(run(&[root, "(begin (import (friction-probe)) probe)", &session.name], "").0, "41");
+    std::fs::write(&probe, "(define-library (friction-probe) (export probe) (import (techne)) (begin (define probe 42)))\n").unwrap();
+    at(&probe, second + std::time::Duration::from_millis(200));
+    let modified = std::fs::metadata(&probe).unwrap().modified().unwrap();
+    assert_eq!(modified, second + std::time::Duration::from_millis(200), "the same second, later than the first version");
+    let (changed, said) = run(&[root, "(begin (import (friction-probe)) probe)", &session.name], "");
+    assert!(said.contains("ran older code; restarting it"), "a changed library: {said}");
+    assert_eq!(changed, "42");
 }
 
 /// The pid a session's job printed first, and whether a pid has ended.

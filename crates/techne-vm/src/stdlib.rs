@@ -546,10 +546,17 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
     if !surplus.is_empty() {
         // The usual cause: a keyword argument written before a positional
         // one, which then took the keyword for its value.
-        let mut values = surplus.iter().map(|v| repr(*v)).collect::<Vec<_>>().join(" ");
-        if let Some((cut, _)) = values.char_indices().nth(200) {
-            values.truncate(cut);
-            values.push('…');
+        // One budget for them all: a value's shared parts can print far
+        // more text than it holds.
+        let mut values = String::new();
+        for v in &surplus {
+            if !values.is_empty() {
+                values.push(' ');
+            }
+            if values.len() >= 200 || !crate::builtins::print_within(&mut values, *v, true, crate::builtins::Sharing::None, 200) {
+                values.push('…');
+                break;
+            }
         }
         return Err(Error::new(format!(
             "{name}: too many arguments, {} more than it takes: {values}; keyword arguments go after the positional ones",

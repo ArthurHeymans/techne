@@ -50,7 +50,10 @@
 (define (unless-set name value)
   (if (and value (not (get-environment-variable name))) `((,name . ,value)) '()))
 (define drawing
-  (append (if render '() (unless-set "VK_DRIVER_FILES" (get-environment-variable "TECHNE_SOFTWARE_VULKAN_DRIVER")))
+  ;; VK_ICD_FILENAMES is the older name of VK_DRIVER_FILES, which the
+  ;; Vulkan loader prefers: a choice made with either is kept.
+  (append (if (or render (get-environment-variable "VK_ICD_FILENAMES")) '()
+              (unless-set "VK_DRIVER_FILES" (get-environment-variable "TECHNE_SOFTWARE_VULKAN_DRIVER")))
           (unless-set "FONTCONFIG_FILE" (get-environment-variable "TECHNE_HEADLESS_FONTCONFIG"))))
 
 ;; Sway in DIR, until COMMAND ends: its status. Leaving, however it

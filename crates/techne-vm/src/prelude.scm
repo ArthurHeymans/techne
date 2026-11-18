@@ -498,11 +498,15 @@ For an empty L, return #t."
   "Return L without its first N elements."
   (if (= n 0) l (drop (cdr l) (- n 1))))
 (define (take-right l n)
-  "Return the last N elements of L."
-  (drop l (- (length l) n)))
+  "Return the last N elements of L, as SRFI 1 does: its tail N pairs long.
+A dotted L keeps its end; N must be at most its length."
+  (let loop ((lead (drop l n)) (lag l))
+    (if (pair? lead) (loop (cdr lead) (cdr lag)) lag)))
 (define (drop-right l n)
-  "Return L without its last N elements."
-  (take l (- (length l) n)))
+  "Return L without its last N elements, as SRFI 1 does.
+A dotted L loses its end; N must be at most its length."
+  (let loop ((lead (drop l n)) (lag l))
+    (if (pair? lead) (cons (car lag) (loop (cdr lead) (cdr lag))) '())))
 (define (list-copy l)
   "Return a copy of the pairs of the list L."
   (if (pair? l)

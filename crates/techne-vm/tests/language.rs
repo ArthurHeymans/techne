@@ -357,8 +357,8 @@ fn library() {
         "map-multi",
         "(displayln (map + '(1 2 3) '(10 20 30))) (for-each (lambda (a b) (display (* a b))) '(1 2) '(3 4)) (newline)
         (displayln (list (append-map list '(1 2) '(a b)) (filter-map (lambda (a b) (and (odd? a) b)) '(1 2 3) '(x y z))
-                         (take-right '(1 2 3) 2) (drop-right '(1 2 3) 2)))",
-        "(11 22 33)\n38\n((1 a 2 b) (x z) (2 3) (1))\n",
+                         (take-right '(1 2 3) 2) (drop-right '(1 2 3) 2) (take-right '(1 2 3 . end) 2) (drop-right '(1 2 3 . end) 2)))",
+        "(11 22 33)\n38\n((1 a 2 b) (x z) (2 3) (1) (2 3 . end) (1))\n",
     );
     check("hash-tables", "(define h (make-hash-table))
         (for-each (lambda (i) (hash-table-set! h i (* i i))) (iota 100))
