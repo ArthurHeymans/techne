@@ -725,7 +725,7 @@
       "is_macro": false
     },
     "lisp-indent": {
-      "description": "(lisp-indent d starts)  procedure, @lisp@/editor/indent.scm:111\n\nReturn the edits (from to text) indenting the lines at STARTS as Lisp.\nSTARTS are sorted line starts of document D.",
+      "description": "(lisp-indent d starts)  procedure, @lisp@/editor/indent.scm:118\n\nReturn the edits (from to text) indenting the lines at STARTS as Lisp.\nSTARTS are sorted line starts of document D.",
       "is_macro": false
     },
     "lisp-indent-edits": {
@@ -1805,7 +1805,7 @@
       "is_macro": false
     },
     "set-indent!": {
-      "description": "(set-indent! name n)  procedure, @lisp@/editor/indent.scm:105\n\nMake the form NAME indent its first N arguments by 4, its body by 2.\nNAME is a symbol, as Emacs's `scheme-indent-function` property is put;\nwith N #f it indents as a call. Names starting with \"def\" have a body.",
+      "description": "(set-indent! name n)  procedure, @lisp@/editor/indent.scm:112\n\nMake the form NAME indent its first N arguments by 4, its body by 2.\nNAME is a symbol, as Emacs's `scheme-indent-function` property is put;\nwith N #f it indents as a call. Names starting with \"def\" have a body.",
       "is_macro": false
     },
     "set-option!": {
