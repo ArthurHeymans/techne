@@ -752,6 +752,7 @@ impl techne_vm::api::IntoValue for EvalPart {
 pub fn install(vm: &mut Vm) -> Result<(), Error> {
     tools::install(vm);
     techne_process::install(vm)?;
+    techne_store::install(vm)?;
     vm.requiring(Capability::Network, natives);
     // In the root module, so every module sees it.
     vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", PRELUDE).map(|_| ())

@@ -1,0 +1,50 @@
+;;; RFC 5322 dates for chronology; invalid dates never become today's clock.
+(define-library (techne mail date)
+  (export mail-date->instant mail-date-label)
+  (import (techne) (techne time) (techne task))
+  (begin
+    (define months '("jan" "feb" "mar" "apr" "may" "jun" "jul" "aug" "sep" "oct" "nov" "dec"))
+    (define (number text)
+      (and (> (string-length text) 0)
+           (every (lambda (c) (char<=? #\0 c #\9)) (string->list text)) (string->number text)))
+    (define (offset text)
+      (let ((known (assoc (string-upcase text) '(("UT" . 0) ("UTC" . 0) ("GMT" . 0) ("Z" . 0)
+                                                ("EST" . -18000) ("EDT" . -14400) ("CST" . -21600) ("CDT" . -18000)
+                                                ("MST" . -25200) ("MDT" . -21600) ("PST" . -28800) ("PDT" . -25200)))))
+        (if known (cdr known)
+            (and (= (string-length text) 5) (memv (string-ref text 0) '(#\+ #\-))
+                 (let ((h (number (substring text 1 3))) (m (number (substring text 3 5))))
+                   (and h m (< h 24) (< m 60) (* (if (char=? (string-ref text 0) #\-) -1 1) (+ (* h 3600) (* m 60)))))))))
+    (define (mail-date->instant text)
+      "Parse RFC 5322 date TEXT to UTC milliseconds, or #f if invalid.
+Numeric zones and common obsolete US/UTC zones are supported; unknown zones
+are not guessed. The Date header, not import order, controls chronology."
+      (guard (e ((not (task-cancelled-condition? e)) #f))
+        (let* ((words (remove (lambda (s) (string=? s "")) (string-split (string-join (string-split text "\t") " ") " ")))
+               (words (if (and (pair? words) (string-index (car words) #\,)) (cdr words) words)))
+          (and (>= (length words) 5)
+               (let* ((day (number (car words))) (mi (list-index (lambda (m) (string-ci=? m (cadr words))) months))
+                      (year (number (caddr words))) (clock (string-split (list-ref words 3) ":")) (zone (offset (list-ref words 4)))
+                      (hour (and (pair? clock) (number (car clock))))
+                      (minute (and (>= (length clock) 2) (number (cadr clock))))
+                      (second (if (= (length clock) 3) (number (caddr clock)) 0))
+                      (year (and year (if (< year 100) (+ year (if (< year 50) 2000 1900)) year))))
+                 (and day mi year zone hour minute second (<= 1900 year 9999)
+                      (<= 1 day (days-in-month year (+ mi 1))) (< hour 24) (< minute 60) (< second 60)
+                      (<= 2 (length clock) 3)
+                      (civil->instant (list year (+ mi 1) day hour minute second) zone)))))))
+    (define (two n) (if (< n 10) (string-append "0" (number->string n)) (number->string n)))
+    (define (mail-date-label text #:now [now (current-milliseconds)] #:zone [zone "UTC"])
+      "Return a concise date label for TEXT relative to NOW in ZONE.
+Today's messages show a clock, yesterday's say Yesterday, older ones a date;
+invalid or missing Date headers explicitly say Unknown date."
+      (let ((instant (mail-date->instant text)))
+        (if (not instant) "Unknown date"
+            (let* ((c (instant->civil instant zone)) (today (instant->civil now zone))
+                   (delta (- (instant->days now zone) (instant->days instant zone))))
+              (cond ((= delta 0) (string-append (two (list-ref c 3)) ":" (two (list-ref c 4))))
+                    ((= delta 1) "Yesterday")
+                    ((= (car c) (car today))
+                     (string-append (list-ref '("Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec") (- (cadr c) 1))
+                                    " " (number->string (caddr c))))
+                    (else (string-append (number->string (car c)) "-" (two (cadr c)) "-" (two (caddr c)))))))))))

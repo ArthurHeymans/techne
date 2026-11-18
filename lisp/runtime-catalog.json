@@ -89,11 +89,15 @@
       "is_macro": false
     },
     "call-with-socket": {
-      "description": "(call-with-socket socket f)  procedure, <techne-net>:31\n\nCall F with SOCKET, closed when F returns, fails or is cancelled.\nSOCKET is a connection or a listener; return what F returns.",
+      "description": "(call-with-socket socket f)  procedure, <techne-net>:46\n\nCall F with SOCKET, closed when F returns, fails or is cancelled.\nSOCKET is a connection or a listener; return what F returns.",
+      "is_macro": false
+    },
+    "call-with-sqlite": {
+      "description": "(call-with-sqlite path proc)  procedure, <techne-store>:8\n\nCall PROC with an open database at PATH; return its result.\nClose the handle when PROC returns, fails or is cancelled.",
       "is_macro": false
     },
     "call-with-tcp-connection": {
-      "description": "(call-with-tcp-connection host port f)  procedure, <techne-net>:36\n\nCall F with a connection to PORT on HOST, closed when F is done.\nIt is closed when F returns, fails or is cancelled, as `call-with-socket`\ndoes; return what F returns.",
+      "description": "(call-with-tcp-connection host port f)  procedure, <techne-net>:51\n\nCall F with a connection to PORT on HOST, closed when F is done.\nIt is closed when F returns, fails or is cancelled, as `call-with-socket`\ndoes; return what F returns.",
       "is_macro": false
     },
     "cancel-request!": {
@@ -1021,11 +1025,11 @@
       "is_macro": false
     },
     "node-close": {
-      "description": "(node-close node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:782\n\nClose the connection to NODE.",
+      "description": "(node-close node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:783\n\nClose the connection to NODE.",
       "is_macro": false
     },
     "node-connect": {
-      "description": "(node-connect command)  built-in procedure, @source@/crates/techne-node/src/lib.rs:774\n\nStart COMMAND, a list of strings, and return the node it serves.\nCOMMAND runs `techne-node`, here or over ssh.",
+      "description": "(node-connect command)  built-in procedure, @source@/crates/techne-node/src/lib.rs:775\n\nStart COMMAND, a list of strings, and return the node it serves.\nCOMMAND runs `techne-node`, here or over ssh.",
       "is_macro": false
     },
     "node-connect-via": {
@@ -1033,11 +1037,11 @@
       "is_macro": false
     },
     "node-describe": {
-      "description": "(node-describe node what)  built-in procedure, @source@/crates/techne-node/src/lib.rs:990\n\nReturn NODE's description of WHAT, a name or a remote value.",
+      "description": "(node-describe node what)  built-in procedure, @source@/crates/techne-node/src/lib.rs:991\n\nReturn NODE's description of WHAT, a name or a remote value.",
       "is_macro": false
     },
     "node-directory-list": {
-      "description": "(node-directory-list node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1006\n\nReturn the entries of the directory PATH on NODE, sorted.\nSubdirectories have a slash after their name.",
+      "description": "(node-directory-list node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1007\n\nReturn the entries of the directory PATH on NODE, sorted.\nSubdirectories have a slash after their name.",
       "is_macro": false
     },
     "node-end": {
@@ -1053,7 +1057,7 @@
       "is_macro": false
     },
     "node-file-read": {
-      "description": "(node-file-read node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1000\n\nReturn the bytes of the file at PATH on NODE, or #f if there is none.\nPATH is NODE's: `~` and a relative path start at its home.",
+      "description": "(node-file-read node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1001\n\nReturn the bytes of the file at PATH on NODE, or #f if there is none.\nPATH is NODE's: `~` and a relative path start at its home.",
       "is_macro": false
     },
     "node-file-stat": {
@@ -1061,15 +1065,15 @@
       "is_macro": false
     },
     "node-file-write": {
-      "description": "(node-file-write node path bytes)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1003\n\nReplace the file at PATH on NODE with the bytevector BYTES.\nIt is written through a temporary file and a rename.",
+      "description": "(node-file-write node path bytes)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1004\n\nReplace the file at PATH on NODE with the bytevector BYTES.\nIt is written through a temporary file and a rename.",
       "is_macro": false
     },
     "node-find-up": {
-      "description": "(node-find-up node directory names)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1009\n\nReturn the nearest directory on NODE from DIRECTORY up with an entry NAMES names.\nNAMES is a list of strings; #f when no directory has one.",
+      "description": "(node-find-up node directory names)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1010\n\nReturn the nearest directory on NODE from DIRECTORY up with an entry NAMES names.\nNAMES is a list of strings; #f when no directory has one.",
       "is_macro": false
     },
     "node-interrupt": {
-      "description": "(node-interrupt node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:794\n\nInterrupt what NODE is evaluating.",
+      "description": "(node-interrupt node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:795\n\nInterrupt what NODE is evaluating.",
       "is_macro": false
     },
     "node-kind": {
@@ -1077,7 +1081,7 @@
       "is_macro": false
     },
     "node-lost": {
-      "description": "(node-lost node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:786\n\nReturn why NODE's connection is unusable, or #f while it is not.",
+      "description": "(node-lost node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:787\n\nReturn why NODE's connection is unusable, or #f while it is not.",
       "is_macro": false
     },
     "node-named?": {
@@ -1089,7 +1093,7 @@
       "is_macro": false
     },
     "node-process": {
-      "description": "(node-process node id)  built-in procedure, @source@/crates/techne-node/src/lib.rs:993\n\nReturn the process ID that NODE runs, to read from and write to again.",
+      "description": "(node-process node id)  built-in procedure, @source@/crates/techne-node/src/lib.rs:994\n\nReturn the process ID that NODE runs, to read from and write to again.",
       "is_macro": false
     },
     "node-processes": {
@@ -1097,7 +1101,7 @@
       "is_macro": false
     },
     "node-shutdown": {
-      "description": "(node-shutdown node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:798\n\nAsk NODE to end, with its processes.",
+      "description": "(node-shutdown node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:799\n\nAsk NODE to end, with its processes.",
       "is_macro": false
     },
     "node-start": {
@@ -1105,7 +1109,7 @@
       "is_macro": false
     },
     "node-transport-pid": {
-      "description": "(node-transport-pid node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:790\n\nReturn the id of the process carrying NODE's connection, or #f.",
+      "description": "(node-transport-pid node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:791\n\nReturn the id of the process carrying NODE's connection, or #f.",
       "is_macro": false
     },
     "normal-directory": {
@@ -1569,11 +1573,11 @@
       "is_macro": false
     },
     "remote-value-written": {
-      "description": "(remote-value-written remote)  built-in procedure, @source@/crates/techne-node/src/lib.rs:808\n\nReturn the node's bounded written preview of REMOTE.\nAt a data limit this is a fixed marker, not a readable datum.",
+      "description": "(remote-value-written remote)  built-in procedure, @source@/crates/techne-node/src/lib.rs:809\n\nReturn the node's bounded written preview of REMOTE.\nAt a data limit this is a fixed marker, not a readable datum.",
       "is_macro": false
     },
     "remote-value?": {
-      "description": "(remote-value? obj)  built-in procedure, @source@/crates/techne-node/src/lib.rs:803\n\nReturn #t if OBJ is a value held by a node.",
+      "description": "(remote-value? obj)  built-in procedure, @source@/crates/techne-node/src/lib.rs:804\n\nReturn #t if OBJ is a value held by a node.",
       "is_macro": false
     },
     "remove-hook!": {
@@ -1590,6 +1594,10 @@
     },
     "request-pending?": {
       "description": "(request-pending? slot)  procedure, @lisp@/editor/requests.scm:39\n\nReturn #t if SLOT has a request in flight.\nA request whose task ended without delivering, cancelled with the scope\nit belongs to, say, is not.",
+      "is_macro": false
+    },
+    "request-view!": {
+      "description": "(request-view! s request #:view (view (pane-view s)))  procedure, @lisp@/editor/windows.scm:21\n\nAsk the frontend to page or recenter VIEW in session S: REQUEST.\nVIEW defaults to the focused pane; targeting another view does not focus it.\nRequests of keys handled before the frontend answers add up: two pages\ndown are one of two screens.",
       "is_macro": false
     },
     "revert-document!": {
@@ -1852,6 +1860,26 @@
       "description": "(show-view! s name make-rows #:mode (mode (quote rows-mode)) #:data (data #f))  procedure, @lisp@/editor/views.scm:123\n\nShow in S the view NAME, whose rows (MAKE-ROWS session) gives.\nIts mode is MODE, `rows-mode` or one extending it, keeping DATA.",
       "is_macro": false
     },
+    "sqlite-close": {
+      "description": "(sqlite-close db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:422\n\nClose DB idempotently and interrupt pending work. The handle becomes\nunusable immediately; its worker rolls back and releases OS resources\nasynchronously. No caller transaction can survive cancellation.",
+      "is_macro": false
+    },
+    "sqlite-closed?": {
+      "description": "(sqlite-closed? db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:424\n\nReturn #t if DB has been closed or its worker has stopped.",
+      "is_macro": false
+    },
+    "sqlite-execute": {
+      "description": "(sqlite-execute db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:409\n\nExecute one non-row-returning SQL statement in DB with bound PARAMS.\nReturn the affected row count. PARAMS is a list/vector of int64,\nfinite flonums, strings, bytevectors and #f (SQL NULL), at most 256\nvalues and 32 MiB. SQL is at most 64 KiB. Each statement is atomic;\nexplicit transactions, ATTACH, extensions and most PRAGMAs are denied.\nSQLite work has a five-second budget, lock waits 250 ms (not a hard\ndeadline on OS filesystem calls). Cancellation\nrolls back unfinished work, but can race an already completed commit.",
+      "is_macro": false
+    },
+    "sqlite-open": {
+      "description": "(sqlite-open path)  procedure, <techne-store>:2\n\nOpen or create the SQLite database at PATH; return a scope-owned handle.\nPATH is a filename or \":memory:\" (not a URI). Requires the files capability.\nAll database work waits asynchronously, on a separate worker.",
+      "is_macro": false
+    },
+    "sqlite-query": {
+      "description": "(sqlite-query db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:416\n\nQuery DB with one read-only SQL statement and bound PARAMS.\nReturn a list of row lists: NULL is #f, blobs are bytevectors, and\nother cells are strings or numbers. Parameter limits match\nsqlite-execute. At most 4096 rows / 40 MiB (including cell overhead),\nnever silently truncated; use SQL LIMIT and paging for larger data.\nInvalid UTF-8 TEXT raises an error. A cell is at most 32 MiB.",
+      "is_macro": false
+    },
     "sset!": {
       "description": "(sset! s k v)  procedure, @lisp@/editor/session.scm:22\n\nStore V as the value of the key K in the session S.",
       "is_macro": false
@@ -1969,15 +1997,15 @@
       "is_macro": false
     },
     "tcp-close": {
-      "description": "(tcp-close socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:585\n\nClose SOCKET, a connection or a listener, if it is open.\nTasks waiting on it fail.",
+      "description": "(tcp-close socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:812\n\nClose SOCKET, a connection or a listener, if it is open.\nTasks waiting on it fail.",
       "is_macro": false
     },
     "tcp-close-output": {
-      "description": "(tcp-close-output connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:577\n\nClose the sending side of CONNECTION: the peer reads end of file.\nReading from CONNECTION goes on.",
+      "description": "(tcp-close-output connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:801\n\nClose the sending side of CONNECTION: the peer reads end of file.\nReading from CONNECTION goes on. TLS does not support half-close;\nuse tcp-close instead.",
       "is_macro": false
     },
     "tcp-closed?": {
-      "description": "(tcp-closed? socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:596\n\nReturn #t if SOCKET, a connection or a listener, is closed.",
+      "description": "(tcp-closed? socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:823\n\nReturn #t if SOCKET, a connection or a listener, is closed.",
       "is_macro": false
     },
     "tcp-connect": {
@@ -1985,7 +2013,7 @@
       "is_macro": false
     },
     "tcp-connection?": {
-      "description": "(tcp-connection? obj)  built-in procedure, @source@/crates/techne-net/src/lib.rs:624\n\nReturn #t if OBJ is a TCP connection.",
+      "description": "(tcp-connection? obj)  built-in procedure, @source@/crates/techne-net/src/lib.rs:851\n\nReturn #t if OBJ is a TCP connection.",
       "is_macro": false
     },
     "tcp-listen": {
@@ -1993,27 +2021,27 @@
       "is_macro": false
     },
     "tcp-listener?": {
-      "description": "(tcp-listener? obj)  built-in procedure, @source@/crates/techne-net/src/lib.rs:628\n\nReturn #t if OBJ is a TCP listener.",
+      "description": "(tcp-listener? obj)  built-in procedure, @source@/crates/techne-net/src/lib.rs:855\n\nReturn #t if OBJ is a TCP listener.",
       "is_macro": false
     },
     "tcp-local-address": {
-      "description": "(tcp-local-address socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:607\n\nReturn the address of SOCKET, a connection or a listener, here.\nIt is a list of the host, a string, and the port.",
+      "description": "(tcp-local-address socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:834\n\nReturn the address of SOCKET, a connection or a listener, here.\nIt is a list of the host, a string, and the port.",
       "is_macro": false
     },
     "tcp-peer-address": {
-      "description": "(tcp-peer-address connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:618\n\nReturn the address of the peer of CONNECTION.\nIt is a list of the host, a string, and the port.",
+      "description": "(tcp-peer-address connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:845\n\nReturn the address of the peer of CONNECTION.\nIt is a list of the host, a string, and the port.",
       "is_macro": false
     },
     "tcp-read": {
-      "description": "(tcp-read connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:569\n\nWait for data from CONNECTION and return it as a string.\nReturn the eof object once the peer has closed its side. Bytes that\nare not UTF-8 read as U+FFFD; a character split between two reads is\nreturned whole, with the second.",
+      "description": "(tcp-read connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:792\n\nWait for data from CONNECTION and return it as a string.\nReturn the eof object once the peer has closed its side. Bytes that\nare not UTF-8 read as U+FFFD; a character split between two reads is\nreturned whole, with the second.",
       "is_macro": false
     },
     "tcp-read-bytes": {
-      "description": "(tcp-read-bytes connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:572\n\nWait for data from CONNECTION and return it as a bytevector.\nReturn the eof object once the peer has closed its side.",
+      "description": "(tcp-read-bytes connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:795\n\nWait for data from CONNECTION and return it as a bytevector.\nReturn the eof object once the peer has closed its side.",
       "is_macro": false
     },
     "tcp-write": {
-      "description": "(tcp-write connection data)  procedure, <techne-net>:21\n\nWrite DATA, a string or a bytevector, to CONNECTION.\nIt waits until the kernel has taken all of it, so a peer that reads\nslowly makes it wait. DATA is sent from where it is, not copied:\nchanging it meanwhile changes what is sent.",
+      "description": "(tcp-write connection data)  procedure, <techne-net>:35\n\nWrite DATA, a string or a bytevector, to CONNECTION.\nIt waits until the kernel has taken all of it, so a peer that reads\nslowly makes it wait. DATA is sent from where it is, not copied:\nchanging it meanwhile changes what is sent. TLS connections additionally\nretain bounded encrypted-record buffers, flushed before this returns.",
       "is_macro": false
     },
     "text-lines": {
@@ -2046,6 +2074,14 @@
     },
     "texts-lines-matcher": {
       "description": "(texts-lines-matcher texts)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:739\n\nReturn a matcher of the non-empty lines of each of TEXTS, in\norder. `matcher-line` gives each entry's start and line number in\nits text, and the index of its text in TEXTS.",
+      "is_macro": false
+    },
+    "tls-connect": {
+      "description": "(tls-connect host port)  procedure, <techne-net>:21\n\nConnect to HOST:PORT using TLS, verifying its certificate and host name.\nTrust anchors are Mozilla's web PKI roots. There is no insecure mode.\nUse tcp-read, tcp-read-bytes, tcp-write and tcp-close on the result.\nThe current scope owns the connection. Cancelling the handshake closes it.",
+      "is_macro": false
+    },
+    "tls-upgrade!": {
+      "description": "(tls-upgrade! connection host)  procedure, <techne-net>:28\n\nUpgrade CONNECTION in place to TLS, verifying the certificate for HOST.\nCall only after a successful protocol upgrade reply, with exclusive use of\nCONNECTION and no unread plaintext buffered by the caller. The current socket\nowner is unchanged. A failed or cancelled handshake closes the connection.",
       "is_macro": false
     },
     "toggle-mode!": {
@@ -2217,14 +2253,18 @@
     "%source-reader",
     "%source-relative",
     "%source-text",
+    "%sqlite-open",
     "%tcp-accept",
     "%tcp-connect",
     "%tcp-listen",
     "%tcp-writable",
     "%tcp-write-some",
+    "%tls-connect",
+    "%tls-upgrade!",
     "%tree-stamp",
     "call-with-process",
     "call-with-socket",
+    "call-with-sqlite",
     "call-with-tcp-connection",
     "char-start",
     "column",
@@ -2382,6 +2422,11 @@
     "service-stop!",
     "services",
     "set-view-read-only!",
+    "sqlite-close",
+    "sqlite-closed?",
+    "sqlite-execute",
+    "sqlite-open",
+    "sqlite-query",
     "string->regexp",
     "string-search-regexp",
     "syntax-capture-names",
@@ -2413,6 +2458,8 @@
     "tcp-read-bytes",
     "tcp-write",
     "texts-lines-matcher",
+    "tls-connect",
+    "tls-upgrade!",
     "view-document",
     "view-edit!",
     "view-edit-at!",

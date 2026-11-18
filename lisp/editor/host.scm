@@ -18,10 +18,21 @@
 (require "buffers.scm")
 (require "windows.scm")
 
-(provide editor-press editor-click editor-message! session-quit?
+(provide editor-press editor-viewport! editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays pane-projections cursor-shape
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations!)
+
+(define-hook viewport-changed
+  "After frontend geometry changes: (session columns rows).
+Dimensions are text-cell estimates (exact terminal cells). Packages decide
+responsive policy in Scheme, reading viewport-columns and viewport-rows in S.")
+(define (editor-viewport! s columns rows)
+  "Record frontend COLUMNS and ROWS in S and run viewport-changed."
+  (unless (and (equal? (sget s 'viewport-columns) columns) (equal? (sget s 'viewport-rows) rows))
+    (sset! s 'viewport-columns (max 1 columns))
+    (sset! s 'viewport-rows (max 2 rows))
+    (run-hook! s 'viewport-changed columns rows)))
 
 (define (editor-press s key)
   "Handle the key KEY in session S, as the frontend sends it."
@@ -175,13 +186,13 @@ what the mode line segments say of the buffer."
 
 (define (pane-display s view)
   "Return what is drawn beside VIEW's text in session S, and its syntax.
-That is (line-numbers eob-marker language), from its buffer's options:
+That is (line-numbers eob-marker language word-wrap), from buffer options:
 LANGUAGE the syntax language to colour it by, or #f for none (never
 without `syntax-highlight'; the mode's `syntax-language' first, then
 the file's name)."
   (let* ((d (view-document view)) (b (document-buffer d)))
     (list (option b 'line-numbers) (option b 'eob-marker)
-          (and (option b 'syntax-highlight) (buffer-language b)))))
+          (and (option b 'syntax-highlight) (buffer-language b)) (option b 'word-wrap))))
 
 (define (echo-line s)
   "Return the echo area of session S.
@@ -231,5 +242,7 @@ Each is (hang LINE AT) or (block AT IMAGE), as `buffer-projections' says."
         '())))
 
 (define (cursor-shape s view)
-  "Return the shape of the caret of VIEW in session S: block or bar."
-  (if (and (view=? view (session-view s)) (memq (sget s 'mode) '(normal visual))) 'block 'bar))
+  "Return the caret of VIEW in session S: block, bar, or hidden."
+  (cond ((not (option (document-buffer (view-document view)) 'cursor-visible)) 'hidden)
+        ((and (view=? view (session-view s)) (memq (sget s 'mode) '(normal visual))) 'block)
+        (else 'bar)))

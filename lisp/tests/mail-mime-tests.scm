@@ -1,0 +1,246 @@
+;;; Run from the repository root with TECHNE_LIBRARY_PATH=$PWD/lisp.
+(require "../test.scm")
+(import (techne mail mime) (techne mail html))
+
+(define (field msg key) (cdr (assq key msg)))
+(define (raises? thunk) (guard (e (#t #t)) (thunk) #f))
+(define (mail-fixture name)
+  (file->string (string-append "lisp/tests/fixtures/mail/" name)))
+(define (text-of tree)
+  (cond ((string? tree) tree) ((pair? tree) (string-append (text-of (car tree)) (text-of (cdr tree)))) (else "")))
+(define (nodes-of tree tag)
+  (if (pair? tree)
+      (append (if (eq? (car tree) tag) (list tree) '()) (nodes-of (car tree) tag) (nodes-of (cdr tree) tag)) '()))
+(define (contains? text part)
+  (let ((n (string-length text)) (k (string-length part)))
+    (let loop ((i 0)) (and (<= (+ i k) n) (or (string=? (substring text i (+ i k)) part) (loop (+ i 1)))))))
+
+(let ((msg (mail-parse "Subject: hello\r\n\r\nhello")))
+  (check "plain" "hello" (mail-text msg))
+  (check "HTML absent" #f (mail-html msg))
+  (check "attachments absent" '() (mail-attachments msg))
+  (check "header case insensitive" "hello" (mail-header msg "SUBJECT"))
+  (check "missing header" "" (mail-header msg "absent"))
+  (check "missing header default" 'missing (mail-header msg "absent" 'missing))
+  (check "lowercase dotted headers" '(("subject" . "hello")) (field msg 'headers))
+  (check "dotted text entry" '(text . "hello") (assq 'text msg))
+  (check "no errors" '() (field msg 'errors)))
+(check "empty message is empty plain text" "" (mail-text (mail-parse "")))
+(check "headerless text" "hello\nworld" (mail-text (mail-parse "hello\nworld")))
+(check "bare LF and folding" "one two three"
+       (mail-header (mail-parse "Subject: one\n two\n\tthree\n\ntext") "subject"))
+(check "first duplicate header retained" "first"
+       (mail-header (mail-parse "Subject: first\nSubject: second\n\nx") "subject"))
+(check "UTF8 unencoded" "Héllo 😀" (mail-text (mail-parse "Content-Type: text/plain\n\nHéllo 😀")))
+(check "UTF8 raw header" "Héllo" (mail-header (mail-parse "Subject: Héllo\n\nx") "subject"))
+(check "UTF8 multi-lengths" "A¢€😀" (mail-text (mail-parse "\nA¢€😀")))
+(check "ASCII decoding" "~Hello" (mail-text (mail-parse "Content-Type: text/plain; charset=us-ascii\n\n~Hello")))
+(check "QP underscores are literal in body" "one_two=bad=Z1="
+       (mail-text (mail-parse "Content-Transfer-Encoding: quoted-printable\n\none_two=3Dbad=Z1=")))
+(check "QP LF soft break" "onetwo" (mail-text (mail-parse "Content-Transfer-Encoding: quoted-printable\n\none=\ntwo")))
+(check "base64 body" "Hello 😀"
+       (mail-text (mail-parse "Content-Transfer-Encoding: base64\n\nSGVsbG8g8J+YgA==")))
+(check "Q encoded UTF8 header" "Zoë" (mail-header (mail-parse "From: =?utf-8?Q?Zo=C3=AB?=\n\nx") "from"))
+(check "B Latin1 header" "café" (mail-header (mail-parse "Subject: =?latin1?B?Y2Fm6Q==?=\n\nx") "subject"))
+(check "separate words retain literal gap" "✓ / café"
+       (mail-header (mail-parse "Subject: =?UTF-8?B?4pyT?= / =?latin1?Q?caf=E9?=\n\nx") "subject"))
+(check "an encoded word longer than RFC 2047's 75 characters is decoded"
+       (string-append (apply string-append (map (lambda (i) "café ") (iota 9))) "café")
+       (mail-header (mail-parse (string-append "Subject: =?utf-8?Q?" (apply string-append (map (lambda (i) "caf=C3=A9_") (iota 9)))
+                                               "caf=C3=A9?=\n\nx")) "subject"))
+(check "Turkish Latin-5 header" "Erdinç ÇALIŞICI <e@example.org>"
+       (mail-header (mail-parse "From: =?iso-8859-9?Q?Erdin=E7_=C7ALI=DEICI?= <e@example.org>\n\nx") "from"))
+(check "Cyrillic header, by an alias" "Привет" (mail-header (mail-parse "Subject: =?CP1251?Q?=CF=F0=E8=E2=E5=F2?=\n\nx") "subject"))
+(check "Latin-9 body has the euro sign" "5 €"
+       (mail-text (mail-parse (bytevector-append (string->utf8 "Content-Type: text/plain; charset=ISO_8859-15\n\n5 ") #u8(164)))))
+(check "a multi-byte charset is not guessed at, and nothing is lost" #t
+       (string? (mail-header (mail-parse "Subject: =?big5?B?pKSk5Q==?=\n\nx") "subject")))
+(check "bad encoded word preserved" "=?utf-8?B?invalid!?="
+       (mail-header (mail-parse "Subject: =?utf-8?B?invalid!?=\n\nx") "subject"))
+
+(let* ((msg (mail-parse (mail-fixture "nested.eml"))) (a (car (mail-attachments msg))))
+  (check "folded adjacent encoded words" "✓ café" (mail-header msg "subject"))
+  (check "encoded sender" "Zoë <zoe@example.test>" (mail-header msg "from"))
+  (check "message ID" "<one@example.test>" (field msg 'message-id))
+  (check "in reply to" "<zero@example.test>" (field msg 'in-reply-to))
+  (check "references unfold" "<older@example.test> <zero@example.test>" (field msg 'references))
+  (check "nested Latin1 plain alternative" "Olá, café.\r\nline joined" (mail-text msg))
+  (check "nested UTF8 HTML alternative" "<h1>Olá</h1><p>A <strong>native</strong> letter.</p>" (mail-html msg))
+  (check "quoted parameter escapes" "report; \"final\".bin" (field a 'name))
+  (check "attachment type" "application/octet-stream" (field a 'type))
+  (check "attachment binary with CRLF" #u8(0 13 10 255 254) (field a 'bytes))
+  (check "nested fixture clean" '() (field msg 'errors)))
+
+(let ((msg (mail-parse "Content-Type: text/plain; name=note.txt\nContent-Disposition: attachment; filename=\"=?utf-8?Q?caf=C3=A9.txt?=\"\n\n**not body**")))
+  (check "text attachment not body" #f (mail-text msg))
+  (check "RFC2047 filename" "café.txt" (field (car (mail-attachments msg)) 'name)))
+(let ((msg (mail-parse "Content-Type: application/octet-stream\nContent-Disposition: attachment; filename*=UTF-8''caf%C3%A9.txt\n\nx")))
+  (check "RFC2231 simple filename" "café.txt" (field (car (mail-attachments msg)) 'name)))
+(let* ((raw (bytevector-append (string->utf8 "Content-Type: application/octet-stream\r\n\r\n") #u8(0 255 13 10 254)))
+       (msg (mail-parse raw)))
+  (check "unencoded bytes preserved" #u8(0 255 13 10 254) (field (car (mail-attachments msg)) 'bytes)))
+(let ((msg (mail-parse (bytevector-append (string->utf8 "Content-Type: text/plain; charset=latin1\n\n") #u8(99 97 102 233)))))
+  (check "wire Latin1 text" "café" (mail-text msg)))
+(let ((msg (mail-parse (bytevector-append (string->utf8 "\n") #u8(255 192 128 237 160 128 65)))))
+  (check "invalid UTF8 uses replacement" "������A" (mail-text msg)))
+(check "windows 1252" "€—" (mail-text (mail-parse (bytevector-append (string->utf8 "Content-Type: text/plain; charset=windows-1252\n\n") #u8(128 151)))))
+
+(define (wrapped body type)
+  (string-append "Content-Type: multipart/" type "; boundary=b\n\n--b\n\nfirst\n--b\n\n" body "\n--b--\n"))
+(check "mixed first body wins" "first" (mail-text (mail-parse (wrapped "second" "mixed"))))
+(check "alternative last body wins" "second" (mail-text (mail-parse (wrapped "second" "alternative"))))
+(check "boundary must be a complete line" "--b-not-a-boundary\nbody"
+       (mail-text (mail-parse "Content-Type: multipart/mixed; boundary=b\n\n--b\n\n--b-not-a-boundary\nbody\n--b--")))
+(let ((msg (mail-parse (mail-fixture "malformed.eml"))))
+  (check "bad part does not kill sibling" "Still readable.\n" (mail-text msg))
+  (check "invalid base64 noted" #t (pair? (field msg 'errors))))
+(let ((msg (mail-parse "Content-Type: multipart/mixed\n\nnot a multipart")))
+  (check "missing boundary no body" #f (mail-text msg))
+  (check "missing boundary noted" #t (pair? (field msg 'errors))))
+(for-each (lambda (s) (check "malformed input returns message" #t (list? (mail-parse s))))
+          '("garbage\r\n" "Bad header\n\nbody" "Subject: x\nno colon\n\nbody" "Content-Type: text/plain; charset=\"\n\nx"
+            "Content-Type: multipart/mixed; boundary=b\n\n--b--" "Content-Transfer-Encoding: quoted-printable\n\n="))
+(define deep
+  (let loop ((n 0) (body "\nend"))
+    (if (= n 28) body
+        (let ((boundary (number->string n)))
+          (loop (+ n 1) (string-append "Content-Type: multipart/mixed; boundary=" boundary "\n\n--" boundary "\n" body "\n--" boundary "--\n"))))))
+(check "nesting capped" #t (pair? (field (mail-parse deep) 'errors)))
+(check "message size bounded" #t (raises? (lambda () (mail-parse (make-string 16777217 #\x)))))
+(check "oversize headers reported" #t (pair? (field (mail-parse (string-append "Subject: " (make-string 262145 #\x) "\n\nbody")) 'errors)))
+(check "wrong input type" #t (raises? (lambda () (mail-parse 42))))
+
+(check "source decoder replaces malformed wire bytes" "a�b" (mail-decode-utf8 #u8(97 255 98)))
+(check "source decoder retains valid Unicode" "café ✓" (mail-decode-utf8 (string->utf8 "café ✓")))
+
+(define (qp-text body)
+  (mail-text (mail-parse (string-append "Content-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: quoted-printable\n\n" body))))
+(check "bulk QP copies normal runs and preserves underscores" "a_b_c=tailcontinued"
+       (qp-text "a=5Fb_c=3Dtail=\r\ncontinued"))
+(check "bulk QP keeps malformed and trailing escapes" "hello==world=GG=" (qp-text "hello==world=GG="))
+(check "bulk QP handles LF soft breaks" "ab" (qp-text "a=\nb"))
+(check "soft-break bulk pass cannot create a hex escape" "=AB" (qp-text "=A=\nB"))
+(check "soft-break bulk pass preserves escaped equals boundaries" "=41" (qp-text "==\n41"))
+(check "soft-break marker cannot collide with decoded UTF-8" "Ā" (qp-text "=C4=80"))
+(check "fast UTF-8 path retains per-octet replacement fallback" "���" (qp-text "=ED=A0=80"))
+(check "encoded word underscores differ from escaped underscores" "a b_c"
+       (mail-header (mail-parse "Subject: =?UTF-8?Q?a_b=5Fc?=\n\nbody") "subject"))
+
+(let* ((payload (bytevector-append #u8(0 255 10) (string->utf8 "--z-not\r\ninside--z\n") #u8(13 10 128 42)))
+       (wire (bytevector-append (string->utf8 "Content-Type: multipart/mixed; boundary=z\r\n\r\npreamble\r\n--z\r\nContent-Type: application/octet-stream; name=x.bin\r\n\r\n")
+                                payload (string->utf8 "\r\n--z-- \t\r\n")))
+       (msg (mail-parse wire)))
+  (check "ranged boundary scan keeps binary and false delimiters" payload (field (car (mail-attachments msg)) 'bytes)))
+
+(let* ((wire "Content-Type: multipart/mixed; boundary=idx\n\n--idx\nContent-Type: text/plain\n\nsearchable text\n--idx\nContent-Type: application/octet-stream; name=data.bin\nContent-Transfer-Encoding: base64\n\n%%%%invalid-base64%%%%\n--idx--")
+       (index (mail-parse wire #:attachments? #f)))
+  (check "indexing retains body text" "searchable text" (mail-text index))
+  (check "indexing does not decode even malformed attachments" '() (field index 'errors))
+  (check "indexing omits decoded attachment payloads" '() (mail-attachments index))
+  (check "normal reading still validates attachments" #t (pair? (field (mail-parse wire) 'errors))))
+
+(let* ((wire "Subject: =?UTF-8?Q?caf=C3=A9?=\nX-Spam-Data: =?UTF-8?Q?transport=20only?=\nContent-Type: text/plain\n\nbody")
+       (msg (mail-parse wire #:index? #t)))
+  (check "index decodes searchable headers" "café" (mail-header msg "subject"))
+  (check "index ignores transport-only header payloads" "absent" (mail-header msg "x-spam-data" "absent"))
+  (check "reader still retains all headers" "transport only" (mail-header (mail-parse wire) "x-spam-data")))
+(let* ((encoded (apply string-append (map (lambda (n)
+                    (string-append "=" (string (string-ref "0123456789ABCDEF" (quotient n 16)))
+                                         (string (string-ref "0123456789abcdef" (modulo n 16))))) (iota 256))))
+       (payload (string-append encoded encoded encoded encoded encoded encoded))
+       (wire (string-append "Content-Type: application/octet-stream; name=all.bin\nContent-Transfer-Encoding: quoted-printable\n\n" payload))
+       (expected (apply bytevector (append (iota 256) (iota 256) (iota 256) (iota 256) (iota 256) (iota 256)))))
+  (check "QP all octets and mixed hex case survive" expected (field (car (mail-attachments (mail-parse wire))) 'bytes)))
+
+;; Filtering during scanning must preserve the old reader-then-filter result,
+;; including syntax state for skipped fields and their folded continuations.
+(define index-header-names '("subject" "from" "to" "cc" "reply-to" "date" "message-id" "in-reply-to" "references"
+                             "content-type" "content-disposition" "content-transfer-encoding"))
+(for-each
+ (lambda (wire)
+   (let ((full (mail-parse wire)) (idx (mail-parse wire #:index? #t)))
+     (for-each (lambda (key)
+       (check "early filtering preserves retained header order and bytes"
+         (filter (lambda (h) (member (car h) index-header-names)) (field full key)) (field idx key))) '(headers headers-raw))
+     (for-each (lambda (key) (check "early filtering preserves body, IDs and errors" (field full key) (field idx key)))
+               '(text html message-id in-reply-to references errors))))
+ (list "X-Only: value\n folded\n\nbody"
+       "X-Only: value\n folded"
+       "X-Noise: ignored\n Subject: not a field\nSubject: =?utf-8?Q?caf=C3=A9?=\n folded\n\nbody"
+       "Subject: first\nX-Noise: old\n folded: ignored\nSubject: second\n\nbody"
+       "Subject: first\nnot a header\n continuation\n\nbody"
+       "\tHeaderless body\nnext line"
+       "Subject: root\r\nX-Noise: ignore\r\n keep ignoring\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nX-Noise: ignored\r\n folded\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--b--\r\n"
+       (mail-fixture "nested.eml")))
+(let ((idx (mail-parse (string-append "Subject: safe\nX-Noise: ignored\n" (string-join (make-list 1200 " folded junk") "\n") "\n\nbody") #:index? #t)))
+  (check "large discarded folded payload cannot contaminate subject" "safe" (mail-header idx "subject"))
+  (check "large discarded folded payload is absent" "absent" (mail-header idx "x-noise" "absent"))
+  (check "discarding folded payload preserves body" "body" (mail-text idx)))
+(let ((idx (mail-parse (string-append "X-Noise: " (make-string 262144 #\x) "\n\nbody") #:index? #t)))
+  (check "discarded header bytes still count against the safety bound" #t (pair? (field idx 'errors))))
+
+;; Rich conversion uses generated strings, never source spans or Markdown.
+(check "HTML empty" '() (mail-html->rich ""))
+(check "HTML plain Markdown remains literal" '((paragraph "**literal** [link](file:///x)"))
+       (mail-html->rich "**literal** [link](file:///x)"))
+(check "HTML basic inline structure" '((heading 2 "Title") (paragraph "A " (strong "bold") " " (emph "italic") " " (code "x") (hard-break) "tail"))
+       (mail-html->rich "<h2>Title</h2><p>A <b>bold</b> <i>italic</i> <code>x</code><br>tail</p>"))
+(check "HTML layout wrappers preserve blocks" '((heading 1 "Title") (paragraph "Text"))
+       (mail-html->rich "<html><body><unknown><div><h1>Title</h1><p>Text</p></div></unknown></body></html>"))
+(check "entities" '((paragraph "<>&\"' €😀 … &unknown;"))
+       (mail-html->rich "&lt;&gt;&amp;&quot;&apos; &#8364;&#x1F600; &hellip; &unknown;"))
+(check "encoded markup stays text" '((paragraph "<script>not active</script>"))
+       (mail-html->rich "&lt;script&gt;not active&lt;/script&gt;"))
+(check "quotes and ordered lists" '((quote (paragraph "quoted")) (list (item "1." #f (paragraph "first")) (item "2." #f (paragraph "second"))))
+       (mail-html->rich "<blockquote><p>quoted</p></blockquote><ol><li>first</li><li>second</li></ol>"))
+(check "omitted li close" '((list (item #f #f (paragraph "one")) (item #f #f (paragraph "two"))))
+       (mail-html->rich "<ul><li>one<li>two</ul>"))
+(check "pre code preserves spacing" '((code-block #f " a  b" "<x>"))
+       (mail-html->rich "<pre><code> a  b\n&lt;x&gt;</code></pre>"))
+(check "table" '((table (left left) (("Name") ("Value")) (("Mail") ("Safe"))))
+       (mail-html->rich "<table><tr><th>Name</th><th>Value</th></tr><tr><td>Mail</td><td>Safe</td></tr></table>"))
+(check "headerless table pads ragged rows" '((table (left left) (() ()) (("a") ()) (("b") ("c"))))
+       (mail-html->rich "<table><tr><td>a</td></tr><tr><td>b</td><td>c</td></tr></table>"))
+(check "newsletter layout tables are readable blocks, not grids"
+       '((heading 2 "Delivery update") (paragraph "Your parcel is on its way.")
+         (paragraph (link "https://example.test/status" "Track parcel")))
+       (mail-html->rich "<table width='100%' border='0'><tr><td height='200'>&nbsp;<br></td></tr><tr><td><table role='presentation'><tr><td><h2>Delivery update</h2><p>Your parcel is on its way.</p><p><a href='https://example.test/status'>Track parcel</a></p></td></tr></table></td></tr><tr><td><b> </b><br></td></tr></table>"))
+(check "layout wrappers keep genuine nested data tables"
+       '((table (left left) (("Name") ("Value")) (("Mail") ("Safe"))))
+       (mail-html->rich "<table role='presentation'><tr><td><table><tr><th>Name</th><th>Value</th></tr><tr><td>Mail</td><td>Safe</td></tr></table></td></tr></table>"))
+(check "tracking pixels leave no spacer paragraphs" '((paragraph "Message"))
+       (mail-html->rich "<img src='https://example.test/track' width='1' height='1'><p>Message</p><div><br><em> </em></div>"))
+(check "malformed image sizes are inert" '((paragraph "[remote-image-blocked: image]"))
+       (mail-html->rich "<img width='1+2i' height='1'>"))
+(check "ASCII folding preserves Unicode source offsets" '((paragraph "İStraße" "after"))
+       (mail-html->rich "İStraße<ScRiPt>hidden</sCrIpT>after"))
+(check "ragged tables cannot amplify into huge padded grids" '()
+       (nodes-of (mail-html->rich
+                   (string-append "<table><tr>" (apply string-append (make-list 32 "<th>Label</th>")) "</tr>"
+                                  (apply string-append (make-list 130 "<tr><td>Value</td></tr>")) "</table>")) 'table))
+(check "safe URLs as strings" '((paragraph (link "https://example.test/?a=1&b=2" "web") (link "HTTP://example.test" "upper") (link "mailto:a@example.test" "mail")))
+       (mail-html->rich "<a href='https://example.test/?a=1&amp;b=2'>web</a><a href='HTTP://example.test'>upper</a><a href='mailto:a@example.test'>mail</a>"))
+(for-each
+ (lambda (url)
+   (check (string-append "inert URL " url) '((paragraph "label"))
+          (mail-html->rich (string-append "<a href='" url "'>label</a>"))))
+ '("javascript:alert(1)" "jav&#x61;script:alert(1)" "data:text/html,x" "file:///etc/passwd" "cid:foo" "../relative" "//example.test" "https://example.test&#10;evil"))
+(let* ((tree (mail-html->rich (mail-fixture "hostile-html.txt"))) (text (text-of tree)))
+  (check "hostile fixture heading" '((heading 1 "A letter")) (nodes-of tree 'heading))
+  (check "hostile fixture safe link only" '((link "https://example.test/?a=1&b=2" "safe")) (nodes-of tree 'link))
+  (check "no image primitives" '() (nodes-of tree 'image))
+  (check "no source spans" '() (nodes-of tree 'span))
+  (for-each (lambda (s) (check (string-append "hidden content " s) #f (contains? text s)))
+            '("Hidden title" "never show" "hidden vector" "hidden frame" "steal()" "color:red" "tracker.test" "/etc/passwd"))
+  (for-each (lambda (s) (check (string-append "image placeholder " s) #t (contains? text (string-append "remote-image-blocked: " s))))
+            '("remote portrait" "local portrait" "attached portrait")))
+(check "unclosed dangerous content suppressed" '((paragraph "before")) (mail-html->rich "before<script>nothing after"))
+(check "case insensitive raw content skip" '((paragraph "before" "after")) (mail-html->rich "before<ScRiPt>x</sCrIpT>after"))
+(for-each (lambda (s) (check "malformed HTML is bounded data" #t (list? (mail-html->rich s))))
+          '("<" "<!--" "<p title='unterminated" "<p><b>broken</p></b>" "<scripture>ordinary</scripture>" "<img alt='<b>not markup'>" "<a href=x href='javascript:x'>label</a>"))
+(check "HTML nesting flattened" #t
+       (list? (mail-html->rich (string-append (apply string-append (make-list 100 "<div>")) "deep" (apply string-append (make-list 100 "</div>"))))))
+(check "HTML size bounded" #t (raises? (lambda () (mail-html->rich (make-string 2097153 #\x)))))
+(check "HTML node budget" #t (raises? (lambda () (mail-html->rich (apply string-append (make-list 50001 "<br>"))))))
+(check "HTML type checked" #t (raises? (lambda () (mail-html->rich #f))))
+(test-summary)

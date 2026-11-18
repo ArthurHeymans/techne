@@ -305,6 +305,19 @@ Options are declared settings, such as ~line-numbers~ and ~read-only~.
 \[set-option] sets one in a buffer or globally; \[describe-option]
 shows the settings that apply and which one wins.
 
+* Mail
+
+\[mail] opens a dashboard of accounts and folders, with quick views for
+unread and starred mail and drafts. Techne reads IMAP and Maildir, keeps a
+local searchable cache, and renders messages in the rich reader. Use
+\[mail-setup] or [[file:mail.org][the mail guide]] to configure an account,
+and \[mail-load-config] to load a trusted Scheme configuration file.
+
+Use =g= to sync, =C= to compose and =D= to resume a draft. SMTP submission
+uses verified TLS, with optional STARTTLS for servers that require it.
+Techne does not automatically retry delivery if the server may already
+have accepted the message. See \[mail-help] for keys and limitations.
+
 * Lisp
 
 Code is evaluated in its file's module, as it is in the file:

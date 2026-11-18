@@ -537,6 +537,12 @@ The nearest mode of B that completes says: (start . candidates)."
 Relative numbers count from the caret's line, which shows its own."
   #:type '(one-of #f absolute relative))
 
+(define-option word-wrap #f
+  "Whether terminal visual lines wrap at spaces rather than within words.
+Oversized words still wrap by grapheme. This changes layout, never source
+text, caret positions or logical rows. Rich prose enables it."
+  #:type 'boolean)
+
 (define-option eob-marker #f
   "What is drawn on the lines past the end of the text, or nothing.
 Vim draws a ~."
@@ -574,6 +580,9 @@ scheme-mode does, so buffers without a file are coloured too."
   #:files '(".rs" ".c" ".h" ".cc" ".cpp" ".hpp" ".py" ".sh" ".bash" ".nix" ".el" ".js" ".ts" ".json" ".go"
             ".java" ".lua" ".zig" ".hs" ".ml" ".rb" ".pl"))
 (define-option read-only #f "Whether the buffer's text can be edited from its views." #:type 'boolean)
+(define-option cursor-visible #t
+  "Whether a buffer shows a text caret. Row-selection interfaces can hide it."
+  #:type 'boolean)
 
 (define-mode special-mode
   "Buffers the editor writes, not you.

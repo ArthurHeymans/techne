@@ -1,0 +1,12 @@
+Subject: broken part, intact sibling
+Content-Type: multipart/mixed; boundary=recover
+
+--recover
+Content-Type: text/plain
+Content-Transfer-Encoding: base64
+
+!not-base64!
+--recover
+Content-Type: text/plain
+
+Still readable.

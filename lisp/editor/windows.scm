@@ -18,11 +18,12 @@
 (define next-screen-context-lines 2
   "The lines of context a screen of scrolling keeps.")
 
-(define (request-view! s request)
-  "Ask the frontend to page or recenter the focused pane of S: REQUEST.
+(define (request-view! s request #:view [view (pane-view s)])
+  "Ask the frontend to page or recenter VIEW in session S: REQUEST.
+VIEW defaults to the focused pane; targeting another view does not focus it.
 Requests of keys handled before the frontend answers add up: two pages
 down are one of two screens."
-  (let ((old (sget s 'view-request)) (id (view-id (pane-view s))))
+  (let ((old (sget s 'view-request)) (id (view-id view)))
     (sset! s 'view-request
            (if (and old (= (car old) id) (eq? (cadr old) 'page) (eq? (car request) 'page))
                (list id 'page (+ (caddr old) (cadr request)) (caddr request))

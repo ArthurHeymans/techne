@@ -1,0 +1,2 @@
+# Wire fixtures retain CRLF and meaningful RFC 2047 folding whitespace.
+*.eml -text whitespace=-blank-at-eol,cr-at-eol

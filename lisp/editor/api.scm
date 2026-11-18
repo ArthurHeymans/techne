@@ -26,6 +26,7 @@
 (require "buffers.scm")
 (require "projects.scm")
 (require "views.scm")
+(require "windows.scm")
 (require "listings.scm")
 (require "lens.scm")
 (require "live.scm")
@@ -91,7 +92,7 @@
          keymap-sources explain-key
          read-file-name read-directory-name normal-directory abbreviate-path absolute-path project-root
          set-buffer-name! set-buffer-mode! drop-buffer! show-in-other-pane! pop-to-buffer! move-path! delete-path-and-buffers!
-         session-focus set-session-panes! session-tree set-session-tree!
+         session-focus set-session-panes! session-tree set-session-tree! request-view!
          make-listing-buffer! listing-redisplay! listing-row listing-mark listing-marked listing-targets
          listing-key-at listing-goto! listing-get listing-set! listing?
          save-document! reload-document! directory-entries path-exists?

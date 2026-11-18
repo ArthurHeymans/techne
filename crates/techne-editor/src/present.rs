@@ -36,6 +36,7 @@ use techne_text::ropey::Rope;
 pub enum CursorShape {
     Bar,
     Block,
+    Hidden,
 }
 
 /// A colour: sRGB, with the ANSI colour (0 to 15) a frontend that has
@@ -239,12 +240,14 @@ pub struct Pane {
     pub display: Display,
 }
 
-/// What a frontend draws beside a pane's text, never in it: line numbers
-/// and a marker on the lines past the end of the text (Vim's `~`).
+/// Buffer display policy: gutters, end markers and soft wrapping. Frontends
+/// realize these without changing source text or logical row identity.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Display {
     pub line_numbers: LineNumbers,
     pub eob_marker: Option<String>,
+    /// Prefer whitespace breaks; oversized tokens still wrap by grapheme.
+    pub word_wrap: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -420,6 +423,9 @@ pub struct Run {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Input {
+    /// Frontend geometry in approximate fixed-width text cells. Scheme owns
+    /// responsive layout policy; native frontends only report the boundary.
+    Viewport { columns: usize, rows: usize },
     /// A key in Emacs notation (`"a"`, `"C-x"`, `"M-<"`, `"RET"`, `"<left>"`).
     Key {
         key: String,

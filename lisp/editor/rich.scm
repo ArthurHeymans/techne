@@ -500,6 +500,7 @@ keeps; `rich-present!' adds its own entries."
 Where the text is a document's, editing it edits the document.
 \\[act-default-at-point] follows the link at point, else goes to the
 source of the text there."
+  #:options '((word-wrap . #t))
   #:keys '(("RET" act-default-at-point) ("C-c C-o" act-default-at-point))
   #:normal '(("RET" act-default-at-point))
   #:layer row-faces

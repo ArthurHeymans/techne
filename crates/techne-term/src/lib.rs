@@ -136,6 +136,7 @@ pub struct Term {
     /// The cursor colour last told to the terminal (OSC 12), from the
     /// snapshot's `cursor` face.
     cursor_color: Option<[u8; 3]>,
+    reported_viewport: Option<(usize, usize)>,
 }
 
 impl Term {
@@ -156,6 +157,7 @@ impl Term {
             clipboard: None,
             depth: Depth::from_env(),
             cursor_color: None,
+            reported_viewport: None,
         }
     }
 
@@ -354,6 +356,10 @@ impl Term {
                 let asked = |i: &usize| requests.iter().any(|(j, _)| j == i);
                 let mut inputs: Vec<Input> = scroll.into_iter().filter(|i| !asked(i)).filter_map(|i| self.keep_caret_visible(i)).collect();
                 inputs.extend(requests.into_iter().filter_map(|(i, r)| self.resolve(i, r)));
+                if self.reported_viewport != Some((self.cols, self.rows)) {
+                    self.reported_viewport = Some((self.cols, self.rows));
+                    inputs.push(Input::Viewport { columns: self.cols, rows: self.rows });
+                }
                 inputs
             }
             Output::Bindings(keys) => {
@@ -817,7 +823,9 @@ impl Grid {
             }
         }
         let last_col = left + area.text_cols() - 1;
-        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), (left + c).min(last_col))) {
+        if pane.cursor != CursorShape::Hidden
+            && let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), (left + c).min(last_col)))
+        {
             if cursor {
                 self.cursor = Some((r, c));
                 self.shape = pane.cursor;
@@ -1053,6 +1061,7 @@ impl Grid {
             let shape = match self.shape {
                 CursorShape::Bar => 6,
                 CursorShape::Block => 2,
+                CursorShape::Hidden => unreachable!("hidden panes do not place the terminal cursor"),
             };
             write!(out, "\x1b[{};{}H\x1b[{shape} q\x1b[?25h", r + 1, c + 1).expect("a string");
         }

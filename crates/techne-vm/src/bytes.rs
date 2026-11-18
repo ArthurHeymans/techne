@@ -131,6 +131,41 @@ fn string_to_utf8(vm: &mut Vm, args: usize, n: usize) -> R {
     Ok(vm.make_bytevector_raw(&bytes))
 }
 
+// Bulk octet conversions are a VM mechanism, not MIME policy. Real-mail
+// profiling after Scheme batching found per-byte conversion consumed most
+// parsing time; callers must not need one VM/native call per wire byte.
+fn latin1_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
+    let len = byte_range(vm, args, n, "latin1->string")?.len();
+    // UTF-8 expansion, temporary output and indexed VM string, conservatively.
+    vm.admit_items(len, 5, 64)?;
+    let bytes = byte_range(vm, args, n, "latin1->string")?;
+    let text: String = if bytes.is_ascii() {
+        std::str::from_utf8(bytes).expect("ASCII is UTF-8").to_owned()
+    } else {
+        bytes.iter().map(|&b| char::from(b)).collect()
+    };
+    Ok(vm.make_string_raw(&text))
+}
+
+fn string_to_latin1(vm: &mut Vm, args: usize, n: usize) -> R {
+    // Fallible collection can retain spare Vec capacity as well as the VM copy.
+    vm.admit_items(str_arg(vm, arg(vm, args, 0), "string->latin1")?.len(), 3, 64)?;
+    let value = arg(vm, args, 0);
+    let len = vm.string_length(value).expect("checked string");
+    let (start, end) = range_args(vm, args, n, 1, len, "string->latin1")?;
+    let from = vm.string_offset(value, start).expect("checked character range");
+    let to = vm.string_offset(value, end).expect("checked character range");
+    let text = &str_arg(vm, value, "string->latin1")?[from..to];
+    let bytes = if text.is_ascii() {
+        text.as_bytes().to_vec()
+    } else {
+        text.chars()
+            .map(|c| u8::try_from(u32::from(c)).map_err(|_| Error::new("string->latin1: character outside Latin-1")))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(vm.make_bytevector_raw(&bytes))
+}
+
 pub fn install(vm: &mut Vm) {
     crate::natives! { vm;
         /// Return #t if OBJ is a bytevector.
@@ -155,5 +190,9 @@ pub fn install(vm: &mut Vm) {
         "(utf8->string bytevector [start] [end])" => utf8_to_string;
         /// Return the UTF-8 encoding of STRING from START to END.
         "(string->utf8 string [start] [end])" => string_to_utf8;
+        /// Return the Latin-1 decoding of BYTEVECTOR from byte START to END, preserving every octet.
+        "(latin1->string bytevector [start] [end])" => latin1_to_string;
+        /// Encode characters START to END of STRING as Latin-1; reject characters above U+00FF.
+        "(string->latin1 string [start] [end])" => string_to_latin1;
     }
 }
