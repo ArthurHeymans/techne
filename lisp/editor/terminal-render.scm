@@ -64,7 +64,11 @@
 (define (render-row r)
   (or (terminal-row-cache r)
       (let ((ascii (and (not (terminal-row-double-width? r)) (terminal-row-ascii r))))
-        (if ascii (render-ascii-row r ascii) (render-cells r)))))
+        ;; Compact rows may have a nonblank fill (DECALN). Only a space
+        ;; suffix can be projected by the padding fast path.
+        (if (and ascii (let ((fill (caddr ascii))) (or (not fill) (string=? (car fill) " "))))
+            (render-ascii-row r ascii)
+            (render-cells r)))))
 
 (define (render-ascii-row r ascii)
   (let* ((attrs (cadr ascii)) (fill (caddr ascii)) (n (string-length (car ascii)))

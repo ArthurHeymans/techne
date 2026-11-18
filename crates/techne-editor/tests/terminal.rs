@@ -78,6 +78,53 @@ fn terminal_runs_a_pty_projects_styles_and_routes_keys() {
 }
 
 #[test]
+fn alignment_pattern_is_projected_on_screen_and_in_scrollback() {
+    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    rt.handle(Input::Viewport { columns: 5, rows: 4, split_gap: 1 });
+    command(&mut rt, r#"stty -echo; printf '\033#8'; read -r go; printf '\033[2;1H\n'"#);
+    let live = until(&mut rt, |s| s.pane().text.to_string() == "EEEEE\nEEEEE\n");
+    assert_eq!(live.pane().scroll, 0);
+    key(&mut rt, "RET");
+    let done = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
+    assert_eq!(done.pane().text.to_string(), "EEEEE\nEEEEE\n     \n");
+    assert!(rt.take_errors().is_empty());
+}
+
+#[test]
+fn eof_retries_output_after_a_timed_draw_fails() {
+    let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    rt.eval(
+        r#"(eval '(begin
+                    (define original-render! render!)
+                    (define live-draws 0)
+                    (set! render!
+                      (lambda (s b state)
+                        (when (process state)
+                          (set! live-draws (+ 1 live-draws))
+                          (when (= live-draws 1) (error "injected draw failure")))
+                        (original-render! s b state))))
+                 (package-module (find-package 'terminal)))"#,
+    )
+    .unwrap();
+    // No more output after the injected failure. Keep the PTY open until
+    // we see that failure, then let the child exit without printing again.
+    command(&mut rt, "stty -echo; printf 'unshown tail'; read -r finish");
+    let attempts = "(eval 'live-draws (package-module (find-package 'terminal)))";
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.eval(attempts).unwrap() == "0" {
+        assert!(Instant::now() < deadline, "timed draw was not attempted");
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
+    }
+    assert!(!rt.snapshot().pane().text.to_string().contains("unshown tail"));
+    key(&mut rt, "RET");
+    let done = until(&mut rt, |s| s.pane().status.contains("Exit 0"));
+    assert!(done.pane().text.to_string().contains("unshown tail"));
+    // The retry must happen before process state is cleared, not as a
+    // side effect of rendering the retained buffer in copy mode.
+    assert_eq!(rt.eval(attempts).unwrap(), "2");
+}
+
+#[test]
 fn redraws_making_progress_during_a_burst_and_flush_the_end() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("notes");

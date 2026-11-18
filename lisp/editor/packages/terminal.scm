@@ -5,11 +5,12 @@
 (require "../terminal-render.scm")
 
 (define-record-type terminal-session
-  (%terminal screen projection directory process reader drawer writer pending size status input pane-size)
+  (%terminal screen projection directory process reader drawer dirty writer pending size status input pane-size)
   terminal-session?
   (screen screen) (projection projection) (directory directory)
   (process process process-set!) (reader reader reader-set!)
-  (drawer drawer drawer-set!) (writer writer writer-set!)
+  (drawer drawer drawer-set!) (dirty draw-dirty? draw-dirty-set!)
+  (writer writer writer-set!)
   (pending pending pending-set!) (size size size-set!)
   (status status status-set!) (input input-mode input-mode-set!)
   (pane-size pane-size pane-size-set!))
@@ -41,13 +42,17 @@
   (terminal-project! (projection state) (screen state))
   (let ((visible (or (copying? state) (terminal-mode? (screen state) 'cursor))))
     (unless (eq? (option b 'cursor-visible) visible) (set-option! 'cursor-visible visible #:buffer b)))
-  (follow! s b state))
+  (follow! s b state)
+  (draw-dirty-set! state #f))
 
 ;; One pending redraw per terminal, measured from the first unshown change.
 ;; Later chunks cannot postpone it. Both tasks share the editor VM, so the
 ;; drawer sees a consistent grid between parser slices, without IPC.
 (define redraw-delay-ms 16)
 (define (schedule-draw! s b state)
+  ;; A draw can fail after its timer has fired. Keep the frame dirty
+  ;; until projection succeeds, independently of the timer's lifetime.
+  (draw-dirty-set! state #t)
   (unless (drawer state)
     (drawer-set! state
                  (spawn (lambda ()
@@ -242,7 +247,7 @@ to resume input, or \\[terminal-char-mode] to pass most keys to the child."
       (if (eof-object? text)
           (begin
             ;; Publish the final state before leaving live input mode.
-            (when (drawer state) (render! s b state))
+            (when (draw-dirty? state) (render! s b state))
             (process-wait p))
           (read (parse text 0 budget))))))
 
@@ -263,7 +268,7 @@ Buffers from the terminal-command prompt and unsuccessful exits stay open."
                                       (let ((p (process state)))
                                         (when p (process-resize p rows cols))))))
          (projection (make-terminal-projection d history-limit)))
-    (set! state (%terminal t projection dir #f #f #f #f '() 0 "Starting" 'semi size))
+    (set! state (%terminal t projection dir #f #f #f #f #f '() 0 "Starting" 'semi size))
     (let ((b (make-generated-buffer! name d 'terminal-mode #:state state)))
       (document-limit-history! d log-history)
       (show-document! s d)
