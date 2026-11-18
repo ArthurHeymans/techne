@@ -1,0 +1,21 @@
+;;; Run from the repository root, with the absolute techne binary as argument.
+;;; These are golden-output tests on recorded data, not timing benchmarks.
+(require "../../test.scm")
+(define binary (cadr (command-line)))
+(define (fixture name) (string-append "crates/techne-cli/tests/bench/" name))
+(define (report expected script args stdin)
+  (call-with-process binary (append (list "run" (string-append "runtime/bench/" script)) args)
+    (lambda (p)
+      (let ((out (process-read-all p 'stdout)))
+        (check (string-append script " exit status") 0 (process-wait p))
+        (check expected (file->string (fixture (string-append "expected/" expected))) out)))
+    #:stdin (if stdin (fixture stdin) 'null) #:stderr 'inherit))
+
+(report "summarize.md" "summarize.scm" (map fixture '("earlier" "later")) #f)
+(report "http-summarize.md" "http/summarize.scm" (list (fixture "results.tsv")) #f)
+(report "http-summarize-empty.md" "http/summarize.scm" (list (fixture "empty.tsv")) #f)
+(report "wrk.tsv" "http/wrk.scm" (list "techne" "1" "/" "16" "0" "9" (fixture "wrk.txt")) #f)
+(report "wrk-bare.tsv" "http/wrk.scm" (list "techne" "1" "/work" "16" "10000" "9" (fixture "wrk-bare.txt")) #f)
+(for-each (lambda (n) (report (string-append "median-" n ".txt") "steady/median.scm" '() (string-append "times-" n ".txt")))
+          '("odd" "even"))
+(test-summary)
