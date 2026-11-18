@@ -54,6 +54,14 @@ pub enum Request {
         interval_ms: usize,
     },
     StopRecording,
+    /// Attach a frontend, its keys read by `profile`, showing the file at
+    /// `file` (absolute) or what the session used last shows: what comes
+    /// after on the connection is the attachment's (`attach`).
+    Attach {
+        profile: String,
+        #[serde(default)]
+        file: Option<PathBuf>,
+    },
     /// Evaluate `source` in `module` (`"user"` if none), in the session
     /// used last or, `detached`, in one no frontend shows, for
     /// `principal` (who the operation runs for, as `current-principal`
@@ -340,9 +348,15 @@ fn serve_capture(shared: &Mutex<Shared>, mut stream: UnixStream, path: PathBuf, 
 
 /// Handle a connection's request: hand it to the runtime, and pass its
 /// replies on until the last, or until the program asking is gone.
-fn serve(shared: &Mutex<Shared>, mut stream: UnixStream) {
+fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream) {
     let _ = stream.set_read_timeout(Some(REQUEST_WAIT));
     let Ok(Some(request)) = read_frame::<Request>(&mut stream) else { return };
+    if let Request::Attach { profile, file } = request {
+        // Read and written as long as the frontend is attached.
+        let _ = stream.set_read_timeout(None);
+        crate::attach::serve(shared, stream, profile, file);
+        return;
+    }
     let _ = stream.set_write_timeout(Some(REQUEST_WAIT));
     if let Request::Capture { path, timeout_ms } = request {
         serve_capture(shared, stream, path, Duration::from_millis(timeout_ms.unwrap_or(25_000).clamp(1, 25_000)));
@@ -387,7 +401,7 @@ fn serve(shared: &Mutex<Shared>, mut stream: UnixStream) {
     if !matches!(request, Request::Open { .. }) {
         let (tx, replies) = mpsc::channel();
         let msg = match request {
-            Request::Capture { .. } | Request::Eval { .. } => unreachable!(),
+            Request::Capture { .. } | Request::Eval { .. } | Request::Attach { .. } => unreachable!(),
             Request::Record { path, frames, interval_ms } => Msg::Recording { path: Some(path), frames, interval_ms, reply: tx },
             Request::StopRecording => Msg::Recording { path: None, frames: 0, interval_ms: 0, reply: tx },
             Request::Open { .. } => unreachable!(),
@@ -458,6 +472,11 @@ fn gone(stream: &UnixStream) -> bool {
     let gone = !matches!((&*stream).read(&mut [0]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
     let _ = stream.set_nonblocking(false);
     gone
+}
+
+/// Send `request`, the first message of a connection.
+pub(crate) fn write_request(w: &mut impl Write, request: &Request) -> std::io::Result<()> {
+    write_frame(w, request)
 }
 
 fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> std::io::Result<()> {

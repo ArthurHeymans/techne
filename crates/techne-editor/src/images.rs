@@ -55,18 +55,35 @@ const DECODERS: usize = 2;
 const CACHE_BYTES: usize = 256 << 20;
 
 /// An image's pixels.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ImageData {
     /// Never reused within the process: frontends key textures by it.
     pub id: u64,
     pub width: u32,
     pub height: u32,
     /// RGBA, row by row, in sRGB, alpha straight.
+    #[serde(with = "serde_bytes")]
     pub rgba: Vec<u8>,
 }
 
 /// A decoded image, shared: cheap to clone into snapshots.
 #[derive(Clone)]
 pub struct Image(pub Arc<ImageData>);
+
+/// An image is sent by its id and size: a frontend in another process is
+/// sent its pixels once (`attach`), and puts them back by its id.
+impl serde::Serialize for Image {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        (self.0.id, self.0.width, self.0.height).serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Image {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Image, D::Error> {
+        let (id, width, height) = <(u64, u32, u32)>::deserialize(d)?;
+        Ok(Image(Arc::new(ImageData { id, width, height, rgba: Vec::new() })))
+    }
+}
 
 impl Image {
     pub fn id(&self) -> u64 {
