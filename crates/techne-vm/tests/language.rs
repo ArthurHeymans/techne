@@ -1642,6 +1642,21 @@ fn assumed_arguments_in_compiled_code() {
 }
 
 #[test]
+fn dynamic_vector_indices() {
+    let source = r#"
+(define v (vector 11 22))
+(define (at i) (vector-ref v i))
+(define (put i x) (vector-set! v i x))
+(do ((j 0 (+ j 1))) ((= j 100)) (put 1 (at 0)))
+(define (probe i)
+  (list (guard (e (#t 'bad)) (at i)) (guard (e (#t 'bad)) (put i 33) 'ok)))
+(displayln (map probe (list 0 1 -1 2 (- (expt 2 47)) (- (expt 2 47) 1) 0.0 #f (vector 0))))
+(displayln v)"#;
+    let expected = "((11 ok) (11 ok) (bad bad) (bad bad) (bad bad) (bad bad) (bad bad) (bad bad) (bad bad))\n#(33 33)\n";
+    check_env("dynamic_vector_indices", source, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_FEEDBACK", "0")], expected);
+}
+
+#[test]
 fn vectors_and_globals_kept_in_compiled_loops() {
     // Compiled loops keep vectors' lengths and the globals they read
     // vectors through or call: what compiled callees change, they read

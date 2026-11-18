@@ -4749,16 +4749,13 @@ impl Gen {
                         let s = b.use_var(self.shifts[i as usize]);
                         b.ins().sshr_imm_s(s, 16)
                     }
-                    false => Self::untag(b, k),
+                    // Subtract the tag without masking the high bits. Only the
+                    // contiguous encodings of fixnums 0..len can pass the
+                    // unsigned comparison (vector lengths fit in 48 bits).
+                    false => b.ins().iadd_imm_s(k, (TAG_INT << 48).wrapping_neg()),
                 };
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
-                let ok = if self.fix[pc].contains(i) {
-                    in_range
-                } else {
-                    let int = Self::is_int(b, k);
-                    b.ins().band(int, in_range)
-                };
-                Self::guard(b, ok, slow);
+                Self::guard(b, in_range, slow);
                 let off = b.ins().ishl_imm_s(idx, 3);
                 let addr = b.ins().iadd(p, off);
                 match *op {
