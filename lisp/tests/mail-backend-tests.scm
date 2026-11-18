@@ -217,4 +217,19 @@
              (rejected? (lambda () (maildir-keys (string-append root "/absent"))))))
     (lambda () (delete-path root #t))))
 
+(let* ((f (fake (string-append "* OK ready\r\n" selected
+                               "* SEARCH 10 11 12\r\nT2 OK search\r\n"
+                               "* 1 FETCH (RFC822.SIZE 1 UID 10)\r\nT3 OK size\r\n"
+                               "* 1 FETCH (UID 10 FLAGS () BODY[] {1}\r\na)\r\nT4 OK body\r\n"
+                               "* 2 FETCH (UID 11 RFC822.SIZE 16777217)\r\nT5 OK size\r\n"
+                               "* 3 FETCH (UID 12 RFC822.SIZE 1)\r\nT6 OK size\r\n"
+                               "* 3 FETCH (UID 12 FLAGS () BODY[] {1}\r\nb)\r\nT7 OK body\r\n") 11))
+       (s (car f)) (events '()))
+  (imap-select! s "INBOX")
+  (imap-for-each-message s (lambda (m) (set! events (cons (field m 'uid) events))) 0
+    #:max-bytes 16777216 #:on-oversized (lambda (uid) (set! events (cons (list 'oversized uid) events))))
+  (check "IMAP continues past an oversized message" '(10 (oversized 11) 12) (reverse events))
+  (check "IMAP never requests the oversized body" #f (member "T6 UID FETCH 11 (UID FLAGS BODY.PEEK[])\r\n" ((cadr f))))
+  (check "IMAP only issues size and body requests for the two small messages and a size request for the large one"
+         7 (length ((cadr f)))))
 (test-summary)

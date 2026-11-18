@@ -93,7 +93,11 @@
       "is_macro": false
     },
     "call-with-sqlite": {
-      "description": "(call-with-sqlite path proc)  procedure, <techne-store>:8\n\nCall PROC with an open database at PATH; return its result.\nClose the handle when PROC returns, fails or is cancelled.",
+      "description": "(call-with-sqlite path proc)  procedure, <techne-store>:16\n\nCall PROC with an open database at PATH; return its result.\nClose the handle when PROC returns, fails or is cancelled.",
+      "is_macro": false
+    },
+    "call-with-sqlite-lease": {
+      "description": "(call-with-sqlite-lease db proc)  procedure, <techne-store>:8\n\nCall PROC under an exclusive, nonwaiting application lease of private DB.\nRaise if another user of this cache holds the lease. This is not an SQL\ntransaction. The lease is released on return, failure or cancellation.",
       "is_macro": false
     },
     "call-with-tcp-connection": {
@@ -1861,23 +1865,23 @@
       "is_macro": false
     },
     "sqlite-close": {
-      "description": "(sqlite-close db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:422\n\nClose DB idempotently and interrupt pending work. The handle becomes\nunusable immediately; its worker rolls back and releases OS resources\nasynchronously. No caller transaction can survive cancellation.",
+      "description": "(sqlite-close db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:553\n\nClose DB idempotently and interrupt pending work. The handle becomes\nunusable immediately; its worker rolls back and releases OS resources\nasynchronously. No caller transaction can survive cancellation.",
       "is_macro": false
     },
     "sqlite-closed?": {
-      "description": "(sqlite-closed? db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:424\n\nReturn #t if DB has been closed or its worker has stopped.",
+      "description": "(sqlite-closed? db)  built-in procedure, @source@/crates/techne-store/src/lib.rs:555\n\nReturn #t if DB has been closed or its worker has stopped.",
       "is_macro": false
     },
     "sqlite-execute": {
-      "description": "(sqlite-execute db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:409\n\nExecute one non-row-returning SQL statement in DB with bound PARAMS.\nReturn the affected row count. PARAMS is a list/vector of int64,\nfinite flonums, strings, bytevectors and #f (SQL NULL), at most 256\nvalues and 32 MiB. SQL is at most 64 KiB. Each statement is atomic;\nexplicit transactions, ATTACH, extensions and most PRAGMAs are denied.\nSQLite work has a five-second budget, lock waits 250 ms (not a hard\ndeadline on OS filesystem calls). Cancellation\nrolls back unfinished work, but can race an already completed commit.",
+      "description": "(sqlite-execute db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:540\n\nExecute one non-row-returning SQL statement in DB with bound PARAMS.\nReturn the affected row count. PARAMS is a list/vector of int64,\nfinite flonums, strings, bytevectors and #f (SQL NULL), at most 256\nvalues and 32 MiB. SQL is at most 64 KiB. Each statement is atomic;\nexplicit transactions, ATTACH, extensions and most PRAGMAs are denied.\nSQLite work has a five-second budget, lock waits 250 ms (not a hard\ndeadline on OS filesystem calls). Cancellation\nrolls back unfinished work, but can race an already completed commit.",
       "is_macro": false
     },
     "sqlite-open": {
-      "description": "(sqlite-open path)  procedure, <techne-store>:2\n\nOpen or create the SQLite database at PATH; return a scope-owned handle.\nPATH is a filename or \":memory:\" (not a URI). Requires the files capability.\nAll database work waits asynchronously, on a separate worker.",
+      "description": "(sqlite-open path #:private? (private? #f))  procedure, <techne-store>:2\n\nOpen or create SQLite at PATH, a filename or \":memory:\" (not a URI).\nPRIVATE? requires an owned directory inaccessible to others and private files.\nThe scope owns the handle. Work waits asynchronously on a database worker.",
       "is_macro": false
     },
     "sqlite-query": {
-      "description": "(sqlite-query db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:416\n\nQuery DB with one read-only SQL statement and bound PARAMS.\nReturn a list of row lists: NULL is #f, blobs are bytevectors, and\nother cells are strings or numbers. Parameter limits match\nsqlite-execute. At most 4096 rows / 40 MiB (including cell overhead),\nnever silently truncated; use SQL LIMIT and paging for larger data.\nInvalid UTF-8 TEXT raises an error. A cell is at most 32 MiB.",
+      "description": "(sqlite-query db sql params)  built-in procedure, @source@/crates/techne-store/src/lib.rs:547\n\nQuery DB with one read-only SQL statement and bound PARAMS.\nReturn a list of row lists: NULL is #f, blobs are bytevectors, and\nother cells are strings or numbers. Parameter limits match\nsqlite-execute. At most 4096 rows / 40 MiB (including cell overhead),\nnever silently truncated; use SQL LIMIT and paging for larger data.\nInvalid UTF-8 TEXT raises an error. A cell is at most 32 MiB.",
       "is_macro": false
     },
     "sset!": {
@@ -2254,6 +2258,8 @@
     "%source-relative",
     "%source-text",
     "%sqlite-open",
+    "%sqlite-release-lease",
+    "%sqlite-try-lease",
     "%tcp-accept",
     "%tcp-connect",
     "%tcp-listen",
@@ -2265,6 +2271,7 @@
     "call-with-process",
     "call-with-socket",
     "call-with-sqlite",
+    "call-with-sqlite-lease",
     "call-with-tcp-connection",
     "char-start",
     "column",

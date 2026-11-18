@@ -1,5 +1,8 @@
 //! The native Scheme mail app: interaction and the frontend-neutral rich view.
-use std::time::{Duration, Instant};
+use std::{
+    os::unix::fs::PermissionsExt,
+    time::{Duration, Instant},
+};
 
 use techne_editor::{
     present::{CursorShape, Input, LineNumbers},
@@ -7,7 +10,7 @@ use techne_editor::{
 };
 
 fn editor() -> (tempfile::TempDir, Runtime) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
     let path = dir.path().join("notes.txt");
     std::fs::write(&path, "My previous workspace\n").unwrap();
     let rt = Runtime::open(&path, &dir.path().join("notes.journal"), "emacs").unwrap().0;
@@ -69,6 +72,43 @@ fn real_accounts(rt: &mut Runtime, dir: &std::path::Path) {
         (from . \"ada@example.org\") (smtp-host . \"smtp.invalid\") (smtp-user . \"ada@example.org\"))))"
     ))
     .unwrap();
+}
+
+#[test]
+fn root_inbox_filters_use_the_displayed_name_and_delete_requires_trash() {
+    let (dir, mut rt) = editor();
+    real_accounts(&mut rt, dir.path());
+    let root = dir.path().join("Maildir");
+    std::fs::create_dir_all(root.join("cur")).unwrap();
+    std::fs::create_dir_all(root.join("Provider/All Mail/cur")).unwrap();
+    let message = "Subject: Root message\r\nMessage-ID: <root@example.org>\r\n\r\nbody";
+    let inbox_file = root.join("cur/one:2,S");
+    let all_file = root.join("Provider/All Mail/cur/one:2,S");
+    std::fs::write(&inbox_file, message).unwrap();
+    std::fs::write(&all_file, message).unwrap();
+    let configure = |rt: &mut Runtime, filter: &str| {
+        rt.eval(&format!(
+            "(set-option! 'mail-accounts '(((id . \"test\") (kind . maildir) (path . {:?}) {filter})))",
+            root.display().to_string()
+        ))
+        .unwrap();
+    };
+    configure(&mut rt, "(folders . (\"INBOX\" \"Provider/All Mail\"))");
+    command(&mut rt, "mail");
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| pane(rt, 0).contains("Up to date"));
+    key(&mut rt, "i");
+    assert_eq!(summary_subjects(&mut rt), "(\"Root message\")");
+    key(&mut rt, "d");
+    let result = rt.eval("(run-command (current-session) 'mail-execute 1)");
+    let echo = rt.snapshot().echo;
+    let outcome = format!("{result:?} {:?} {echo}", rt.take_errors());
+    assert!(outcome.contains("Set trash"), "{outcome}");
+    assert!(inbox_file.is_file() && all_file.is_file(), "neither copy can be marked for expunge");
+    configure(&mut rt, "(skip . (\"INBOX\"))");
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| summary_subjects(rt) == "()");
+    assert!(inbox_file.is_file(), "excluding a folder only affects the cache");
 }
 
 #[test]
@@ -1277,6 +1317,7 @@ fn archive_and_delete_change_the_maildir_as_mu4e_does() {
         (&gmail, "[Gmail]/All Mail", "1", "<one@x>", 12),
         (&gmail, "Inbox", "2", "<two@x>", 11),
         (&gmail, "[Gmail]/All Mail", "2", "<two@x>", 11),
+        (&gmail, "[Gmail]/Trash", "", "", 0),
         (&plain, "Inbox", "3", "<three@x>", 10),
         (&plain, "Inbox", "4", "<four@x>", 9),
         (&plain, "Archive", "", "", 0),
@@ -1292,7 +1333,7 @@ fn archive_and_delete_change_the_maildir_as_mu4e_does() {
         }
     }
     rt.eval(&format!(
-        "(set-option! 'mail-accounts '(((id . \"g\") (kind . maildir) (path . {:?}))
+        "(set-option! 'mail-accounts '(((id . \"g\") (kind . maildir) (path . {:?}) (archive-inbox-label? . #t))
                                        ((id . \"p\") (kind . maildir) (path . {:?}) (archive . \"Archive\"))))",
         gmail.display().to_string(),
         plain.display().to_string()
@@ -1313,15 +1354,16 @@ fn archive_and_delete_change_the_maildir_as_mu4e_does() {
     key(&mut rt, "a");
     assert_eq!(files(&gmail.join("Inbox")), ["cur/1:2,S", "cur/2:2,S"]);
     assert_eq!(summary_subjects(&mut rt), "(\"m1\" \"m2\" \"m3\" \"m4\")");
-    // Gmail: deleting is every copy gone, marked d and done with x.
+    // Delete moves to the real Trash, even when there is an All Mail folder.
     key(&mut rt, "M-<");
     key(&mut rt, "n");
     key(&mut rt, "d");
     // An account with an archive folder: archiving moves it there.
     key(&mut rt, "r");
     key(&mut rt, "x");
-    assert_eq!(files(&gmail.join("Inbox")), ["cur/1:2,S", "cur/2:2,ST"]);
-    assert_eq!(files(&gmail.join("[Gmail]/All Mail")), ["cur/1:2,S", "cur/2:2,ST"]);
+    assert_eq!(files(&gmail.join("Inbox")), ["cur/1:2,S"]);
+    assert_eq!(files(&gmail.join("[Gmail]/All Mail")), ["cur/1:2,S", "cur/2:2,S"]);
+    assert_eq!(files(&gmail.join("[Gmail]/Trash")), ["cur/2:2,S"]);
     assert_eq!(files(&plain.join("Inbox")), ["cur/4:2,S"]);
     assert_eq!(files(&plain.join("Archive")), ["cur/3:2,S"]);
     assert_eq!(summary_subjects(&mut rt), "(\"m1\" \"m4\")");
@@ -1335,9 +1377,7 @@ fn archive_and_delete_change_the_maildir_as_mu4e_does() {
     key(&mut rt, "a");
     assert_eq!(files(&plain.join("Inbox")), ["cur/4:2,S"]);
     assert_eq!(files(&plain.join("Trash")), Vec::<String>::new());
-    // The next sync reads the files: a message trashed stays out, one
-    // mbsync expunged goes from the cache.
-    std::fs::remove_file(gmail.join("Inbox/cur/2:2,ST")).unwrap();
+    // The next sync reads the files; the moved copy stays out of the Inbox.
     command(&mut rt, "mail-sync");
     pump_until(&mut rt, |rt| pane(rt, 0).contains("Up to date"));
     command(&mut rt, "mail-inbox");

@@ -156,19 +156,17 @@ mbsync carries that to the server:
 - Reading and starring set the =S= and =F= flags in its name (in every
   folder it is in); a sync takes the flags the files have, so what a phone
   read through Gmail is read here after mbsync.
-- Archiving (=r=, =A=) is Gmail's: the message leaves the Inbox. Its Inbox
-  copy gets the =T= flag, which mbsync expunges, dropping the Inbox label;
-  All Mail and its other labels keep it. An account with an =archive=
-  folder has the message moved there instead, as =mu4e-refile-folder=
-  does; another account cannot archive.
-- Deleting (=d=, then =x=) moves the message to the account's trash: its
-  =trash= folder, else one named Trash, Deleted Items or Deleted Messages.
-  A Gmail account without one gives every copy =T=: Gmail then archives or
-  bins it, as its IMAP setting for messages expunged from their last folder
-  says ("Move the message to the Bin" deletes it). Nothing is deleted for
-  good.
-- A trashed message is in no list. =a= renames back what the last change
-  renamed; once mbsync has run, it has reached the server.
+- Archiving (=r=, =A=) moves the message to the configured =archive=
+  folder. For a Gmail Maildir, set =(archive-inbox-label? . #t)= instead
+  to mark only the Inbox copy for expunge, and only when a cached All Mail
+  copy still exists on disk. mbsync then removes the Inbox label.
+- Deleting (=d=, then =x=) moves the selected copy to the configured
+  =trash= folder or a recognized Trash, Deleted Items, or Deleted Messages
+  Maildir (including Gmail's Trash or Bin). If no such folder exists, the
+  operation is refused. Delete never marks messages for expunge. Other
+  cached copies stay in their original folders.
+- =a= undoes a change only while its original cached source and location
+  still match. Once mbsync has run, the change may have reached the server.
 
 The Inbox is the Inbox folders of the accounts. A message of an IMAP
 account, or one cached without a file, keeps its state here only.
@@ -365,30 +363,29 @@ is not settled cannot be discarded or deleted. The mode
 line distinguishes saving, saved, save failure, submitting, SMTP acceptance
 and uncertain delivery.
 
-A message over 16 MiB, mostly its attachments, is not read into the cache:
-it is not listed or searched. A sync says how many each folder has, as a
-note, not a failure; their files are unchanged.
+Mail above 16 MiB is not cached, listed, or searched. A sync reports newly
+skipped messages and continues. For IMAP, Techne checks the size before
+fetching the body and remembers deliberately skipped UIDs until UIDVALIDITY
+changes or the mailbox is removed from the cache.
 
-=C-c C-c= requires an explicit confirmation of the recipient envelope. The
-confirmed text is frozen while sending; a durable SQLite claim prevents another
-buffer from submitting the same saved snapshot concurrently. SMTP acceptance
-is reported only after the DATA response. Acceptance means the server accepted
-the message, not that a recipient read it or final delivery is guaranteed.
+=C-c C-c= requires explicit confirmation of the recipient envelope. The
+confirmed text is frozen. A cache allows only one live submission at a time,
+across runtimes. Once the server accepts DATA, Techne records that outcome
+without waiting for a reply to QUIT. Acceptance is not proof of final delivery.
 
-A failure before writing DATA is definitely not submitted and remains a
-retryable draft. A failure after DATA may be ambiguous: its saved snapshot is
-read-only, survives reopening and cannot be reset by an ordinary save. No
-submission is automatically retried. Inspect it with =mail-drafts=, check server
-delivery evidence, and use =C-c C-r= to explicitly record delivered or confirm
-non-delivery before returning it to draft. Absence from a Sent folder alone is
-not proof of non-delivery, especially without an automatic Sent-folder copy.
+A failure before writing DATA normally leaves a retryable draft. A failure
+after DATA, or an interrupted runtime with a pending send, can leave a draft
+read-only. No submission is automatically retried. When the live send is no
+longer running, inspect the draft and check server delivery evidence before
+using =C-c C-r= to record delivery or confirm non-delivery. Absence from a
+Sent folder alone does not prove non-delivery.
 
 * Private local data
 
 The default cache is =XDG_DATA_HOME/techne/mail/cache.sqlite=, falling back to
-=~/.local/share/techne/mail/cache.sqlite=. Its directory is created with mode
-0700. It contains private bodies, attachments, reading state and drafts, not
-just a disposable search index. Protect and back it up like a mailbox. Set
-=mail-database= in configuration to choose another file. Set it before opening
-mail in a new runtime; changing it does not switch an already-open cache.
-There is no automatic live-account access or account test.
+=~/.local/share/techne/mail/cache.sqlite=. It holds private message bodies and
+drafts. Protect and back it up like a mailbox. For a custom =mail-database=,
+use a directory you own that nobody else can access (=chmod 700 DIRECTORY=).
+Techne refuses shared cache directories and makes cache files private. Do
+not remove the cache's lease file while any editor runtime is using it.
+Set the path before opening mail in a new runtime; it does not switch a live cache.

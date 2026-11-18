@@ -34,6 +34,26 @@ impl Store {
 }
 
 #[test]
+fn private_cache_refuses_shared_locations_and_sets_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite");
+    let permissions = std::fs::Permissions::from_mode;
+    let mut s = Store::new();
+    std::fs::set_permissions(dir.path(), permissions(0o755)).unwrap();
+    let open = format!("(sqlite-open {:?} #:private? #t)", path.to_str().unwrap());
+    s.fails(&open, "inaccessible to others");
+    assert!(!path.exists());
+    std::fs::set_permissions(dir.path(), permissions(0o700)).unwrap();
+    std::fs::File::create(&path).unwrap();
+    std::fs::set_permissions(&path, permissions(0o644)).unwrap();
+    s.eval(&format!("(define db {open}) (call-with-sqlite-lease db (lambda () #t))"));
+    for file in [path, dir.path().join("cache.sqlite-lease")] {
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[test]
 fn binding_roundtrip_and_documentation() {
     let mut s = Store::new();
     assert_eq!(

@@ -5,7 +5,9 @@
           mail-store-dedupe! mail-store-copy-mailboxes mail-store-forget! mail-store-senders mail-store-recipients
           mail-store-copies mail-store-move!
           mail-store-draft! mail-store-drafts mail-store-delete-draft! mail-store-prepare-imap!
-          mail-store-draft-state mail-store-claim-draft! mail-store-resolve-draft! mail-ref)
+          mail-store-draft-state mail-store-claim-draft! mail-store-finish-draft!
+          mail-store-ambiguous-attempt mail-store-resolve-draft! call-with-mail-store-lease
+          mail-store-skip-imap! mail-ref)
   (import (techne) (techne task) (techne sqlite) (techne mail mime) (techne mail date) (techne mail maildir))
   (begin
     (define (mail-ref object key . default)
@@ -17,7 +19,7 @@
       "Open the local mail cache at PATH; :memory: makes an isolated store.
 Sources are authoritative: a Maildir message's read, star and trashed
 state are its flags, read at each sync and written when they change."
-      (let ((db (sqlite-open path)))
+      (let ((db (sqlite-open path #:private? #t)))
         (for-each
          (lambda (sql) (sqlite-execute db sql '()))
          '("CREATE TABLE IF NOT EXISTS mail_messages (id INTEGER PRIMARY KEY, account TEXT NOT NULL, mailbox TEXT NOT NULL, source_key TEXT NOT NULL, raw TEXT NOT NULL, subject TEXT NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, date TEXT NOT NULL, sent_at INTEGER NOT NULL DEFAULT 0, message_id TEXT NOT NULL, reply_to TEXT NOT NULL, refs TEXT NOT NULL, body TEXT NOT NULL, unread INTEGER NOT NULL DEFAULT 1, starred INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, UNIQUE(account,mailbox,source_key))"
@@ -48,6 +50,12 @@ state are its flags, read at each sync and written when they change."
         (guard (e ((not (task-cancelled-condition? e))
                    (sqlite-execute db "ALTER TABLE mail_drafts ADD COLUMN updated INTEGER NOT NULL DEFAULT 0" '())))
           (sqlite-query db "SELECT updated FROM mail_drafts LIMIT 0" '()))
+        (guard (e ((not (task-cancelled-condition? e))
+                   (guard (e ((not (task-cancelled-condition? e))
+                              (sqlite-query db "SELECT attempt FROM mail_drafts LIMIT 0" '())))
+                     (sqlite-execute db "ALTER TABLE mail_drafts ADD COLUMN attempt TEXT NOT NULL DEFAULT ''" '()))))
+          (sqlite-query db "SELECT attempt FROM mail_drafts LIMIT 0" '()))
+        (sqlite-execute db "CREATE TABLE IF NOT EXISTS mail_imap_skipped (account TEXT NOT NULL, mailbox TEXT NOT NULL, validity INTEGER NOT NULL, uid INTEGER NOT NULL, PRIMARY KEY(account,mailbox))" '())
         ;; Counting a folder's mail, or a group's, reads this and not the
         ;; rows: a cold cache of 500 MB took seconds without it.
         (sqlite-execute db "DROP INDEX IF EXISTS mail_folder_state" '())
@@ -168,6 +176,10 @@ source changes: fetching what is still there brings it back."
                                                        (list account mailbox (json->string (list->vector chunk))))))))))
                    (mailbox (sqlite-execute db "DELETE FROM mail_messages WHERE account=? AND mailbox=?" (list account mailbox)))
                    (else (sqlite-execute db "DELETE FROM mail_messages WHERE account=?" (list account))))))
+        (unless keys
+          (sqlite-execute db (if mailbox "DELETE FROM mail_imap_skipped WHERE account=? AND mailbox=?"
+                                          "DELETE FROM mail_imap_skipped WHERE account=?")
+                          (if mailbox (list account mailbox) (list account))))
         (when (and (> removed 0) (or mailbox keys)) (mail-store-dedupe! db account))
         removed))
     (define (follow-flags! db account present keys)
@@ -342,73 +354,77 @@ only, without touching Maildir or transferring raw blobs."
                          (remove (lambda (e) (eq? (car e) 'raw)) m))
                    m)))))
 
+    (define (copy-rows db ids copies?)
+      (let loop ((ids ids) (out '()))
+        (if (null? ids) (delete-duplicates out)
+            (let* ((n (min 1000 (length ids))) (json (json->string (list->vector (take ids n))))
+                   (sql (string-append "SELECT id,account,mailbox,source_key,source_path,unread,starred,trashed FROM mail_messages"
+                                       " WHERE id>?2 AND (id IN (SELECT value FROM json_each(?1))"
+                                       (if copies?
+                                           " OR (message_id<>'' AND (account,message_id) IN (SELECT account,message_id FROM mail_messages WHERE id IN (SELECT value FROM json_each(?1))))"
+                                           "") ") ORDER BY id LIMIT 512")))
+              (loop (drop ids n)
+                    (let page ((after 0) (out out))
+                      (let ((rows (sqlite-query db sql (list json after))))
+                        (if (< (length rows) 512) (append rows out)
+                            (page (caar (reverse rows)) (append rows out))))))))))
     (define (mail-store-copies db ids #:copies? [copies? #t])
       "Return (ID ACCOUNT MAILBOX KEY PATH) of IDS in DB, with their copies.
-Copies are the rows of one account with one Message-ID (`mail-store-dedupe!`);
 COPIES? #f leaves them out. PATH is a Maildir message's, else empty."
-      (let loop ((ids ids) (out '()))
-        (if (null? ids) out
-            (let* ((chunk (take ids (min 2000 (length ids))))
-                   (json (string-append "[" (string-join (map number->string chunk) ",") "]")))
-              (loop (drop ids (length chunk))
-                    (append (sqlite-query db (string-append "SELECT id,account,mailbox,source_key,source_path FROM mail_messages"
-                                                            " WHERE id IN (SELECT value FROM json_each(?1))"
-                                                            (if copies?
-                                                                (string-append " OR (message_id<>'' AND (account,message_id) IN"
-                                                                               " (SELECT account,message_id FROM mail_messages WHERE id IN (SELECT value FROM json_each(?1))))")
-                                                                ""))
-                                          (list json))
-                            out))))))
-    (define (mail-store-state! db ids field value #:copies? [copies? #t])
-      "Set FIELD (unread, starred or trashed) of IDS in DB to boolean VALUE.
-The copies of those messages (`mail-store-dedupe!`) are set with them,
-unless COPIES? is #f. A Maildir message's flag is set at the source, by
-renaming its file as mu4e does (S read, F starred, T trashed), and mbsync
-carries it to the server; others are kept here only. A file another
-program moved meanwhile keeps its state; the next sync reads it."
-      (let* ((column (case field ((unread) "unread") ((starred) "starred") ((trashed) "trashed")
-                           (else (error "Unknown mail state" field))))
+      (map (lambda (row) (take row 5)) (copy-rows db ids copies?)))
+
+    (define (mail-store-state! db ids field value #:copies? [copies? #t]
+                              #:expected [expected #f] #:on-change [on-change (lambda (rows) #f)])
+      "Set FIELD (unread, starred or trashed) of IDS and their copies to VALUE.
+With EXPECTED, change only exact matching (ID ACCOUNT MAILBOX KEY PATH) rows.
+ON-CHANGE receives undo records after each bounded batch, so prior batches
+remain undoable if a later batch fails. Maildir flags are renamed at source."
+      (let* ((index (case field ((unread) 5) ((starred) 6) ((trashed) 7) (else (error "Unknown mail state" field))))
+             (column (symbol->string field))
              (letter (case field ((unread) #\S) ((starred) #\F) (else #\T)))
              (on? (if (eq? field 'unread) (not value) value))
-             (rows (mail-store-copies db ids #:copies? copies?))
-             (moved (filter-map (lambda (r)
-                                  (let ((path (list-ref r 4)))
-                                    (and (not (string=? path ""))
-                                         (let ((now (maildir-set-flag! path (list-ref r 3) letter on?)))
-                                           (and now (not (string=? now path)) (vector (car r) now))))))
-                                rows))
-             (affected (map car rows)))
-        ;; One statement, so one commit, for up to 2000 messages: marking
-        ;; a mailbox read is not a commit a message.
-        (let loop ((ids affected))
-          (when (pair? ids)
-            (let* ((n (min 2000 (length ids))) (chunk (take ids n)))
-              (sqlite-execute db (string-append "UPDATE mail_messages SET " column "=?1 WHERE id IN (SELECT value FROM json_each(?2))")
-                              (list (if value 1 0) (string-append "[" (string-join (map number->string chunk) ",") "]")))
-              (loop (drop ids n)))))
-        (let loop ((rows moved))
+             (wanted (if value 1 0))
+             (identities (and expected (make-hash-table))))
+        (when expected (for-each (lambda (r) (hash-table-set! identities (car r) r)) expected))
+        (let loop ((rows (copy-rows db ids (and copies? (not expected)))))
           (when (pair? rows)
-            (let ((chunk (take rows (min 2000 (length rows)))))
-              (sqlite-execute db (string-append "UPDATE mail_messages SET source_path=json_extract(j.value,'$[1]')"
-                                                " FROM json_each(?) AS j WHERE mail_messages.id=json_extract(j.value,'$[0]')")
-                              (list (json->string (list->vector chunk))))
-              (loop (drop rows (length chunk))))))
-        (when (eq? field 'trashed)
-          (for-each (lambda (account) (mail-store-dedupe! db account)) (delete-duplicates (map cadr rows))))))
-    (define (mail-store-move! db id mailbox root)
-      "Move Maildir message ID of DB into its account's MAILBOX, at ROOT.
-Its file is renamed into ROOT's cur, flags kept; the row follows. Return
-(MAILBOX PATH) it was in, to move it back, or #f when its file is gone."
-      (let ((row (car (or (pair-or-false (sqlite-query db "SELECT account,mailbox,source_key,source_path FROM mail_messages WHERE id=?" (list id)))
-                          (error "No such message" id)))))
-        (when (string=? (list-ref row 3) "") (error "Only a Maildir message can be moved"))
-        (let ((now (maildir-move! (list-ref row 3) (list-ref row 2) root)))
-          (and now
-               (begin
-                 (sqlite-execute db "UPDATE mail_messages SET mailbox=?,source_path=? WHERE id=?" (list mailbox now id))
-                 (mail-store-dedupe! db (car row))
-                 (list (cadr row) (list-ref row 3)))))))
-    (define (pair-or-false x) (and (pair? x) x))
+            (let* ((n (min 512 (length rows)))
+                   (changed
+                    (filter-map
+                     (lambda (r)
+                       (let* ((identity (take r 5)) (path (list-ref r 4)))
+                         (and (not (= wanted (list-ref r index)))
+                              (or (not expected) (and (equal? identity (hash-table-ref/default identities (car r) #f))
+                                                      (or (string=? path "") (file-exists? path))))
+                              (let ((now (if (string=? path "") path (maildir-set-flag! path (list-ref r 3) letter on?))))
+                                (and now (list identity now))))))
+                     (take rows n))))
+              (when (pair? changed)
+                ;; The row must still be the same cached source before writing.
+                (sqlite-execute db
+                  (string-append "UPDATE mail_messages SET " column "=?1,source_path=json_extract(j.value,'$[5]')"
+                                 " FROM json_each(?2) AS j WHERE (mail_messages.id,account,mailbox,source_key,source_path)="
+                                 "(json_extract(j.value,'$[0]'),json_extract(j.value,'$[1]'),json_extract(j.value,'$[2]'),json_extract(j.value,'$[3]'),json_extract(j.value,'$[4]'))")
+                  (list wanted (json->string (list->vector (map (lambda (c) (list->vector (append (car c) (cdr c)))) changed)))))
+                (on-change (map (lambda (c) (list (caar c) field (not value) (append (take (car c) 4) (cdr c)))) changed))
+                (when (eq? field 'trashed)
+                  (for-each (lambda (account) (mail-store-dedupe! db account)) (delete-duplicates (map cadar changed)))))
+              (loop (drop rows n)))))))
+    (define (mail-store-move! db id mailbox root #:expected [expected #f] #:undo? [undo? #f])
+      "Move Maildir message ID of DB to MAILBOX at ROOT, keeping its flags.
+EXPECTED, if set, requires the same cached identity and location before moving.
+Return (MAILBOX PATH) it was in, with its new identity appended if UNDO?."
+      (let* ((rows (copy-rows db (list id) #f)) (row (and (pair? rows) (take (car rows) 5))))
+        (and row (or (not expected) (equal? expected row))
+             (let ((path (list-ref row 4)) (key (list-ref row 3)))
+               (when (string=? path "") (error "Only a Maildir message can be moved"))
+               (let ((now (and (or (not expected) (file-exists? path)) (maildir-move! path key root))))
+                 (and now
+                      (begin
+                        (sqlite-execute db "UPDATE mail_messages SET mailbox=?,source_path=? WHERE id=? AND account=? AND mailbox=? AND source_key=? AND source_path=?"
+                                        (append (list mailbox now) row))
+                        (mail-store-dedupe! db (cadr row))
+                        (append (list (caddr row) path) (if undo? (list (list id (cadr row) mailbox key now)) '())))))))))
 
     (define (mail-store-copy-mailboxes db id)
       "Return the mailboxes holding message ID of DB or a copy of it.
@@ -474,31 +490,51 @@ Local reading state on invalidated entries is discarded."
       (let ((prefix (string-append (number->string validity) ":")))
         (sqlite-execute db "DELETE FROM mail_messages WHERE account=? AND mailbox=? AND source_key NOT LIKE ?"
                         (list account mailbox (string-append prefix "%")))
-        (caar (sqlite-query db "SELECT coalesce(max(CAST(substr(source_key,?) AS INTEGER)),0) FROM mail_messages WHERE account=? AND mailbox=?"
-                            (list (+ 1 (string-length prefix)) account mailbox)))))
+        (caar (sqlite-query db "SELECT max(coalesce((SELECT max(CAST(substr(source_key,?1) AS INTEGER)) FROM mail_messages WHERE account=?2 AND mailbox=?3),0),coalesce((SELECT uid FROM mail_imap_skipped WHERE account=?2 AND mailbox=?3 AND validity=?4),0))"
+                            (list (+ 1 (string-length prefix)) account mailbox validity)))))
+    (define (mail-store-skip-imap! db account mailbox validity uid)
+      "Checkpoint a deliberately omitted oversized UID, never a failed import."
+      (sqlite-execute db "INSERT INTO mail_imap_skipped VALUES(?,?,?,?) ON CONFLICT(account,mailbox) DO UPDATE SET validity=excluded.validity,uid=CASE WHEN validity=excluded.validity THEN max(uid,excluded.uid) ELSE excluded.uid END"
+                      (list account mailbox validity uid)))
 
     (define (mail-store-draft! db id account text #:state [state "draft"])
-      "Persist draft ID, ACCOUNT and TEXT in DB with delivery STATE.
-STATE is draft, sending, sent or uncertain; uncertain is never auto-retried."
-      (unless (member state '("draft" "sending" "sent" "uncertain")) (error "Invalid draft state" state))
-      (sqlite-execute db "INSERT INTO mail_drafts(id,account,text,state,updated) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET account=excluded.account,text=CASE WHEN mail_drafts.state IN ('sending','uncertain','sent') AND excluded.state='draft' THEN mail_drafts.text ELSE excluded.text END,state=CASE WHEN mail_drafts.state IN ('sending','uncertain','sent') AND excluded.state='draft' THEN mail_drafts.state ELSE excluded.state END,updated=CASE WHEN mail_drafts.text=excluded.text AND mail_drafts.account=excluded.account THEN mail_drafts.updated ELSE excluded.updated END"
+      "Save a draft snapshot. A live, uncertain or sent snapshot is never replaced."
+      (unless (member state '("draft" "uncertain")) (error "Invalid draft save state" state))
+      (sqlite-execute db (string-append "INSERT INTO mail_drafts(id,account,text,state,updated) VALUES(?,?,?,?,?)"
+                                        " ON CONFLICT(id) DO UPDATE SET account=excluded.account,text=excluded.text,state=excluded.state,"
+                                        "updated=CASE WHEN mail_drafts.text=excluded.text AND mail_drafts.account=excluded.account"
+                                        " THEN mail_drafts.updated ELSE excluded.updated END WHERE mail_drafts.state='draft'")
                       (list id account text state (current-milliseconds))))
 
     (define (mail-store-draft-state db id)
       "Return durable delivery state of draft ID in DB, or #f."
       (let ((rows (sqlite-query db "SELECT state FROM mail_drafts WHERE id=?" (list id))))
         (and (pair? rows) (caar rows))))
-    (define (mail-store-claim-draft! db id text)
-      "Atomically claim one saved draft for sending; return a boolean.
-DB must hold ID in draft state with exactly TEXT. Only that snapshot can be
-submitted, including across buffers."
-      (= 1 (sqlite-execute db "UPDATE mail_drafts SET state='sending' WHERE id=? AND state='draft' AND text=?" (list id text))))
-    (define (mail-store-resolve-draft! db id state)
-      "Resolve ambiguous delivery of ID in DB to draft or sent STATE.
-The caller must obtain the operator's check of server delivery before returning
-to draft. No message is submitted by resolving this state."
+    (define (call-with-mail-store-lease db proc)
+      "Call PROC with exclusive delivery access to DB, across runtimes."
+      (call-with-sqlite-lease db proc))
+    (define (mail-store-claim-draft! db id text token)
+      "Claim draft ID for TOKEN if its saved TEXT still matches; hold the delivery lease."
+      (unless (and (string? token) (not (string=? token ""))) (error "Missing delivery token"))
+      (= 1 (sqlite-execute db "UPDATE mail_drafts SET state='sending',attempt=? WHERE id=? AND state='draft' AND text=?"
+                           (list token id text))))
+    (define (mail-store-finish-draft! db id token state)
+      "Complete the live attempt identified by TOKEN; hold the delivery lease."
+      (unless (member state '("sent" "uncertain" "draft")) (error "Invalid delivery outcome"))
+      (= 1 (sqlite-execute db "UPDATE mail_drafts SET state=?,attempt=CASE WHEN ?='draft' THEN '' ELSE attempt END WHERE id=? AND state='sending' AND attempt=?"
+                           (list state state id token))))
+    (define (mail-store-ambiguous-attempt db id)
+      "Read the ambiguous (STATE TOKEN) snapshot of ID, or #f."
+      (let ((rows (sqlite-query db "SELECT state,attempt FROM mail_drafts WHERE id=? AND state IN ('sending','uncertain')" (list id))))
+        (and (pair? rows) (car rows))))
+    (define (mail-store-resolve-draft! db id expected state)
+      "Resolve the matching ambiguous attempt after the operator checks delivery.
+A live runtime's lease prevents recovery, even in another process."
       (unless (member state '("draft" "sent")) (error "Invalid delivery resolution"))
-      (sqlite-execute db "UPDATE mail_drafts SET state=? WHERE id=? AND state IN ('sending','uncertain')" (list state id)))
+      (call-with-mail-store-lease db
+        (lambda ()
+          (= 1 (sqlite-execute db "UPDATE mail_drafts SET state=?,attempt='' WHERE id=? AND state=? AND attempt=?"
+                               (append (list state id) expected))))))
 
     (define (mail-store-drafts db)
       "Return saved (id account text state updated) drafts in DB, newest first.
@@ -506,5 +542,8 @@ UPDATED is when the text was last changed, in milliseconds, 0 if unknown."
       (sqlite-query db "SELECT id,account,text,state,updated FROM mail_drafts WHERE state<>'sent' ORDER BY updated DESC,rowid DESC" '()))
 
     (define (mail-store-delete-draft! db id)
-      "Remove local draft ID from DB, never a source message."
-      (sqlite-execute db "DELETE FROM mail_drafts WHERE id=?" (list id)))))
+      "Remove local draft ID from DB unless its delivery is unsettled."
+      (let ((n (sqlite-execute db "DELETE FROM mail_drafts WHERE id=? AND state NOT IN ('sending','uncertain')" (list id))))
+        (when (and (= n 0) (mail-store-ambiguous-attempt db id))
+          (error "Cannot discard a draft with unsettled delivery"))
+        n))))

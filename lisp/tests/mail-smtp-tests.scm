@@ -78,4 +78,14 @@
  '("454 unavailable\r\n" "220 go\r\n250 injected\r\n"))
 (check "SMTP does not write after TLS failure" (list #f #f (list ehlo starttls 'upgrade))
        (try-starttls (list "220 ready\r\n" advertised "220 go\r\n") (lambda () (error "certificate rejected"))))
+;; A server may leave the connection open after acceptance. There must be
+;; no subsequent read, not even one guarded against EOF or another error.
+(let ((replies "220 ready\r\n250 hello\r\n250 sender\r\n250 recipient\r\n354 go\r\n250 accepted\r\n")
+      (reads 0) (writes '()))
+  (let ((s (smtp-session (lambda () (set! reads (+ reads 1)) (if (= reads 1) replies (error "would hang")))
+                         (lambda (text) (set! writes (cons text writes))) (lambda () #t))))
+    (check "DATA acceptance does not depend on QUIT" #t
+           (smtp-submit! s "" "" "a@example.org" '("b@example.org") "hello"))
+    (check "no read after DATA acceptance" 1 reads)
+    (check "no command after DATA acceptance" 5 (length writes))))
 (test-summary)

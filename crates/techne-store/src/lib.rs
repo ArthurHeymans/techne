@@ -8,7 +8,11 @@
 //! Dropping/closing a handle interrupts its worker and releases the connection.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell as Flag, RefCell},
+    fs::{self, File, OpenOptions, TryLockError},
+    io,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, OnceLock,
@@ -60,6 +64,21 @@ struct Database {
     gate: Arc<Mutex<()>>,
     interrupt: Arc<InterruptHandle>,
     closed: Arc<AtomicBool>,
+    lease_path: Option<PathBuf>,
+    memory_lease: Option<Rc<Flag<bool>>>,
+}
+
+struct DatabaseLease(RefCell<Option<Lease>>);
+enum Lease {
+    File { _file: File },
+    Memory(Rc<Flag<bool>>),
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Self::Memory(flag) = self {
+            flag.set(false);
+        }
+    }
 }
 
 impl Database {
@@ -188,6 +207,56 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
     }
 }
 
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    name.into()
+}
+
+fn check_private_file(path: &Path) -> io::Result<bool> {
+    let m = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !m.is_file() || m.nlink() != 1 || m.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::other("expected an owned regular file without links"));
+    }
+    if m.mode() & 0o077 != 0 {
+        match fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => (),
+        }
+    }
+    Ok(true)
+}
+
+fn prepare_private(path: &Path) -> io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| io::Error::other("expected a database filename"))?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let dir = parent.canonicalize()?;
+    let m = dir.metadata()?;
+    if !m.is_dir() || m.mode() & 0o077 != 0 || m.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::other("private database requires an owned directory inaccessible to others (mode 0700)"));
+    }
+    let path = dir.join(name);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        check_private_file(&sidecar(&path, suffix))?;
+    }
+    // Don't open and close an existing SQLite inode: it could release POSIX
+    // locks held by another SQLite connection in the same process.
+    if !check_private_file(&path)? {
+        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(_) => (),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                check_private_file(&path)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(path)
+}
+
 fn configure(path: &str) -> rusqlite::Result<Connection> {
     let c = Connection::open_with_flags(
         path,
@@ -291,12 +360,29 @@ fn perform(c: &mut Connection, job: &Job, closed: &Arc<AtomicBool>) -> Result<Re
     result
 }
 
-type Opened = (mpsc::SyncSender<Job>, Arc<InterruptHandle>, Arc<AtomicBool>);
+type Opened = (mpsc::SyncSender<Job>, Arc<InterruptHandle>, Arc<AtomicBool>, Option<PathBuf>);
 
-fn worker(path: String, ready: oneshot::Sender<Result<Opened, String>>, _permit: tokio::sync::SemaphorePermit<'static>) {
+fn worker(path: String, private: bool, ready: oneshot::Sender<Result<Opened, String>>, _permit: tokio::sync::SemaphorePermit<'static>) {
     if ready.is_closed() {
         return;
     }
+    let (path, lease_path) = if private && path != ":memory:" {
+        match prepare_private(Path::new(&path)) {
+            Ok(safe) => match safe.to_str() {
+                Some(path) => (path.to_owned(), Some(sidecar(&safe, "-lease"))),
+                None => {
+                    let _ = ready.send(Err("sqlite-open: private path is not UTF-8".into()));
+                    return;
+                }
+            },
+            Err(e) => {
+                let _ = ready.send(Err(format!("sqlite-open: {e}")));
+                return;
+            }
+        }
+    } else {
+        (path, None)
+    };
     let mut c = match configure(&path) {
         Ok(c) => c,
         Err(e) => {
@@ -307,7 +393,7 @@ fn worker(path: String, ready: oneshot::Sender<Result<Opened, String>>, _permit:
     let (sender, receiver) = mpsc::sync_channel::<Job>(1);
     let interrupt = Arc::new(c.get_interrupt_handle());
     let closed = Arc::new(AtomicBool::new(false));
-    if ready.send(Ok((sender, interrupt, closed.clone()))).is_err() {
+    if ready.send(Ok((sender, interrupt, closed.clone(), lease_path))).is_err() {
         return;
     }
     while let Ok(job) = receiver.recv() {
@@ -338,11 +424,19 @@ async fn request(db: Rc<Database>, sql: String, params: Vec<SqlValue>, query: bo
 }
 
 const PRELUDE: &str = r#"
-(define (sqlite-open path)
-  "Open or create the SQLite database at PATH; return a scope-owned handle.
-PATH is a filename or \":memory:\" (not a URI). Requires the files capability.
-All database work waits asynchronously, on a separate worker."
-  (scope-own! (%sqlite-open path) sqlite-close sqlite-closed?))
+(define (sqlite-open path #:private? [private? #f])
+  "Open or create SQLite at PATH, a filename or \":memory:\" (not a URI).
+PRIVATE? requires an owned directory inaccessible to others and private files.
+The scope owns the handle. Work waits asynchronously on a database worker."
+  (scope-own! (%sqlite-open path private?) sqlite-close sqlite-closed?))
+
+(define (call-with-sqlite-lease db proc)
+  "Call PROC under an exclusive, nonwaiting application lease of private DB.
+Raise if another user of this cache holds the lease. This is not an SQL
+transaction. The lease is released on return, failure or cancellation."
+  (let ((lease (%sqlite-try-lease db)))
+    (unless lease (error "Another task or runtime holds this database’s lease"))
+    (dynamic-wind (lambda () #f) proc (lambda () (%sqlite-release-lease lease)))))
 
 (define (call-with-sqlite path proc)
   "Call PROC with an open database at PATH; return its result.
@@ -362,26 +456,63 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
 /// other blocking work). No async runtime context is needed while driving VM tasks.
 pub fn install_on(vm: &mut Vm, io: Handle) -> Result<(), Error> {
     vm.name_foreign_type::<Database>("sqlite-database");
+    vm.name_foreign_type::<DatabaseLease>("sqlite-lease");
     vm.requiring(Capability::Files, |vm| natives(vm, io));
     vm.eval_in(ROOT_MODULE, "<techne-store>", PRELUDE).map(|_| ())
 }
 
 fn natives(vm: &mut Vm, io: Handle) {
-    vm.register_async("%sqlite-open", 1, move |vm: &mut Vm, args: Args<'_>| {
+    vm.register_async("%sqlite-open", 2, move |vm: &mut Vm, args: Args<'_>| {
+        let private = args.get::<bool>(vm, 1).map_err(|e| e.msg.clone());
         let path = args.inspect(vm, 0, |v| bounded_text(v, 4096, "sqlite-open")).and_then(|r| r);
         let io = io.clone();
         async move {
             let path = path.map_err(|e| e.msg.clone())?;
+            let private = private?;
+            let memory_lease = (path == ":memory:").then(|| Rc::new(Flag::new(false)));
             if path.is_empty() || path.starts_with("file:") || (path.starts_with(':') && path != ":memory:") {
                 return Err("sqlite-open: expected a filename or :memory:, not a URI".to_string());
             }
             let permit = CONNECTIONS.try_acquire().map_err(|_| "sqlite-open: process limit of 32 connections")?;
             let (ready, receive) = oneshot::channel();
-            io.spawn_blocking(move || worker(path, ready, permit));
-            let (sender, interrupt, closed) = receive.await.map_err(|_| "sqlite-open: worker stopped")??;
-            Ok(Foreign::new(Database { sender: RefCell::new(Some(sender)), interrupt, closed, gate: Arc::new(Mutex::new(())) }))
+            io.spawn_blocking(move || worker(path, private, ready, permit));
+            let (sender, interrupt, closed, lease_path) = receive.await.map_err(|_| "sqlite-open: worker stopped")??;
+            Ok(Foreign::new(Database {
+                sender: RefCell::new(Some(sender)),
+                interrupt,
+                closed,
+                gate: Arc::new(Mutex::new(())),
+                lease_path,
+                memory_lease,
+            }))
         }
     });
+    techne_vm::procedures! { vm;
+        "(%sqlite-try-lease db)" => |db: Foreign<Database>| -> Result<Option<Foreign<DatabaseLease>>, Error> {
+            let db = db.0;
+            if db.closed.load(Ordering::SeqCst) { return Err(Error::new("sqlite lease: database is closed")); }
+            let lease = if let Some(path) = &db.lease_path {
+                // The private directory was verified at open. Never unlink the
+                // sidecar: every process must contend for the same inode.
+                let lock = || -> io::Result<Option<Lease>> {
+                    check_private_file(path)?;
+                    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path)?;
+                    match file.try_lock() {
+                        Ok(()) => Ok(Some(Lease::File { _file: file })),
+                        Err(TryLockError::WouldBlock) => Ok(None),
+                        Err(TryLockError::Error(e)) => Err(e),
+                    }
+                };
+                lock().map_err(|e| Error::new(format!("sqlite lease: {e}")))?
+            } else if let Some(flag) = &db.memory_lease {
+                (!flag.replace(true)).then(|| Lease::Memory(flag.clone()))
+            } else {
+                return Err(Error::new("sqlite lease: open the database with private files"));
+            };
+            Ok(lease.map(|lease| Foreign::new(DatabaseLease(RefCell::new(Some(lease))))))
+        };
+        "(%sqlite-release-lease lease)" => |lease: Foreign<DatabaseLease>| { lease.0.0.borrow_mut().take(); };
+    }
     for (name, query) in [("sqlite-execute", false), ("sqlite-query", true)] {
         vm.register_async(name, 3, move |vm: &mut Vm, args: Args<'_>| {
             let input = (|| -> Result<_, Error> {

@@ -331,11 +331,37 @@ to UTF-8 text unless constructed with RAW-BYTES? #t. MIME decoding is separate."
            (map (lambda (entry) (if (and (eq? (car entry) 'raw) (bytevector? (cdr entry)))
                                    (cons 'raw (utf8->string (cdr entry))) entry)) message))))
 
-(define (imap-for-each-message s proc [since-uid 0])
-  "Call PROC with each new message of session S, after SINCE-UID.
-Search UIDs first, then fetch one body at a time with PEEK: memory is bounded
-by one message, not the mailbox. PROC may suspend to persist each message;
-completed messages need not be downloaded again after cancellation."
+(define (%imap-message-size s uid)
+  ;; Match the requested UID, not unsolicited flag updates.
+  (define (size-row r)
+    (and (>= (length r) 4) (%imap-is? (car r) "*") (%imap-is? (caddr r) "FETCH")
+         (let loop ((items (list-ref r 3)) (found #f) (size #f))
+           (cond ((not (list? items)) (%imap-fail))
+                 ((null? items) (and (eqv? found uid) size))
+                 ((null? (cdr items)) #f)
+                 (else (loop (cddr items)
+                             (if (%imap-is? (car items) "UID") (%imap-decimal (cadr items)) found)
+                             (if (%imap-is? (car items) "RFC822.SIZE") (%imap-decimal (cadr items)) size)))))))
+  (let ((responses (%imap-command s (string-append "UID FETCH " (number->string uid) " (UID RFC822.SIZE)"))))
+    (or (any size-row responses)
+        ;; A missing UID can have been expunged since SEARCH, but a FETCH
+        ;; for our UID without a size must not silently drop the message.
+        (if (any (lambda (r)
+                   (and (>= (length r) 4) (%imap-is? (car r) "*") (%imap-is? (caddr r) "FETCH")
+                        (let ((items (list-ref r 3)))
+                          (and (list? items)
+                               (let loop ((items items))
+                                 (and (pair? items) (pair? (cdr items))
+                                      (or (and (%imap-is? (car items) "UID") (eqv? (%imap-decimal (cadr items)) uid))
+                                          (loop (cddr items))))))))) responses)
+            (%imap-fail) #f))))
+
+(define (imap-for-each-message s proc [since-uid 0] #:max-bytes [max-bytes #f]
+                              #:on-oversized [on-oversized (lambda (uid) #f)])
+  "Call PROC with each new message of S, after SINCE-UID, in UID order.
+With MAX-BYTES, check RFC822.SIZE first; call ON-OVERSIZED with each UID
+above the limit and continue without fetching its body. Fetch bodies one
+at a time with PEEK. PROC and ON-OVERSIZED may suspend to persist progress."
   (unless (and (integer? since-uid) (exact? since-uid) (<= 0 since-uid 4294967295))
     (error "imap: invalid since UID"))
   (unless (vector-ref s 9) (error "imap: SELECT a mailbox first"))
@@ -351,12 +377,18 @@ completed messages need not be downloaded again after cancellation."
                                          (and (> uid since-uid) uid))) (cddr r)) '()))
                    (%imap-command s (string-append "UID SEARCH UID " (number->string (+ since-uid 1)) ":*")))) <)))
       (for-each
-       (lambda (uid)
-         (for-each proc
-                   (filter-map (lambda (r)
-                                 (let ((message (%imap-fetch-row r since-uid)))
-                                   (and message (= (cdr (assq 'uid message)) uid) (%imap-body-mode s message))))
-                               (%imap-command s (string-append "UID FETCH " (number->string uid) " (UID FLAGS BODY.PEEK[])")))))
+        (lambda (uid)
+          (let ((size (and max-bytes (%imap-message-size s uid))))
+            (cond ((and max-bytes (not size)) #f)
+                  ((and max-bytes (> size max-bytes)) (on-oversized uid))
+                  (else
+                   (for-each (lambda (m)
+                               (if (and max-bytes (> (bytevector-length (cdr (assq 'raw m))) max-bytes))
+                                   (on-oversized uid) (proc (%imap-body-mode s m))))
+                             (filter-map (lambda (r)
+                                           (let ((message (%imap-fetch-row r since-uid)))
+                                             (and message (= (cdr (assq 'uid message)) uid) message)))
+                                         (%imap-command s (string-append "UID FETCH " (number->string uid) " (UID FLAGS BODY.PEEK[])"))))))))
        uids))))
 
 (define (%imap-flag flag)

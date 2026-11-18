@@ -1016,15 +1016,11 @@ Groups are across accounts: Inbox, Unread, Starred, All mail."
           (if (pair? marked) (map target-value marked) (list (current-id s))))
         (list (current-id s)))))
 (define (remember-state! ids field value #:more? [more? #f] #:copies? [copies? #t])
-  ;; What `mail-undo` puts back: each message FIELD changes for, with
-  ;; what it was. MORE? adds to what is remembered (marks done together).
-  ;; A Maildir message's state is its file's flags: it is set there.
-  (let ((changed (filter-map (lambda (id)
-                               (let ((before (= (mail-ref (mail-store-message (database!) id #:raw? #f) field) 1)))
-                                 (and (not (eq? before value)) (list id field before)))) ids)))
-    (remember! changed #:more? more?)
+  ;; Record each changed copy, only after its batch has been written.
+  (let ((more? more?))
     (for-each (lambda (id) (hash-table-delete! %kept id)) ids)
-    (mail-store-state! (database!) ids field value #:copies? copies?)))
+    (mail-store-state! (database!) ids field value #:copies? copies?
+      #:on-change (lambda (entries) (remember! entries #:more? more?) (set! more? #t)))))
 (define (remember! changed #:more? [more? #f])
   (when (pair? changed)
     (set! %last-before (if more? (append changed %last-before) changed)) (set! %last-change #t)))
@@ -1047,8 +1043,7 @@ Groups are across accounts: Inbox, Unread, Starred, All mail."
     (if (not (string? root)) '()
         (map (lambda (f) (cons (if (string=? (car f) "") "INBOX" (car f)) (cdr f)))
              (maildir-folders root)))))
-(define (gmail-maildir? folders)
-  (any (lambda (f) (string-suffix? "/all mail" (string-downcase (car f)))) folders))
+
 (define (folder-named folders name)
   (find (lambda (f) (string=? (car f) name)) folders))
 (define (trash-folder account folders)
@@ -1070,16 +1065,15 @@ Groups are across accounts: Inbox, Unread, Starred, All mail."
               (copies (mail-store-copies db (list id)))
               (inbox (map car (filter (lambda (r) (string=? (string-downcase (caddr r)) "inbox")) copies))))
          (define (trash! ids)
-           ;; T on these copies: mbsync expunges them.
-           (let ((live (filter (lambda (i) (= 0 (mail-ref (mail-store-message db i #:raw? #f) 'trashed))) ids)))
-             (when (pair? live)
-               (set! undo (append (map (lambda (i) (list i 'trashed #f)) live) undo))
-               (mail-store-state! db live 'trashed #t #:copies? #f)
-               (set! done (+ done 1)))))
-         (define (move! folder)
-           (unless (string=? (mail-ref m 'mailbox) (car folder))
-             (let ((back (mail-store-move! db id (car folder) (cdr folder))))
-               (when back (set! undo (cons (list id 'move back) undo)) (set! done (+ done 1))))))
+            ;; T for explicit Inbox-label removal, or cache-only hiding.
+            (mail-store-state! db ids 'trashed #t #:copies? #f
+              #:on-change (lambda (entries)
+                            (set! undo (append entries undo))
+                            (set! done (+ done 1)))))
+          (define (move! folder)
+            (unless (string=? (mail-ref m 'mailbox) (car folder))
+              (let ((back (mail-store-move! db id (car folder) (cdr folder) #:undo? #t)))
+                (when back (set! undo (cons (list id 'move back) undo)) (set! done (+ done 1))))))
          (hash-table-delete! %kept id)
          (cond
           ;; Kept here only (an IMAP account, or not from a file): hidden here.
@@ -1093,15 +1087,18 @@ Groups are across accounts: Inbox, Unread, Starred, All mail."
                   (cond (named (move! (or (folder-named folders named) (error "The account's archive folder is not there" named))))
                         ;; Gmail keeps everything in All Mail: archiving is
                         ;; leaving the Inbox, which drops its Inbox label.
-                        ((gmail-maildir? folders) (trash! inbox))
+                        ((eq? (mail-ref account 'archive-inbox-label?) #t)
+                          (unless (any (lambda (r)
+                                         (and (string-ci=? (caddr r) "[Gmail]/All Mail")
+                                              (not (string=? (list-ref r 4) ""))
+                                              (file-exists? (list-ref r 4)))) copies)
+                            (error "Inbox-label archive requires a cached Gmail All Mail copy on disk"))
+                          (trash! inbox))
                         (else (error "Set archive, the folder archiving moves mail to, for this account" (mail-ref account 'id))))))
                (else
-                (let ((trash (and (not (and (gmail-maildir? folders) (not (mail-ref account 'trash))))
-                                  (trash-folder account folders))))
-                  (cond (trash (move! trash))
-                        ;; Gmail: every copy gone, as deleting is there.
-                        ((gmail-maildir? folders) (trash! (map car copies)))
-                        (else (error "Set trash, the folder deleting moves mail to, for this account" (mail-ref account 'id))))))))))))
+                 (let ((trash (trash-folder account folders)))
+                   (unless trash (error "Set trash to an existing Maildir folder; Delete does not expunge messages"))
+                   (move! trash)))))))))
      ids)
     (values done undo)))
 (define (dispose-now! s how)
@@ -1122,28 +1119,34 @@ folder, if set, is where it is moved. Press a to undo, until mbsync runs."
   (dispose-now! s 'archive))
 (define-command (mail-toggle-unread s n) "Toggle unread on marked messages, or the current message." (change! s 'unread))
 (define-command (mail-undo s n)
-  "Undo the last change: a message read, or the marks last done.
-A Maildir message is renamed back: before mbsync runs, nothing of it
-has reached the server."
+  "Undo the last mail change while the same source and location still match.
+Copies moved or removed since the change are left alone."
   (if %last-change
-      (let ((db (database!)))
+      (let ((db (database!)) (undone 0))
         (set! %kept (make-hash-table))
-        ;; By field and value, not by message: thousands at a time.
         (for-each (lambda (field)
                     (for-each (lambda (before)
-                                (let ((ids (filter-map (lambda (entry)
-                                                         (and (eq? (cadr entry) field) (eq? (caddr entry) before) (car entry)))
-                                                       %last-before)))
-                                  (when (pair? ids) (mail-store-state! db ids field before #:copies? (not (eq? field 'trashed))))))
+                                (let ((expected (filter-map (lambda (entry)
+                                                              (and (eq? (cadr entry) field) (eq? (caddr entry) before) (cadddr entry)))
+                                                            %last-before)))
+                                  (when (pair? expected)
+                                    (mail-store-state! db (map car expected) field before #:expected expected
+                                      #:on-change (lambda (entries) (set! undone (+ undone (length entries))))))))
                               '(#t #f)))
                   '(unread starred trashed))
         (for-each (lambda (entry)
                     (when (eq? (cadr entry) 'move)
                       (let ((back (caddr entry)))
-                        (mail-store-move! db (car entry) (car back) (path-directory (path-directory (cadr back)))))))
+                        (when (mail-store-move! db (car entry) (car back) (path-directory (path-directory (cadr back)))
+                                                #:expected (caddr back))
+                          (set! undone (+ undone 1))))))
                   %last-before)
-        (set! %last-change #f) (set! %last-before '()) (put! (mail-state s) 'listed #f)
-        (redisplay-mail! s) (message! s "Mail change undone"))
+        (let ((skipped (- (length %last-before) undone)))
+          (set! %last-change #f) (set! %last-before '()) (put! (mail-state s) 'listed #f)
+          (redisplay-mail! s)
+          (message! s (cond ((= skipped 0) "Mail change undone")
+                            ((= undone 0) "Nothing to undo · the original messages or flags changed")
+                            (else "Mail change partly undone · changed sources skipped")))))
       (message! s "No mail change to undo")))
 
 ;;; Marks, as mu4e's: a row is marked for what is to be done with its
@@ -1182,14 +1185,16 @@ dashboard, the selected row's. \\[mail-undo] undoes it all."
                    (view-of st)))
          (query (string-append (if dashboard? "" (get st 'query "")) " is:unread"))
          (total
-          ;; A page at a time: what is made read is not found again.
-          (let loop ((total 0) (changed '()))
-            (let ((ids (map (lambda (m) (mail-ref m 'id)) (view-query view query #:limit 4000))))
-              (if (null? ids)
-                  (begin (when (pair? changed) (set! %last-before changed) (set! %last-change #t)) total)
-                  (begin (mail-store-state! db ids 'unread #f)
-                         (loop (+ total (length ids))
-                               (append (map (lambda (id) (list id 'unread #t)) ids) changed))))))))
+          ;; Record each successful batch before attempting the next one.
+          (let loop ((total 0))
+            (let ((ids (map (lambda (m) (mail-ref m 'id)) (view-query view query #:limit 512))))
+              (if (null? ids) total
+                  (let ((changed 0))
+                    (mail-store-state! db ids 'unread #f
+                      #:on-change (lambda (entries)
+                                    (remember! entries #:more? (or (> total 0) (> changed 0)))
+                                    (set! changed (+ changed (length entries)))))
+                    (if (> changed 0) (loop (+ total (length ids))) total)))))))
     (set! %kept (make-hash-table))
     (put! st 'listed #f)
     (when (get st 'summary) (refresh! s))
@@ -1231,9 +1236,6 @@ make them read, r to archive. \\[mail-execute] does it."
 A mark key then gives them all its mark, and \\[mail-execute] does it."
   (let* ((st (mail-state s)) (id (current-id s)))
     (mark-rows! s (hash-table-ref/default (get st 'threads (make-hash-table)) id (list id)) "of this conversation")))
-(define-command (mail-mark-keys s n)
-  "Say which keys mark a message, where a listing's own would not apply."
-  (message! s "r archive · d delete · ! read · ? unread · + star · - unstar · m several · u unmark · x do it · c all read"))
 (define-command (mail-execute s n)
   "Do what messages are marked for: archive, delete, read, star...
 A Maildir message is renamed, its flags or folder changed as mu4e changes
@@ -1308,13 +1310,12 @@ Invalid UTF-8 bytes display as replacements; original octets remain in SQLite."
         (only (mail-ref account 'folders)) (skip (mail-ref account 'skip '())))
     (unless (string? root) (error "A Maildir account needs a path"))
     (if box (list (cons box root))
-        (let ((all (maildir-folders root)))
-          (when (null? all) (error "No Maildir at or under the account's path" root))
-          (map (lambda (folder) (cons (if (string=? (car folder) "") "INBOX" (car folder)) (cdr folder)))
-               (filter (lambda (folder)
-                         (and (not (member (car folder) skip))
-                              (or (not (pair? only)) (member (car folder) only))))
-                       all))))))
+        (let ((all (account-maildirs account)))
+          (when (null? all) (error "No Maildir at or under the account’s path" root))
+          (filter (lambda (folder)
+                    (and (not (member (car folder) skip))
+                         (or (not (pair? only)) (member (car folder) only))))
+                  all)))))
 (define (issue! id box phase remedy)
   (set! %sync-issues (append %sync-issues (list (list (cons 'account id) (cons 'mailbox box)
                                                       (cons 'phase phase) (cons 'remedy remedy))))))
@@ -1352,16 +1353,24 @@ Invalid UTF-8 bytes display as replacements; original octets remain in SQLite."
           (for-each
            (lambda (box)
              (notify 'select box 0)
-             (let* ((selected (imap-select! connection box)) (validity (mail-ref selected 'uidvalidity))
-                    (since (mail-store-prepare-imap! (database!) id box validity)))
-               (notify 'fetch box 0)
-               (imap-for-each-message connection
-                 (lambda (m)
-                   (notify 'cache box 0)
-                   (mail-store-import! (database!) id box
-                                       (string-append (number->string validity) ":" (number->string (mail-ref m 'uid)))
-                                       (mail-ref m 'raw) (mail-ref m 'flags '()))
-                   (notify 'fetch box 1)) since)))
+              (let* ((selected (imap-select! connection box)) (validity (mail-ref selected 'uidvalidity))
+                     (db (database!)) (since (mail-store-prepare-imap! db id box validity)) (large 0))
+                (notify 'fetch box 0)
+                (dynamic-wind
+                  (lambda () #f)
+                  (lambda ()
+                    (imap-for-each-message connection
+                      (lambda (m)
+                        (notify 'cache box 0)
+                        (mail-store-import! db id box
+                                            (string-append (number->string validity) ":" (number->string (mail-ref m 'uid)))
+                                            (mail-ref m 'raw) (mail-ref m 'flags '()))
+                        (notify 'fetch box 1)) since #:max-bytes 16777216
+                      #:on-oversized (lambda (uid)
+                                       (mail-store-skip-imap! db id box validity uid)
+                                       (set! large (+ large 1)))))
+                  (lambda ()
+                    (when (> large 0) (set! %sync-large (append %sync-large (list (list id box large)))))))))
            (by-rank (mail-ref account 'mailboxes '("INBOX")) (lambda (box) box)))
           ;; A Gmail message fetched from INBOX and from All Mail is one.
           (mail-store-dedupe! (database!) id))
@@ -1791,9 +1800,9 @@ Preserve its Message-ID threading headers."
   (let ((st (buffer-state b)))
     (when (or (get st 'sending?) (get st 'uncertain?))
       (error "Its delivery is not settled; resolve it with C-c C-r first"))
-    (put! st 'discarded? #t)
     (when (get st 'autosave) (task-cancel (get st 'autosave)))
-    (mail-store-delete-draft! (get st 'db) (get st 'draft-id))))
+    (mail-store-delete-draft! (get st 'db) (get st 'draft-id))
+    (put! st 'discarded? #t)))
 (define (discard-draft! s b)
   ;; The draft gone from the cache and its buffer killed, unsaved.
   (forget-draft! b)
@@ -1985,9 +1994,9 @@ A draft of an account no longer configured is sent from one that is."
   "Resolve an uncertain delivery after checking the server.
 Inspect the saved message read-only first. Explicitly confirm delivered or not
 delivered; returning to draft never sends anything automatically."
-  (let* ((b (draft-buffer s)) (st (buffer-state b)) (db (get st 'db)) (id (get st 'draft-id))
-         (state (mail-store-draft-state db id)))
-    (unless (member state '("sending" "uncertain")) (error "This draft has no ambiguous delivery to resolve"))
+   (let* ((b (draft-buffer s)) (st (buffer-state b)) (db (get st 'db)) (id (get st 'draft-id))
+          (attempt (mail-store-ambiguous-attempt db id)))
+     (unless attempt (error "This draft has no ambiguous delivery to resolve"))
     (when (get st 'sending?) (error "The live submission is still running"))
     (completing-read s "After checking server delivery: "
                      (list (candidate "Keep uncertain" #:annotation "Safest if outcome is unknown; no retry")
@@ -1996,10 +2005,12 @@ delivered; returning to draft never sends anything automatically."
                      #:accept (lambda (s c)
                                 (let ((choice (candidate-text c)))
                                   (cond ((string-prefix? "Confirmed delivered" choice)
-                                         (mail-store-resolve-draft! db id "sent") (put! st 'uncertain? #f) (put! st 'sent? #t)
+                                          (unless (mail-store-resolve-draft! db id attempt "sent") (error "Delivery state has changed; reopen the draft"))
+                                          (put! st 'uncertain? #f) (put! st 'sent? #t)
                                          (set-option! 'read-only #t #:buffer b) (message! s "Delivery recorded as sent; it will not be retried"))
                                         ((string-prefix? "Confirmed NOT delivered" choice)
-                                         (mail-store-resolve-draft! db id "draft") (put! st 'uncertain? #f) (put! st 'sent? #f)
+                                          (unless (mail-store-resolve-draft! db id attempt "draft") (error "Delivery state has changed; reopen the draft"))
+                                          (put! st 'uncertain? #f) (put! st 'sent? #f)
                                          (put! st 'saved-revision (document-revision (buffer-document b)))
                                          (set-option! 'read-only #f #:buffer b) (message! s "Draft editable again · review and confirm sending separately"))
                                         (else (message! s "Uncertainty retained · no mail sent"))))))))
@@ -2036,28 +2047,40 @@ automatically retried; check the server's Sent mail before sending again."
                                (set-option! 'read-only #t #:buffer b)
                                (spawn
                                 (lambda ()
-                                  (let ((claimed? #f) (data-started? #f))
-                                    (guard (e (#t (put! st 'sending? #f) (put! st 'uncertain? data-started?)
-                                                   (set! %deliveries (- %deliveries 1))
-                                                   (set-option! 'read-only data-started? #:buffer b)
-                                                   (when claimed?
-                                                     (if data-started?
-                                                         (mail-store-draft! db id (mail-ref a 'id) saved-text #:state "uncertain")
-                                                         (mail-store-resolve-draft! db id "draft")))
-                                                   (message! s (if data-started?
-                                                                   "Delivery uncertain · inspect draft · check server delivery, then C-c C-r"
-                                                                   "Not submitted · draft kept · check SMTP host/credentials, then retry explicitly"))))
-                                      (let* ((password (secret a 'smtp))
-                                             (security (mail-ref a 'smtp-security 'implicit-tls))
-                                             (port (mail-ref a 'smtp-port (if (eq? security 'starttls) 587 465))))
-                                        (unless (mail-store-claim-draft! db id saved-text) (error "Draft was already claimed or changed"))
-                                        (set! claimed? #t)
-                                        (mail-submit! (mail-ref a 'smtp-host) port (mail-ref a 'smtp-user (mail-ref a 'user ""))
-                                                      password from recipients raw #:security security #:on-data (lambda () (set! data-started? #t))))
-                                      (mail-store-draft! db id (mail-ref a 'id) saved-text #:state "sent")
-                                      (forget-contacts!)
-                                      (put! st 'sending? #f) (put! st 'sent? #t) (set! %deliveries (- %deliveries 1))
-                                      (message! s "Message accepted by your SMTP server · no automatic retry"))))))))))))
+                                   (let ((token (uuid-v4)) (claimed? #f) (data-started? #f) (accepted? #f))
+                                     (dynamic-wind
+                                       (lambda () #f)
+                                       (lambda ()
+                                         (guard (e ((not (task-cancelled-condition? e))
+                                                    (let* ((state (mail-store-draft-state db id))
+                                                           (uncertain? (member state '("sending" "uncertain")))
+                                                           (sent? (equal? state "sent")))
+                                                      (put! st 'uncertain? (and uncertain? #t)) (put! st 'sent? sent?)
+                                                      (set-option! 'read-only (or sent? (and uncertain? #t)) #:buffer b)
+                                                      (message! s (cond (accepted? "SMTP accepted the message, but recording delivery failed · do not retry")
+                                                                        (uncertain? "Delivery unsettled · inspect the draft and check the server before resolving")
+                                                                        (sent? "Delivery was already recorded as sent")
+                                                                        (else "Not submitted · draft kept · check SMTP host/credentials or another running send"))))))
+                                           (call-with-mail-store-lease db
+                                             (lambda ()
+                                               (guard (e ((not (task-cancelled-condition? e))
+                                                          (when (and claimed? (not accepted?))
+                                                            (mail-store-finish-draft! db id token (if data-started? "uncertain" "draft")))
+                                                          (raise e)))
+                                                 (let* ((password (secret a 'smtp))
+                                                        (security (mail-ref a 'smtp-security 'implicit-tls))
+                                                        (port (mail-ref a 'smtp-port (if (eq? security 'starttls) 587 465))))
+                                                   (unless (mail-store-claim-draft! db id saved-text token) (error "Draft was already claimed or changed"))
+                                                   (set! claimed? #t)
+                                                   (mail-submit! (mail-ref a 'smtp-host) port (mail-ref a 'smtp-user (mail-ref a 'user ""))
+                                                                 password from recipients raw #:security security #:on-data (lambda () (set! data-started? #t))))
+                                                 (set! accepted? #t)
+                                                 (unless (mail-store-finish-draft! db id token "sent") (error "Delivery claim changed")))))
+                                           (forget-contacts!)
+                                           (put! st 'sent? #t)
+                                           (message! s "Message accepted by your SMTP server · no automatic retry")))
+                                       (lambda ()
+                                         (put! st 'sending? #f) (set! %deliveries (- %deliveries 1))))))))))))))
 
 ;;; Clickable reader controls share exactly the keyboard commands.
 (define-action mail-control (mail-use-control s control)

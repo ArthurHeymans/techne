@@ -134,8 +134,7 @@ only after DATA is accepted. No automatic retries occur."
              (stuffed (string-join (map (lambda (line) (if (string-prefix? "." line) (string-append "." line) line)) lines) "\r\n")))
         ((vector-ref s 1) (string-append stuffed (if (string-suffix? "\r\n" stuffed) "" "\r\n") ".\r\n")))
       (smtp-response s 250)
-      ;; Acceptance is authoritative even if QUIT fails afterwards.
-      (guard (e (#t #f)) (smtp-command s "QUIT" 221))
+      ;; DATA acceptance is authoritative: close without another network wait.
       #t)
 
     (define (mail-submit! host port user password from recipients raw #:security [security 'implicit-tls] #:on-data [on-data (lambda () #t)])

@@ -1,4 +1,5 @@
 //! Check mail through the real terminal layout, including responsive navigation.
+use std::os::unix::fs::PermissionsExt;
 use techne_editor::{
     present::{CursorShape, Output},
     runtime::Runtime,
@@ -23,7 +24,7 @@ fn present(rt: &mut Runtime, term: &mut Term) -> String {
 #[test]
 fn reader_next_and_previous_keep_the_selected_title_visible_in_both_layouts() {
     for position in ["bottom", "side"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
         let mut rt = Runtime::with_document(Document::new("previous"), "emacs").unwrap();
         rt.eval(&format!(
             "(require {:?}) (mail-test-seed-navigation! {:?} 100)
@@ -62,7 +63,7 @@ fn reader_next_and_previous_keep_the_selected_title_visible_in_both_layouts() {
 
 #[test]
 fn the_dashboard_is_a_full_frame_of_rows_with_a_highlight_not_a_caret() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
     let mut rt = Runtime::with_document(Document::new("previous"), "emacs").unwrap();
     rt.eval(&format!(
         "(require {:?}) (mail-test-seed-samples! {:?}) (run-command (current-session) 'mail 1)",
@@ -94,7 +95,7 @@ fn the_dashboard_is_a_full_frame_of_rows_with_a_highlight_not_a_caret() {
 
 #[test]
 fn mail_cells_are_usable_wide_and_narrow_and_support_paging() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
     let mut rt = Runtime::with_document(Document::new("previous"), "emacs").unwrap();
     rt.eval(&format!(
         "(require {:?}) (mail-test-seed-samples! {:?}) (run-command (current-session) 'mail-inbox 1)",
