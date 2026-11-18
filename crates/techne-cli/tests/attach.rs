@@ -3,6 +3,8 @@
 //! `--start` starts `techne daemon` there when none runs. The machine is
 //! this one, the command a plain one instead of ssh.
 
+#![cfg(any(feature = "window", feature = "term"))]
+
 use std::{
     path::Path,
     process::Command,
@@ -19,16 +21,31 @@ use techne_editor::{
 const TECHNE: &str = env!("CARGO_BIN_EXE_techne");
 
 /// `techne attach --stdio` with `args`, in the runtime directory `run`.
-fn relay(run: &Path, args: &[&str]) -> Vec<String> {
-    let mut command =
-        vec!["env".to_string(), format!("XDG_RUNTIME_DIR={}", run.display()), TECHNE.into(), "attach".into(), "--stdio".into()];
+fn relay(run: &Path, state: &Path, ssh: bool, args: &[&str]) -> Vec<String> {
+    let mut command = if ssh {
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-T", "-e", "none", "--", "localhost"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    command.extend([
+        "env".to_owned(),
+        format!("XDG_RUNTIME_DIR={}", run.display()),
+        format!("XDG_STATE_HOME={}", state.display()),
+        format!("XDG_CONFIG_HOME={}", state.display()),
+        TECHNE.into(),
+        "attach".into(),
+        "--stdio".into(),
+    ]);
     command.extend(args.iter().map(|a| a.to_string()));
     command
 }
 
-fn attach(command: &[String]) -> (Remote, mpsc::Receiver<Event>) {
+fn attach(command: &[String], file: Option<&Path>) -> (Remote, mpsc::Receiver<Event>) {
     let (tx, events) = mpsc::channel();
-    (Remote::attach_through(command, "emacs", None, move |e| drop(tx.send(e))).unwrap(), events)
+    (Remote::attach_through(command, "emacs", file.map(Path::to_owned), move |e| drop(tx.send(e))).unwrap(), events)
 }
 
 fn event<T>(events: &mpsc::Receiver<Event>, mut take: impl FnMut(Event) -> Option<T>) -> T {
@@ -69,13 +86,23 @@ impl Drop for Daemon {
 
 #[test]
 fn attached_through_a_relay_to_a_daemon_it_started() {
+    relay_scenario(false);
+}
+
+#[test]
+#[ignore = "needs passwordless ssh to localhost"]
+fn attached_through_real_ssh_to_a_daemon_it_started() {
+    relay_scenario(true);
+}
+
+fn relay_scenario(ssh: bool) {
     let run = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    // SAFETY: before anything of this test reads it; the daemon started
-    // gets it from here.
-    unsafe { std::env::set_var("XDG_STATE_HOME", state.path()) };
+    let file = state.path().join("draft.txt");
+    std::fs::write(&file, "").unwrap();
+    let relay = |args: &[&str]| relay(run.path(), state.path(), ssh, args);
     // None runs: the frontend is told so, as an editor would tell it.
-    let (_r, events) = attach(&relay(run.path(), &[]));
+    let (_r, events) = attach(&relay(&[]), None);
     let why = event(&events, |e| match e {
         Event::Failed(why) => Some(why),
         _ => None,
@@ -83,7 +110,7 @@ fn attached_through_a_relay_to_a_daemon_it_started() {
     assert!(why.starts_with("no editor is running there"), "{why}");
     // Started.
     let _daemon = Daemon(run.path().to_owned());
-    let (mut first, events) = attach(&relay(run.path(), &["--start"]));
+    let (mut first, events) = attach(&relay(&["--start"]), Some(&file));
     snapshot(&events, |_| true);
     for k in ["h", "i"] {
         first.send(Input::Key { key: k.into(), at: Instant::now() });
@@ -91,8 +118,13 @@ fn attached_through_a_relay_to_a_daemon_it_started() {
     snapshot(&events, |s| s.pane().text == "hi");
     first.close();
     // The daemon runs on: the next one finds what the first typed.
-    let (second, events) = attach(&relay(run.path(), &[]));
+    let (mut second, events) = attach(&relay(&[]), Some(&file));
     snapshot(&events, |s| s.pane().text == "hi");
+    for k in ["C-x", "C-s"] {
+        second.send(Input::Key { key: k.into(), at: Instant::now() });
+    }
+    snapshot(&events, |s| !s.pane().status.contains("[+]"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap().trim_end(), "hi");
     // It is stopped by SIGTERM, telling those attached.
     let pid = daemon_pid(run.path()).expect("the daemon's pid in its log");
     assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());

@@ -422,6 +422,7 @@ impl Daemon {
                 // Each detaches as it does closing, its session's state
                 // (minibuffer histories) kept, before the runtime stops.
                 for (&client, f) in &frontends {
+                    f.interrupts.kill_before(f.sent);
                     let _ = tx.send(Msg::Input(client, Input::Close, f.backlog.admit(&Input::Close)));
                 }
                 let _ = tx.send(Msg::Stop);

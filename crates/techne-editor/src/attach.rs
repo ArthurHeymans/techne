@@ -38,7 +38,11 @@ use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::Instant,
 };
 
@@ -46,10 +50,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use techne_text::ropey::Rope;
 
 use crate::{
-    host::{BUSY_AFTER, Event, Host, Shared},
+    host::{BACKLOG_BYTES, BACKLOG_INPUTS, BUSY_AFTER, Event, Host, Shared},
     images::{Image, ImageData},
     present::{CapturedFrame, Input, Output, Snapshot},
-    runtime::{File, journal_for},
+    runtime::{File, journal_for, weight},
     server::{OpenError, Request},
 };
 
@@ -500,10 +504,10 @@ fn apply(rope: &mut Rope, text: Text) -> Result<(), String> {
 /// An attachment to an editor in another process, through its socket: what
 /// a frontend does with a `Host`, it does with this.
 pub struct Remote {
-    /// To the editor: its socket, or a program relaying to it (`relay`).
-    out: Box<dyn Write + Send>,
-    /// Ends the connection, when dropped: after `out`, declared before.
-    _end: EndOnDrop,
+    /// One writer owns the socket or child pipe. No frontend thread writes to it.
+    out: mpsc::SyncSender<(Up, usize)>,
+    out_bytes: Arc<AtomicUsize>,
+    end: Arc<ConnectionEnd>,
     /// The keys and clicks sent, numbered from 1.
     numbered: u64,
     /// Those sent and not answered yet, by number, with when they were
@@ -564,16 +568,28 @@ impl Remote {
             .spawn()
             .map_err(|e| OpenError::Failed(format!("{program}: {e}")))?;
         let (to, from) = (child.stdin.take(), child.stdout.take());
-        // However attaching ends, the command is ended and reaped.
-        let mut end = move || {
+        let (Some(to), Some(from)) = (to, from) else {
             let _ = child.kill();
             let _ = child.wait();
-        };
-        let (Some(to), Some(from)) = (to, from) else {
-            end();
             return Err(OpenError::Failed(format!("{program}: no pipes")));
         };
-        Remote::over(from, to, end, profile, path, deliver)
+        // End the relay by dropping the sender. Reaping must not happen on
+        // the frontend thread, including when an input overruns the queue.
+        let (keep, ended) = mpsc::channel::<()>();
+        let child = Arc::new(Mutex::new(child));
+        let relay = child.clone();
+        if let Err(e) = std::thread::Builder::new().name("attachment relay".into()).spawn(move || {
+            let _ = ended.recv();
+            let mut relay = relay.lock().expect("the relay");
+            let _ = relay.kill();
+            let _ = relay.wait();
+        }) {
+            let mut child = child.lock().expect("the relay");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(OpenError::Failed(format!("{program}: {e}")));
+        }
+        Remote::over(from, to, move || drop(keep), profile, path, deliver)
     }
 
     /// Attach over a connection read from `input` and written to `out`,
@@ -587,31 +603,59 @@ impl Remote {
         deliver: impl Fn(Event) + Send + 'static,
     ) -> Result<Remote, OpenError> {
         // Ended if what follows fails, with the guard.
-        let end = EndOnDrop(Some(Box::new(end)));
+        let end = Arc::new(ConnectionEnd(Mutex::new(Some(Box::new(end)))));
         let failed = |e: std::io::Error| OpenError::Failed(e.to_string());
         let request = Request::Attach { profile: profile.into(), file: path, version: VERSION };
-        crate::server::write_request(&mut out, &request).map_err(failed)?;
         let waiting = Arc::<Mutex<VecDeque<(u64, Instant)>>>::default();
         let captures = Arc::<Mutex<Captures>>::default();
         let (w, c) = (waiting.clone(), captures.clone());
+        // Absorb normal key bursts, including when the server is busy, but
+        // limit retained clipboard/capture bytes separately from the count.
+        let (send, recv) = mpsc::sync_channel(2 * BACKLOG_INPUTS);
+        let out_bytes = Arc::new(AtomicUsize::new(0));
+        let writer_bytes = out_bytes.clone();
+        let writer_end = end.clone();
         std::thread::Builder::new()
-            .name("attachment in".into())
+            .name("attachment out".into())
             .spawn(move || {
-                let why = receive(input, &w, &c, &deliver).err().unwrap_or_else(|| "the editor went away".into());
-                deliver(Event::Failed(why));
+                let write = || -> std::io::Result<()> {
+                    crate::server::write_request(&mut out, &request)?;
+                    for (message, bytes) in recv {
+                        write_frame(&mut out, &message)?;
+                        writer_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                    }
+                    Ok(())
+                };
+                let _ = write();
+                writer_end.stop();
             })
             .map_err(failed)?;
-        Ok(Remote { out: Box::new(out), _end: end, numbered: 0, waiting, captures })
+        let reader_end = end.clone();
+        if let Err(e) = std::thread::Builder::new().name("attachment in".into()).spawn(move || {
+            let why = receive(input, &w, &c, &deliver).err().unwrap_or_else(|| "the editor went away".into());
+            deliver(Event::Failed(why));
+            reader_end.stop();
+        }) {
+            end.stop();
+            return Err(failed(e));
+        }
+        Ok(Remote { out: send, out_bytes, end, numbered: 0, waiting, captures })
     }
 
     /// Send an input. C-g interrupts what the runtime does for this
     /// frontend as soon as it arrives, as it does for one in its process.
     pub fn send(&mut self, input: Input) {
         if let Input::Key { at, .. } | Input::Click { at, .. } = &input {
+            let mut waiting = self.waiting.lock().expect("the waiting");
+            if waiting.len() >= 4096 {
+                drop(waiting);
+                self.end.stop();
+                return;
+            }
             self.numbered += 1;
-            self.waiting.lock().expect("the waiting").push_back((self.numbered, *at));
+            waiting.push_back((self.numbered, *at));
         }
-        let _ = write_frame(&mut self.out, &Up::Input(input));
+        self.enqueue(Up::Input(input));
     }
 
     /// When the runtime is busy, as far as this frontend can tell: as
@@ -625,7 +669,33 @@ impl Remote {
     pub fn captured(&mut self, id: usize, result: Result<CapturedFrame, String>) {
         let asked = self.captures.lock().expect("the captures").asked.remove(&id);
         if let Some((generation, id)) = asked {
-            let _ = write_frame(&mut self.out, &Up::Captured { generation, id, result });
+            self.enqueue(Up::Captured { generation, id, result });
+        }
+    }
+
+    fn enqueue(&self, message: Up) {
+        let bytes = match &message {
+            Up::Input(input) => weight(input),
+            Up::Captured { result, .. } => {
+                std::mem::size_of::<Up>()
+                    + match result {
+                        Ok(frame) => frame.png.capacity(),
+                        Err(error) => error.capacity(),
+                    }
+            }
+        };
+        let Ok(_) = self.out_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            let total = held.saturating_add(bytes);
+            // As with the runtime backlog, one larger frame may go alone.
+            ((held == 0 && bytes <= MAX_FRAME) || total <= BACKLOG_BYTES).then_some(total)
+        }) else {
+            self.end.stop();
+            return;
+        };
+        if self.out.try_send((message, bytes)).is_err() {
+            self.out_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            // A stalled peer must not accumulate input or block the event loop.
+            self.end.stop();
         }
     }
 
@@ -635,15 +705,27 @@ impl Remote {
     }
 }
 
-/// Runs what ends a connection when dropped: when attaching fails part way
-/// as when the frontend detaches, a relay is never left running.
-struct EndOnDrop(Option<Box<dyn FnOnce() + Send>>);
-
-impl Drop for EndOnDrop {
+impl Drop for Remote {
     fn drop(&mut self) {
-        if let Some(end) = self.0.take() {
+        self.end.stop();
+    }
+}
+
+/// Interrupts a blocked read or write by shutting down the transport once.
+struct ConnectionEnd(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl ConnectionEnd {
+    fn stop(&self) {
+        let end = self.0.lock().expect("attachment shutdown").take();
+        if let Some(end) = end {
             end();
         }
+    }
+}
+
+impl Drop for ConnectionEnd {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -921,6 +1003,59 @@ fn running(socket: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_blocked_transport_does_not_block_input_or_detach() {
+        use std::time::Duration;
+
+        let (peer, writer) = UnixStream::pair().unwrap();
+        let input = writer.try_clone().unwrap();
+        let ender = writer.try_clone().unwrap();
+        let (ended, end) = mpsc::channel();
+        let mut remote = Remote::over(
+            input,
+            writer,
+            move || {
+                let _ = ender.shutdown(std::net::Shutdown::Both);
+                let _ = ended.send(());
+            },
+            "emacs",
+            None,
+            |_| {},
+        )
+        .unwrap();
+        // The peer deliberately never reads. One frame exceeds the socket's
+        // send buffer; the following frames fill the frontend's bounded queue.
+        let (returned, done) = mpsc::channel();
+        let send = std::thread::spawn(move || {
+            let text = "a".repeat(1 << 20);
+            for _ in 0..64 {
+                remote.send(Input::Clipboard { text: text.clone() });
+            }
+            returned.send(()).unwrap();
+            remote.close();
+        });
+        let result = done.recv_timeout(Duration::from_secs(5));
+        drop(peer); // Even on a regression, let the test's writer exit.
+        send.join().unwrap();
+        result.expect("the frontend did not block on a stalled writer");
+        end.recv_timeout(Duration::from_secs(2)).expect("shutdown cancels the transport");
+    }
+
+    #[test]
+    fn a_stalled_child_relay_is_cancelled_when_its_queue_fills() {
+        use std::time::Duration;
+
+        // Like an SSH pipe whose peer has stopped draining, this process
+        // keeps both pipes open without reading or writing them.
+        let (tx, events) = mpsc::channel();
+        let mut remote = Remote::attach_through(&["sleep".into(), "20".into()], "emacs", None, move |e| drop(tx.send(e))).unwrap();
+        for _ in 0..6 {
+            remote.send(Input::Clipboard { text: "a".repeat(1 << 20) });
+        }
+        assert!(matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), Event::Failed(_)));
+        remote.close();
+    }
+
     /// The splice from `a` to `b`, checked to make `b` of `a`.
     fn check(a: &str, b: &str) -> Text {
         let (old, new) = (Rope::from_str(a), Rope::from_str(b));
@@ -1040,13 +1175,17 @@ mod tests {
         remote.captured(after, Err("new".into()));
         // Answered once only.
         remote.captured(after, Err("again".into()));
+        // Read through a sentinel before closing. An unexpected queued
+        // reply cannot disappear when the asynchronous writer is cancelled.
+        remote.send(Input::Clipboard { text: "sentinel".into() });
+        editor.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let Some(Up::Captured { generation, id, result }) = read_frame::<Up>(&mut editor).unwrap() else {
+            panic!("expected a capture reply");
+        };
+        assert_eq!((generation, id, result.unwrap_err()), (1, 0, "new".to_string()));
+        assert!(matches!(read_frame::<Up>(&mut editor).unwrap(),
+            Some(Up::Input(Input::Clipboard { text })) if text == "sentinel"));
         remote.close();
-        let mut answers = Vec::new();
-        while let Some(up) = read_frame::<Up>(&mut editor).unwrap() {
-            if let Up::Captured { generation, id, result } = up {
-                answers.push((generation, id, result.unwrap_err()));
-            }
-        }
-        assert_eq!(answers, [(1, 0, "new".to_string())]);
+        assert!(read_frame::<Up>(&mut editor).unwrap().is_none());
     }
 }
