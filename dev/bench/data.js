@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794946214679,
+  "lastUpdate": 1794985152047,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -53354,6 +53354,315 @@ window.BENCHMARK_DATA = {
           {
             "name": "compile: load",
             "value": 59951,
+            "unit": "instructions per form"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "81f9f72fb1679d6ea3a622c68911e9d2deb20a80",
+          "message": "Attach through ssh, and techne daemon (#363)\n\n* editor: attach through ssh, and techne daemon\n\nA frontend could attach only to the editor running on its own machine,\nand only while the window the editor started in, or another frontend,\nkept it running: the editor living on a server, with windows on a\nlaptop coming and going, was not possible. Emacs has emacs --daemon and\nemacsclient over a server socket.\n\n`techne window --ssh HOST [FILE]` (and `techne term --ssh HOST`) attach\nto the editor running on HOST: `ssh HOST techne attach --stdio` relays\nthe protocol to the editor's socket there, so authentication and\nencryption are ssh's and no port is opened. TECHNE_SSH and\nTECHNE_REMOTE_PROGRAM say how to run them; the destination comes after\n`--`, never taken for an option, and the relay is ended however\nattaching ends. The attachment's first\nmessage now carries the protocol's version, refused by an editor of\nanother, as a techne of another build on another machine may be.\n\n`techne daemon` runs an editor with no frontend until SIGTERM, SIGINT\nor SIGHUP (the frontends attached then detach as they do closing, their\nhistories kept), listening on the socket: the last frontend detaching does\nnot stop its runtime, which is started again when it crashes with none\nattached (a frontend attached starts it again itself). With `--start`,\nattaching starts one, here or on HOST, when none runs, in a process\ngroup of its own, logging beside the socket. A frontend attaching with\nno file and no session to show what it shows shows what the last\nsession to end showed: a daemon's frontends come and go.\n\nRust: processes, pipes and the socket, and the runtime outliving its\nfrontends, which the host owns; what a session shows is Lisp's.\n\n* editor: bound attachment writes and cancel stalled SSH relays\n\nWrite to the socket or relay pipe on a bounded worker. Interrupt active frontend commands before daemon shutdown, and reap SSH without blocking the UI. These changes belong to the Rust socket and process boundary.\n\nExercise both stalled relay cancellation and the real SSH lifecycle on localhost.\n\n* editor: refuse attachments once the daemon starts stopping\n\nA socket request accepted before shutdown can arrive after the runtime input sender has been removed. Record shutdown under the host lock, so a late attach or crash recovery cannot spawn a new runtime. Refuse the request with the same message sent to existing frontends. This invariant belongs to the Rust host that owns the runtime thread and socket admission.\n\nKeep the listener alive in the daemon integration test and verify that a late frontend gets a refusal, not a new session.",
+          "timestamp": "2026-11-18T07:51:17+01:00",
+          "tree_id": "690e9e9c6f56bbb5a6142df09b1dd96445c8618e",
+          "url": "https://github.com/ArthurHeymans/techne/commit/81f9f72fb1679d6ea3a622c68911e9d2deb20a80"
+        },
+        "date": 1794985150829,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "startup (jit)",
+            "value": 13478456,
+            "unit": "instructions"
+          },
+          {
+            "name": "startup (interp)",
+            "value": 13467945,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (jit)",
+            "value": 472086236,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (interp)",
+            "value": 2045799102,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (jit)",
+            "value": 534638494,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (interp)",
+            "value": 2561305188,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (jit)",
+            "value": 918793493,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (interp)",
+            "value": 3179954517,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens GC pause",
+            "value": 276,
+            "unit": "words"
+          },
+          {
+            "name": "bintrees (jit)",
+            "value": 3461547178,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees (interp)",
+            "value": 10389339538,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees GC pause",
+            "value": 393093,
+            "unit": "words"
+          },
+          {
+            "name": "hof (jit)",
+            "value": 813661740,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof (interp)",
+            "value": 3336574400,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof GC pause",
+            "value": 1048549,
+            "unit": "words"
+          },
+          {
+            "name": "qsort (jit)",
+            "value": 651495101,
+            "unit": "instructions"
+          },
+          {
+            "name": "qsort (interp)",
+            "value": 4234925150,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (jit)",
+            "value": 153275659,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (interp)",
+            "value": 2545951454,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (jit)",
+            "value": 534688724,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (interp)",
+            "value": 767921605,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash GC pause",
+            "value": 229418,
+            "unit": "words"
+          },
+          {
+            "name": "orgparse (jit)",
+            "value": 346000985,
+            "unit": "instructions"
+          },
+          {
+            "name": "orgparse (interp)",
+            "value": 1556329914,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (jit)",
+            "value": 437795836,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (interp)",
+            "value": 1725397068,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks GC pause",
+            "value": 327556,
+            "unit": "words"
+          },
+          {
+            "name": "numstr (jit)",
+            "value": 246530839,
+            "unit": "instructions"
+          },
+          {
+            "name": "numstr (interp)",
+            "value": 685351748,
+            "unit": "instructions"
+          },
+          {
+            "name": "tasks (jit)",
+            "value": 241828649,
+            "unit": "instructions"
+          },
+          {
+            "name": "tasks (interp)",
+            "value": 107677411,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor load (jit)",
+            "value": 6480,
+            "unit": "instructions per datum"
+          },
+          {
+            "name": "editor load (interp)",
+            "value": 6034,
+            "unit": "instructions per datum"
+          },
+          {
+            "name": "keys: type (jit)",
+            "value": 961758,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-long-line (jit)",
+            "value": 978575,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-long-word (jit)",
+            "value": 1113991,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-rust (jit)",
+            "value": 32688075,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-rust (jit)",
+            "value": 9371205,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-rust-big (jit)",
+            "value": 32696239,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-rust-big (jit)",
+            "value": 9354007,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: indent-after-long-line (jit)",
+            "value": 16528945,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move (jit)",
+            "value": 922105,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-modal (jit)",
+            "value": 896213,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-open (jit)",
+            "value": 16411086,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-first-key (jit)",
+            "value": 8180286,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-narrow (jit)",
+            "value": 6984427,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-delete (jit)",
+            "value": 1326866,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-yank-line (jit)",
+            "value": 25432577,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: command-first-key (jit)",
+            "value": 1392490,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: completion-filter (jit)",
+            "value": 20695232,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: completion-delete (jit)",
+            "value": 20386402,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "http: plaintext request (jit)",
+            "value": 7145,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: plaintext request (interp)",
+            "value": 8465,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: /work request (jit)",
+            "value": 226734,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: /work request (interp)",
+            "value": 683888,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "compile: read",
+            "value": 19806,
+            "unit": "instructions per form"
+          },
+          {
+            "name": "compile: load",
+            "value": 59952,
             "unit": "instructions per form"
           }
         ]
