@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795035597620,
+  "lastUpdate": 1795035599690,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -58472,6 +58472,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 649643976,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107661,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "94cf51ab44d067b1a9ea7b0b3508fe661e441e4c",
+          "message": "Merge pull request #380 from ArthurHeymans/tests/scheme-command-forms\n\nTest command forms in Scheme against real editor sessions",
+          "timestamp": "2026-11-18T21:11:31+01:00",
+          "tree_id": "622f266541d6b2c074c8b355b453f5efae61b703",
+          "url": "https://github.com/ArthurHeymans/techne/commit/94cf51ab44d067b1a9ea7b0b3508fe661e441e4c"
+        },
+        "date": 1795035599607,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697422239,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 649644446,
             "unit": "instructions"
           },
           {
