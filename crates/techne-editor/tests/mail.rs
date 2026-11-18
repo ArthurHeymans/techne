@@ -742,80 +742,20 @@ fn narrow_viewport_has_one_pane_and_working_read_back_and_paging() {
 }
 
 #[test]
-fn opening_a_stale_draft_row_reads_the_newer_saved_text_without_writing() {
-    let (dir, mut rt) = editor();
-    real_accounts(&mut rt, dir.path());
-    command(&mut rt, "mail");
-    rt.eval(
-        "(define inspect-db (mail-store-open (option #f 'mail-database)))
-         (mail-store-draft! inspect-db \"draft-fixture\" \"test\" \"From: ada@example.org\\nSubject: Before\\n\\nOld body\")",
-    )
-    .unwrap();
-    command(&mut rt, "mail-drafts");
-    assert!(pane(&mut rt, 0).contains("Before"));
-    rt.eval("(mail-store-draft! inspect-db \"draft-fixture\" \"test\" \"From: ada@example.org\\nSubject: After\\n\\nNew body\")").unwrap();
-    key(&mut rt, "RET");
-    assert!(rt.snapshot().pane().text.to_string().contains("New body"));
-    rt.eval(
-        "(mail-store-draft! inspect-db \"draft-fixture\" \"test\" \"Subject: Newer still\\n\\nNewer body\")
-             (define stale-buffer (current-buffer (current-session)))",
-    )
-    .unwrap();
-    command(&mut rt, "mail-postpone");
-    let saved = |rt: &mut Runtime| rt.eval("(caddr (mail-store-draft inspect-db \"draft-fixture\"))").unwrap();
-    assert!(saved(&mut rt).contains("Newer body"), "postponing must not rewrite an unchanged draft");
-    rt.eval("(drop-buffer! (current-session) stale-buffer)").unwrap();
-    assert!(saved(&mut rt).contains("Newer body"), "closing must not rewrite an unchanged draft");
-}
-
-#[test]
-fn discarding_a_sent_buffer_keeps_the_delivery_record() {
-    let (dir, mut rt) = editor();
-    real_accounts(&mut rt, dir.path());
-    command(&mut rt, "mail");
-    command(&mut rt, "mail-compose");
-    rt.eval(
-        "(define inspect-db (mail-store-open (option #f 'mail-database)))
-         (define saved-draft (car (mail-store-drafts inspect-db)))
-         (define draft-id (car saved-draft))
-         (call-with-mail-store-lease inspect-db
-           (lambda ()
-             (unless (mail-store-claim-draft! inspect-db draft-id (caddr saved-draft) \"token\")
-               (error \"draft claim failed\"))
-             (mail-store-finish-draft! inspect-db draft-id \"token\" \"sent\")))",
-    )
-    .unwrap();
-    command(&mut rt, "mail-discard-draft");
-    assert!(rt.snapshot().echo.contains("delivery record retained"));
-    assert_eq!(rt.eval("(mail-store-draft-state inspect-db draft-id)").unwrap(), "\"sent\"");
-    assert!(rt.snapshot().minibuffer.is_none());
-}
-
-#[test]
-fn ambiguous_draft_is_inspectable_and_ordinary_save_reopen_cannot_reset_it() {
-    let (dir, mut rt) = editor();
-    real_accounts(&mut rt, dir.path());
-    command(&mut rt, "mail");
-    command(&mut rt, "mail-compose");
-    rt.eval("(define inspect-db (mail-store-open (option #f 'mail-database)))
-      (define draft-id (caar (mail-store-drafts inspect-db)))
-      (mail-store-draft! inspect-db draft-id \"test\" \"From: ada@example.org\\nTo: ben@example.org\\nSubject: ambiguous\\n\\nBody\" #:state \"uncertain\")").unwrap();
-    command(&mut rt, "mail-save-draft");
-    rt.eval("(drop-buffer! (current-session) (current-buffer (current-session)))").unwrap();
-    command(&mut rt, "mail-drafts");
-    assert!(pane(&mut rt, 0).contains("ambiguous") && pane(&mut rt, 0).contains("uncertain"), "{}", pane(&mut rt, 0));
-    key(&mut rt, "RET");
-    let focus = rt.snapshot().focus;
-    assert!(pane(&mut rt, focus).contains("Subject: ambiguous"));
-    command(&mut rt, "mail-save-draft");
-    assert_eq!(rt.eval("(mail-store-draft-state inspect-db draft-id)").unwrap(), "\"uncertain\"");
-    let before = pane(&mut rt, focus);
-    rt.handle(Input::Key { key: "X".into(), at: Instant::now() });
-    rt.take_errors();
-    assert_eq!(pane(&mut rt, focus), before);
-    command(&mut rt, "mail-resolve-delivery");
-    enter(&mut rt, "Confirmed NOT delivered");
-    assert_eq!(rt.eval("(mail-store-draft-state inspect-db draft-id)").unwrap(), "\"draft\"");
+fn scheme_compose_cases() {
+    let suite = techne_editor::runtime::lisp_dir().join("tests/mail/compose.scm");
+    for i in 0.. {
+        let (dir, mut rt) = editor();
+        rt.eval(&format!("(require {:?})", suite.display().to_string())).unwrap();
+        let count: usize = rt.eval("(length compose-cases)").unwrap().parse().unwrap();
+        assert!(count > 0);
+        let db = dir.path().join("mail.sqlite");
+        let failed = rt.eval(&format!("(run-compose-case {i} {:?})", db.display().to_string())).unwrap();
+        assert_eq!(failed, "0", "compose case {i}");
+        if i + 1 == count {
+            break;
+        }
+    }
 }
 
 #[test]
@@ -851,22 +791,6 @@ fn credential_failure_before_submission_remains_retryable_and_secret_free() {
 }
 
 #[test]
-fn pasted_encoded_from_to_cc_bcc_preserve_mailbox_boundaries() {
-    let (dir, mut rt) = editor();
-    real_accounts(&mut rt, dir.path());
-    command(&mut rt, "mail");
-    command(&mut rt, "mail-compose");
-    rt.eval("(view-edit! (session-view (current-session))
-      (list (list 0 (document-length (doc (current-session)))
-        \"From: =?UTF-8?Q?D=C3=B6e=2C_Ada?= <ada@example.org>\\nTo: =?UTF-8?Q?D=C3=B6e=2C_Jane?= <jane@example.org>\\nCc: =?UTF-8?Q?Rivers=2C_Ben?= <ben@example.org>\\nBcc: =?UTF-8?Q?Hidden=2C_Recipient?= <hidden@example.org>\\nSubject: Pasted headers\\n\\nBody\")) \"new\")").unwrap();
-    command(&mut rt, "mail-send");
-    let snapshot = rt.snapshot();
-    let prompt = &snapshot.minibuffer.as_ref().expect("explicit confirmation").prompt;
-    assert!(prompt.contains("Send to jane@example.org, ben@example.org, hidden@example.org?"), "{prompt}");
-    key(&mut rt, "C-g"); // Never submit to the configured invalid host.
-}
-
-#[test]
 fn real_mail_opens_unread_not_old_read_messages() {
     let (dir, mut rt) = editor();
     real_accounts(&mut rt, dir.path());
@@ -890,22 +814,6 @@ fn real_mail_opens_unread_not_old_read_messages() {
     assert!(pane(&mut reopened, 0).contains("You're caught up."));
     assert!(pane(&mut reopened, 0).contains("Browse all mail"));
     assert!(!pane(&mut reopened, 0).contains("Connect an IMAP"));
-}
-
-#[test]
-fn new_composition_starts_in_the_recipient_field() {
-    let (dir, mut rt) = editor();
-    real_accounts(&mut rt, dir.path());
-    command(&mut rt, "mail");
-    command(&mut rt, "mail-compose");
-    assert_eq!(
-        rt.eval("(let* ((s (current-session)) (d (doc s)) (p (point s))) (document-substring d (line-start d p) p))").unwrap(),
-        "\"To: \""
-    );
-    for c in "ben@example.org".chars() {
-        key(&mut rt, &c.to_string());
-    }
-    assert!(pane(&mut rt, 0).contains("To: ben@example.org\n"));
 }
 
 #[test]
