@@ -1537,9 +1537,23 @@ fn append(vm: &mut Vm, args: usize, n: usize) -> R {
     vm.admit_items(total, 32, 0)?;
     let mut b = Bulk::list(vm, total)?;
     let mut result = arg(vm, args, n - 1);
-    let items: Vec<Value> = (0..n - 1).flat_map(|i| list_items(arg(vm, args, i))).collect();
-    for car in items.into_iter().rev() {
-        result = b.pair(vm, car, result);
+    let items = (0..n - 1).flat_map(|i| list_items(arg(vm, args, i)));
+    // The lists were validated above and the bulk allocator cannot collect
+    // after reservation. Take the values after reservation, not across it.
+    const INLINE_ITEMS: usize = 16;
+    if total <= INLINE_ITEMS {
+        let mut buf = [Value::NIL; INLINE_ITEMS];
+        for (slot, car) in buf[..total].iter_mut().zip(items) {
+            *slot = car;
+        }
+        for &car in buf[..total].iter().rev() {
+            result = b.pair(vm, car, result);
+        }
+    } else {
+        let buf: Vec<Value> = items.collect();
+        for car in buf.into_iter().rev() {
+            result = b.pair(vm, car, result);
+        }
     }
     Ok(result)
 }

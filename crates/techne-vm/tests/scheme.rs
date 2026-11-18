@@ -16,6 +16,25 @@ const CASES: &[(&str, &str)] = &[
     ("(displayln (list (and 1 2 3) (or #f 5) (and 1 #f 3)))", "(3 5 #f)\n"),
     ("(displayln (map (lambda (x) (* x x)) (iota 5)))", "(0 1 4 9 16)\n"),
     (
+        r#"
+(define (check n)
+  (let* ((head (map (lambda (i) (cons i (- i))) (iota n)))
+         (marker (list 'a)) (last (cons 'tail 42))
+         (result (append '() head marker last)))
+    (let loop ((original head) (copy result))
+      (if (null? original)
+          (and (not (eq? copy marker)) (eq? (car copy) 'a) (eq? (cdr copy) last))
+          (and (not (eq? original copy)) (eq? (car original) (car copy))
+               (loop (cdr original) (cdr copy)))))))
+(displayln (list (append) (append 42) (append '() '() 42) (check 15) (check 16)))
+(define cycle (list 'x))
+(set-cdr! cycle cycle)
+(define (rejects? x) (guard (e (else #t)) (append x '()) #f))
+(displayln (list (rejects? '(1 . 2)) (rejects? cycle)))
+"#,
+        "(() 42 42 #t #t)\n(#t #t)\n",
+    ),
+    (
         "(displayln (let loop ((i 0) (acc '())) (if (= i 3) acc (loop (+ i 1) (cons (lambda () i) acc)))))",
         "(#<procedure> #<procedure> #<procedure>)\n",
     ),
