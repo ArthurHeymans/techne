@@ -185,6 +185,11 @@ fn a_named_maildir_accepts_symlinked_cur_but_does_not_prune_an_unavailable_sourc
     command(&mut rt, "mail");
     command(&mut rt, "mail-sync");
     pump_until(&mut rt, |rt| pane(rt, 0).contains("Up to date"));
+    // An absent new directory was fine on the first sync. A readable new
+    // directory must not mask an unavailable cur on the next one.
+    let actual_new = dir.path().join("actual-new");
+    std::fs::create_dir(&actual_new).unwrap();
+    std::os::unix::fs::symlink(&actual_new, root.join("new")).unwrap();
     std::fs::remove_dir_all(actual_cur).unwrap();
     command(&mut rt, "mail-sync");
     pump_until(&mut rt, |rt| pane(rt, 0).contains("Sync incomplete"));

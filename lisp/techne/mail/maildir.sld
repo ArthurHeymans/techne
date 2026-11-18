@@ -12,18 +12,19 @@
        (lambda (entry) (and (string-contains suffix (string (car entry))) (cdr entry)))
        '((#\D . "\\Draft") (#\F . "\\Flagged") (#\P . "$Forwarded")
          (#\R . "\\Answered") (#\S . "\\Seen") (#\T . "\\Deleted"))))
-    (define (%maildir-paths root [ordered? #t])
+    (define (%maildir-paths root [ordered? #t] [authoritative? #f])
       (let* ((base (file-truename root))
+             (subdirs (if authoritative? (%maildir-subdirs base) '("cur" "new")))
              (paths (append-map
           (lambda (sub)
             (let ((dir (path-join base sub)))
-              (if (not (file-exists? dir)) '()
+              (if (and (not authoritative?) (not (file-exists? dir))) '()
                   (filter-map (lambda (name)
                                 (and (> (string-length name) 0)
                                      (not (char=? (string-ref name 0) #\.))
                                      (not (string-suffix? "/" name))
                                      (path-join dir name))) (directory-list dir)))))
-          '("cur" "new"))))
+          subdirs)))
         (if ordered? (sort paths string<?) paths)))
     (define (maildir-folders root #:depth [depth 4])
       "Return the Maildirs at and under ROOT as (NAME . PATH) pairs.
@@ -35,7 +36,9 @@ Nothing is created or changed."
       (let walk ((dir root) (name "") (depth depth))
         (let* ((entries (guard (e ((not (task-cancelled-condition? e)) '())) (directory-list dir)))
                (subs (filter-map (lambda (e) (and (string-suffix? "/" e) (substring e 0 (- (string-length e) 1)))) entries))
-               (here (if (or (member "cur" subs) (member "new" subs)) (list (cons name dir)) '())))
+               ;; Keep a mailbox with a broken entry in the discovery result.
+               (here (if (or (member "cur" subs) (member "new" subs) (member "cur" entries) (member "new" entries))
+                         (list (cons name dir)) '())))
           (append here
                   (if (= depth 0) '()
                       (append-map (lambda (sub)
@@ -88,18 +91,24 @@ holding every body of a large mailbox in memory."
                    (cond ((not (eq? (vector-ref a 1) (vector-ref b 1))) (vector-ref a 1))
                          ((not (= (vector-ref a 2) (vector-ref b 2))) (> (vector-ref a 2) (vector-ref b 2)))
                          (else (string>? (vector-ref a 0) (vector-ref b 0))))))))
+    (define (%maildir-subdirs root)
+      ;; directory-list follows symlinks when deciding whether to add a slash.
+      ;; A bare entry is not absence: its target may be unavailable.
+      (let* ((entries (directory-list root))
+             (subdirs (filter (lambda (sub) (member (string-append sub "/") entries)) '("cur" "new"))))
+        (when (or (member "cur" entries) (member "new" entries))
+          (error "Maildir cur or new is unavailable" root))
+        (when (null? subdirs) (error "Maildir requires cur or new" root))
+        subdirs))
     (define (maildir-check-root root)
-      "Require at least one cur or new directory directly inside ROOT."
-      ;; directory-list adds a slash to directories, following symlinks.
-      (let ((entries (directory-list root)))
-        (unless (or (member "cur/" entries) (member "new/" entries))
-          (error "Maildir requires cur or new" root))))
+      "Require at least one cur or new directory directly inside ROOT.
+An existing but unavailable cur or new makes the whole scan incomplete."
+      (%maildir-subdirs root))
     (define (maildir-keys root)
       "Return Maildir ROOT's message keys and paths without reading bodies.
 An unavailable Maildir is an error, not an empty mailbox."
-      (maildir-check-root root)
       (let ((keys (make-hash-table)))
-        (for-each (lambda (path) (hash-table-set! keys (maildir-path-key path) path)) (%maildir-paths root #f))
+        (for-each (lambda (path) (hash-table-set! keys (maildir-path-key path) path)) (%maildir-paths root #f #t))
         keys))
     (define (%maildir-suffix name)
       (let ((marker (string-contains name ":2,")))

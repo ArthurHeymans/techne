@@ -256,7 +256,9 @@ cached messages also take the flags their files have now."
         (flush!)
         ;; New rows may be copies of ones cached from another folder.
         (when (> total 0) (mail-store-dedupe! db account))
-        (when (pair? gone) (remove-missing (mail-store-forget! db account #:mailbox mailbox #:keys gone)))
+        (when (pair? gone)
+          (maildir-check-root root)
+          (remove-missing (mail-store-forget! db account #:mailbox mailbox #:keys gone)))
         total))
 
     (define columns '(id account mailbox source-key subject sender recipients date message-id reply-to refs body unread starred trashed sent-at))
