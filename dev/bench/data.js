@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795073376914,
+  "lastUpdate": 1795073378537,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -58820,6 +58820,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 649644446,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 107661,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "28a2b143aa61dbc9d2a542d92899d705e8e2de45",
+          "message": "Merge pull request #381 from ArthurHeymans/perf/jit-vector-index\n\nReduce redundant checks in JIT-compiled vector code",
+          "timestamp": "2026-11-19T08:22:15+01:00",
+          "tree_id": "bd967d5a9095950b5ee4808ad4cfa721d6079fac",
+          "url": "https://github.com/ArthurHeymans/techne/commit/28a2b143aa61dbc9d2a542d92899d705e8e2de45"
+        },
+        "date": 1795073378474,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697448232,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 649644917,
             "unit": "instructions"
           },
           {
