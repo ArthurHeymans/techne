@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795083022734,
+  "lastUpdate": 1795083024690,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -59173,6 +59173,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 107661,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "451c5b38dd88ce7e50b667d21e38df75cd468077",
+          "message": "Merge pull request #382 from ArthurHeymans/editor/package-autoloads\n\nInstall pinned Scheme packages and load commands on first use",
+          "timestamp": "2026-11-19T10:58:38+01:00",
+          "tree_id": "27fc650ddf9b48a5aabc25916cab2029d92a0448",
+          "url": "https://github.com/ArthurHeymans/techne/commit/451c5b38dd88ce7e50b667d21e38df75cd468077"
+        },
+        "date": 1795083024622,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 692926544,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 645166838,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 106438,
             "unit": "data"
           }
         ]
