@@ -113,6 +113,9 @@
   (check "retain only the last buffer" only? (contains? (status) "*terminal*")))
 
 (define (redraw-retry)
+  (check-true "terminal is advertised" (memq (quote terminal-command) (command-names)))
+  (check "terminal starts cold" #f (find-package (quote terminal)))
+  (run-command s (quote terminal-command) 1) (keys "C-g")
   (let ((pkg (package-module (find-package 'terminal))))
     (eval '(begin (define original-render! render!) (define draws 0)
                   (set! render! (lambda (s b state)

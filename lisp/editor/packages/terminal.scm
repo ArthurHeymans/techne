@@ -134,11 +134,6 @@
 
 ;; Semi-char leaves Ebb's editor chords and modified navigation to the
 ;; active profile. Once that profile starts a sequence, it gets the rest.
-(define-option terminal-editor-keys
-  '("C-c" "C-x" "C-\\" "C-g" "C-h" "C-u" "C-M-c" "M-x" "M-:" "M-!" "M-&")
-  "Keys left to the editor profile in terminal semi-char mode."
-  #:type '(list-of string))
-
 (define (semi-editor-key? b key)
   (or (member key (option b 'terminal-editor-keys))
       (let ((i (string-index key #\<)))
@@ -278,11 +273,6 @@ to resume input, or \\[terminal-char-mode] to pass most keys to the child."
             (process-wait p))
           (read (parse text 0 budget))))))
 
-(define-option terminal-detect-passwords #f
-  "Whether to offer hidden input when the child disables PTY echo.
-A canonical non-echoing read is not always a password prompt."
-  #:type 'boolean)
-
 (define (check-terminal-password! s b state)
   (when (and (process state) (not (copying? state)) (option b 'terminal-detect-passwords)
              (not (eq? (password-probe state) 'checking)))
@@ -389,11 +379,6 @@ Press Return to send it; Escape or control-G cancels it."
                                              #:stdin 'null #:stdout 'null #:stderr 'null)))))
         (message! s "No terminal hyperlink at point"))))
 
-(define-option terminal-close-on-exit #t
-  "Whether to close an interactive terminal after its shell exits zero.
-Buffers from the terminal-command prompt and unsuccessful exits stay open."
-  #:type 'boolean)
-
 ;; The node owns the remote PTY; the editor keeps its grid locally.
 (define (call-with-terminal-pty dir program args t read)
   (let* ((dir (if (remote-path? dir) (remote-absolute-path dir) dir))
@@ -479,10 +464,6 @@ Start it on the machine of the current buffer's directory."
   (let* ((dir (default-directory s)) (shell (get-environment-variable "SHELL"))
          (program (and (not (remote-path? dir)) (if (and shell (not (string=? shell ""))) shell "sh"))))
     (start-terminal! s dir program '() #:interactive #t)))
-
-(define-option terminal-serial-baud 115200
-  "Baud rate for a serial terminal opened with socat."
-  #:type '(one-of 9600 19200 38400 57600 115200 230400))
 
 (define-command (terminal-serial s n)
   "Open a local serial console using socat at the configured baud rate."
