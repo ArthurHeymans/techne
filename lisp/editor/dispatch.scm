@@ -172,10 +172,15 @@ the declarations. A failed load can be retried."
   (unless (and (symbol? package) (string? path) (list? commands) (pair? commands)
                (every (lambda (c) (and (list? c) (= (length c) 2) (symbol? (car c)) (string? (cadr c)))) commands))
     (error "Invalid command package" package))
-  (let ((names (map car commands)))
+  (let ((names (map car commands)) (predecessor (%scope-predecessor (current-scope))))
     (unless (= (length names) (length (delete-duplicates names))) (error "Duplicate command in package" package))
-    (for-each (lambda (name) (when (registry-ref %commands name) (error "Command already registered" name))) names))
-  (let ((loading? #f) (impl (make-registry package)))
+    (for-each (lambda (name)
+                (let ((old (registry-ref %offers name)))
+                  (when (and (registry-ref %commands name)
+                             (not (and old predecessor (eq? predecessor (registry-owner %offers name))
+                                       (eq? (offer-package old) package))))
+                    (error "Command already registered" name)))) names))
+  (let ((loading? #f))
     (define (activate)
       (when loading? (error "Package activation in progress" package))
       (unless (find-package package)
@@ -191,6 +196,9 @@ the declarations. A failed load can be retried."
               generation)))))
     (for-each (lambda (c)
                 (let* ((name (car c)) (proxy (lambda args (apply (caddr (resolve-command name)) args)))
+                       ;; The bootstrap can reload independently of the implementation.
+                       ;; Its successor keeps the slot already filled by that generation.
+                       (old (registry-ref %offers name)) (impl (if old (offer-impl old) (make-registry package)))
                        (offer (make-offer package (cadr c) activate impl proxy)))
                   (registry-add! %offers name offer) (registry-add! %commands name offer))) commands)))
 

@@ -1206,7 +1206,12 @@ a setting comes from."
 (define (reserve-package! name path stage)
   "Reserve NAME for PATH in this scope.
 STAGE calls its load thunk and checks the result before publication."
-  (when (or (package-declared? name) (find-package name)) (error "Package name already in use" name))
+  (let ((old (registry-ref %package-declarations name))
+        (predecessor (%scope-predecessor (current-scope))))
+    (when (and (or old (find-package name))
+               (not (and old predecessor (eq? predecessor (registry-owner %package-declarations name))
+                         (equal? path (car old)))))
+      (error "Package name already in use" name)))
   (registry-add! %package-declarations name (cons path stage)))
 
 (define (find-package name)
