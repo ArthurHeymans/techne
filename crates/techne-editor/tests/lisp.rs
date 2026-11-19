@@ -5,6 +5,18 @@ use std::path::Path;
 
 use techne_vm::vm::Vm;
 
+/// Two independent attached editor worlds share only a private on-disk store.
+#[test]
+fn installed_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let suite = techne_editor::runtime::lisp_dir().join("tests/packages/install.scm");
+    for phase in ["install-and-use", "restore-offline"] {
+        let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+        rt.eval(&format!("(require {:?})", suite.display().to_string())).unwrap();
+        assert_eq!(rt.eval(&format!("({phase} {:?})", dir.path().display().to_string())).unwrap(), "0", "{phase}");
+    }
+}
+
 #[test]
 fn editor_suites() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/editor/tests");

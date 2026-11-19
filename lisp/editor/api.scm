@@ -49,7 +49,7 @@
 (require "capture.scm")
 
 (provide screenshot! recording-start! recording-stop!
-         define-command register-command! command command-names run-command message!
+         define-command register-command! register-command-package! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
          mode-name mode-doc mode-parent mode-chain derived-mode? mode-for-file register-mode-line-segment!
          define-option register-option! set-option! unset-option! option explain-option
