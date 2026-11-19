@@ -18,6 +18,16 @@ fn observed(source: &str, warm: &str) -> Vm {
 }
 
 #[test]
+fn repeated_global_read_requires_an_uninterrupted_path() {
+    let get = || Op::GetG { dst: 0, g: 3 };
+    let ops = [get(), Op::VRef { dst: 1, v: 0, i: 2 }, get(), Op::SetG { g: 3, src: 1 }, get(), get()];
+    let mut edges: Vec<Vec<usize>> = (1..=ops.len()).map(|next| vec![next]).collect();
+    assert_eq!(bound_globals(&ops, &edges, &[0, 5]), [false, false, true, false, false, false]);
+    edges[5] = vec![2];
+    assert!(!bound_globals(&ops, &edges, &[0])[2]);
+}
+
+#[test]
 fn register_iteration_is_sparse_ordered_and_crosses_words() {
     for n in [0, 1, 63, 64, 65, 129] {
         let mut regs = Regs::empty(n);
