@@ -299,6 +299,59 @@ fn until(rt: &mut Runtime, what: &str, done: impl Fn(&Snapshot) -> bool) -> Snap
     }
 }
 
+// The keyboard reader accepts a remote directory in Find file, closes the
+// prompt, and opens a listing whose links still point to the same route.
+#[test]
+fn find_file_browses_a_remote_directory() {
+    state();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("remote");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    std::fs::write(root.join("nested/note.txt"), "from the node\n").unwrap();
+    let mut rt = with_methods(Runtime::open(&dir.path().join("scratch"), &dir.path().join("journal"), "emacs").unwrap().0);
+    let location = format!("/pipe::{}/", root.display());
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, &location);
+    assert!(rt.snapshot().minibuffer.unwrap().input_selected);
+    keys(&mut rt, "RET");
+    let listing = rt.snapshot();
+    assert!(listing.minibuffer.is_none(), "{}", listing.echo);
+    assert!(listing.pane().text.to_string().contains("nested/"));
+    keys(&mut rt, "D");
+    let refused = rt.snapshot();
+    assert!(refused.echo.contains("only supported on local paths"), "{}", refused.echo);
+    assert!(refused.minibuffer.is_none());
+
+    keys(&mut rt, "RET");
+    assert!(rt.snapshot().pane().text.to_string().contains("note.txt"));
+    keys(&mut rt, "^");
+    assert_eq!(eval(&mut rt, "(default-directory (current-session))"), format!("{location:?}"));
+    keys(&mut rt, "RET RET");
+    assert_eq!(rt.snapshot().pane().text.to_string(), "from the node\n");
+    assert_eq!(eval(&mut rt, "(document-path (doc (current-session)))"), format!("\"{location}nested/note.txt\""));
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, "/pipe::/");
+    keys(&mut rt, "RET ^");
+    let at_root = rt.snapshot();
+    assert!(at_root.minibuffer.is_none());
+    assert_eq!(eval(&mut rt, "(default-directory (current-session))"), r#""/pipe::/""#);
+    assert!(!at_root.pane().text.to_string().contains("../"));
+
+    // Switching from local Dirvish to an open remote listing keeps the
+    // listing, but must not show local previews.
+    let local = dir.path().join("local.txt");
+    std::fs::write(&local, "local\n").unwrap();
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {:?}))", local.to_str().unwrap()));
+    eval(&mut rt, "(run-command (current-session) 'dirvish 1)");
+    assert_eq!(eval(&mut rt, "(length (session-panes (current-session)))"), "3");
+    keys(&mut rt, "C-x b");
+    type_text(&mut rt, &location);
+    keys(&mut rt, "M-RET");
+    assert_eq!(eval(&mut rt, "(length (session-panes (current-session)))"), "1");
+    assert_eq!(eval(&mut rt, "(default-directory (current-session))"), format!("{location:?}"));
+    assert!(rt.take_errors().is_empty());
+}
+
 #[test]
 fn terminal_uses_the_remote_directory_and_pty() {
     state();
