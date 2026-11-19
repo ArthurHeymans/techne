@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795085931439,
+  "lastUpdate": 1795085933338,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -59521,6 +59521,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 106438,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bb41e2c758ef1cf3c2793bd3e8f7154a30996df0",
+          "message": "Merge pull request #370 from ArthurHeymans/editor/terminal-emulator\n\nRun interactive terminals inside Techne",
+          "timestamp": "2026-11-19T11:51:17+01:00",
+          "tree_id": "c00dd10dcd15fd7c25478355617f5f5fea54c20a",
+          "url": "https://github.com/ArthurHeymans/techne/commit/bb41e2c758ef1cf3c2793bd3e8f7154a30996df0"
+        },
+        "date": 1795085933272,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 688378406,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 640624615,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 105287,
             "unit": "data"
           }
         ]
