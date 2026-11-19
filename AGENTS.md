@@ -34,7 +34,8 @@ Use Rust only where Scheme cannot do the job:
 Keep that Rust a small mechanism with its policy exposed to Lisp, and say
 in the commit why it could not be Scheme.
 
-Write tests for Scheme applications in Scheme too. Use `lisp/test.scm`;
+Write tests in Scheme by default; use Rust only when the test needs a host-level check that Scheme cannot make.
+Use `lisp/test.scm`;
 for headless editor suites, `crates/techne-editor/tests/lisp.rs` already
 loads `lisp/editor/tests/*.scm` with the editor primitives installed.
 Keep Rust tests for the host contracts they actually observe (for example,
