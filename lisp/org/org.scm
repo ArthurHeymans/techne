@@ -221,7 +221,11 @@
 
 ;; "#+TODO: TODO NEXT | DONE CANCELLED" -> (todo-states . done-states)
 (define (todo-keywords lines)
-  (let ((spec (find (lambda (l) (string-prefix? "#+TODO:" (string-upcase l))) lines)))
+  ;; Most documents have no directive. Don't uppercase every heading and
+  ;; paragraph just to discover that it isn't a keyword line.
+  (let ((spec (find (lambda (l) (and (string-prefix? "#+" l)
+                                     (>= (string-length l) 7)
+                                     (string-ci=? "#+TODO:" (substring l 0 7)))) lines)))
     (if (not spec)
         (cons default-todo default-done)
         (let* ((words (string-split (substring spec 7)))
