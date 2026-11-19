@@ -288,7 +288,7 @@ pub struct Message<T> {
 }
 
 /// The version of the framed node protocol (not nREPL).
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The first frame in each direction, before any request or response.
 #[derive(Serialize, Deserialize, Debug)]

@@ -9,7 +9,7 @@
 (require "../../files.scm")
 (require "../../live.scm")
 (provide osc-prompts alignment resize initial-size split-size shell-exit redraw-retry burst paste
-         private-prompt profile-keys test-failures)
+         private-prompt profile-keys retire-terminal test-failures)
 
 (define s (current-session))
 (define (keys k) (for-each (lambda (key) (editor-press s key)) (kbd k)))
@@ -31,6 +31,20 @@
 (define (enter-command script)
   (check "command prompt" "Terminal command: " (car (editor-minibuffer s)))
   (typing script) (keys "RET"))
+
+(define (retire-terminal reload?)
+  (command "printf '\\033[?1000hretained output'; read -r go")
+  (output "retained output")
+  (let* ((b (current-buffer s)) (shown (text)) (pkg (find-package 'terminal))
+         (task (eval '(reader (session-of (current-buffer (current-session)))) (package-module pkg))))
+    (if reload? (load-package 'terminal (package-path pkg)) (unload-package 'terminal))
+    (wait-for "reader cancellation" (lambda () (task-done? task)))
+    (check "buffer survives" #t (eq? b (current-buffer s)))
+    (check "last frame preserved" shown (text))
+    (check "ordinary read-only buffer" 'special-mode (buffer-mode b))
+    (check "no old grid or process" #f (buffer-state b))
+    (check "no mouse capture" #f (option b 'report-pointer))
+    (keys "x") (check "typing cannot edit retired transcript" shown (text))))
 
 (define (private-prompt)
   (set-option! 'terminal-detect-passwords #t)

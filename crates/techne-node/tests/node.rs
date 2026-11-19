@@ -416,11 +416,11 @@ fn the_server_refuses_a_different_protocol_version() {
         let mut input = child.stdout.take().unwrap();
         let mut out = child.stdin.take().unwrap();
         assert_eq!(read_frame::<Hello>(&mut input).await.unwrap().unwrap().version, VERSION);
-        write_frame(&mut out, &Hello { version: VERSION + 1, facts: None }).await.unwrap();
+        write_frame(&mut out, &Hello { version: 2, facts: None }).await.unwrap();
         let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await.unwrap().unwrap();
         let error = String::from_utf8(output.stderr).unwrap();
         assert!(error.contains("node protocol version handshake failed: version mismatch"), "{error}");
-        assert!(error.contains(&format!("expected {VERSION}, received {}", VERSION + 1)), "{error}");
+        assert!(error.contains(&format!("expected {VERSION}, received {}", 2)), "{error}");
     });
 }
 

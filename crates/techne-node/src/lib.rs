@@ -87,10 +87,28 @@ impl std::fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
+// A spawn result owns the remote process until the awaiting caller takes it.
+// Cancellation can happen either before delivery or while the reply is already
+// sitting in the oneshot channel. Both paths drop this same guard.
+struct Delivery {
+    reply: Option<Reply>,
+    release: Option<mpsc::UnboundedSender<Option<Message<Request>>>>,
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        if let (Some(out), Some(Reply::Spawned { proc, .. })) = (&self.release, &self.reply) {
+            let _ = out.send(Some(Message { id: 0, body: Request::Release { proc: *proc } }));
+        }
+    }
+}
+
+type ReplySender = oneshot::Sender<Result<Delivery, RequestError>>;
+
 /// The client side of a connection.
 struct Conn {
     next: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Reply, RequestError>>>>,
+    pending: Mutex<HashMap<u64, (ReplySender, bool)>>,
     /// Why the connection is unusable, once it is.
     lost: Mutex<Option<String>>,
     /// To the writer task; `None` closes the node's input.
@@ -117,7 +135,7 @@ impl Conn {
                 Some(reason) => Err(reason),
                 None => {
                     let id = self.next.fetch_add(1, Ordering::Relaxed);
-                    pending.insert(id, tx);
+                    pending.insert(id, (tx, matches!(&request, Request::Spawn { .. })));
                     if self.out.send(Some(Message { id, body: request })).is_err() {
                         pending.remove(&id);
                         Err("node connection lost".to_string())
@@ -129,7 +147,16 @@ impl Conn {
         };
         async move {
             sent.map_err(RequestError::Failed)?;
-            rx.await.map_err(|_| RequestError::Unknown("node connection lost".to_string()))?
+            let mut delivery = rx.await.map_err(|_| RequestError::Unknown("node connection lost".to_string()))??;
+            Ok(delivery.reply.take().expect("unclaimed node reply"))
+        }
+    }
+
+    fn deliver(&self, id: u64, body: Response) {
+        if let Some((tx, spawn)) = self.pending.lock().unwrap().remove(&id) {
+            let _ = tx.send(
+                body.map(|reply| Delivery { reply: Some(reply), release: spawn.then(|| self.out.clone()) }).map_err(RequestError::Failed),
+            );
         }
     }
 
@@ -141,7 +168,7 @@ impl Conn {
     fn lose(&self, reason: String) {
         let mut pending = self.pending.lock().unwrap();
         self.lost.lock().unwrap().get_or_insert(reason.clone());
-        for (_, tx) in pending.drain() {
+        for (_, (tx, _)) in pending.drain() {
             let _ = tx.send(Err(RequestError::Unknown(reason.clone())));
         }
         self.greeted.notify_waiters();
@@ -411,7 +438,7 @@ fn speak(
                 out_rx.close();
                 while let Some(msg) = out_rx.recv().await {
                     if let Some(msg) = msg
-                        && let Some(tx) = reader.pending.lock().unwrap().remove(&msg.id)
+                        && let Some((tx, _)) = reader.pending.lock().unwrap().remove(&msg.id)
                     {
                         let _ = tx.send(Err(RequestError::Failed(format!("node connection failed: {e}"))));
                     }
@@ -428,7 +455,7 @@ fn speak(
             while let Some(Some(msg)) = out_rx.recv().await {
                 if let Err(e) = write_frame(&mut output, &msg).await {
                     if e.kind() == std::io::ErrorKind::InvalidInput {
-                        if let Some(tx) = writer.pending.lock().unwrap().remove(&msg.id) {
+                        if let Some((tx, _)) = writer.pending.lock().unwrap().remove(&msg.id) {
                             let _ = tx.send(Err(RequestError::Failed(e.to_string())));
                         }
                     } else {
@@ -442,9 +469,7 @@ fn speak(
         let reason = loop {
             match read_frame::<Message<Response>>(&mut input).await {
                 Ok(Some(Message { id, body })) => {
-                    if let Some(tx) = reader.pending.lock().unwrap().remove(&id) {
-                        let _ = tx.send(body.map_err(RequestError::Failed));
-                    }
+                    reader.deliver(id, body);
                 }
                 Ok(None) => break "node connection lost".to_string(),
                 Err(e) => break format!("node connection lost: {e}"),
@@ -1041,6 +1066,32 @@ mod request_tests {
             },
             rx,
         )
+    }
+
+    #[test]
+    fn cancelled_spawn_releases_the_acknowledged_process_on_the_live_connection() {
+        for cancel_before_ack in [true, false] {
+            let (conn, mut wire) = connection();
+            let request = conn.request(Request::Spawn {
+                program: "sh".into(),
+                args: vec![],
+                pty: true,
+                persist: false,
+                directory: None,
+                environment: vec![],
+            });
+            let id = wire.try_recv().unwrap().unwrap().id;
+            let ack = || conn.deliver(id, Ok(Reply::Spawned { proc: 42, pid: 123 }));
+            if cancel_before_ack {
+                drop(request);
+                ack();
+            } else {
+                ack();
+                drop(request);
+            }
+            assert!(matches!(wire.try_recv().unwrap().unwrap().body, Request::Release { proc: 42 }));
+            assert!(wire.try_recv().is_err());
+        }
     }
 
     fn write() -> Request {

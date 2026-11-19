@@ -92,6 +92,8 @@ fn scheme_terminal_scenarios() {
         "(burst)",
         "(paste)",
         "(private-prompt)",
+        "(retire-terminal #f)",
+        "(retire-terminal #t)",
         "(profile-keys #t)",
     ]
     .into_iter()

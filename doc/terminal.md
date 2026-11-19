@@ -73,8 +73,14 @@ normal-size glyphs. Scrollback retains up to 2,000 rows of the main screen.
 Saved text reflows on width changes; the live and alternate grids do not.
 Visual wraps copy as separate lines. Wide CJK characters and common
 combining sequences are supported. Applications can request xterm mouse
-and focus reports in both frontends. Shift or copy mode keeps mouse input
-with the editor. OSC clipboard access is not supported.
+and focus reports in both frontends. The text frontend reports button and drag
+events, not no-button motion. Shift or copy mode keeps mouse input with the
+editor. OSC clipboard access is not supported.
+
+Unloading or reloading the terminal package stops its children and leaves each
+terminal's last projected text in an ordinary read-only buffer. It does not
+reattach a new terminal to the old buffer. Remote PTY probes and frontend input
+require matching node and attachment protocol versions (version 3).
 
 The window frontend draws traditional Kitty inline placements. The direct
 base64 medium accepts chunked PNG and raw RGB/RGBA within fixed storage

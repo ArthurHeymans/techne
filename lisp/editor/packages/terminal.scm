@@ -415,6 +415,21 @@ Press Return to send it; Escape or control-G cancels it."
          (projection (make-terminal-projection d history-limit)))
     (set! state (%terminal t projection dir #f #f #f #f #f '() 0 "Starting" 'semi size (make-terminal-graphics) #f))
     (let ((b (make-generated-buffer! name d 'terminal-mode #:state state)))
+      ;; The buffer belongs to the editor; the PTY, input handlers and grid
+      ;; belong to this generation. Preserve the last projected text, not
+      ;; the dead generation, when the package unloads or is replaced.
+      (scope-own! state
+        (lambda (_)
+          (when (eq? (buffer-state b) state)
+            (close-terminal-passwords! s state)
+            (for-each (lambda (session)
+                        (when (eq? (sget session 'terminal-quote) b) (sset! session 'terminal-quote #f)))
+                      (attached-sessions))
+            (process-set! state #f)
+            (set-buffer-state! b #f)
+            (set-buffer-mode! b 'special-mode)
+            (unset-option! 'report-pointer #:buffer b)
+            (unset-option! 'cursor-visible #:buffer b))))
       (document-limit-history! d log-history)
       (show-document! s d)
       (render! s b state)
@@ -452,6 +467,7 @@ Press Return to send it; Escape or control-G cancels it."
            (lambda (s b)
              (let ((state (session-of b)))
                (when state
+                 (scope-disown! state)
                  (process-set! state #f)
                  (close-terminal-passwords! s state)
                  (when (writer state) (task-cancel (writer state)))
