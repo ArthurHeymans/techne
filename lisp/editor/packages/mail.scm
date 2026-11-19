@@ -38,13 +38,6 @@ use mail-toggle-reader-position, or set this option in your mail
 configuration."
   #:type '(one-of bottom side))
 
-(define %mail-runtime (string-append (directory-of (current-module)) "../mail/runtime.scm"))
-
-;; Only M-x mail is needed before visiting mail. The runtime publishes the
-;; remaining commands and replaces this entry when it loads.
-(define-command (mail s n)
-  "Open the mail dashboard. Configure accounts with `mail-accounts`."
-  (load-package 'mail-runtime %mail-runtime)
-  (let ((implementation (command 'mail)))
-    (when (eq? implementation mail) (error "Mail command was not loaded"))
-    (with-scope (package-scope (find-package 'mail-runtime)) (implementation s n))))
+(register-command-package! (quote mail-runtime)
+  (string-append (directory-of (current-module)) "../mail/runtime.scm")
+  (quote ((mail "Open the mail dashboard. Configure accounts with `mail-accounts`."))))

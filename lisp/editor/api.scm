@@ -49,10 +49,10 @@
 (require "capture.scm")
 
 (provide screenshot! recording-start! recording-stop!
-         define-command register-command! command command-names run-command message!
+         define-command register-command! register-command-package! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
          mode-name mode-doc mode-parent mode-chain derived-mode? mode-for-file register-mode-line-segment!
-         define-option register-option! set-option! unset-option! option explain-option
+          define-option register-option! find-option set-option! unset-option! option explain-option
          define-face register-face! find-face face-names face-doc set-face! unset-face! explain-face face-attributes
          set-palette! palette-color load-theme unload-theme
          define-language register-language! find-language language-names language-generation buffer-language path-language

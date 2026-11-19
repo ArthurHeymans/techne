@@ -18,7 +18,7 @@
 (require "../schema.scm")
 
 (provide press press-keys type-text command-doc
-         define-command register-command! command command-names run-command command-joins! message!
+         define-command register-command! register-command-package! command command-names run-command command-joins! message!
          invoke make-contract command-contract command-code contract? contract-params contract-entries contract-read
          contract-effects contract-expose contract-available contract-stageable contract-result contract-hash
          contract-argument-schema contract-sensitive set-command-acquirer! contract-conform-argument ->data error-text messages-document message-log-max
@@ -142,13 +142,77 @@ the contract's arguments, in order, and the command is run with them:
 read from the user (keys, \\[execute-extended-command]), or given as
 data (`invoke`)."
   ;; Last: (procedure . its code-id), the code BODY gave last, numbered.
-  (registry-add! %commands name (list doc proc (scope-procedure proc) (or body (lambda () proc)) contract (cons #f #f))))
+  (let* ((o (registry-ref %offers name))
+         (reg (if (and o (eq? (scope-name (current-scope)) (offer-package o))) (offer-impl o) %commands)))
+    (when (and o (eq? reg (offer-impl o)) (%offered-generation)
+               (eq? (current-scope) (car (%offered-generation))))
+      (hash-table-set! (cdr (%offered-generation)) name #t))
+    (registry-add! reg name (list doc proc (scope-procedure proc) (or body (lambda () proc)) contract (cons #f #f)))))
 
 (define (command-code name)
   "Return the number of the code the command NAME runs now, or #f.
 Records of its runs keep the number of theirs (`record-code`)."
+  (let ((c (command-entry name)))
+    (and c (not (offer? c)) (command-code-id c))))
+
+;; Keep an offer's place in the command stack even when its package activates
+;; through a sibling command. Only the implementation slot belongs to the
+;; loaded generation; unloading it uncovers the same declaration.
+(define-record-type command-offer
+  (make-offer package doc activate impl proxy) offer?
+  (package offer-package) (doc offer-doc) (activate offer-activate)
+  (impl offer-impl) (proxy offer-proxy))
+(define %offers (make-registry 'command-offers))
+(define %offered-generation (make-parameter #f))
+
+(define (register-command-package! package path commands)
+  "Advertise COMMANDS of PACKAGE without loading PATH.
+COMMANDS is a list of (name documentation) pairs. The current scope owns
+the declarations. A failed load can be retried."
+  (unless (and (symbol? package) (string? path) (list? commands) (pair? commands)
+               (every (lambda (c) (and (list? c) (= (length c) 2) (symbol? (car c)) (string? (cadr c)))) commands))
+    (error "Invalid command package" package))
+  (let ((names (map car commands)) (predecessor (%scope-predecessor (current-scope))))
+    (unless (= (length names) (length (delete-duplicates names))) (error "Duplicate command in package" package))
+    (for-each (lambda (name)
+                (let ((old (registry-ref %offers name)))
+                  (when (and (registry-ref %commands name)
+                             (not (and old predecessor (eq? predecessor (registry-owner %offers name))
+                                       (eq? (offer-package old) package))))
+                    (error "Command already registered" name)))) names))
+  (let ((loading? #f))
+    (define (activate)
+      (when loading? (error "Package activation in progress" package))
+      (unless (find-package package)
+        (dynamic-wind (lambda () (set! loading? #t)) (lambda () (load-package package path))
+                      (lambda () (set! loading? #f)))))
+    (reserve-package! package path
+      (lambda (load)
+        (let ((seen (make-hash-table eq?)))
+          (parameterize ((%offered-generation (cons (current-scope) seen)))
+            (let ((generation (load)))
+              (for-each (lambda (c) (unless (hash-table-ref/default seen (car c) #f)
+                                      (error "Package did not define advertised command" package (car c)))) commands)
+              generation)))))
+    (for-each (lambda (c)
+                (let* ((name (car c)) (proxy (lambda args (apply (caddr (resolve-command name)) args)))
+                       ;; The bootstrap can reload independently of the implementation.
+                       ;; Its successor keeps the slot already filled by that generation.
+                       (old (registry-ref %offers name)) (impl (if old (offer-impl old) (make-registry package)))
+                       (offer (make-offer package (cadr c) activate impl proxy)))
+                  (registry-add! %offers name offer) (registry-add! %commands name offer))) commands)))
+
+(define (command-entry name)
   (let ((c (registry-ref %commands name)))
-    (and c (command-code-id c))))
+    (if (offer? c) (registry-ref (offer-impl c) name c) c)))
+(define (resolve-command name [cold? #t])
+  (let ((c (command-entry name)))
+    (cond ((not c) (error "No such command" name))
+          ((not (offer? c)) c)
+          ((not cold?) (error "Command package not activated by the user" name))
+          (else ((offer-activate c))
+                (or (registry-ref (offer-impl c) name)
+                    (error "Package did not define its advertised command" (offer-package c) name))))))
 
 ;; The number of the code command entry C runs now: the procedure its
 ;; binding holds, numbered once while it holds the same.
@@ -161,14 +225,14 @@ Records of its runs keep the number of theirs (`record-code`)."
 
 (define (command-contract name)
   "Return the contract of the command NAME, or #f: run by a count only."
-  (let ((c (registry-ref %commands name)))
-    (and c (list-ref c 4))))
+  (let ((c (command-entry name)))
+    (and c (not (offer? c)) (list-ref c 4))))
 
 ;; The command's procedure, as defined (for its documentation and source).
 (define (command name)
   "Return the procedure of the command NAME; it is an error if none."
-  (let ((c (registry-ref %commands name)))
-    (if c (cadr c) (error "no such command" name))))
+  (let ((c (command-entry name)))
+    (cond ((offer? c) (offer-proxy c)) (c (cadr c)) (else (error "no such command" name)))))
 
 (define (command-names)
   "Return the names of the commands defined."
@@ -176,12 +240,12 @@ Records of its runs keep the number of theirs (`record-code`)."
 
 (define (command-doc name)
   "Return the documentation of the command NAME, or #f."
-  (let ((c (registry-ref %commands name)))
-    (and c (car c))))
+  (let ((c (command-entry name)))
+    (if (offer? c) (offer-doc c) (and c (car c)))))
 
 ;; Call command NAME in its package's scope.
 (define (invoke-command name s n)
-  (let ((c (or (registry-ref %commands name) (error "no such command" name))))
+  (let ((c (resolve-command name)))
     ((caddr c) s n)))
 
 ;; The table calls the global binding, so redefining a command takes effect
@@ -433,7 +497,7 @@ Errors are raised to the caller, sensitive irritants redacted.
 The operation is a child of PARENT when given (the failed one a recovery
 choice is of), and
 STARTED, if given, is called with its record before the command runs."
-  (let* ((c (or (registry-ref %commands name) (error "No such command" name)))
+  (let* ((c (resolve-command name (and (equal? principal "user") (eq? mode (quote apply)))))
          (contract (or (list-ref c 4) (error "This command takes no arguments as data: it has no contract" name))))
     (unless (or (equal? principal "user") (memq 'agents (contract-expose contract)))
       (error "This command is not exposed to agents" name))
@@ -629,7 +693,7 @@ Return #t when the command finished, #f when it raised an error."
   (sset! s 'goal-now #f)
   (message! s #f)
   (let ((ok (guard (e (#t (failed! s name e) #f))
-              (let ((c (or (registry-ref %commands name) (error "no such command" name))))
+              (let ((c (resolve-command name)))
                 (cond ((list-ref c 4)
                        ;; Its arguments are read, then it is invoked with them,
                        ;; an operation of its own.

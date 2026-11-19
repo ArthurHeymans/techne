@@ -11,6 +11,8 @@ editor itself, under C-h, what each command, procedure and option does.
 and presents messages with the markdown preview's rich reader; `M-x mail`
 opens its dashboard of groups, accounts and folders.
 
+[Editor packages](doc/packages.md) can be installed from Git and activated on first use.
+
 The Lisp is meant to be a general-purpose language in its own right,
 embeddable from Rust. Its runtime is described in
 [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md). Its

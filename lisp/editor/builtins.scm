@@ -4,6 +4,7 @@
 ;;; what order, is decided here.
 
 (require "files.scm")
+(require "dispatch.scm")
 
 (define builtin-packages '(compile dired ibuffer vc markdown-preview mail)
   "The editor's own packages, loaded at start in this order.")
@@ -12,5 +13,9 @@
 (define %here (current-module))
 
 (for-each (lambda (name)
-            (load-package name (string-append (directory-of %here) "packages/" (symbol->string name) ".scm")))
+            (let ((path (string-append (directory-of %here) "packages/" (symbol->string name) ".scm")))
+              (case name
+                ((markdown-preview)
+                 (register-command-package! name path (quote ((markdown-preview "Show this markdown buffer rendered, beside it.")))))
+                (else (load-package name path)))))
           builtin-packages)

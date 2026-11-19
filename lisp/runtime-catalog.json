@@ -177,7 +177,7 @@
       "is_macro": false
     },
     "command": {
-      "description": "(command name)  procedure, @lisp@/editor/dispatch.scm:168\n\nReturn the procedure of the command NAME; it is an error if none.",
+      "description": "(command name)  procedure, @lisp@/editor/dispatch.scm:232\n\nReturn the procedure of the command NAME; it is an error if none.",
       "is_macro": false
     },
     "command-available": {
@@ -185,15 +185,15 @@
       "is_macro": false
     },
     "command-contract": {
-      "description": "(command-contract name)  procedure, @lisp@/editor/dispatch.scm:162\n\nReturn the contract of the command NAME, or #f: run by a count only.",
+      "description": "(command-contract name)  procedure, @lisp@/editor/dispatch.scm:226\n\nReturn the contract of the command NAME, or #f: run by a count only.",
       "is_macro": false
     },
     "command-joins!": {
-      "description": "(command-joins! name join)  procedure, @lisp@/editor/dispatch.scm:596\n\nLet runs of the command NAME join one operation when JOIN says so.\nJOIN is #t, or a procedure (session record) saying whether this run\njoins the last, whose record is RECORD.",
+      "description": "(command-joins! name join)  procedure, @lisp@/editor/dispatch.scm:660\n\nLet runs of the command NAME join one operation when JOIN says so.\nJOIN is #t, or a procedure (session record) saying whether this run\njoins the last, whose record is RECORD.",
       "is_macro": false
     },
     "command-names": {
-      "description": "(command-names)  procedure, @lisp@/editor/dispatch.scm:173\n\nReturn the names of the commands defined.",
+      "description": "(command-names)  procedure, @lisp@/editor/dispatch.scm:237\n\nReturn the names of the commands defined.",
       "is_macro": false
     },
     "command-schema": {
@@ -209,27 +209,27 @@
       "is_macro": false
     },
     "contract-effects": {
-      "description": "(contract-effects record)  procedure, @lisp@/editor/dispatch.scm:241\n\nReturn the `effects` field of RECORD, a `contract` record.",
+      "description": "(contract-effects record)  procedure, @lisp@/editor/dispatch.scm:305\n\nReturn the `effects` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract-entries": {
-      "description": "(contract-entries record)  procedure, @lisp@/editor/dispatch.scm:236\n\nReturn the `entries` field of RECORD, a `contract` record.",
+      "description": "(contract-entries record)  procedure, @lisp@/editor/dispatch.scm:300\n\nReturn the `entries` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract-expose": {
-      "description": "(contract-expose record)  procedure, @lisp@/editor/dispatch.scm:243\n\nReturn the `expose` field of RECORD, a `contract` record.",
+      "description": "(contract-expose record)  procedure, @lisp@/editor/dispatch.scm:307\n\nReturn the `expose` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract-params": {
-      "description": "(contract-params record)  procedure, @lisp@/editor/dispatch.scm:232\n\nReturn the `params` field of RECORD, a `contract` record.",
+      "description": "(contract-params record)  procedure, @lisp@/editor/dispatch.scm:296\n\nReturn the `params` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract-stageable": {
-      "description": "(contract-stageable record)  procedure, @lisp@/editor/dispatch.scm:249\n\nReturn the `stageable` field of RECORD, a `contract` record.",
+      "description": "(contract-stageable record)  procedure, @lisp@/editor/dispatch.scm:313\n\nReturn the `stageable` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract?": {
-      "description": "(contract? obj)  procedure, @lisp@/editor/dispatch.scm:229\n\nReturn #t if OBJ is a `contract` record.",
+      "description": "(contract? obj)  procedure, @lisp@/editor/dispatch.scm:293\n\nReturn #t if OBJ is a `contract` record.",
       "is_macro": false
     },
     "current-buffer": {
@@ -261,7 +261,7 @@
       "is_macro": true
     },
     "define-command": {
-      "description": "define-command: macro, @lisp@/editor/dispatch.scm:190\n\nDefine the command NAME, a procedure of the session S and the count N.\nDOC documents both the procedure and the command; BODY runs when it is\ninvoked. With #:arguments after DOC, it is a command with a contract,\na procedure of the session and its arguments, in order: (define-command\n(name s arg ...) doc #:arguments '((arg schema option ...) ...) ...\nbody ...), with #:read, #:effects, #:expose, #:available, #:stageable\nand #:result after #:arguments as `make-contract` takes them.",
+      "description": "define-command: macro, @lisp@/editor/dispatch.scm:254\n\nDefine the command NAME, a procedure of the session S and the count N.\nDOC documents both the procedure and the command; BODY runs when it is\ninvoked. With #:arguments after DOC, it is a command with a contract,\na procedure of the session and its arguments, in order: (define-command\n(name s arg ...) doc #:arguments '((arg schema option ...) ...) ...\nbody ...), with #:read, #:effects, #:expose, #:available, #:stageable\nand #:result after #:arguments as `make-contract` takes them.",
       "is_macro": true
     },
     "define-face": {
@@ -469,7 +469,7 @@
       "is_macro": false
     },
     "error-text": {
-      "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:537\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
+      "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:601\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
       "is_macro": false
     },
     "error-with-choices": {
@@ -558,6 +558,10 @@
     },
     "find-operation-record": {
       "description": "(find-operation-record serial)  procedure, @lisp@/editor/operations.scm:729\n\nReturn the record of the operation SERIAL of this runtime, or #f.\n#f when it is forgotten: past the bounds of the logs, ended.",
+      "is_macro": false
+    },
+    "find-option": {
+      "description": "(find-option name)  procedure, @lisp@/editor/modes.scm:262\n\nReturn the declaration of the option NAME, or #f.",
       "is_macro": false
     },
     "forget-operation!": {
@@ -653,7 +657,7 @@
       "is_macro": false
     },
     "invoke": {
-      "description": "(invoke s name args #:principal (principal \"user\") #:mode (mode (quote apply)) #:parent (parent #f) #:started (started #f))  procedure, @lisp@/editor/dispatch.scm:420\n\nRun the command NAME in session S with ARGS, a dict of its arguments.\nKeys are the arguments' names, symbols or strings (JSON's). The command\nmust have a contract; it checks that PRINCIPAL (\"user\", or an agent's\nname) may invoke it, that it is available, and conforms and validates\nARGS, refusing with what is wrong, values of sensitive arguments left\nout. It runs as an operation, a child of the current one, recording the\narguments as data. MODE `check` stops there and returns #t; `apply`\nruns it and returns what it returns. `stage` runs reads and queries,\nbut edits become revision-checked proposals; settings and external\neffects are refused, as are edits through presentations and undo, and\nthe `edit` effect of a command that does not declare #:stageable.\nErrors are raised to the caller, sensitive irritants redacted.\nThe operation is a child of PARENT when given (the failed one a recovery\nchoice is of), and\nSTARTED, if given, is called with its record before the command runs.",
+      "description": "(invoke s name args #:principal (principal \"user\") #:mode (mode (quote apply)) #:parent (parent #f) #:started (started #f))  procedure, @lisp@/editor/dispatch.scm:484\n\nRun the command NAME in session S with ARGS, a dict of its arguments.\nKeys are the arguments' names, symbols or strings (JSON's). The command\nmust have a contract; it checks that PRINCIPAL (\"user\", or an agent's\nname) may invoke it, that it is available, and conforms and validates\nARGS, refusing with what is wrong, values of sensitive arguments left\nout. It runs as an operation, a child of the current one, recording the\narguments as data. MODE `check` stops there and returns #t; `apply`\nruns it and returns what it returns. `stage` runs reads and queries,\nbut edits become revision-checked proposals; settings and external\neffects are refused, as are edits through presentations and undo, and\nthe `edit` effect of a command that does not declare #:stageable.\nErrors are raised to the caller, sensitive irritants redacted.\nThe operation is a child of PARENT when given (the failed one a recovery\nchoice is of), and\nSTARTED, if given, is called with its record before the command runs.",
       "is_macro": false
     },
     "kbd": {
@@ -849,7 +853,7 @@
       "is_macro": false
     },
     "make-contract": {
-      "description": "(make-contract entries #:read (read (quote ())) #:effects (effects (quote ())) #:expose (expose (quote ())) #:available (available #f) #:stageable (stageable #f) #:result (result #f))  procedure, @lisp@/editor/dispatch.scm:254\n\nReturn the contract of a command taking the arguments ENTRIES.\nENTRIES are (name schema option ...), as a dict schema's, SCHEMA a\nprocedure of the arguments before when it depends on them; options\n#:doc, #:default, #:optional and #:sensitive (redacted wherever it would\nbe recorded or written). READ says how to ask the user for each: (name\nhow option ...). EFFECTS is what it may do, a list of `read`, `query`,\n`edit`, `settings`, `external`, or a procedure of the arguments giving\nit. EXPOSE lists who else may invoke it (`agents`). AVAILABLE is a\nprocedure of the session giving #t or why not. STAGEABLE, #t, says the\nbody does not read its own edits back nor assume another effect of its\nlanded, so its `edit` effect may run in `stage` mode. RESULT is the\nschema of what it returns.",
+      "description": "(make-contract entries #:read (read (quote ())) #:effects (effects (quote ())) #:expose (expose (quote ())) #:available (available #f) #:stageable (stageable #f) #:result (result #f))  procedure, @lisp@/editor/dispatch.scm:318\n\nReturn the contract of a command taking the arguments ENTRIES.\nENTRIES are (name schema option ...), as a dict schema's, SCHEMA a\nprocedure of the arguments before when it depends on them; options\n#:doc, #:default, #:optional and #:sensitive (redacted wherever it would\nbe recorded or written). READ says how to ask the user for each: (name\nhow option ...). EFFECTS is what it may do, a list of `read`, `query`,\n`edit`, `settings`, `external`, or a procedure of the arguments giving\nit. EXPOSE lists who else may invoke it (`agents`). AVAILABLE is a\nprocedure of the session giving #t or why not. STAGEABLE, #t, says the\nbody does not read its own edits back nor assume another effect of its\nlanded, so its `edit` effect may run in `stage` mode. RESULT is the\nschema of what it returns.",
       "is_macro": false
     },
     "make-document": {
@@ -945,7 +949,7 @@
       "is_macro": false
     },
     "message!": {
-      "description": "(message! s text)  procedure, @lisp@/editor/dispatch.scm:493\n\nShow TEXT in the echo area of session S; #f clears it.\nThe message is kept in *Messages*.",
+      "description": "(message! s text)  procedure, @lisp@/editor/dispatch.scm:557\n\nShow TEXT in the echo area of session S; #f clears it.\nThe message is kept in *Messages*.",
       "is_macro": false
     },
     "method-names": {
@@ -1532,6 +1536,10 @@
       "description": "(register-command! name doc proc #:body (body #f) #:contract (contract #f))  procedure, @lisp@/editor/dispatch.scm:135\n\nMake PROC, a procedure of a session and a count, the command NAME.\nDOC documents it. The current scope owns the command. BODY, if given,\nis a thunk returning the procedure PROC runs now (a global binding's,\nwhich redefining changes), whose identity records of its runs keep.\nWith CONTRACT (`make-contract`), PROC is a procedure of a session and\nthe contract's arguments, in order, and the command is run with them:\nread from the user (keys, \\[execute-extended-command]), or given as\ndata (`invoke`).",
       "is_macro": false
     },
+    "register-command-package!": {
+      "description": "(register-command-package! package path commands)  procedure, @lisp@/editor/dispatch.scm:168\n\nAdvertise COMMANDS of PACKAGE without loading PATH.\nCOMMANDS is a list of (name documentation) pairs. The current scope owns\nthe declarations. A failed load can be retried.",
+      "is_macro": false
+    },
     "register-face!": {
       "description": "(register-face! name doc #:inherit (inherit (quote ())) #:fg (fg (quote ())) #:bg (bg (quote ())) #:weight (weight (quote ())) #:slant (slant (quote ())) #:underline (underline (quote ())) #:strike (strike (quote ())) #:extend (extend (quote ())) #:family (family (quote ())) #:height (height (quote ())))  procedure, @lisp@/editor/faces.scm:126\n\nDeclare the face NAME, documented by DOC, with its own attributes.\nFG and BG are colours, as the file's head says; WEIGHT is `light',\n`normal' or `bold'; SLANT `normal' or `italic'; UNDERLINE #t, `line',\n`curl', `dotted', `dashed' or `double', or one of those with a\ncolour: (curl red); STRIKE and EXTEND are booleans (an extending\nbackground or underline reaches the pane's edge where the face covers a line's\nend); FAMILY is a font family, or `fixed' or `variable'; HEIGHT the\nsize as a factor of the frontend's, 1.3 say. FAMILY and HEIGHT\nchange fonts wherever the face is, in a frontend that has them (a\nwindow; a terminal has one font): a line is as tall as its tallest\ntext. An attribute set to #f clears what the face\ninherits of it. INHERIT is the face whose unset attributes this\none takes: not given, its longest declared dotted prefix; #f, none.\nDefining it again in the same scope replaces the declaration, as a\nreload does.",
       "is_macro": false
@@ -1701,7 +1709,7 @@
       "is_macro": false
     },
     "run-command": {
-      "description": "(run-command s name n #:operation (operation #t))  procedure, @lisp@/editor/dispatch.scm:620\n\nRun the command NAME in session S with the count N.\nThe run is an operation, a child of the current one, unless OPERATION\nis #f: a key of the minibuffer, which only reads, runs in none.\nWhat commands record for the next one (a kill to append to, a goal\ncolumn) moves from now to last here; an error becomes the message.\nReturn #t when the command finished, #f when it raised an error.",
+      "description": "(run-command s name n #:operation (operation #t))  procedure, @lisp@/editor/dispatch.scm:684\n\nRun the command NAME in session S with the count N.\nThe run is an operation, a child of the current one, unless OPERATION\nis #f: a key of the minibuffer, which only reads, runs in none.\nWhat commands record for the next one (a kill to append to, a goal\ncolumn) moves from now to last here; an error becomes the message.\nReturn #t when the command finished, #f when it raised an error.",
       "is_macro": false
     },
     "run-hook!": {
@@ -1973,7 +1981,7 @@
       "is_macro": false
     },
     "take-violations!": {
-      "description": "(take-violations! s)  procedure, @lisp@/editor/dispatch.scm:581\n\nReturn and forget the violations raised in session S since last asked.\nThey are those of commands and hooks, oldest first, each as \"who: what\nit says\".",
+      "description": "(take-violations! s)  procedure, @lisp@/editor/dispatch.scm:645\n\nReturn and forget the violations raised in session S since last asked.\nThey are those of commands and hooks, oldest first, each as \"who: what\nit says\".",
       "is_macro": false
     },
     "target": {
