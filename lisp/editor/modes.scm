@@ -39,12 +39,12 @@
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
-         buffer-directory)
+         buffer-directory buffer-input buffer-display-options)
 
 ;;; Buffers
 
 (define-record-type buffer
-  (%make-buffer document name mode state view settings)
+  (%make-buffer document name mode state view settings display-cache)
   buffer?
   ;; A document, or a presentation.
   (document buffer-document)
@@ -55,13 +55,18 @@
   (state buffer-state set-buffer-state!)
   (view buffer-view set-buffer-view!)
   ;; Options set in this buffer: an alist of (name . value).
-  (settings buffer-settings set-buffer-settings!))
+  (settings buffer-settings %set-buffer-settings!)
+  (display-cache buffer-display-cache set-buffer-display-cache!))
+
+(define (set-buffer-settings! b settings)
+  (%set-buffer-settings! b settings)
+  (set-buffer-display-cache! b #f))
 
 (define (make-buffer document name mode #:state [state #f])
   "Return a new buffer of DOCUMENT called NAME, in the major mode MODE.
 LENS is the lens whose document it is, if any; STATE is what its mode
 keeps in it."
-  (%make-buffer document name mode state #f '()))
+  (%make-buffer document name mode state #f '() #f))
 
 (define %buffers '())
 
@@ -127,7 +132,12 @@ input."
 ;; The minor modes' names, sorted, found again once modes change: the
 ;; modes on in a buffer are asked for on every key.
 (define %minor-names #f)
-(define %modes (make-registry 'modes #:changed (lambda (key value) (set! %minor-names #f))))
+;; The six display options are requested together on every snapshot. Registry
+;; changes (including scope teardown) invalidate inherited values; buffer-local
+;; settings clear the buffer's cache, and the cache key includes its mode.
+(define %display-generation 0)
+(define (display-changed! key value) (set! %display-generation (+ 1 %display-generation)))
+(define %modes (make-registry 'modes #:changed (lambda (key value) (set! %minor-names #f) (display-changed! key value))))
 
 (define (find-mode name)
   "Return the mode NAME, or #f if there is none."
@@ -161,10 +171,16 @@ STATE is `chord` (the default) or `normal`."
                                (owned layer) (owned target-at) (owned complete) (owned indent) (owned directory)
                                options files))))
 
+(define %mode-inputs (make-registry 'mode-inputs))
+
+(define (buffer-input b)
+  "Return the direct key handler for buffer B, or #f."
+  (and b (any (lambda (m) (registry-ref %mode-inputs (mode-name m))) (mode-chain (buffer-mode b)))))
+
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
                         #:complete [complete #f] #:indent [indent #f] #:directory [directory #f] #:options [options '()]
-                        #:projections [projections #f])
+                        #:projections [projections #f] #:input [input #f])
   "Define the major mode NAME, documented by DOC, extending PARENT.
 It has PARENT's keys, layers and options, and its own: KEYS and NORMAL
 are (key-description command) bindings for chords and for modal normal
@@ -179,10 +195,13 @@ with its slash, for a buffer of no file (a directory's listing); OPTIONS
 an alist of (option . value) set in the mode, FILES the file name
 suffixes it is for, PROJECTIONS a procedure (document from to) giving
 how the text is laid out (`buffer-projections'). It defines the command
-NAME, which gives the focused buffer this mode."
+NAME, which gives the focused buffer this mode. INPUT is a procedure
+(session key) returning true if it handled the key before the profile."
   (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete indent directory
              options files)
   (projections! name projections)
+  ;; INPUT gets (session key) and returns true if it consumed the key.
+  (registry-add! %mode-inputs name (and input (scope-procedure input)))
   (register-command! name doc (lambda (s n)
                                 (set-buffer-mode! (or (current-buffer s) (error "No buffer")) name)
                                 (message! s (symbol->string name))))
@@ -253,11 +272,11 @@ That is the one with the longest suffix of PATH, else
   (doc option-doc)
   (type option-type))
 
-(define %options (make-registry 'options))
+(define %options (make-registry 'options #:changed display-changed!))
 
 ;; Settings made with set-option!, by (name mode) or (name): the value and
 ;; who made it, each owned by the scope it was made in.
-(define %settings (make-registry 'settings))
+(define %settings (make-registry 'settings #:changed display-changed!))
 
 (define (find-option name)
   "Return the declaration of the option NAME, or #f."
@@ -326,6 +345,18 @@ in it, a mode for its own options)."
             in-modes
             (settings 'global (list name))
             (list (list 'default (and o (option-default o)) 'default)))))
+
+(define (buffer-display-options b)
+  "Return a vector of the resolved display options of buffer B.
+In order: line numbers, end marker, syntax highlighting, word wrapping,
+truncation and pointer reporting. With B false, return global values."
+  (let ((cached (and b (buffer-display-cache b))) (mode (and b (buffer-mode b))))
+    (if (and cached (= %display-generation (vector-ref cached 0)) (eq? mode (vector-ref cached 1)))
+        (vector-copy (vector-ref cached 2))
+        (let ((values (vector (option b 'line-numbers) (option b 'eob-marker) (option b 'syntax-highlight)
+                              (option b 'word-wrap) (option b 'truncate-lines) (option b 'report-pointer))))
+          (when b (set-buffer-display-cache! b (vector %display-generation mode (vector-copy values))))
+          values))))
 
 ;; The value of option NAME in buffer B (#f: what applies to no buffer).
 (define (option b name)
@@ -557,6 +588,14 @@ Relative numbers count from the caret's line, which shows its own."
   "Whether terminal visual lines wrap at spaces rather than within words.
 Oversized words still wrap by grapheme. This changes layout, never source
 text, caret positions or logical rows. Rich prose enables it."
+  #:type 'boolean)
+
+(define-option report-pointer #f
+  "Whether the frontend delivers pointer events in text cells."
+  #:type 'boolean)
+
+(define-option truncate-lines #f
+  "Whether long lines are clipped instead of wrapped."
   #:type 'boolean)
 
 (define-option eob-marker #f

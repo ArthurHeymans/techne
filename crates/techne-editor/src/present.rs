@@ -248,6 +248,12 @@ pub struct Display {
     pub eob_marker: Option<String>,
     /// Prefer whitespace breaks; oversized tokens still wrap by grapheme.
     pub word_wrap: bool,
+    /// Keep prelaid rows on one visual line, clipping any excess.
+    #[serde(default)]
+    pub truncate_lines: bool,
+    /// Deliver pointer events in pane cells instead of editor clicks.
+    #[serde(default)]
+    pub report_pointer: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -360,6 +366,9 @@ pub struct Hang {
 pub struct Block {
     pub at: usize,
     pub image: crate::images::Image,
+    /// Column, width and height in grid cells; an overlay, not a block.
+    #[serde(default)]
+    pub grid: Option<(usize, usize, usize)>,
 }
 
 /// The minibuffer (EDITOR.md, section 10): a prompt, the input being
@@ -425,7 +434,7 @@ pub struct Run {
 pub enum Input {
     /// Frontend geometry in approximate fixed-width text cells. Scheme owns
     /// responsive layout policy; native frontends only report the boundary.
-    Viewport { columns: usize, rows: usize },
+    Viewport { columns: usize, rows: usize, split_gap: usize },
     /// A key in Emacs notation (`"a"`, `"C-x"`, `"M-<"`, `"RET"`, `"<left>"`).
     Key {
         key: String,
@@ -458,6 +467,10 @@ pub enum Input {
     /// What the system clipboard holds, when it may have changed (another
     /// program put text there): it becomes the newest kill.
     Clipboard { text: String },
+    /// A pointer event in a pane's text grid. Code uses xterm button bits.
+    Pointer { view: u64, column: usize, row: usize, code: usize, release: bool },
+    /// The frontend gained or lost focus.
+    Focus { focused: bool },
     /// The frontend is closing: it detaches.
     Close,
 }

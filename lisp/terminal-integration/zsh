@@ -1,0 +1,9 @@
+# Source from ~/.zshrc to report the cwd and semantic prompts to Techne.
+if [[ -o interactive && ${TERM_PROGRAM-} == techne ]]; then
+    autoload -Uz add-zsh-hook
+    __techne_precmd() {
+        local path=${PWD//%/%25}
+        printf '\033]7;file://%s%s\033\\\033]133;A\033\\' "$HOST" "$path"
+    }
+    add-zsh-hook precmd __techne_precmd
+fi

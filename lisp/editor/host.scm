@@ -18,28 +18,48 @@
 (require "buffers.scm")
 (require "windows.scm")
 
-(provide editor-press editor-viewport! editor-click editor-message! session-quit?
+(provide editor-press editor-viewport! editor-pointer! editor-focus-event! editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays pane-projections cursor-shape
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations!)
 
 (define-hook viewport-changed
-  "After frontend geometry changes: (session columns rows).
-Dimensions are text-cell estimates (exact terminal cells). Packages decide
-responsive policy in Scheme, reading viewport-columns and viewport-rows in S.")
-(define (editor-viewport! s columns rows)
-  "Record frontend COLUMNS and ROWS in S and run viewport-changed."
-  (unless (and (equal? (sget s 'viewport-columns) columns) (equal? (sget s 'viewport-rows) rows))
-    (sset! s 'viewport-columns (max 1 columns))
-    (sset! s 'viewport-rows (max 2 rows))
-    (run-hook! s 'viewport-changed columns rows)))
+  "After frontend geometry changes: (session columns rows).")
+(define (editor-viewport! s columns rows . gaps)
+  "Record frontend COLUMNS and ROWS in session S.
+The first element of GAPS is the split gap in cells; it defaults to one."
+  (let ((cols (max 1 columns)) (rows (max 2 rows)) (gap (max 1 (if (null? gaps) 1 (car gaps)))))
+    (unless (and (equal? (sget s (quote viewport-columns)) cols)
+                 (equal? (sget s (quote viewport-rows)) rows)
+                 (equal? (sget s (quote viewport-split-gap)) gap))
+      (sset! s (quote viewport-columns) cols) (sset! s (quote viewport-rows) rows)
+      (sset! s (quote viewport-split-gap) gap) (run-hook! s (quote viewport-changed) cols rows))))
 
 (define (editor-press s key)
   "Handle the key KEY in session S, as the frontend sends it."
-  (press s key))
+  (let ((private (sget s 'private-key)))
+    (if private ((car private) key)
+        (let ((input (and (not (sget s 'transient)) (buffer-input (current-buffer s)))))
+          (unless (and input
+                       (guard (e (#t (failed! s 'buffer-input e) #t)) (input s key)))
+            (press s key))))))
+(define-hook frontend-pointer "A pane grid pointer event: (session view column row code release?).")
+(define-hook frontend-focus "A frontend focus change: (session focused?).")
+
+(define (editor-pointer! s view col row code release)
+  "Deliver a pointer event in VIEW at COL and ROW of session S.
+CODE is an xterm button code, RELEASE true for releases."
+  (unless (or (sget s 'transient) (sget s 'private-key))
+    (run-hook! s 'frontend-pointer view col row code release)))
+
+(define (editor-focus-event! s focused)
+  "Report whether frontend session S is FOCUSED."
+  (run-hook! s 'frontend-focus focused))
+
 (define (editor-click s view pos extend)
   "Handle a click at POS in VIEW, which the frontend resolved, in S.
 With EXTEND, the click extends the selection."
+  (let ((private (sget s 'private-key))) (when private ((cdr private))))
   (focus-view! s view)
   ((profile-click (sget s 'profile)) s pos extend))
 ;; The frontend paged VIEW: its caret goes to POS, extending a region.
@@ -186,13 +206,14 @@ what the mode line segments say of the buffer."
 
 (define (pane-display s view)
   "Return what is drawn beside VIEW's text in session S, and its syntax.
-That is (line-numbers eob-marker language word-wrap), from buffer options:
+That is (line-numbers eob-marker language word-wrap truncate-lines
+report-pointer).
 LANGUAGE the syntax language to colour it by, or #f for none (never
 without `syntax-highlight'; the mode's `syntax-language' first, then
 the file's name)."
-  (let* ((d (view-document view)) (b (document-buffer d)))
-    (list (option b 'line-numbers) (option b 'eob-marker)
-          (and (option b 'syntax-highlight) (buffer-language b)) (option b 'word-wrap))))
+  (let* ((b (document-buffer (view-document view))) (opts (buffer-display-options b)))
+    (list (vector-ref opts 0) (vector-ref opts 1) (and (vector-ref opts 2) (buffer-language b))
+          (vector-ref opts 3) (vector-ref opts 4) (and (vector-ref opts 5) (not (sget s 'transient)) (not (sget s 'private-key))))))
 
 (define (echo-line s)
   "Return the echo area of session S.

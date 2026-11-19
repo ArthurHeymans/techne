@@ -10,6 +10,8 @@ editor itself, under C-h, what each command, procedure and option does.
 [Native mail](doc/mail.org) reads IMAP or Maildir, caches/searches with SQLite,
 and presents messages with the markdown preview's rich reader; `M-x mail`
 opens its dashboard of groups, accounts and folders.
+[Terminal buffers](doc/terminal.md) run an interactive shell or a full-screen
+program in either frontend; open one with `M-x terminal`.
 
 [Editor packages](doc/packages.md) can be installed from Git and activated on first use.
 

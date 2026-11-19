@@ -222,6 +222,9 @@ pub enum Request {
         proc: u64,
         signal: String,
     },
+    PasswordMode {
+        proc: u64,
+    },
     Resize {
         proc: u64,
         rows: u16,
@@ -285,7 +288,7 @@ pub struct Message<T> {
 }
 
 /// The version of the framed node protocol (not nREPL).
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The first frame in each direction, before any request or response.
 #[derive(Serialize, Deserialize, Debug)]

@@ -217,10 +217,12 @@ struct App {
     renderer: Option<Renderer>,
     layout: Layout,
     screen: Screen,
+    reported_viewport: Option<(usize, usize, usize)>,
     /// Mode lines and the echo area, shaped, by their text.
     labels: HashMap<String, Buffer>,
     mods: ModifiersState,
     mouse: (f32, f32),
+    mouse_button: Option<usize>,
     /// The window is closing: the runtime ending is no crash.
     quitting: bool,
     /// It closes because the runtime failed, or the editor refused it.
@@ -235,7 +237,6 @@ struct App {
     capture_worker: capture::Worker,
     capture_in_flight: bool,
     capture_epoch: u64,
-    reported_viewport: Option<(usize, usize)>,
 }
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
@@ -291,20 +292,35 @@ impl App {
     /// The window's size, and the screen's: text wraps inside the padding.
     fn size(&mut self) -> (f32, f32) {
         let (w, h) = self.renderer.as_ref().map_or((800.0, 600.0), |r| r.size());
-        self.screen.set_size(w - 2.0 * self.pad(), h);
-        let cells = (
-            ((w - 2.0 * self.pad()) / self.layout.char_width().max(1.0)).max(1.0) as usize,
-            (h / self.layout.line_height().max(1.0)).max(2.0) as usize,
-        );
-        if self.reported_viewport != Some(cells) {
-            self.reported_viewport = Some(cells);
-            self.send(Input::Viewport { columns: cells.0, rows: cells.1 });
+        let width = w - 2.0 * self.pad();
+        self.screen.set_size(width, h);
+        let cw = self.layout.char_width().max(1.0);
+        let lh = self.layout.line_height().max(1.0);
+        // Allow a cell of rounding at split boundaries in addition to
+        // the window's full line-height divider (not a one-cell divider).
+        let viewport = ((width / cw).max(1.0) as usize, (h / lh).max(2.0) as usize, (Screen::gap(&self.layout) / cw).ceil() as usize + 1);
+        if self.reported_viewport != Some(viewport) {
+            self.reported_viewport = Some(viewport);
+            self.send(Input::Viewport { columns: viewport.0, rows: viewport.1, split_gap: viewport.2 });
         }
         (w, h)
     }
 
     fn send(&mut self, input: Input) {
         self.host.send(input);
+    }
+
+    fn report_pointer(&mut self, code: usize, release: bool) -> bool {
+        // Shift retains editor selection, even in a TUI with mouse reporting.
+        if self.mods.shift_key() {
+            return false;
+        }
+        let mods = 8 * usize::from(self.mods.alt_key()) + 16 * usize::from(self.mods.control_key());
+        let Some(input) = self.screen.pointer(&self.layout, self.mouse.0 - self.pad(), self.mouse.1, code + mods, release) else {
+            return false;
+        };
+        self.send(input);
+        true
     }
 
     fn redraw(&self) {
@@ -348,6 +364,7 @@ impl App {
                 }
                 Event::Ended if self.quitting => {}
                 Event::Ended if self.host.restart() => {
+                    self.reported_viewport = None;
                     self.captures.clear();
                     self.capture_epoch += 1;
                     eprintln!("techne: the runtime stopped; a new one has the unsaved edits");
@@ -603,6 +620,24 @@ impl App {
                 let caret = snap.style(if focused && snap.minibuffer.is_none() { snap.chrome.cursor } else { snap.chrome.cursor_inactive });
                 let color = caret.bg.or(caret.fg).map(rgb).unwrap_or(pane_fg);
                 rects.extend(place(Rect { w, ..c }).map(|r| (r, color)));
+            }
+            for b in &pane.blocks {
+                if let Some((column, cols, rows)) = b.grid {
+                    let cw = self.layout.char_width();
+                    let line = pane.text.byte_to_line(b.at);
+                    if let Some(first) = shown.placed.first() {
+                        let first_line = pane.text.byte_to_line(first.seg.start);
+                        let at = Rect {
+                            x: left + column as f32 * cw,
+                            y: area.top + first.top + (line as f32 - first_line as f32) * lh,
+                            w: cols as f32 * cw,
+                            h: rows as f32 * lh,
+                        };
+                        if let Some(shown) = at.intersect(clip) {
+                            images.push((at, shown, b.image.clone()));
+                        }
+                    }
+                }
             }
             for p in &shown.placed {
                 // Its blocks, above its text.
@@ -947,9 +982,14 @@ impl ApplicationHandler<Wake> for App {
                 self.redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::Focused(true) => {
-                if let Some(text) = self.clipboard.as_ref().and_then(|c| c.load().ok()) {
+            WindowEvent::Focused(focused) => {
+                self.send(Input::Focus { focused });
+                if focused && let Some(text) = self.clipboard.as_ref().and_then(|c| c.load().ok()) {
                     self.send(Input::Clipboard { text });
+                }
+                if !focused {
+                    self.mouse_button = None;
+                    self.screen.release();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && self.bench.is_none() => {
@@ -959,12 +999,28 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x as f32, position.y as f32);
-                if let Some(i) = self.screen.drag(&self.layout, self.mouse.0 - self.pad(), self.mouse.1) {
+                if !self.report_pointer(32 + self.mouse_button.unwrap_or(3), false)
+                    && let Some(i) = self.screen.drag(&self.layout, self.mouse.0 - self.pad(), self.mouse.1)
+                {
                     self.send(i);
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                if state == ElementState::Pressed {
+            WindowEvent::MouseInput { state, button, .. } => {
+                let code = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Middle => 1,
+                    MouseButton::Right => 2,
+                    _ => return,
+                };
+                let pressed = state == ElementState::Pressed;
+                self.mouse_button = pressed.then_some(code);
+                if self.report_pointer(code, !pressed) || code != 0 {
+                    if !pressed {
+                        self.screen.release();
+                    }
+                    return;
+                }
+                if pressed {
                     let (x, y) = (self.mouse.0 - self.pad(), self.mouse.1);
                     if let Some(i) = self.screen.press(&self.layout, x, y, self.mods.shift_key()) {
                         self.send(i);
@@ -978,6 +1034,9 @@ impl ApplicationHandler<Wake> for App {
                     MouseScrollDelta::LineDelta(_, y) => (-y * 3.0).round() as i64,
                     MouseScrollDelta::PixelDelta(p) => (-p.y as f32 / self.layout.line_height()).round() as i64,
                 };
+                if lines != 0 && self.report_pointer(if lines < 0 { 64 } else { 65 }, false) {
+                    return;
+                }
                 if let Some(i) = (lines != 0)
                     .then(|| {
                         let x = self.mouse.0 - self.pad();
@@ -1130,9 +1189,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
         renderer: None,
         layout: Layout::new(15.0, "monospace"),
         screen: Screen::default(),
+        reported_viewport: None,
         labels: HashMap::new(),
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
+        mouse_button: None,
         quitting: false,
         failed: false,
         unanswered: Vec::new(),
@@ -1143,7 +1204,6 @@ pub fn main(args: Vec<String>) -> ExitCode {
         capture_worker,
         capture_in_flight: false,
         capture_epoch: 0,
-        reported_viewport: None,
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, failed, .. } = app;

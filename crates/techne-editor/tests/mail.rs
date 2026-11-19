@@ -256,7 +256,7 @@ fn maildir_sync_skips_oversized_sources_and_loads_binary_mime_on_demand() {
         (set-option! 'mail-credential-provider (lambda (a p) (error \"MUST-NOT-LOOK-UP-SECRETS\")))"
     ))
     .unwrap();
-    rt.handle(Input::Viewport { columns: 160, rows: 50 });
+    rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
     command(&mut rt, "mail");
     command(&mut rt, "mail-sync");
     // Too large is left out on purpose, and said so: not a failure.
@@ -376,7 +376,7 @@ fn autosave_drains_an_edit_arriving_during_a_delayed_sqlite_write() {
 fn reader_navigation_tracks_the_unfocused_summary_without_moving_focus() {
     for position in ["bottom", "side"] {
         let (dir, mut rt) = editor();
-        rt.handle(Input::Viewport { columns: 160, rows: 50 });
+        rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
         rt.eval(&format!(
             "(require {:?}) (mail-test-seed-navigation! {:?} 100)
              (set-option! 'mail-reader-position '{position})",
@@ -421,7 +421,7 @@ fn reader_navigation_tracks_the_unfocused_summary_without_moving_focus() {
 #[test]
 fn compact_reader_details_disclose_identity_and_recipients_without_source() {
     let (dir, mut rt) = editor();
-    rt.handle(Input::Viewport { columns: 80, rows: 30 });
+    rt.handle(Input::Viewport { columns: 80, rows: 30, split_gap: 1 });
     samples(&mut rt, dir.path());
     key(&mut rt, "RET");
     assert!(pane(&mut rt, 0).contains("▸ to Arthur <arthur@example.org>"));
@@ -545,7 +545,7 @@ fn catching_up_reads_all_of_a_group_and_one_undo_takes_it_back() {
 #[test]
 fn q_in_the_reader_closes_it_and_ret_opens_it_again() {
     let (dir, mut rt) = editor();
-    rt.handle(Input::Viewport { columns: 160, rows: 50 });
+    rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
     samples(&mut rt, dir.path());
     key(&mut rt, "RET");
     assert_eq!(rt.snapshot().panes.len(), 2);
@@ -567,7 +567,7 @@ fn q_in_the_reader_closes_it_and_ret_opens_it_again() {
     assert_eq!(rt.snapshot().panes.len(), 2, "the list stays open beside the message");
     assert!(pane(&mut rt, 0).contains("Inbox · 7 messages"));
     // In one pane, as a short frame has, q is back to the list.
-    rt.handle(Input::Viewport { columns: 80, rows: 30 });
+    rt.handle(Input::Viewport { columns: 80, rows: 30, split_gap: 1 });
     key(&mut rt, "q");
     assert!(pane(&mut rt, 0).contains("Inbox · 7 messages"));
 }
@@ -727,7 +727,7 @@ fn marks_are_shown_on_rows_then_done_and_undone_together() {
 #[test]
 fn narrow_viewport_has_one_pane_and_working_read_back_and_paging() {
     let (dir, mut rt) = editor();
-    rt.handle(Input::Viewport { columns: 80, rows: 30 });
+    rt.handle(Input::Viewport { columns: 80, rows: 30, split_gap: 1 });
     samples(&mut rt, dir.path());
     assert_eq!(rt.snapshot().panes.len(), 1);
     key(&mut rt, "RET");
@@ -1001,7 +1001,7 @@ fn search_empty_state_and_reset_work_with_keys() {
 #[test]
 fn bottom_reader_is_default_and_live_position_changes_restore_title_space() {
     let (dir, mut rt) = editor();
-    rt.handle(Input::Viewport { columns: 160, rows: 50 });
+    rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
     samples(&mut rt, dir.path());
     key(&mut rt, "RET");
     key(&mut rt, "b");
@@ -1055,22 +1055,22 @@ fn reader_position_changes_preserve_focus_point_scroll_and_maximized_view() {
 #[test]
 fn bottom_and_side_responsiveness_use_height_and_width_respectively() {
     let (dir, mut rt) = editor();
-    rt.handle(Input::Viewport { columns: 80, rows: 50 });
+    rt.handle(Input::Viewport { columns: 80, rows: 50, split_gap: 1 });
     samples(&mut rt, dir.path());
     key(&mut rt, "RET");
     key(&mut rt, "b");
     assert_eq!(rt.snapshot().panes.len(), 2, "a tall narrow viewport can stack panes");
-    rt.handle(Input::Viewport { columns: 80, rows: 30 });
+    rt.handle(Input::Viewport { columns: 80, rows: 30, split_gap: 1 });
     assert_eq!(rt.snapshot().panes.len(), 1);
-    rt.handle(Input::Viewport { columns: 80, rows: 50 });
+    rt.handle(Input::Viewport { columns: 80, rows: 50, split_gap: 1 });
     assert_eq!(rt.snapshot().panes.len(), 2, "automatically collapsed panes restore when they fit");
     command(&mut rt, "mail-toggle-reader-position");
     assert_eq!(rt.snapshot().panes.len(), 1, "side layout must not cram two panes into 80 columns");
-    rt.handle(Input::Viewport { columns: 160, rows: 50 });
+    rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
     assert_eq!(rt.snapshot().panes.len(), 2);
     key(&mut rt, "f");
-    rt.handle(Input::Viewport { columns: 120, rows: 50 });
-    rt.handle(Input::Viewport { columns: 170, rows: 50 });
+    rt.handle(Input::Viewport { columns: 120, rows: 50, split_gap: 1 });
+    rt.handle(Input::Viewport { columns: 170, rows: 50, split_gap: 1 });
     assert_eq!(rt.snapshot().panes.len(), 1, "manual maximization survives resizing");
     key(&mut rt, "f");
     assert_eq!(rt.snapshot().panes.len(), 2);
@@ -1185,7 +1185,7 @@ fn quit_restores_previous_panes_and_reader_is_read_only() {
 #[test]
 fn the_dashboard_lists_every_account_and_its_folders_and_opens_them_as_lists() {
     let (dir, mut rt) = editor();
-    rt.handle(Input::Viewport { columns: 120, rows: 50 });
+    rt.handle(Input::Viewport { columns: 120, rows: 50, split_gap: 1 });
     let database = dir.path().join("mail.sqlite").display().to_string();
     rt.eval(&format!(
         "(import (techne mail store)) (set-option! 'mail-database {database:?})
@@ -1243,7 +1243,7 @@ fn the_dashboard_lists_every_account_and_its_folders_and_opens_them_as_lists() {
 #[test]
 fn composing_is_from_the_account_shown_and_completes_whom_you_write_to() {
     let (dir, mut rt) = editor();
-    rt.handle(Input::Viewport { columns: 160, rows: 50 });
+    rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
     let database = dir.path().join("mail.sqlite").display().to_string();
     rt.eval(&format!(
         "(import (techne mail store)) (set-option! 'mail-database {database:?})
@@ -1584,7 +1584,7 @@ fn a_sync_reads_every_accounts_inbox_before_the_other_folders() {
 #[test]
 fn a_group_chosen_from_outside_mail_opens_as_from_the_dashboard() {
     let (dir, mut rt) = editor();
-    rt.handle(Input::Viewport { columns: 160, rows: 50 });
+    rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
     rt.eval(&format!(
         "(require {:?}) (mail-test-seed-samples! {:?})",
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-sample-fixture.scm"),

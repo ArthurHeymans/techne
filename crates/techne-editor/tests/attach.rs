@@ -84,6 +84,15 @@ fn eval(socket: &Path, source: &str, detached: bool) -> Result<String, String> {
     server::eval(socket, &request).map_err(|e| format!("{e:?}"))?.result
 }
 
+#[test]
+fn a_version_two_frontend_is_refused_before_exchanging_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("socket");
+    let (_local, _listener) = editor(&socket);
+    let why = server::request(&socket, &Request::Attach { profile: "emacs".into(), file: None, version: 2 }).unwrap_err();
+    assert!(why.contains("attachment protocol, the frontend 2: run the same techne"), "{why}");
+}
+
 /// Typing in either is shown in both, each in a view of its own: the text
 /// sent as what changed, characters of several bytes whole.
 #[test]

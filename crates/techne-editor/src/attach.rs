@@ -59,7 +59,7 @@ use crate::{
 
 /// The version of the protocol below: an editor refuses a frontend that
 /// speaks another, as a techne of another build on another machine may.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Largest frame of an attachment: an image's pixels and a captured frame
 /// cross it whole. The peer runs as the same user, as the socket's

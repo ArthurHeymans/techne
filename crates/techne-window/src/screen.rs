@@ -54,6 +54,7 @@ fn shape_runs(s: &Snapshot, p: &Pane) -> (Shape, Vec<ShapeRun>) {
 /// counting (scrolling, the caret) and drawing shape it alike.
 fn prepare(layout: &mut Layout, s: &Snapshot, p: &Pane, area: Area) {
     layout.set_width(area.text_width());
+    layout.set_truncate_lines(p.display.truncate_lines);
     layout.set_inlays(&p.inlays, |id| inlay_shape(Some(s), id));
     let (base, runs) = shape_runs(s, p);
     layout.set_shape(base, runs);
@@ -301,6 +302,22 @@ impl Screen {
                 Shown { view: p.view, revision: p.revision, area, placed: layout.frame(&p.text, anchor, area.text) }
             })
             .collect();
+    }
+
+    /// A pointer report for the terminal pane under the pointer.
+    pub fn pointer(&self, layout: &Layout, x: f32, y: f32, code: usize, release: bool) -> Option<Input> {
+        let snapshot = self.snap.as_ref()?;
+        let shown = self.shown.iter().find(|s| {
+            let a = s.area;
+            a.top <= y && y < a.top + a.text && a.text_left() <= x && x < a.left + a.width
+        })?;
+        let pane = snapshot.panes.iter().find(|p| p.view == shown.view)?;
+        if !pane.display.report_pointer {
+            return None;
+        }
+        let column = ((x - shown.area.text_left()) / layout.char_width().max(1.0)) as usize;
+        let row = ((y - shown.area.top) / layout.line_height().max(1.0)) as usize;
+        Some(Input::Pointer { view: shown.view, column, row, code, release })
     }
 
     /// A press of the button at (x, y): a click in the pane there.

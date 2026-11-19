@@ -17,7 +17,7 @@
                   (load-package boot path)
                   (check "bootstrap reload leaves runtime cold" #f (find-package runtime))
                   (check-true "entry remains advertised" (command-doc boot))))
-              '((mail mail-runtime) (ibuffer ibuffer-runtime)))
+              '((mail mail-runtime) (ibuffer ibuffer-runtime) (compile compile-runtime)))
     (run-command (current-session) 'ibuffer 1)
     (let ((runtime (find-package 'ibuffer-runtime)) (override (make-scope 'reload-override)))
       (check-true "buffer list activated" runtime)

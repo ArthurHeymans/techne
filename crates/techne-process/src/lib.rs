@@ -267,6 +267,8 @@ pub trait ProcessBackend {
     fn signal(&self, signal: String) -> LocalFuture<()>;
     /// Set a pty's size.
     fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()>;
+    /// Whether the PTY uses canonical input with echo off.
+    fn password_mode(&self) -> LocalFuture<bool>;
     /// Output bytes dropped unread (persistent processes on a node).
     fn dropped(&self) -> LocalFuture<i64>;
     fn wait(&self) -> LocalFuture<Exit>;
@@ -358,6 +360,10 @@ impl ProcessBackend for Arc<Process> {
         let result = Process::resize(self, rows, cols);
         Box::pin(async move { result })
     }
+    fn password_mode(&self) -> LocalFuture<bool> {
+        let result = Process::password_mode(self);
+        Box::pin(async move { Ok(result) })
+    }
     fn dropped(&self) -> LocalFuture<i64> {
         let dropped = Process::dropped(self) as i64;
         Box::pin(async move { Ok(dropped) })
@@ -399,10 +405,27 @@ fn incomplete_tail(data: &[u8]) -> usize {
 /// Read `reader` into `tx` until EOF, waiting whenever the queue is full. A
 /// failed read ends the stream with its error, except EIO on a pty (`pty`),
 /// which is how a pty's output ends once its child has gone.
-async fn pump(mut reader: impl AsyncRead + Unpin, tx: mpsc::Sender<Item>, pty: bool) {
+async fn pump(mut reader: impl AsyncRead + Unpin, tx: mpsc::Sender<Item>, exit: Option<watch::Receiver<Option<ExitStatus>>>) {
+    let pty = exit.is_some();
     let mut buf = vec![0u8; CHUNK_BYTES];
+    // Descendants can hold the slave open after the PTY leader exits.
+    // Finish a blocked read after a grace period; do not discard queued data.
+    let ended = async move {
+        if let Some(mut exit) = exit {
+            let _ = exit.wait_for(Option::is_some).await;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(ended);
     loop {
-        let item = match reader.read(&mut buf).await {
+        let result = tokio::select! {
+            biased;
+            result = reader.read(&mut buf) => result,
+            _ = &mut ended => return,
+        };
+        let item = match result {
             Ok(0) => return,
             Ok(n) => Ok(buf[..n].to_vec()),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -565,7 +588,7 @@ impl Process {
                 .map_err(|e| e.into_parts().1)?;
             let (stderr, terminal) = if let Some((terminal, handle)) = terminal {
                 let (read, write) = terminal.into_split();
-                rt.spawn(pump(read, out_tx, true));
+                rt.spawn(pump(read, out_tx, Some(status.clone())));
                 rt.spawn(feed(write, stdin_rx, Some(status.clone())));
                 (None, Some(handle))
             } else {
@@ -573,10 +596,10 @@ impl Process {
                 // no input.
                 let (err_tx, stderr) = output(retain);
                 if let Some(read) = child.stdout.take() {
-                    rt.spawn(pump(tokio::process::ChildStdout::from_std(read)?, out_tx, false));
+                    rt.spawn(pump(tokio::process::ChildStdout::from_std(read)?, out_tx, None));
                 }
                 if let Some(err) = child.stderr.take() {
-                    rt.spawn(pump(tokio::process::ChildStderr::from_std(err)?, err_tx, false));
+                    rt.spawn(pump(tokio::process::ChildStderr::from_std(err)?, err_tx, None));
                 }
                 if let Some(write) = child.stdin.take() {
                     rt.spawn(feed(tokio::process::ChildStdin::from_std(write)?, stdin_rx, None));
@@ -669,6 +692,17 @@ impl Process {
         rustix::termios::tcsetwinsize(terminal, size).map_err(|e| format!("process-resize: {e}"))
     }
 
+    /// Whether the PTY is canonical with echo disabled (not a raw-mode TUI).
+    pub fn password_mode(&self) -> bool {
+        use rustix::termios::{LocalModes, tcgetattr};
+        !self.exited()
+            && self
+                .terminal
+                .as_ref()
+                .and_then(|t| tcgetattr(t).ok())
+                .is_some_and(|attrs| attrs.local_modes.contains(LocalModes::ICANON) && !attrs.local_modes.contains(LocalModes::ECHO))
+    }
+
     /// How it ended, once it has.
     pub fn exit(&self) -> Option<Exit> {
         self.status.borrow().map(Exit::from)
@@ -683,7 +717,11 @@ impl Process {
     pub fn kill(&self) {
         let mut group = self.group.lock().unwrap();
         if let Some(release) = group.take() {
-            let _ = kill_process_group(Pid::from_raw(self.pid as i32).expect("child pid"), Signal::KILL);
+            let leader = Pid::from_raw(self.pid as i32).expect("child pid");
+            let _ = kill_process_group(leader, Signal::KILL);
+            if self.pty {
+                kill_pty_jobs(leader);
+            }
             let _ = release.send(());
         }
     }
@@ -695,7 +733,7 @@ impl Process {
     /// and only a process of this session could join the group.
     pub fn finished(&self) -> bool {
         let mut group = self.group.lock().unwrap();
-        if group.is_some() && self.exited() && !group_runs(self.pid) {
+        if group.is_some() && self.exited() && !group_runs(self.pid, self.pty) {
             let _ = group.take().map(|release| release.send(()));
         }
         group.is_none()
@@ -709,18 +747,44 @@ impl Process {
     }
 }
 
-/// Whether something runs in process group `group`, by `/proc`: a
+// Keep the PTY leader unreaped so its session ID cannot be recycled.
+// Send via pidfd so an exiting job's PID cannot be reused under us.
+fn kill_pty_jobs(leader: Pid) {
+    use rustix::process::{PidfdFlags, pidfd_open, pidfd_send_signal};
+    let Ok(entries) = std::fs::read_dir("/proc") else { return };
+    let session_id = leader.as_raw_nonzero().to_string();
+    for entry in entries.flatten() {
+        let Ok(raw) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
+        if raw <= 0 {
+            continue;
+        }
+        let pid = Pid::from_raw(raw).expect("positive pid");
+        let path = entry.path();
+        let belongs = || matches!(stat(&path), Known { session, .. } if session == session_id.as_bytes());
+        if pid != leader
+            && belongs()
+            && let Ok(fd) = pidfd_open(pid, PidfdFlags::empty())
+            && belongs()
+        {
+            let _ = pidfd_send_signal(&fd, Signal::KILL);
+        }
+    }
+}
+
+/// Whether something runs in process group `group` (or its PTY session), by `/proc`: a
 /// process in it with a thread that is not a zombie (its main thread may
 /// have ended before the others). What cannot be read, but did not go,
 /// counts as running: releasing a group too soon would leave it unowned.
-fn group_runs(group: u32) -> bool {
+fn group_runs(group: u32, pty: bool) -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else { return true };
     let group = group.to_string();
     entries.filter_map(Result::ok).filter(|e| e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))).any(|e| {
         match stat(&e.path()) {
             Gone => false,
             Unknown => true,
-            Known { state, pgrp } => pgrp == group.as_bytes() && (!matches!(state, b'Z' | b'X') || threads_run(&e.path())),
+            Known { state, pgrp, session } => {
+                (if pty { session } else { pgrp }) == group.as_bytes() && (!matches!(state, b'Z' | b'X') || threads_run(&e.path()))
+            }
         }
     })
 }
@@ -729,7 +793,7 @@ fn group_runs(group: u32) -> bool {
 enum Stat {
     Gone,
     Unknown,
-    Known { state: u8, pgrp: Vec<u8> },
+    Known { state: u8, pgrp: Vec<u8>, session: Vec<u8> },
 }
 use Stat::{Gone, Known, Unknown};
 
@@ -744,8 +808,8 @@ fn stat(dir: &std::path::Path) -> Stat {
         Ok(bytes) => {
             let rest = bytes.iter().rposition(|&b| b == b')').map_or(&[][..], |i| &bytes[i + 1..]);
             let mut fields = rest.split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty());
-            match (fields.next(), fields.nth(1)) {
-                (Some(&[state]), Some(pgrp)) => Known { state, pgrp: pgrp.to_vec() },
+            match (fields.next(), fields.nth(1), fields.next()) {
+                (Some(&[state]), Some(pgrp), Some(session)) => Known { state, pgrp: pgrp.to_vec(), session: session.to_vec() },
                 _ => Unknown,
             }
         }
@@ -942,6 +1006,11 @@ fn natives(vm: &mut Vm) {
         Ok(p.backend.resize(size(rows)?, size(cols)?))
     });
     process_op(vm, "process-wait", 1, |_, p, _| Ok(p.backend.wait()));
+    process_op(vm, "process-password-mode?", 1, |_, p, _| Ok(p.backend.password_mode()));
+    techne_vm::document! { vm;
+        /// Whether PROCESS's PTY is canonical and has echo disabled.
+        "(process-password-mode? process)";
+    }
     process_op(vm, "process-dropped", 1, |_, p, _| Ok(p.backend.dropped()));
     process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.backend.exited()));
     techne_vm::document! { vm;

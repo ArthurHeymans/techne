@@ -455,13 +455,21 @@ pub(crate) fn weight(input: &Input) -> usize {
                 keys.capacity() * std::mem::size_of::<String>() + keys.iter().map(String::capacity).sum::<usize>()
             }
             Input::Unrecognized { input: text } | Input::Clipboard { text } => text.capacity(),
-            Input::Viewport { .. } | Input::Click { .. } | Input::Scroll { .. } | Input::Edge { .. } | Input::Close => 0,
+            Input::Click { .. }
+            | Input::Scroll { .. }
+            | Input::Edge { .. }
+            | Input::Viewport { .. }
+            | Input::Pointer { .. }
+            | Input::Focus { .. }
+            | Input::Close => 0,
         }
 }
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 42] = [
+const PROCS: [&str; 44] = [
+    "editor-pointer!",
+    "editor-focus-event!",
     "editor-cancel-capture!",
     "editor-cancel-captures!",
     "editor-record!",
@@ -737,12 +745,24 @@ impl Runtime {
                 Some(_) => self.message(if end { "End of buffer" } else { "Beginning of buffer" }),
                 None => Ok(()),
             },
-            Input::Viewport { columns, rows } => {
-                self.call("editor-viewport!", &[Arg::Session, Arg::Int(columns), Arg::Int(rows)]).map(drop)
-            }
             Input::Unsendable { keys } => self.call("editor-unsendable!", &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
             Input::Clipboard { text } => self.call("editor-clipboard!", &[Arg::Session, Arg::Str(text)]).map(drop),
+            Input::Viewport { columns, rows, split_gap } => {
+                self.call("editor-viewport!", &[Arg::Session, Arg::Int(columns), Arg::Int(rows), Arg::Int(split_gap)]).map(drop)
+            }
+            Input::Pointer { view, column, row, code, release } => {
+                if let Some(v) = views.get(&view).cloned() {
+                    self.call(
+                        "editor-pointer!",
+                        &[Arg::Session, Arg::View(v), Arg::Int(column), Arg::Int(row), Arg::Int(code), Arg::Bool(release)],
+                    )
+                    .map(drop)
+                } else {
+                    Ok(())
+                }
+            }
+            Input::Focus { focused } => self.call("editor-focus-event!", &[Arg::Session, Arg::Bool(focused)]).map(drop),
             Input::Close => Ok(()),
         }
     }
@@ -1388,7 +1408,7 @@ impl Runtime {
                         hangs.push(Hang { line: *line, at: *at });
                     }
                 }
-                Projection::Block(at, image) if boundary(*at) => blocks.push(Block { at: *at, image: image.clone() }),
+                Projection::Block(at, image, grid) if boundary(*at) => blocks.push(Block { at: *at, image: image.clone(), grid: *grid }),
                 _ => {}
             }
         }
@@ -1667,7 +1687,7 @@ fn inlays(v: Val<'_>) -> Result<Vec<(usize, String, Rc<str>)>, Error> {
 /// How Lisp lays out text (`buffer-projections`).
 enum Projection {
     Hang(usize, usize),
-    Block(usize, crate::images::Image),
+    Block(usize, crate::images::Image, Option<(usize, usize, usize)>),
 }
 
 /// Projections from Lisp: each (hang line at) or (block at image).
@@ -1680,9 +1700,15 @@ fn projections(v: Val<'_>) -> Result<Vec<Projection>, Error> {
                 (Some("hang"), [line, at]) => Ok(Projection::Hang(usize::from_arg(*line)?, usize::from_arg(*at)?)),
                 (Some("block"), [at, image]) => {
                     let image = image.foreign::<crate::images::Image>().ok_or_else(|| image.type_error("image"))?;
-                    Ok(Projection::Block(usize::from_arg(*at)?, (*image).clone()))
+                    Ok(Projection::Block(usize::from_arg(*at)?, (*image).clone(), None))
                 }
-                _ => Err(Error::new("a projection is (hang line at) or (block at image)")),
+                (Some("grid-image"), [at, column, cols, rows, image]) => {
+                    let image = image.foreign::<crate::images::Image>().ok_or_else(|| image.type_error("image"))?;
+                    let grid =
+                        (usize::from_arg(*column)?.min(512), usize::from_arg(*cols)?.clamp(1, 512), usize::from_arg(*rows)?.clamp(1, 256));
+                    Ok(Projection::Block(usize::from_arg(*at)?, (*image).clone(), Some(grid)))
+                }
+                _ => Err(Error::new("a projection is (hang line at), (block at image), or (grid-image at column cols rows image)")),
             }
         })
         .collect()
@@ -1769,20 +1795,31 @@ fn face_table(v: Val<'_>) -> Result<Vec<(String, Style)>, Error> {
 }
 
 /// A pane's display options and syntax language from Lisp:
-/// `(line-numbers eob-marker language)`, the first #f, `absolute` or
-/// `relative`, the second a string or #f, the third a symbol or #f.
+/// `(line-numbers eob-marker language truncate-lines)`.
 /// The language is the runtime's, not a frontend's: `Display` (in the
 /// snapshot) does not carry it.
 fn display(v: Val<'_>) -> Result<(Display, Option<String>), Error> {
-    let [numbers, marker, language, word_wrap] = list(v)?[..] else {
-        return Err(Error::new("a display is (line-numbers eob-marker language word-wrap)"));
+    let fields = list(v)?;
+    let (numbers, marker, language, options) = match fields.as_slice() {
+        [numbers, marker, language, options @ ..] if options.len() <= 3 => (*numbers, *marker, *language, options),
+        _ => return Err(Error::new("expected (line-numbers eob-marker language [word-wrap [truncate-lines [report-pointer]]])")),
     };
     let line_numbers = match name(numbers).as_deref() {
         Some("absolute") => LineNumbers::Absolute,
         Some("relative") => LineNumbers::Relative,
         _ => LineNumbers::Off,
     };
-    Ok((Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)?, word_wrap: !word_wrap.is_false() }, name(language)))
+    let flag = |i: usize| options.get(i).is_some_and(|v| !v.is_false());
+    Ok((
+        Display {
+            line_numbers,
+            eob_marker: Option::<String>::from_arg(marker)?,
+            word_wrap: flag(0),
+            truncate_lines: flag(1),
+            report_pointer: flag(2),
+        },
+        name(language),
+    ))
 }
 
 /// A view request from Lisp: `(page screens context)`, `(recenter where)`,

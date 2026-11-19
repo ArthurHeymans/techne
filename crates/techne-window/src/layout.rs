@@ -252,6 +252,7 @@ pub struct Layout {
     metrics: Metrics,
     family: String,
     width: f32,
+    truncate_lines: bool,
     /// The advance of a character of the text's font (for which-key's
     /// columns, laid out in characters).
     char_width: f32,
@@ -279,6 +280,7 @@ impl Layout {
             metrics: metrics(font_size, 100),
             family: family.to_string(),
             width: 0.0,
+            truncate_lines: false,
             char_width: 0.0,
             cache: HashMap::new(),
             frame: 0,
@@ -307,6 +309,11 @@ impl Layout {
     /// The width text wraps at, from now on (each pane sets its own).
     pub fn set_width(&mut self, width: f32) {
         self.width = width;
+    }
+
+    /// Keep one visual row per line of text, clipping at the pane edge.
+    pub fn set_truncate_lines(&mut self, truncate: bool) {
+        self.truncate_lines = truncate;
     }
 
     /// The inlays shaped in the text, from now on (each pane sets its
@@ -356,7 +363,8 @@ impl Layout {
     /// had all along). Paint attributes are no part of it: a colour never
     /// reshapes.
     fn key(&self, text: &str, base: &Shape, runs: &[RunSpan]) -> String {
-        let mut key = format!("{}\u{0}{text}", self.width.round() as u32);
+        let width = if self.truncate_lines { "clip".into() } else { (self.width.round() as u32).to_string() };
+        let mut key = format!("{width}\u{0}{text}");
         if *base != Shape::default() || !runs.is_empty() {
             key.push_str(&format!("\u{0}{base:?}"));
             for (from, to, s) in runs {
@@ -386,8 +394,13 @@ impl Layout {
     /// Shape `text` once, in stretches of one shape.
     fn build_buffer(&mut self, text: &str, base: &Shape, runs: &[RunSpan]) -> Buffer {
         let mut buffer = Buffer::new(&mut self.fonts, metrics(self.metrics.font_size, base.height));
-        buffer.set_wrap(Wrap::WordOrGlyph);
-        buffer.set_size(Some(self.width.max(1.0)), None);
+        if self.truncate_lines {
+            buffer.set_wrap(Wrap::None);
+            buffer.set_size(None, None);
+        } else {
+            buffer.set_wrap(Wrap::WordOrGlyph);
+            buffer.set_size(Some(self.width.max(1.0)), None);
+        }
         // The text in stretches of one shape, the runs' boundaries on
         // character boundaries.
         let floor = |i: usize| (0..=i.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
@@ -568,6 +581,7 @@ impl Layout {
         self.blocks[first..]
             .iter()
             .take_while(|b| b.at <= end)
+            .filter(|b| b.grid.is_none())
             .map(|b| {
                 let (w, h) = b.image.size();
                 let scale = (self.width / w as f32).min(self.block_height / h as f32).min(1.0);
@@ -952,6 +966,20 @@ mod tests {
         assert_eq!(l.scroll_lines(&t, 0, 1), starts[1]);
     }
 
+    #[test]
+    fn prelaid_grid_rows_do_not_gain_visual_rows_in_the_window() {
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(160.0);
+        let t = Rope::from_str(&format!("{}\nnext row\n", "📁 file ".repeat(8)));
+        assert!(l.frame(&t, 0, 1000.0)[0].lines.len() > 1);
+        l.set_truncate_lines(true);
+        let placed = l.frame(&t, 0, 1000.0);
+        assert_eq!(placed[0].lines.len(), 1);
+        assert_eq!(placed[1].top, l.line_height());
+        l.set_truncate_lines(false);
+        assert!(l.frame(&t, 0, 1000.0)[0].lines.len() > 1);
+    }
+
     fn bold(from: usize, to: usize) -> ShapeRun {
         ShapeRun { from, to, shape: Shape { weight: Weight::Bold, slant: Slant::Italic, ..Shape::default() } }
     }
@@ -1074,7 +1102,7 @@ mod tests {
         let image = techne_editor::images::decode(std::path::Path::new("x.svg"), svg).unwrap();
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(200.0);
-        l.set_projections(&[], &[Block { at: 6, image: image.clone() }], 1000.0);
+        l.set_projections(&[], &[Block { at: 6, image: image.clone(), grid: None }], 1000.0);
         let placed = l.frame(&t, 0, 1000.0);
         let (r, shown) = &placed[1].blocks[0];
         assert_eq!(*shown, image);
@@ -1099,7 +1127,7 @@ mod tests {
         let image = techne_editor::images::decode(std::path::Path::new("x.svg"), svg).unwrap();
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(400.0);
-        l.set_projections(&[], &[Block { at: 0, image: image.clone() }, Block { at: 0, image }], 1000.0);
+        l.set_projections(&[], &[Block { at: 0, image: image.clone(), grid: None }, Block { at: 0, image, grid: None }], 1000.0);
         let placed = l.frame(&t, 0, 100.0);
         let c = caret(&l, &placed, &t, 0).unwrap();
         assert!(c.y >= 0.0 && c.y + c.h <= 100.5, "{c:?}");

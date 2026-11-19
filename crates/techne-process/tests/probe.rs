@@ -178,6 +178,27 @@ fn pty_processes_have_a_terminal() {
 }
 
 #[test]
+fn pty_exit_drains_the_leaders_output_and_stops_separate_shell_jobs() {
+    let mut vm = vm();
+    let out = eval(
+        &mut vm,
+        r#"(define out
+             (call-with-process "sh" '("-c" "set -m; sleep 30 & printf '%s\\nfinal\\n' \"$!\"; exit 0")
+               (lambda (p) (list (process-read-all p 'stdout) (process-wait p))) #:pty #t))
+           out"#,
+    );
+    assert!(out.ends_with(r#"\r\nfinal\r\n" 0)"#), "{out}");
+    let pid = out.strip_prefix("(\"").unwrap().split('\\').next().unwrap().parse::<u32>().unwrap();
+    let at = std::time::Instant::now();
+    while std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .is_ok_and(|s| s.rsplit_once(") ").is_some_and(|(_, fields)| !fields.starts_with('Z')))
+    {
+        assert!(at.elapsed() < std::time::Duration::from_secs(2), "shell job {pid} survived");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn cancelled_tasks_kill_their_processes() {
     let mut vm = vm();
     let out = eval(
