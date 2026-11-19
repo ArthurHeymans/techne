@@ -149,6 +149,23 @@ fn a_lost_commit_reply_blocks_writes_without_replaying() {
     type_text(&mut rt, "from Techne");
     keys(&mut rt, "C-c C-c");
     until(&mut rt, "post-commit hook running", |_| marker.is_file());
+    {
+        let mut other = runtime();
+        other.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+        let other_loc = format!("{route}{}", root.join("other.txt").display());
+        std::fs::write(root.join("other.txt"), "another buffer in the same repository\n").unwrap();
+        eval(&mut other, &format!("(show-document! (current-session) (file-document {other_loc:?}))"));
+        keys(&mut other, "C-x v d");
+        until(&mut other, "other runtime sees pending write", |s| s.pane().text.to_string().contains("outcome unknown"));
+        keys(&mut other, "C-x v !");
+        until(&mut other, "other runtime inspected evidence", |s| {
+            s.pane().text.to_string().contains("Write outcome unknown · writes blocked")
+        });
+        keys(&mut other, "a");
+        type_text(&mut other, "yes");
+        keys(&mut other, "RET");
+        until(&mut other, "live attempt cannot be acknowledged by another runtime", |s| s.echo.contains("holds this database"));
+    }
     eval(&mut rt, &format!("(node-close (location-endpoint {loc:?}))"));
     keys(&mut rt, "C-c C-k");
     until(&mut rt, "unknown write outcome", |s| s.pane().text.to_string().contains("outcome unknown"));

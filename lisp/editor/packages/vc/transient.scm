@@ -138,7 +138,11 @@ ARGUMENT ends in =, as \"--author=\"."
                 (iota height)))))
       bands (iota (length bands))))))
 
-(define %buffer-name "*vc-menu*")
+(define (new-menu-buffer!)
+  (let loop ((i 1))
+    (let ((name (if (= i 1) "*vc-menu*" (string-append "*vc-menu " (number->string i) "*"))))
+      (if (buffer-named name) (loop (+ i 1))
+          (make-generated-buffer! name (make-presentation) 'special-mode)))))
 
 (define (render! s state)
   (let* ((b (hash-table-ref state 'buffer))
@@ -217,8 +221,7 @@ INITIAL is a list of (KEY . VALUE): switches on, options with values."
     (when open (close! s open)))
   (let* ((state (make-hash-table))
          (values (make-hash-table))
-         (b (or (buffer-named %buffer-name)
-                (make-generated-buffer! %buffer-name (make-presentation) 'special-mode)))
+         (b (new-menu-buffer!))
          (handler (lambda (s key) (handle-key s state key))))
     (for-each (lambda (g)
                 (for-each (lambda (e)

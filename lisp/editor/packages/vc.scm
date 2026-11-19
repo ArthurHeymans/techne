@@ -268,7 +268,7 @@ With #f refresh explicitly. Remote status always refreshes on demand."
          (unpulled (later (lambda () (git-commits repo "HEAD..@{upstream}" 50))))
          (unpushed (later (lambda () (git-commits repo "@{upstream}..HEAD" 50))))
          (recent (later (lambda () (git-commits repo "HEAD" 10))))
-         (stashes (later (lambda () (nonempty-lines (run-in repo '("--no-optional-locks" "stash" "list" "--format=%gd%x09%s"))))))
+         (stashes (later (lambda () (git-stashes repo))))
          (tag (later (lambda () (optional-git-ref repo '("describe" "--tags" "--abbrev=0" "HEAD")))))
          (push (later (lambda () (optional-git-ref repo '("rev-parse" "--abbrev-ref" "--symbolic-full-name" "@{push}"))))))
     (list (cons 'summary (task-join summary)) (cons 'operation (task-join operation)) (cons 'head-commit (task-join head))
@@ -372,30 +372,34 @@ With #f refresh explicitly. Remote status always refreshes on demand."
           (string-append "Push " source " → " (label remote) ":" (label ref) "; observed tip " observed
                          (if (string=? source observed) " (matches requested commit)" "") "; " state)))))
 
-(define (run-write! repo args title #:input [input #f] #:destination [destination '()] #:env [env #f])
+(define (run-write! repo args title #:input [input #f] #:destination [destination '()] #:env [env #f]
+                    #:check [check #f] #:program [program (symbol->string (car repo))])
   (guard (e ((not (cancelled-condition? e))
              (log-process! repo title args 'fail (error-text e))
              (raise e)))
-    (let ((out (run-write-1! repo args title #:input input #:destination destination #:env env)))
+    (let ((out (call-with-vc-write-lease repo
+                 (lambda () (run-write-1! repo program args title input destination env check)))))
       (log-process! repo title args 'ok (string-append (if (string? out) out "") %last-stderr))
       out)))
 
-(define (run-write-1! repo args title #:input [input #f] #:destination [destination '()] #:env [env #f])
+(define (run-write-1! repo program args title input destination env check)
   (let ((st (vc-recovery-state repo)))
     (when (hash-table-ref/default st 'unresolved #f)
       (error "A remote write is unresolved; use C-x v ! before trying again"))
     (if (and (not (remote-path? (cadr repo))) (null? destination))
-        (run (cadr repo) (symbol->string (car repo)) args #:input input #:env env)
+        (begin (when check (check))
+               (run (cadr repo) program args #:input input #:env env))
         (let* ((before (write-observation repo destination))
-               (attempt (begin (ensure-push-destination repo destination)
+               (attempt (begin (when check (check))
+                               (ensure-push-destination repo destination)
                                (vc-recovery-begin! repo title before #:destination destination))))
           (hash-table-set! st 'write-running #t)
           (dynamic-wind
             (lambda () #f)
             (lambda ()
-              (run (cadr repo) (symbol->string (car repo)) args #:input input #:env env
+              (run (cadr repo) program args #:input input #:env env
                    #:exit (lambda (status)
-                            (when (integer? status) (vc-recovery-complete! repo)))))
+                            (when (integer? status) (vc-recovery-complete! repo attempt)))))
             (lambda ()
               (hash-table-set! st 'write-running #f)
               (when (eq? attempt (hash-table-ref/default st 'unresolved #f))
@@ -553,7 +557,7 @@ With #f refresh explicitly. Remote status always refreshes on demand."
              (run-in repo (list "--no-lazy-fetch" "show" "--no-color" "--no-ext-diff" "--no-textconv" "--format=fuller"
                                 "--stat" "--patch" "--decorate=short" sha "--")))))
       ((vc-stash)
-       (run-in (car v) (list "stash" "show" "--no-color" "--no-ext-diff" "--include-untracked" "--stat" "--patch" (cadr v))))
+       (run-in (car v) (list "stash" "show" "--no-color" "--no-ext-diff" "--include-untracked" "--stat" "--patch" (caddr v))))
       ((vc-git-range)
        (run-in (car v) (append '("--no-optional-locks" "diff" "--no-color" "--no-ext-diff" "--no-textconv" "--stat" "--patch")
                                (cadr v) '("--"))))
@@ -836,10 +840,10 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
          (section 'index "Staged changes" (side-entries 'index) closed (lambda (es) (git-file-rows repo es 'index)))
          (section 'stashes "Stashes" (or (get 'stashes) '()) closed
                   (lambda (items)
-                    (map (lambda (line)
-                           (let* ((p (string-split line "\t")) (name (car p)))
-                             (row (list "  " (list name 'vc.hash) " " (label (string-join (cdr p) "\t")))
-                                  #:key (list 'stash name) #:target (target 'vc-stash (list repo name)))))
+                    (map (lambda (item)
+                           (let ((name (car item)) (oid (cadr item)))
+                             (row (list "  " (list name 'vc.hash) " " (label (caddr item)))
+                                  #:key (list 'stash oid name) #:target (target 'vc-stash (list repo name oid)))))
                          items)))
          (if upstream
              (section 'unpulled (string-append "Unpulled from " upstream) (or (get 'unpulled) '()) closed
@@ -1441,7 +1445,7 @@ patch; on a section's heading, fold the section."
                                     (content (substring line 1 (string-length line))))
                                (case sign
                                  ((#\space) line)
-                                 ((#\\) line)
+                                 ((#\\) (error "Select the whole hunk when a line has no final newline"))
                                  ((#\+ #\-)
                                   (if selected?
                                       (begin (set! edits (+ 1 edits)) (string-append (string sign) content))
@@ -1573,23 +1577,59 @@ With a prefix argument, untracked files too."
   (vc-read-char-choice! s (string-append question " (y or n) ")
                         (list (cons "y" thunk) (cons "n" (lambda () (message! s "Nothing discarded"))))))
 
+;; Read exact leaf contents without filters, including symlink targets and
+;; binary files. Refuse directories, special files and symlinked parents.
+(define (discard-leaf repo path)
+  (let ((kind (run (cadr repo) "sh"
+                   (list "-c" (string-append
+                                 "p=$1; d=$p; while [ \"${d%/*}\" != \"$d\" ]; do d=${d%/*}; "
+                                 "if [ -L \"$d\" ]; then printf unsafe; exit; fi; done; "
+                                 "if [ -L \"$p\" ]; then printf link; elif [ -f \"$p\" ]; then printf file; "
+                                 "elif [ -e \"$p\" ]; then printf unsafe; else printf missing; fi") "sh" path))))
+    (when (string=? kind "unsafe") (error "Discard only supports exact file paths; inspect the changed path again"))
+    (cons kind
+          (and (not (string=? kind "missing"))
+               (sha-256 (run (cadr repo) "git"
+                             (list "diff" "--no-index" "--binary" "--no-color" "--no-ext-diff" "--no-textconv" "--" "/dev/null" path)
+                             #:accept-exit '(0 1)))))))
+
+(define (discard-basis repo side files paths)
+  (let ((actual (map target-value (changes repo))))
+    (unless (every (lambda (f) (member (target-value f) actual)) files)
+      (error "File changed; refresh status before discarding"))
+    (list (and (eq? side 'index) (git-rebase-basis repo))
+          (run-in repo (append '("--literal-pathspecs" "ls-files" "--stage" "-z" "--") paths))
+          (map (lambda (path) (discard-leaf repo path)) paths))))
+
 (define (discard-files! s repo side files)
-  (let* ((paths (file-paths files)) (n (length files))
-         (what (if (= n 1) (label (cadr (target-value (car files)))) (string-append (number->string n) " files"))))
-    (case side
-      ((untracked)
-       (vc-y-or-n s (string-append "Delete untracked " what "?")
-                  (lambda () (git-index! s repo (append '("--literal-pathspecs" "clean" "-f" "-q" "--") paths)
-                                         "Delete untracked files" (string-append "Deleted " what)))))
-      ((worktree)
-       (vc-y-or-n s (string-append "Discard unstaged changes to " what "?")
-                  (lambda () (git-index! s repo (append '("--literal-pathspecs" "restore" "--worktree" "--") paths)
-                                         "Discard unstaged changes" (string-append "Discarded changes to " what)))))
-      ((index)
-       (vc-y-or-n s (string-append "Discard staged and unstaged changes to " what ", back to HEAD?")
-                  (lambda () (git-index! s repo (append '("--literal-pathspecs" "restore" "--source=HEAD" "--staged" "--worktree" "--") paths)
-                                         "Discard staged changes" (string-append "Reset " what " to HEAD")))))
-      (else (message! s "Resolve a conflicted file with e, or abort the operation")))))
+  (cond
+    ((null? files) (message! s "Nothing to discard"))
+    ((not (memq side '(untracked worktree index))) (message! s "Resolve a conflicted file with e, or abort the operation"))
+    (else
+     (let* ((paths (file-paths files)) (n (length files))
+            (what (if (= n 1) (label (cadr (target-value (car files)))) (string-append (number->string n) " files")))
+            (question (case side ((untracked) (string-append "Delete untracked " what "?"))
+                                 ((worktree) (string-append "Discard unstaged changes to " what "?"))
+                                 (else (string-append "Discard staged and unstaged changes to " what ", back to HEAD?"))))
+            (args (append (case side ((untracked) '("-f" "--"))
+                                     ((worktree) '("--literal-pathspecs" "restore" "--worktree" "--"))
+                                     (else '("--literal-pathspecs" "restore" "--source=HEAD" "--staged" "--worktree" "--"))) paths))
+            (done (case side ((untracked) (string-append "Deleted " what))
+                             ((worktree) (string-append "Discarded changes to " what))
+                             (else (string-append "Reset " what " to HEAD")))))
+       (request! (make-request-slot) (lambda () (discard-basis repo side files paths))
+                 (lambda (basis)
+                   (vc-y-or-n s question
+                     (lambda ()
+                       (request! (make-request-slot)
+                                 (lambda ()
+                                   (run-write! repo args question #:program (if (eq? side 'untracked) "rm" "git")
+                                     #:check (lambda ()
+                                               (unless (equal? basis (discard-basis repo side files paths))
+                                                 (error "File contents changed; review them before discarding")))))
+                                 (lambda (_) (message! s done) (refresh-repository! repo))
+                                 #:fail (lambda (e) (message! s (error-text e)) (refresh-repository! repo))))))
+                 #:fail (lambda (e) (message! s (error-text e)) (refresh-repository! repo)))))))
 
 (define (discard-hunk! s t selected)
   (let* ((data (target-value t)) (f (car data)) (v (target-value f)) (repo (car v)) (side (cadddr v))
@@ -2774,8 +2814,7 @@ On a change, discard all its edits."
   (message! s (string-append title "…"))
   (request! (make-request-slot)
             (lambda ()
-              (when check (check))
-              (run-write! repo args title #:destination destination #:input input #:env env))
+              (run-write! repo args title #:destination destination #:input input #:env env #:check check))
             (lambda (_)
               (message! s (string-append title " finished"))
               (refresh-repository! repo)
@@ -2973,6 +3012,17 @@ On a change, discard all its edits."
   "Keep top then bottom, without the ancestor or conflict markers."
   (use-conflict-side! s string-append))
 
+(define (conflicted-path? repo path)
+  (any (lambda (item) (and (git-conflict-target? item) (string=? (cadr (target-value item)) path))) (changes repo)))
+
+(define (check-saved-git-resolution! repo path name)
+  (when (any (lambda (b)
+               (let ((d (buffer-document b)))
+                 (and (equal? (document-path d) name) (document-dirty? d))))
+             (buffer-list))
+    (error "Save the resolved file buffer before staging"))
+  (check-git-resolution! repo path name))
+
 (define (check-git-resolution! repo path name)
   (when (path-exists? name)
     ;; The empty base makes Git check every saved line, not just lines added
@@ -2996,15 +3046,9 @@ On a change, discard all its edits."
                    (when (string=? (candidate-text c) "yes")
                      (git-command! s repo (list "--literal-pathspecs" "add" "--" path) "Stage resolution"
                        #:check (lambda ()
-                                 (unless (any (lambda (item) (and (git-conflict-target? item)
-                                                                  (string=? (cadr (target-value item)) path))) (changes repo))
+                                 (unless (conflicted-path? repo path)
                                    (error "File is no longer conflicted; refresh status"))
-                                 (when (any (lambda (b)
-                                              (let ((d (buffer-document b)))
-                                                (and (equal? (document-path d) name) (document-dirty? d))))
-                                            (buffer-list))
-                                   (error "Save the resolved file buffer before staging"))
-                                  (check-git-resolution! repo path name)))))))))
+                                 (check-saved-git-resolution! repo path name)))))))))
 
 (define-command (vc-git-branch s n)
   "Switch to an existing local Git branch without forcing it."
@@ -3077,7 +3121,8 @@ On a change, discard all its edits."
                              (git-command! s repo (append '("push" "--no-follow-tags")
                                                                          (if lease (list (string-append "--force-with-lease=" ref ":" lease)) '())
                                                                          (list "--" remote (string-append tip ":" ref)))
-                                            (if lease "Push with lease" "Push branch") #:destination plan
+                                            (cond (lease "Push with lease") ((string-prefix? "refs/tags/" ref) "Push tag") (else "Push branch"))
+                                            #:destination plan
                                            #:after (and branch-to-track
                                                         (lambda () (track-published-branch! s repo branch-to-track remote))))))))
             #:fail (lambda (e) (message! s (error-text e)))))
@@ -3954,17 +3999,15 @@ A remote branch makes a local one tracking it."
   (let ((repo (current-git-repo s)))
     (read-ref-from s "Push tag: " '("refs/tags/") #t
       (lambda (tag)
-        (request! (make-request-slot) (lambda () (nonempty-lines (run-in repo '("remote"))))
-                  (lambda (remotes)
-                    (completing-read s (string-append "Push " (label tag) " to: ") remotes
-                      #:accept (lambda (s c)
-                                 (let ((remote (candidate-text c)))
-                                   (completing-read s (string-append "Push tag " (label tag) " to " (label remote) "? ") '("no" "yes")
-                                     #:accept (lambda (s c)
-                                                (when (string=? (candidate-text c) "yes")
-                                                  (git-command! s repo (list "push" "--" remote (string-append "refs/tags/" tag))
-                                                                (string-append "Push " (label tag))))))))))
-                  #:fail (lambda (e) (message! s (error-text e))))))))
+        (let ((ref (string-append "refs/tags/" tag)))
+          (request! (make-request-slot)
+                    (lambda ()
+                      (cons (chomp (run-in repo (list "rev-parse" "--verify" ref)))
+                            (nonempty-lines (run-in repo '("remote")))))
+                    (lambda (plan)
+                      (completing-read s (string-append "Push " (label tag) " to: ") (cdr plan)
+                        #:accept (lambda (s c) (confirm-git-push! s repo (car plan) (candidate-text c) ref #f))))
+                    #:fail (lambda (e) (message! s (error-text e)))))))))
 
 (define-command (vc-push-menu s n)
   "Show the push menu."
@@ -4158,19 +4201,33 @@ The rebase starts at the commit at point."
 
 ;;; Stash
 
-(define (stash-at s)
-  (let ((t (target-at (doc s) (point s))))
-    (and t (eq? (target-kind t) 'vc-stash) (cadr (target-value t)))))
+(define (git-stashes repo)
+  (map (lambda (line)
+         (let ((fields (string-split line "\t")))
+           (list (car fields) (cadr fields) (string-join (cddr fields) "\t"))))
+       (nonempty-lines (run-in repo '("--no-optional-locks" "stash" "list" "--format=%gd%x09%H%x09%s")))))
 
 (define (with-stash s prompt f)
-  (let ((at (stash-at s)) (repo (current-git-repo s)))
-    (if at (f at)
-        (request! (make-request-slot) (lambda () (nonempty-lines (run-in repo '("stash" "list" "--format=%gd%x09%s"))))
+  (let* ((t (target-at (doc s) (point s))) (repo (current-git-repo s)))
+    (if (and t (eq? (target-kind t) 'vc-stash))
+        (apply f (target-value t))
+        (request! (make-request-slot) (lambda () (git-stashes repo))
                   (lambda (stashes)
                     (if (null? stashes) (message! s "No stashes")
-                        (completing-read s prompt stashes
-                          #:accept (lambda (s c) (f (car (string-split (candidate-text c) "\t")))))))
+                        (let ((choices (map (lambda (item) (cons (string-append (car item) "  " (label (caddr item))) item)) stashes)))
+                          (completing-read s prompt (map car choices)
+                            #:accept (lambda (s c)
+                                       (let ((item (cdr (assoc (candidate-text c) choices))))
+                                         (f repo (car item) (cadr item))))))))
                   #:fail (lambda (e) (message! s (error-text e)))))))
+
+(define (check-stash! repo name oid)
+  (unless (equal? oid (optional-git-ref repo (list "rev-parse" "--verify" name)))
+    (error "Stash list changed; select the stash again")))
+
+(define (drop-stash! s repo name oid)
+  (git-command! s repo (list "stash" "drop" name) (string-append "Drop " name)
+                #:check (lambda () (check-stash! repo name oid))))
 
 (define (stash-save! s what)
   (let ((args (filter (lambda (a) (member a '("--include-untracked" "--all"))) (vc-transient-args s))))
@@ -4187,29 +4244,40 @@ The rebase starts at the commit at point."
 
 (define-command (vc-stash-apply s n)
   "Apply the stash at point, keeping it."
-  (with-stash s "Apply stash: " (lambda (name) (git-command! s (current-git-repo s) (list "stash" "apply" "--index" name) (string-append "Apply " name)))))
+  (with-stash s "Apply stash: "
+    (lambda (repo name oid) (git-command! s repo (list "stash" "apply" "--index" oid) (string-append "Apply " name)))))
 
 (define-command (vc-stash-pop s n)
   "Apply the stash at point and drop it."
-  (with-stash s "Pop stash: " (lambda (name) (git-command! s (current-git-repo s) (list "stash" "pop" "--index" name) (string-append "Pop " name)))))
+  (with-stash s "Pop stash: "
+    (lambda (repo name oid)
+      ;; Apply the selected object, not a moving reflog entry. Only drop
+      ;; after a successful apply, and only if the same entry is still there.
+      (git-command! s repo (list "stash" "apply" "--index" oid) (string-append "Apply " name)
+                    #:check (lambda () (check-stash! repo name oid))
+                    #:after (lambda () (drop-stash! s repo name oid))))))
 
 (define-command (vc-stash-drop s n)
   "Drop the stash at point, after asking."
   (with-stash s "Drop stash: "
-    (lambda (name)
+    (lambda (repo name oid)
       (vc-y-or-n s (string-append "Drop " name "?")
-        (lambda () (git-command! s (current-git-repo s) (list "stash" "drop" name) (string-append "Drop " name)))))))
+        (lambda () (drop-stash! s repo name oid))))))
 
 (define-command (vc-stash-show s n)
   "Show the stash at point's patch."
-  (with-stash s "Show stash: " (lambda (name) (show-target-diff! s (target 'vc-stash (list (current-git-repo s) name))))))
+  (with-stash s "Show stash: " (lambda (repo name oid) (show-target-diff! s (target 'vc-stash (list repo name oid))))))
 
 (define-command (vc-stash-branch s n)
   "Make a branch from the stash at point and apply it there."
   (with-stash s "Branch from stash: "
-    (lambda (name)
+    (lambda (repo name oid)
       (read-name s "Branch name: "
-        (lambda (branch) (git-command! s (current-git-repo s) (list "stash" "branch" branch name) (string-append "Branch " (label branch))))))))
+        (lambda (branch)
+          (when (string-prefix? "-" branch) (error "Enter a branch name"))
+          (git-command! s repo (list "stash" "branch" branch oid) (string-append "Branch " (label branch))
+                        #:check (lambda () (check-stash! repo name oid))
+                        #:after (lambda () (drop-stash! s repo name oid))))))))
 
 (define-command (vc-stash-menu s n)
   "Show the stash menu."
@@ -4277,10 +4345,7 @@ What it says is in the process log, \\[vc-process-log]."
       #:accept (lambda (s c)
                  (let ((command (string-trim (candidate-text c))))
                    (request! (make-request-slot)
-                             (lambda ()
-                               (guard (e ((not (cancelled-condition? e)) (log-process! repo command (list "sh" "-c" command) 'fail (error-text e)) (raise e)))
-                                 (let ((out (run (cadr repo) "sh" (list "-c" command))))
-                                   (log-process! repo command (list "sh" "-c" command) 'ok out) out)))
+                             (lambda () (run-write! repo (list "-c" command) "Run shell command" #:program "sh"))
                              (lambda (out)
                                (let ((lines (nonempty-lines out)))
                                  (message! s (if (null? lines) "Done" (string-append (last lines) "  ($ log)"))))
@@ -4776,41 +4841,14 @@ The plan is edited in a buffer of its own, then \\[vc-todo-finish] runs it."
       ("Fetch from" (suffix "f" "Default remotes" vc-jj-fetch-default) (suffix "a" "All remotes" vc-jj-fetch-all)
                     (suffix "e" "A remote read" vc-jj-fetch)))))
 
-(define (confirm-jj-push! s question args)
-  (let ((repo (current-jj-repo s)))
-    (request! (make-request-slot) (lambda () (jj-operation-id repo))
-              (lambda (before)
-                (completing-read s question '("no" "yes")
-                  #:accept (lambda (s c)
-                             (when (string=? (candidate-text c) "yes")
-                               (jj-write! s repo before (append '("--ignore-working-copy" "git" "push") args))))))
-              #:fail (lambda (e) (message! s (error-text e))))))
-
-(define-command (vc-jj-push-change s n)
-  "Push the change at point under a bookmark made from its change ID."
-  (let ((dry (vc-transient-arg? s "--dry-run")))
-    (with-jj-change s
-      (lambda (repo commit before rev)
-        (confirm-jj-push! s (string-append "Push change " (substring commit 0 8) " under a new bookmark? ")
-                          (append (list "--change" rev) (if dry '("--dry-run") '())))))))
-
-(define-command (vc-jj-push-tracked s n)
-  "Push every tracked bookmark that moved."
-  (confirm-jj-push! s "Push every tracked bookmark that moved? " (append '("--tracked") (if (vc-transient-arg? s "--dry-run") '("--dry-run") '()))))
-
-(define-command (vc-jj-push-all s n)
-  "Push every bookmark, new ones too."
-  (confirm-jj-push! s "Push every bookmark, new ones too? " (append '("--all") (if (vc-transient-arg? s "--dry-run") '("--dry-run") '()))))
-
+;; Publish one reviewed bookmark at a time. Generated and bulk pushes cannot
+;; use the single-destination recovery record without first expanding a plan.
 (define-command (vc-jj-push-menu s n)
   "Show the Jujutsu push menu."
   (vc-transient! s
     '("Push"
       ("Arguments" (switch "-n" "Only say what would be pushed" "--dry-run"))
-      ("Push" (suffix "p" "A bookmark of the change at point" vc-jj-publish)
-              (suffix "c" "The change at point, as a new bookmark" vc-jj-push-change)
-              (suffix "t" "Tracked bookmarks" vc-jj-push-tracked)
-              (suffix "a" "All bookmarks" vc-jj-push-all)))))
+      ("Push" (suffix "p" "A bookmark of the change at point" vc-jj-publish)))))
 
 (define (jj-move! s verb)
   (let ((repo (current-jj-repo s)))
@@ -5059,7 +5097,11 @@ A Jujutsu working copy is recorded first, as Magit and Majutsu do."
     (lambda (repo path)
       (unless (eq? (car repo) 'git) (error "Jujutsu records the file itself; g in its status"))
       (run-write! repo (if stage? (list "--literal-pathspecs" "add" "--" path) (list "--literal-pathspecs" "reset" "-q" "--" path))
-                  (if stage? "Stage file" "Unstage file")))
+                  (if stage? "Stage file" "Unstage file")
+                  #:check (and stage? (lambda ()
+                                        (when (conflicted-path? repo path)
+                                          (check-saved-git-resolution! repo path
+                                            (absolute-path (string-append (normal-directory (cadr repo)) path))))))))
     (lambda (origin repo path _)
       (message! s (string-append (if stage? "Staged " "Unstaged ") (label path)))
       (refresh-repository! repo))))

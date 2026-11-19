@@ -420,6 +420,33 @@ fn git_branch_switch_history_and_push_use_real_refs() {
     keys(&mut rt, "RET");
     until(&mut rt, "rewritten tip published", |s| s.echo == "Push with lease finished");
     assert_eq!(ref_id(upstream.path(), "refs/heads/follow-up"), rewritten);
+
+    git(&root, &["tag", "-a", "release", "-m", "Reviewed release", "HEAD"]);
+    let tag = ref_id(&root, "refs/tags/release");
+    let choose_tag = |rt: &mut Runtime| {
+        keys(rt, "P t");
+        until(rt, "tag picker", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Push tag")));
+        keys(rt, "RET");
+        until(rt, "tag remote picker", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Push release to")));
+        keys(rt, "RET");
+        let prompt = until(rt, "tag push confirmation", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("refs/tags/release")));
+        assert!(prompt.minibuffer.unwrap().prompt.contains(&tag[..8]));
+    };
+    choose_tag(&mut rt);
+    let replacement = tempfile::tempdir().unwrap();
+    git(replacement.path(), &["init", "--bare", "-q"]);
+    git(&root, &["remote", "set-url", "--push", "origin", replacement.path().to_str().unwrap()]);
+    type_text(&mut rt, "yes");
+    keys(&mut rt, "RET");
+    until(&mut rt, "changed tag destination rejected", |s| s.echo.contains("push destination changed"));
+    assert!(git_out(replacement.path(), &["for-each-ref", "refs/tags/"]).is_empty());
+    git(&root, &["remote", "set-url", "--push", "origin", upstream.path().to_str().unwrap()]);
+    choose_tag(&mut rt);
+    git(&root, &["tag", "-f", "release", "HEAD^"]);
+    type_text(&mut rt, "yes");
+    keys(&mut rt, "RET");
+    until(&mut rt, "reviewed tag published", |s| s.echo == "Push tag finished");
+    assert_eq!(ref_id(upstream.path(), "refs/tags/release"), tag);
 }
 
 #[test]
@@ -1309,6 +1336,19 @@ fn stash_fixup_and_an_interactive_rebase_from_the_menus() {
     assert!(text(&stashed).contains("stash@{0}") && !text(&stashed).contains("modified   a.txt"));
     assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
     goto(&mut rt, "stash@{0}", 0);
+    keys(&mut rt, "z k");
+    until(&mut rt, "stash drop confirmation", |s| s.echo.contains("Drop stash@{0}?"));
+    std::fs::write(root.join("a.txt"), "new stash\n").unwrap();
+    git(&root, &["stash", "push", "-qm", "new stash"]);
+    let newest = git_out(&root, &["rev-parse", "stash@{0}"]);
+    keys(&mut rt, "y");
+    until(&mut rt, "stale stash selector rejected", |s| s.echo.contains("Stash list changed"));
+    assert_eq!(git_out(&root, &["rev-parse", "stash@{0}"]), newest);
+    until(&mut rt, "both stashes shown", |s| text(s).contains("Stashes (2)"));
+    git(&root, &["stash", "drop", "stash@{0}"]);
+    keys(&mut rt, "g");
+    until(&mut rt, "original stash shown again", |s| text(s).contains("Stashes (1)"));
+    goto(&mut rt, "stash@{0}", 0);
     keys(&mut rt, "z p");
     until(&mut rt, "stash popped", |s| text(s).contains("modified   a.txt") && !text(s).contains("Stashes"));
     assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "ONE\n");
@@ -1387,8 +1427,20 @@ fn discarding_one_hunk_and_an_untracked_file() {
     until(&mut rt, "discarded", |s| s.echo == "Discarded");
     assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), original.replace("line 29\n", "line twenty-nine\n"));
     goto(&mut rt, "new.txt", 0);
-    keys(&mut rt, "k n");
-    assert!(root.join("new.txt").exists());
+    keys(&mut rt, "k");
+    until(&mut rt, "delete question before replacement", |s| s.echo.contains("Delete untracked new.txt?"));
+    let path = root.join("new.txt");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("keep.txt"), "Keep this file\n").unwrap();
+    keys(&mut rt, "y");
+    until(&mut rt, "refused to delete the replacement", |s| s.echo.contains("File changed"));
+    assert!(path.join("keep.txt").is_file());
+    until(&mut rt, "replacement shown", |s| text(s).contains("new.txt/keep.txt"));
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, "new file\n").unwrap();
+    keys(&mut rt, "g");
+    until(&mut rt, "original path shown", |s| text(s).contains("new.txt") && !text(s).contains("keep.txt"));
     goto(&mut rt, "new.txt", 0);
     keys(&mut rt, "k");
     until(&mut rt, "delete question", |s| s.echo.contains("Delete untracked new.txt?"));

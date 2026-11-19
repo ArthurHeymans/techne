@@ -1,10 +1,10 @@
 ;;; Repository state independent of the status buffers and VC package generation.
 
-(import (techne crypto))
+(import (techne crypto) (techne sqlite))
 (require "../../files.scm")
 
-
-(provide vc-recovery-state vc-recovery-begin! vc-recovery-complete! vc-recovery-acknowledge!)
+(provide vc-recovery-state vc-recovery-begin! vc-recovery-complete! vc-recovery-acknowledge!
+         call-with-vc-write-lease)
 
 (define %recovery (make-hash-table))
 
@@ -19,18 +19,28 @@
 (define (write-evidence-file path evidence)
   (call-with-output-file path (lambda (port) (write evidence port))))
 
+(define (call-with-vc-write-lease repo thunk)
+  "Run THUNK while this runtime owns the repository's private write lease."
+  (let ((db (sqlite-open (string-append (recovery-path repo) ".lease.sqlite") #:private? #t)))
+    (dynamic-wind (lambda () #f)
+                  (lambda () (call-with-sqlite-lease db thunk))
+                  (lambda () (sqlite-close db)))))
+
+(define %unknown-attempt '("Interrupted write" "Details unavailable" "unknown"))
+
+(define (pending-attempt path)
+  (let ((pending (string-append path ".pending")))
+    (and (file-exists? pending) (read-evidence (string-append pending "/attempt") %unknown-attempt))))
+
 (define (vc-recovery-state repo)
-  "Return the table of write recovery evidence for REPO."
-  (or (hash-table-ref/default %recovery repo #f)
-      (let ((state (make-hash-table)))
-        (let* ((path (recovery-path repo)) (pending (string-append path ".pending")))
-          (when (file-exists? pending)
-            (hash-table-set! state 'unresolved (read-evidence (string-append pending "/attempt")
-                                                             '("Interrupted write" "Details unavailable" "unknown"))))
-          (when (file-exists? (string-append path ".last"))
-            (hash-table-set! state 'last-unresolved (read-evidence (string-append path ".last") #f))))
-        (hash-table-set! %recovery repo state)
-        state)))
+  "Return the current write recovery evidence for REPO, including other runtimes' writes."
+  (let* ((state (or (hash-table-ref/default %recovery repo #f) (make-hash-table)))
+         (path (recovery-path repo)) (attempt (pending-attempt path)))
+    (unless (equal? attempt (hash-table-ref/default state 'unresolved #f))
+      (hash-table-set! state 'unresolved attempt))
+    (hash-table-set! state 'last-unresolved (read-evidence (string-append path ".last") #f))
+    (hash-table-set! %recovery repo state)
+    state))
 
 (define (vc-recovery-begin! repo title before #:destination [destination '()])
   "Record the remote attempt TITLE for REPO before dispatch.
@@ -45,21 +55,24 @@ is a list of the source commit, remote name, ref and endpoint digest."
     (write-evidence-file (string-append pending "/attempt") attempt)
     attempt))
 
-(define (vc-recovery-complete! repo)
-  "Release the pending record for REPO after receiving an exit status."
-  (delete-path (string-append (recovery-path repo) ".pending") #t)
-  (hash-table-set! (vc-recovery-state repo) 'unresolved #f))
+(define (vc-recovery-complete! repo attempt)
+  "Release exactly ATTEMPT after receiving an exit status, under the write lease."
+  (let ((path (recovery-path repo)))
+    (unless (and attempt (equal? attempt (pending-attempt path)))
+      (error "The pending write changed; inspect it again"))
+    (delete-path (string-append path ".pending") #t)
+    (vc-recovery-state repo)))
 
 (define (vc-recovery-acknowledge! repo attempt observed)
   "Keep ATTEMPT and OBSERVED as evidence for REPO.
 Permit new writes without asserting what the previous command did."
-  (let* ((path (recovery-path repo)) (temp (string-append path ".pending/observed"))
-         (evidence (list (car attempt) (cadr attempt) observed)))
-    (unless (equal? attempt (read-evidence (string-append path ".pending/attempt")
-                                          '("Interrupted write" "Details unavailable" "unknown")))
-      (error "The pending write changed; inspect it again"))
-    (when (file-exists? temp) (delete-file temp))
-    (write-evidence-file temp evidence)
-    (rename-file temp (string-append path ".last"))
-    (vc-recovery-complete! repo)
-    (hash-table-set! (vc-recovery-state repo) 'last-unresolved evidence)))
+  (call-with-vc-write-lease repo
+    (lambda ()
+      (let* ((path (recovery-path repo)) (temp (string-append path ".pending/observed"))
+             (evidence (list (car attempt) (cadr attempt) observed)))
+        (unless (equal? attempt (pending-attempt path))
+          (error "The pending write changed; inspect it again"))
+        (when (file-exists? temp) (delete-file temp))
+        (write-evidence-file temp evidence)
+        (rename-file temp (string-append path ".last"))
+        (vc-recovery-complete! repo attempt)))))

@@ -279,8 +279,8 @@ for regular text files. =r= rebases the change at point or the marked
 ones (=-w= with descendants, the change alone, or its branch) onto, after
 or before a change read, or the marked ones onto the change at point.
 =b= is the bookmark menu (set, delete, forget, rename, track, untrack),
-=f= fetches, =P= pushes a bookmark of the change at point, the change
-itself under a new bookmark, the tracked or all bookmarks.
+=f= fetches, =P= previews or pushes one bookmark of the change at point.
+To publish a change without a bookmark, set one first with =b=.
 \[vc-jj-conflicts] resolves a supported two-sided text conflict by taking
 one side for the whole file. =l= chooses the revset (all, mine, trunk,
 bookmarks), \[vc-jj-filter] edits it, \[vc-jj-more] shows more changes.
