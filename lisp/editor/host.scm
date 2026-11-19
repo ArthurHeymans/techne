@@ -206,14 +206,14 @@ what the mode line segments say of the buffer."
 
 (define (pane-display s view)
   "Return what is drawn beside VIEW's text in session S, and its syntax.
-That is (line-numbers eob-marker language word-wrap truncate-lines).
+That is (line-numbers eob-marker language word-wrap truncate-lines
+report-pointer).
 LANGUAGE the syntax language to colour it by, or #f for none (never
 without `syntax-highlight'; the mode's `syntax-language' first, then
 the file's name)."
-  (let* ((d (view-document view)) (b (document-buffer d)))
-    (list (option b 'line-numbers) (option b 'eob-marker)
-          (and (option b 'syntax-highlight) (buffer-language b))
-          (option b (quote word-wrap)) (option b 'truncate-lines) (and (not (sget s 'transient)) (not (sget s 'private-key)) (option b 'report-pointer)))))
+  (let* ((b (document-buffer (view-document view))) (opts (buffer-display-options b)))
+    (list (vector-ref opts 0) (vector-ref opts 1) (and (vector-ref opts 2) (buffer-language b))
+          (vector-ref opts 3) (vector-ref opts 4) (and (vector-ref opts 5) (not (sget s 'transient)) (not (sget s 'private-key))))))
 
 (define (echo-line s)
   "Return the echo area of session S.
