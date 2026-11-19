@@ -144,6 +144,9 @@ data (`invoke`)."
   ;; Last: (procedure . its code-id), the code BODY gave last, numbered.
   (let* ((o (registry-ref %offers name))
          (reg (if (and o (eq? (scope-name (current-scope)) (offer-package o))) (offer-impl o) %commands)))
+    (when (and o (eq? reg (offer-impl o)) (%offered-generation)
+               (eq? (current-scope) (car (%offered-generation))))
+      (hash-table-set! (cdr (%offered-generation)) name #t))
     (registry-add! reg name (list doc proc (scope-procedure proc) (or body (lambda () proc)) contract (cons #f #f)))))
 
 (define (command-code name)
@@ -160,6 +163,7 @@ Records of its runs keep the number of theirs (`record-code`)."
   (package offer-package) (doc offer-doc) (activate offer-activate)
   (impl offer-impl) (proxy offer-proxy))
 (define %offers (make-registry 'command-offers))
+(define %offered-generation (make-parameter #f))
 
 (define (register-command-package! package path commands)
   "Advertise COMMANDS of PACKAGE without loading PATH.
@@ -177,6 +181,14 @@ the declarations. A failed load can be retried."
       (unless (find-package package)
         (dynamic-wind (lambda () (set! loading? #t)) (lambda () (load-package package path))
                       (lambda () (set! loading? #f)))))
+    (reserve-package! package path
+      (lambda (load)
+        (let ((seen (make-hash-table eq?)))
+          (parameterize ((%offered-generation (cons (current-scope) seen)))
+            (let ((generation (load)))
+              (for-each (lambda (c) (unless (hash-table-ref/default seen (car c) #f)
+                                      (error "Package did not define advertised command" package (car c)))) commands)
+              generation)))))
     (for-each (lambda (c)
                 (let* ((name (car c)) (proxy (lambda args (apply (caddr (resolve-command name)) args)))
                        (offer (make-offer package (cadr c) activate impl proxy)))

@@ -19,6 +19,11 @@ Installation fetches a private checkout and records the exact commit under
 The same declaration reuses its pin offline. In a fresh editor call
 `(package-restore!)` to register the installed packages, or repeat just the
 install declarations you want. Both take `#:directory` to select another store.
+An installed declaration reserves its package identity, commands and option names,
+including while cold. Setting an existing option is not redeclaring it. Installation
+rejects collisions before publishing the checkout; restore preflights the store.
+If a publisher crashes leaving `.publishing` in the store, remove the empty directory
+only after confirming that no install is in progress.
 The store is managed data, not a working tree to edit. There is no central
 catalog, dependency solver or automatic update of moving branches in this version.
 

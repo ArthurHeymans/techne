@@ -1197,6 +1197,18 @@ a setting comes from."
 
 (define %packages (make-hash-table eq?))
 
+;; A declaration owns the identity even between active generations. The
+;; optional stage wrapper checks registrations before they become visible.
+(define %package-declarations (make-registry 'package-declarations))
+(define (package-declared? name)
+  "Return whether NAME has a reserved package identity."
+  (and (registry-ref %package-declarations name) #t))
+(define (reserve-package! name path stage)
+  "Reserve NAME for PATH in this scope.
+STAGE calls its load thunk and checks the result before publication."
+  (when (or (package-declared? name) (find-package name)) (error "Package name already in use" name))
+  (registry-add! %package-declarations name (cons path stage)))
+
 (define (find-package name)
   "Return the package called NAME, or #f."
   (hash-table-ref/default %packages name #f))
@@ -1220,13 +1232,17 @@ a setting comes from."
   "Load the package NAME from the file PATH; return its generation.
 If NAME is loaded, this loads its next generation. On failure, nothing
 visible changes."
-  (let* ((old (find-package name))
+  (let* ((declaration (registry-ref %package-declarations name))
+         (old (find-package name))
          (generation (if old (+ 1 (package-generation old)) 1))
          (s (make-scope name #:parent %root-scope)))
+    (when (and declaration (not (equal? path (car declaration)))
+               (not (equal? (file-truename path) (file-truename (car declaration)))))
+      (scope-shutdown! s) (error "Package name reserved for a different entry" name))
     (%set-scope-pending! s '())
     (when old (%set-scope-predecessor! s (package-scope old)))
     (let* ((staged (guard (e (#t (%package-discard) (scope-shutdown! s) (raise e)))
-                     (with-scope s (%package-stage path))))
+                     (with-scope s (if declaration ((cdr declaration) (lambda () (%package-stage path))) (%package-stage path)))))
            (module (car staged)))
       ;; Publish: modules, then the held-back registrations, in order.
       (%package-publish)
