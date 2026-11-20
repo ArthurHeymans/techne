@@ -569,7 +569,9 @@ pub(crate) struct Module {
     /// Sees only its own definitions and imports, not the root module (R7RS
     /// libraries and environments).
     pub(crate) isolated: bool,
-    /// The package generation the module belongs to (0: none).
+    /// The package generation the module belongs to (0: none, the
+    /// world's): a package's are the files in its directory and the
+    /// libraries they define, not what it loads from elsewhere.
     pub generation: u32,
     /// Its package generation was retired or its library load aborted:
     /// it is freed once nothing live uses it.
@@ -598,7 +600,8 @@ struct Library {
 
 /// A package generation being loaded (`Vm::stage_package`).
 struct Staging {
-    /// The package's directory: files under it load afresh.
+    /// The package's directory: files under it, and the libraries they
+    /// define, load afresh.
     dir: PathBuf,
     generation: u32,
     modules: FxHashMap<PathBuf, u32>,
@@ -1640,6 +1643,11 @@ impl Vm {
     // ----- modules and globals -----
 
     pub(crate) fn new_module(&mut self, name: &str, path: Option<PathBuf>) -> u32 {
+        // A package's own while it is staged: one from its directory, or
+        // of no file. What it loads from elsewhere is the world's, whichever
+        // package loads it first: retired with that one, the others would
+        // keep a copy a later import no longer finds.
+        let generation = self.staging_here().filter(|s| path.as_deref().is_none_or(|p| p.starts_with(&s.dir))).map_or(0, |s| s.generation);
         let module = Module {
             name: name.into(),
             path,
@@ -1650,7 +1658,7 @@ impl Vm {
             library: None,
             loader: None,
             isolated: false,
-            generation: self.staging_here().map_or(0, |s| s.generation),
+            generation,
             retired: false,
             charged: 0,
         };
@@ -1975,7 +1983,33 @@ impl Vm {
             .get(Path::new(name))
             .copied()
             .or_else(|| Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied()));
-        file.or_else(|| self.modules.iter().rposition(|m| &*m.name == name && !m.retired).map(|m| m as u32))
+        file.or_else(|| self.named_module(name))
+    }
+
+    /// The module called `name` a lookup here finds: the one of the newest
+    /// generation. A generation not published yet is found by the load
+    /// staging it only, and that load finds nothing else from the package's
+    /// directory: the libraries its files define load afresh with them,
+    /// never the previous generation's, which is retired once this one is
+    /// published.
+    fn named_module(&self, name: &str) -> Option<u32> {
+        let staging = self.staging_here();
+        let unpublished = |generation: u32| {
+            generation != 0
+                && (self.staging.as_ref().is_some_and(|s| s.generation == generation)
+                    || self.staged.as_ref().is_some_and(|(staged, _)| *staged == generation))
+        };
+        self.modules
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| &*m.name == name && !m.retired)
+            .filter(|(_, m)| match staging {
+                Some(s) if m.generation == s.generation => true,
+                Some(s) => !m.path.as_deref().is_some_and(|p| p.starts_with(&s.dir)),
+                None => !unpublished(m.generation),
+            })
+            .max_by_key(|(i, m)| (m.generation, *i))
+            .map(|(i, _)| i as u32)
     }
 
     /// The module called `name`, or the module of the file at path `name`
@@ -2370,12 +2404,14 @@ impl Vm {
         forms.module
     }
 
-    /// Load a new generation of the package whose main file is `path`: it
-    /// and the files it requires from its directory load into fresh
-    /// modules, which `publish_staged` makes the ones `require` and module
-    /// names find, and `discard_staged` retires. Returns the main module and
-    /// the generation. Nothing else changes unless the package's code does
-    /// it; if loading fails, the generation is retired.
+    /// Load a new generation of the package whose main file is `path`: it,
+    /// the files it requires from its directory and the libraries those
+    /// define load into fresh modules, which `publish_staged` makes the
+    /// ones `require` and module names find, and `discard_staged` retires.
+    /// A file or library from elsewhere loads as at any other time, once,
+    /// and is no part of the generation. Returns the main module and the
+    /// generation. Nothing else changes unless the package's code does it;
+    /// if loading fails, the generation is retired.
     pub fn stage_package(&mut self, path: &Path) -> Result<(u32, u32), Error> {
         self.abandon_dead_package();
         if self.staging.is_some() || self.staged.is_some() {
