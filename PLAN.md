@@ -869,13 +869,16 @@ deltas, layers, projections) is added only when a slice needs it.
    now uses the minibuffer's incremental matcher: keyfuzz's six-key
    `buffers` reproducer fell from 28.33 M to 20.66 M, with named
    `completion-filter` and `completion-delete` workloads (20.67 M and
-   20.36 M). Other known cases are indenting after an open bracket (as
-   on main, by TAB, RET or C-M-\: the scan starts at the list's opening
-   line), a session's first definition motion, which compiles its
-   language's definitions query (the plan: compile it on the worker when
-   the language is first used), and indent-sexp on an unclosed list
-   (50 M, as on main: it reindents to the end of the buffer; the plan,
-   indenting what is shown first, the rest in a task).
+   20.36 M). Completing the input to a whole line at once (TAB, 29.3 M
+   over a 100k-line file) searches each of its words over every line, as
+   `search-yank-line` does just within the budget; the plan, searching
+   them all in one pass. Other known cases are indenting after an open
+   bracket (as on main, by TAB, RET or C-M-\: the scan starts at the
+   list's opening line), a session's first definition motion, which
+   compiles its language's definitions query (the plan: compile it on
+   the worker when the language is first used), and indent-sexp on an
+   unclosed list (50 M, as on main: it reindents to the end of the
+   buffer; the plan, indenting what is shown first, the rest in a task).
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes
