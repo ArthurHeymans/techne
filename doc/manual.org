@@ -175,7 +175,16 @@ inline, or a change's files. =1= to =4= show the sections' headings only,
 their items, or every file's patch too. \[vc-visit-at-point] visits what
 is at point: a file at the line of the hunk point is in, a commit's or a
 change's patch. \[vc-diff-at-point] shows the patch of what is at point in
-another pane. Patches mark the words a changed line gained or lost.
+another pane. Triangles mark rows that can be opened (▸) or folded (▾).
+Patches keep source syntax colours over green and red backgrounds for
+added and removed lines. Changed words get a stronger tint. In Git
+history or on a Jujutsu change,
+=RET= opens the change in the current pane and =SPC= previews it beside
+history without moving focus. In the Git log, =Alt+Page Down= and
+=Alt+Page Up= scroll that preview without moving focus. In the open patch,
+=n= and =p= visit hunks
+and =q= returns to the same history position. =?= in history shows
+commands for that view and the change at point.
 \[vc-status-refresh] reads the repository again; open sections and patches
 stay open. Saving a file of the repository refreshes its status when it
 is shown (the option =vc-refresh-on-save=).
@@ -269,10 +278,14 @@ at point, \[vc-jj-abandon] abandons it, \[vc-jj-duplicate] copies it,
 \[vc-jj-absorb] moves each of its edits into the ancestor that last
 changed those lines.
 
-=s= squashes what is at point (a change, a file, a hunk or the lines of
-the region) into its parent, the marked changes into the change at
-point, or (=s i=) into a change read. \[vc-jj-split] splits the file,
-hunk or lines at point out of their change into one before it.
+=s= opens Squash and shows what will move: the whole change, a file,
+a hunk, selected lines, or the marked changes. =s s= moves that selection
+into its parent (marked changes go into the change at point); =s i=
+lets you choose a destination. =S= opens Split; =S s= puts the selection
+in a new change before the original. On a change, it asks which whole
+files to split out. For a smaller selection, use =F= from the change,
+=RET= on a file, then =n= or =p= to reach a hunk. Use the same Squash and
+Split menus there. =C-SPC= selects lines if you only want part of a hunk.
 \[vc-jj-restore] discards them from their change, after asking. Hunks and
 lines are selected with Git's patch applied in jj's temporary diff tree,
 for regular text files. =r= rebases the change at point or the marked

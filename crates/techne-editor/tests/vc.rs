@@ -295,7 +295,7 @@ fn a_status_view_from_a_process() {
     let recent = format!("▾ Recent commits (1)\n  {sha} main start");
     keys(&mut rt, "C-x v d");
     let s = until(&mut rt, "the status", |s| text(s).contains("a.txt"));
-    assert_eq!(text(&s), format!("{head}\n▾ Unstaged changes (1)\n  modified   a.txt\n{recent}"));
+    assert_eq!(text(&s), format!("{head}\n▾ Unstaged changes (1)\n  ▸ a.txt\n{recent}"));
     assert!(s.pane().status.contains("vc-git-status"), "{}", s.pane().status);
     // M-n goes from section to section; TAB folds one.
     keys(&mut rt, "M-n TAB");
@@ -303,23 +303,173 @@ fn a_status_view_from_a_process() {
     assert!(text(&folded).contains("▸ Unstaged changes (1)\n▾ Recent"), "{} / {}", text(&folded), folded.echo);
     keys(&mut rt, "TAB");
     let reopened = rt.snapshot();
-    assert!(text(&reopened).contains("  modified   a.txt\n"), "{} / {}", text(&reopened), reopened.echo);
+    assert!(text(&reopened).contains("  ▸ a.txt\n"), "{} / {}", text(&reopened), reopened.echo);
     // The caret inside a.txt's row; then more changes, one wider.
-    keys(&mut rt, "n C-f C-f C-f C-f C-f C-f C-f C-f C-f C-f C-f C-f C-f C-f");
+    keys(&mut rt, "n C-f C-f C-f C-f C-f");
     std::fs::write(root.join("b.txt"), "TWO\n").unwrap();
     std::fs::write(root.join("c.txt"), "new\n").unwrap();
     keys(&mut rt, "g");
     let s = until(&mut rt, "the refresh", |s| text(s).contains("c.txt"));
-    assert_eq!(
-        text(&s),
-        format!("{head}\n▾ Untracked files (1)\n  c.txt\n▾ Unstaged changes (2)\n  modified   a.txt\n  modified   b.txt\n{recent}")
-    );
+    assert_eq!(text(&s), format!("{head}\n▾ Untracked files (1)\n  ▸ c.txt\n▾ Unstaged changes (2)\n  ▸ a.txt\n  ▸ b.txt\n{recent}"));
     let (t, head_at) = (&s.pane().text, s.pane().head());
     assert_eq!(t.byte_to_line(head_at), 6, "still on a.txt's row");
     assert_eq!(t.byte_slice(head_at - 1..head_at).to_string(), "a", "after the same character");
     // RET opens the file of the row.
     keys(&mut rt, "C-n RET");
     assert!(rt.snapshot().pane().status.contains("b.txt"));
+}
+
+#[test]
+fn inline_and_separate_patches_show_source_faces_and_keep_diff_signs() {
+    let (_dir, _state, root, mut rt) = repository();
+    let file = root.join("example.rs");
+    std::fs::write(&file, "fn greeting() -> &'static str {\n    let word = \"café\";\n    word\n}\n").unwrap();
+    git(&root, &["add", "example.rs"]);
+    git(&root, &["commit", "-qm", "Greeting"]);
+    std::fs::write(&file, "fn greeting() -> &'static str {\n    let word = \"cafés\";\n    word\n}\n").unwrap();
+    rt.eval("(set-face! 'keyword #:fg \"#123456\")").unwrap();
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "collapsed file", |s| text(s).contains("▸ example.rs"));
+    goto(&mut rt, "▸ example.rs", 0);
+    keys(&mut rt, "TAB");
+    let added = "+    let word = \"cafés\";";
+    let inline = until(&mut rt, "expanded file", |s| text(s).contains("▾ example.rs") && text(s).contains(added));
+    let check = |s: &Snapshot, pane: &techne_editor::present::Pane| {
+        let text = pane.text.to_string();
+        let style_at = |at| s.style(pane.layers.iter().find(|h| h.from <= at && at < h.to).unwrap().style);
+        let start = text.find(added).unwrap();
+        assert_eq!(style_at(start + 5).fg.unwrap().rgb, [0x12, 0x34, 0x56]);
+        assert_ne!(style_at(start).fg, style_at(start + 5).fg);
+        let added_band = style_at(start).bg.expect("added row background");
+        assert_eq!(style_at(start + 5).bg, Some(added_band), "syntax overlays the band");
+        assert_eq!(style_at(start + added.len()).extend, Some(true), "the band reaches past the text");
+        assert_ne!(style_at(start + added.find("cafés").unwrap()).bg, Some(added_band), "word emphasis is stronger");
+        let old = text.find("-    let").unwrap();
+        let removed_band = style_at(old).bg.expect("removed row background");
+        assert_eq!(style_at(old + 5).bg, Some(removed_band));
+        assert_ne!(added_band, removed_band);
+        assert_eq!(style_at(old + 5).fg, style_at(start + 5).fg);
+        assert_ne!(style_at(old).fg, style_at(start).fg);
+        assert!(
+            !pane
+                .layers
+                .iter()
+                .any(|h| h.from <= start + added.len() + 2 && start + added.len() + 2 < h.to && s.style(h.style).bg.is_some())
+        );
+    };
+    check(&inline, inline.pane());
+    keys(&mut rt, "TAB");
+    assert!(text(&rt.snapshot()).contains("▸ example.rs"));
+    assert!(!text(&rt.snapshot()).contains(added));
+    keys(&mut rt, "=");
+    let separate = until(&mut rt, "separate patch", |s| s.panes.iter().any(|p| p.text.to_string().contains(added)));
+    check(&separate, separate.panes.iter().find(|p| p.text.to_string().contains(added)).unwrap());
+}
+
+#[test]
+fn log_columns_keep_hashes_and_metadata_aligned_across_a_merge_and_resize() {
+    let (_dir, _state, root, mut rt) = repository();
+    git(&root, &["switch", "-qc", "side"]);
+    git(&root, &["commit", "-qam", "Short side subject", "--author=Side Author <side@example.com>"]);
+    git(&root, &["switch", "-q", "main"]);
+    git(&root, &["commit", "-q", "--allow-empty", "-m", "Primary subject", "--author=Main Author <main@example.com>"]);
+    git(&root, &["merge", "-q", "--no-ff", "side", "-m", "Merge the side"]);
+    rt.handle(Input::Viewport { columns: 120, rows: 25, split_gap: 1 });
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "status", |s| text(s).contains("Merge the side"));
+    keys(&mut rt, "l l");
+    let log = until(&mut rt, "aligned log", |s| text(s).contains("Side Author"));
+    let log = text(&log);
+    let main = log.lines().find(|l| l.contains("Primary subject")).unwrap();
+    let side = log.lines().find(|l| l.contains("Short side subject")).unwrap();
+    assert_eq!(main.find("Main Author"), side.find("Side Author"), "{log}");
+    assert_eq!(main.len(), side.len(), "ages share a right edge");
+    let sha = git_out(&root, &["rev-parse", "--short", "side"]);
+    assert!(side.starts_with(sha.trim()), "hash at left: {side}");
+    assert!(log.lines().any(|l| l.starts_with(&" ".repeat(sha.trim().len() + 1)) && l.trim() == "|\\"), "{log}");
+    goto(&mut rt, "Short side subject", 0);
+    rt.handle(Input::Viewport { columns: 54, rows: 25, split_gap: 1 });
+    let narrow = rt.snapshot();
+    let narrow_text = text(&narrow);
+    assert!(!narrow_text.contains("Side Author"), "{narrow_text}");
+    assert!(narrow_text.contains("Short side subject"));
+    assert!(narrow.pane().text.line(narrow.pane().text.byte_to_line(narrow.pane().head())).to_string().starts_with(sha.trim()));
+}
+
+#[test]
+fn history_help_preview_and_focused_inspection() {
+    let (_dir, _state, root, mut rt) = repository();
+    std::fs::write(root.join("b.txt"), "TWO\n").unwrap();
+    git(&root, &["commit", "-qam", "Two files"]);
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "Git status", |s| text(s).contains("Two files"));
+    keys(&mut rt, "l l");
+    until(&mut rt, "history", |s| text(s).contains("Commits in HEAD"));
+    keys(&mut rt, "?");
+    let empty_menu = pane_named(&rt.snapshot(), "*vc-menu*").unwrap();
+    assert!(empty_menu.contains("Next entry") && !empty_menu.contains("Open change"), "{empty_menu}");
+    keys(&mut rt, "C-g");
+    goto(&mut rt, "Two files", 0);
+    let before = rt.snapshot();
+    keys(&mut rt, "?");
+    let menu = pane_named(&rt.snapshot(), "*vc-menu*").unwrap();
+    assert!(menu.contains("Open change") && menu.contains("Copy ID") && menu.contains("Cherry-pick"), "{menu}");
+    assert!(!menu.contains("Stage") && !menu.contains("Discard"), "{menu}");
+    keys(&mut rt, "C-g SPC");
+    let preview = until(&mut rt, "side preview", |s| s.panes.iter().any(|p| p.text.to_string().contains("+TWO")));
+    assert_eq!(preview.pane().view, before.pane().view);
+    let other_pane = preview.panes.iter().find(|p| p.view != preview.pane().view).unwrap();
+    let diff = other_pane.text.to_string();
+    let bar = diff.find(" | 2 +-").unwrap() + " | 2 ".len();
+    let rgb = |at| {
+        let h = other_pane.layers.iter().find(|h| h.from <= at && at < h.to).unwrap();
+        preview.style(h.style).fg.unwrap().rgb
+    };
+    assert_eq!(rgb(bar), [0xa6, 0xe3, 0xa1]);
+    assert_eq!(rgb(bar + 1), [0xf3, 0x8b, 0xa8]);
+    for (key, screens) in [("M-<next>", 1.0), ("M-<prior>", -1.0)] {
+        keys(&mut rt, key);
+        let paged = rt.snapshot();
+        assert_eq!(paged.pane().view, before.pane().view);
+        assert_eq!(paged.pane().head(), before.pane().head());
+        assert!(paged.pane().request.is_none());
+        let pane = paged.panes.iter().find(|p| p.view == other_pane.view).unwrap();
+        assert_eq!(pane.request, Some(techne_editor::present::ViewRequest::Page { screens, context: 2 }));
+        let anchor = if screens > 0.0 { diff.find("\ndiff --git").unwrap() + 1 } else { 0 };
+        rt.handle(Input::Scroll { view: pane.view, revision: pane.revision, anchor, caret: Some(anchor) });
+        let answered = rt.snapshot();
+        assert_eq!(answered.pane().view, before.pane().view);
+        assert_eq!(answered.pane().head(), before.pane().head());
+        assert_eq!(answered.panes.iter().find(|p| p.view == pane.view).unwrap().scroll, anchor);
+    }
+    keys(&mut rt, "RET");
+    let opened = until(&mut rt, "focused read-only change", |s| text(s).contains("+TWO"));
+    assert_eq!(opened.panes.len(), preview.panes.len());
+    let patch = text(&opened);
+    let headers = patch.match_indices("\n@@ ").map(|(i, _)| i + 1).collect::<Vec<_>>();
+    assert_eq!(headers.len(), 2);
+    for (key, target) in [("n", headers[0]), ("n", headers[1]), ("p", headers[0])] {
+        keys(&mut rt, key);
+        assert_eq!(rt.snapshot().pane().head(), target);
+    }
+    rt.eval(&format!("(view-set-scroll! (session-view (current-session)) {})", headers[0])).unwrap();
+    assert_ne!(rt.snapshot().pane().scroll, 0);
+    keys(&mut rt, "q");
+    let back = rt.snapshot();
+    assert_eq!(back.pane().view, before.pane().view);
+    assert_eq!(back.pane().head(), before.pane().head());
+    assert_eq!(back.pane().scroll, before.pane().scroll);
+
+    // Opening this change again must not inherit the patch's scroll.
+    keys(&mut rt, "RET");
+    let reopened = until(&mut rt, "reopened change", |s| text(s).contains("+TWO"));
+    assert_eq!(reopened.pane().scroll, 0);
+    assert_eq!(reopened.pane().selections, [(0, 0)]);
+    rt.eval(&format!("(view-set-scroll! (session-view (current-session)) {})", headers[0])).unwrap();
+    keys(&mut rt, "q n RET");
+    let other = until(&mut rt, "older change", |s| text(s).contains("+one"));
+    assert_eq!(other.pane().scroll, 0);
+    assert_eq!(other.pane().selections, [(0, 0)]);
 }
 
 #[test]
@@ -343,7 +493,9 @@ fn git_branch_switch_history_and_push_use_real_refs() {
     goto(&mut rt, "topic work", 0);
     keys(&mut rt, "RET");
     until(&mut rt, "selected commit", |s| s.panes.iter().any(|p| p.text.to_string().contains("+ONE")));
-    keys(&mut rt, "q C-x v d P p");
+    keys(&mut rt, "q q");
+    until(&mut rt, "back to status", |s| text(s).starts_with("Git status"));
+    keys(&mut rt, "P p");
     let preview =
         until(&mut rt, "push confirmation", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("origin:refs/heads/main")));
     assert_eq!(preview.minibuffer.unwrap().rows[0].text(0), "no");
@@ -642,9 +794,8 @@ fn a_region_stages_and_unstages_only_the_selected_lines() {
     until(&mut rt, "changed file", |s| text(s).contains("a.txt"));
     goto(&mut rt, "a.txt", 0);
     keys(&mut rt, "TAB");
-    let shown = until(&mut rt, "inline hunk", |s| text(s).contains("+second addition"));
-    let pos = text(&shown).find("    +first addition").unwrap();
-    rt.eval(&format!("(move! (current-session) (lambda (_) {pos}))")).unwrap();
+    until(&mut rt, "inline hunk", |s| text(s).contains("+second addition"));
+    goto(&mut rt, "+first addition", 0);
     keys(&mut rt, "C-SPC C-n s");
     until(&mut rt, "line staged", |s| s.echo == "Staged");
     assert_eq!(index(), "before\n\nbase\nfirst addition\nafter\n");
@@ -653,9 +804,8 @@ fn a_region_stages_and_unstages_only_the_selected_lines() {
     until(&mut rt, "staged file only", |s| text(s).contains("Staged changes") && !text(s).contains("Unstaged"));
     goto(&mut rt, "a.txt", 0);
     keys(&mut rt, "TAB");
-    let shown = until(&mut rt, "staged patch", |s| text(s).contains("+second addition"));
-    let pos = text(&shown).find("    +first addition").unwrap();
-    rt.eval(&format!("(move! (current-session) (lambda (_) {pos}))")).unwrap();
+    until(&mut rt, "staged patch", |s| text(s).contains("+second addition"));
+    goto(&mut rt, "+first addition", 0);
     keys(&mut rt, "C-SPC C-n u");
     until(&mut rt, "line unstaged", |s| s.echo == "Unstaged");
     assert_eq!(index(), "before\n\nbase\nsecond addition\nafter\n");
@@ -670,10 +820,10 @@ fn inline_patches_can_be_opened_independently_and_staged() {
     until(&mut rt, "both files", |s| text(s).contains("b.txt"));
     goto(&mut rt, "a.txt", 0);
     keys(&mut rt, "TAB");
-    until(&mut rt, "first inline patch", |s| text(s).contains("    +ONE"));
+    until(&mut rt, "first inline patch", |s| text(s).lines().any(|line| line == "+ONE"));
     keys(&mut rt, "n n TAB");
-    let both = until(&mut rt, "second inline patch", |s| text(s).contains("    +ALSO TWO"));
-    assert!(text(&both).contains("    +ONE"));
+    let both = until(&mut rt, "second inline patch", |s| text(s).lines().any(|line| line == "+ALSO TWO"));
+    assert!(text(&both).lines().any(|line| line == "+ONE"));
     assert_eq!(both.panes.len(), 1);
     keys(&mut rt, "n s");
     until(&mut rt, "second file's hunk staged", |s| s.echo == "Staged");
@@ -681,7 +831,7 @@ fn inline_patches_can_be_opened_independently_and_staged() {
     assert!(shown.status.success());
     assert_eq!(shown.stdout, b"ALSO TWO\n");
     let status = until(&mut rt, "status after staging", |s| text(s).contains("▾ Staged changes"));
-    assert!(text(&status).contains("    +ONE"));
+    assert!(text(&status).lines().any(|line| line == "+ONE"));
 }
 
 #[test]
@@ -956,10 +1106,13 @@ fn jj_file_rewrites_are_scoped_and_reject_unreviewed_edits() {
     let menu = pane_named(&rt.snapshot(), "*vc-menu*").unwrap();
     assert!(menu.starts_with("Jujutsu files") && menu.contains("RET Inspect recorded patch"), "{menu}");
     keys(&mut rt, "RET");
-    let shown = until(&mut rt, "recorded file diff", |s| s.panes.iter().any(|p| p.text.to_string().contains("+cache edit")));
+    let shown = until(&mut rt, "focused recorded file diff", |s| text(s).contains("+cache edit"));
     assert!(!shown.panes.iter().any(|p| p.text.to_string().contains("+other edit")));
     keys(&mut rt, "S");
-    until(&mut rt, "split prompt", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Description of split")));
+    let menu = pane_named(&rt.snapshot(), "*vc-menu*").unwrap();
+    assert!(menu.contains("Whole file · a (cache).txt") && menu.contains("Split this selection"), "{menu}");
+    keys(&mut rt, "s");
+    until(&mut rt, "split prompt", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Description of the part")));
     type_text(&mut rt, "Cache only");
     keys(&mut rt, "RET");
     until(&mut rt, "split recorded", |s| s.echo.starts_with("Recorded Jujutsu operation"));
@@ -1044,8 +1197,10 @@ fn jj_browsing_does_not_snapshot_the_working_copy() {
     until(&mut rt, "the jj graph", |s| text(s).contains("Recorded work"));
     keys(&mut rt, "n RET");
     let s = until(&mut rt, "the recorded patch", |s| s.panes.iter().any(|p| p.text.to_string().contains("+recorded")));
+    assert!(text(&s).contains("+recorded"));
     assert!(!s.panes.iter().any(|p| p.text.to_string().contains("+not yet recorded")));
     assert_eq!(operation(), before);
+    keys(&mut rt, "q");
     keys(&mut rt, "/ C-a C-k");
     type_text(&mut rt, "none()");
     keys(&mut rt, "RET");
@@ -1217,7 +1372,7 @@ fn reloading_while_a_refresh_is_in_flight() {
     rt.eval(&format!("(load-package 'vc {path:?})")).unwrap();
     assert_eq!(rt.eval("(package-generation (find-package 'vc))").unwrap(), "2");
     let s = until(&mut rt, "the new generation's refresh", |s| text(s).contains("c.txt"));
-    assert!(text(&s).contains("▾ Untracked files (1)\n  c.txt\n▾ Unstaged changes (1)\n  modified   a.txt"), "{}", text(&s));
+    assert!(text(&s).contains("▾ Untracked files (1)\n  ▸ c.txt\n▾ Unstaged changes (1)\n  ▸ a.txt"), "{}", text(&s));
     // It refreshes by itself: a file written later shows up.
     rt.eval("(set-option! 'vc-refresh-interval 20)").unwrap();
     std::fs::write(root.join("d.txt"), "later\n").unwrap();
@@ -1319,7 +1474,7 @@ fn stash_fixup_and_an_interactive_rebase_from_the_menus() {
     let (_dir, _state, root, mut rt) = repository();
     configure_git(&root);
     keys(&mut rt, "C-x v d");
-    until(&mut rt, "the status", |s| text(s).contains("modified   a.txt"));
+    until(&mut rt, "the status", |s| text(s).contains("▸ a.txt"));
     // A menu shows below and leaves with C-g; a switch shows it is set.
     keys(&mut rt, "c");
     let menu = pane_named(&rt.snapshot(), "*vc-menu*").unwrap();
@@ -1333,7 +1488,7 @@ fn stash_fixup_and_an_interactive_rebase_from_the_menus() {
     until(&mut rt, "stash message", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Stash message")));
     keys(&mut rt, "RET");
     let stashed = until(&mut rt, "stash listed", |s| text(s).contains("▾ Stashes (1)"));
-    assert!(text(&stashed).contains("stash@{0}") && !text(&stashed).contains("modified   a.txt"));
+    assert!(text(&stashed).contains("stash@{0}") && !text(&stashed).contains("▸ a.txt"));
     assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
     goto(&mut rt, "stash@{0}", 0);
     keys(&mut rt, "z k");
@@ -1350,7 +1505,7 @@ fn stash_fixup_and_an_interactive_rebase_from_the_menus() {
     until(&mut rt, "original stash shown again", |s| text(s).contains("Stashes (1)"));
     goto(&mut rt, "stash@{0}", 0);
     keys(&mut rt, "z p");
-    until(&mut rt, "stash popped", |s| text(s).contains("modified   a.txt") && !text(s).contains("Stashes"));
+    until(&mut rt, "stash popped", |s| text(s).contains("▸ a.txt") && !text(s).contains("Stashes"));
     assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "ONE\n");
     // Commit with -a from the menu: nothing staged first.
     keys(&mut rt, "c - a c");
@@ -1361,8 +1516,8 @@ fn stash_fixup_and_an_interactive_rebase_from_the_menus() {
     // A fixup of the first commit, folded in at once.
     std::fs::write(root.join("b.txt"), "two, fixed\n").unwrap();
     keys(&mut rt, "g");
-    until(&mut rt, "b.txt changed", |s| text(s).contains("modified   b.txt"));
-    goto(&mut rt, "modified   b.txt", 0);
+    until(&mut rt, "b.txt changed", |s| text(s).contains("▸ b.txt"));
+    goto(&mut rt, "▸ b.txt", 0);
     keys(&mut rt, "s");
     until(&mut rt, "b.txt staged", |s| text(s).contains("Staged changes"));
     goto(&mut rt, " start", 0);
@@ -1416,8 +1571,8 @@ fn discarding_one_hunk_and_an_untracked_file() {
     std::fs::write(root.join("a.txt"), &edited).unwrap();
     std::fs::write(root.join("new.txt"), "scratch\n").unwrap();
     keys(&mut rt, "C-x v d");
-    until(&mut rt, "the status", |s| text(s).contains("modified   a.txt") && text(s).contains("new.txt"));
-    goto(&mut rt, "modified   a.txt", 0);
+    until(&mut rt, "the status", |s| text(s).contains("▸ a.txt") && text(s).contains("new.txt"));
+    goto(&mut rt, "▸ a.txt", 0);
     keys(&mut rt, "TAB");
     until(&mut rt, "hunks", |s| text(s).contains("+line twenty-nine"));
     goto(&mut rt, "+line two", 0);
@@ -1510,14 +1665,30 @@ fn jj_hunks_from_the_workspace_and_marked_rebase() {
     let mut rt = Runtime::open(&path, &state.path().join("journal"), "emacs").unwrap().0;
     keys(&mut rt, "C-x v d");
     until(&mut rt, "working copy changes", |s| text(s).contains("Working copy changes (1)"));
-    goto(&mut rt, "modified  c.txt", 0);
+    goto(&mut rt, "▸ c.txt", 0);
     keys(&mut rt, "TAB");
-    until(&mut rt, "hunks", |s| text(s).contains("+TWENTY-EIGHT"));
-    goto(&mut rt, "+TWO", 0);
-    keys(&mut rt, "s s");
-    until(&mut rt, "hunk squashed", |s| s.echo.starts_with("Recorded Jujutsu operation") && !text(s).contains("+TWO"));
+    let hunks = until(&mut rt, "hunks", |s| text(s).contains("▾ c.txt") && text(s).contains("+TWENTY-EIGHT"));
+    let inline = text(&hunks);
+    assert!(inline.lines().any(|line| line.starts_with("@@ ")), "hunk headers start at the left edge");
+    assert!(inline.lines().any(|line| line == "+TWENTY-EIGHT"), "code starts right after the diff sign: {inline}");
+    assert!(inline.lines().any(|line| line == " 29"), "context and changed code share a column");
+    let at = inline.find("+TWENTY-EIGHT").unwrap();
+    assert!(hunks.pane().layers.iter().any(|h| h.from <= at && at < h.to && hunks.style(h.style).bg.is_some()));
+    keys(&mut rt, "M-< n RET");
+    until(&mut rt, "focused Jujutsu change", |s| text(s).contains("F changed files") && text(s).contains("+TWO"));
+    keys(&mut rt, "F");
+    until(&mut rt, "files of the focused change", |s| text(s).starts_with("Files of recorded change"));
+    keys(&mut rt, "n RET");
+    until(&mut rt, "focused Jujutsu file", |s| text(s).contains("C-SPC selects lines") && text(s).contains("+TWO"));
+    keys(&mut rt, "n s");
+    let menu = pane_named(&rt.snapshot(), "*vc-menu*").unwrap();
+    assert!(menu.contains("Hunk at point · c.txt") && menu.contains("Move into parent"), "{menu}");
+    keys(&mut rt, "s");
+    until(&mut rt, "hunk squashed", |s| s.echo.starts_with("Recorded Jujutsu operation"));
     assert_eq!(show("@-"), lines(&[(2, "TWO")]));
-    // The patch stays open across the rewrite, on the change's new commit.
+    keys(&mut rt, "q q");
+    until(&mut rt, "refreshed graph", |s| text(s).contains("+TWENTY-EIGHT") && !text(s).contains("+TWO"));
+    // The inline patch stays open across the rewrite, on the change's new commit.
     goto(&mut rt, "+TWENTY-EIGHT", 0);
     keys(&mut rt, "R");
     until(&mut rt, "restore question", |s| s.echo.ends_with("(y or n) "));
@@ -1527,6 +1698,9 @@ fn jj_hunks_from_the_workspace_and_marked_rebase() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), lines(&[(2, "TWO"), (15, "FIFTEEN")]));
     goto(&mut rt, "+FIFTEEN", 0);
     keys(&mut rt, "S");
+    let menu = pane_named(&rt.snapshot(), "*vc-menu*").unwrap();
+    assert!(menu.contains("Hunk at point · c.txt") && menu.contains("Split this selection"), "{menu}");
+    keys(&mut rt, "s");
     until(&mut rt, "split description", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Description of the part")));
     type_text(&mut rt, "Fifteen alone");
     keys(&mut rt, "RET");
@@ -1535,7 +1709,7 @@ fn jj_hunks_from_the_workspace_and_marked_rebase() {
     keys(&mut rt, "u");
     until(&mut rt, "undone", |s| s.echo == "Undone · U redoes" && !text(s).contains("Fifteen alone"));
     // On a change, S reads the files to split out.
-    keys(&mut rt, "M-< n S");
+    keys(&mut rt, "M-< n S s");
     until(&mut rt, "file to split", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Split out file")));
     type_text(&mut rt, "c.txt");
     keys(&mut rt, "RET");
@@ -1572,12 +1746,12 @@ fn a_region_across_hunks_stages_the_lines_it_covers() {
     let edited = original.replace("line 3\n", "changed 3\n").replace("line 28\n", "changed 28\n").replace("line 29\n", "changed 29\n");
     std::fs::write(root.join("a.txt"), &edited).unwrap();
     keys(&mut rt, "C-x v d");
-    until(&mut rt, "the status", |s| text(s).contains("modified   a.txt"));
-    goto(&mut rt, "modified   a.txt", 0);
+    until(&mut rt, "the status", |s| text(s).contains("▸ a.txt"));
+    goto(&mut rt, "▸ a.txt", 0);
     keys(&mut rt, "TAB");
     let shown = until(&mut rt, "two hunks", |s| text(s).contains("+changed 29"));
-    let from = text(&shown).find("    -line 3").unwrap();
-    let to = text(&shown).find("    +changed 28").unwrap() + "    +changed 28".len();
+    let from = text(&shown).find("\n-line 3").unwrap() + 1;
+    let to = text(&shown).find("\n+changed 28").unwrap() + "\n+changed 28".len();
     rt.eval(&format!("(move! (current-session) (lambda (_) {from}))")).unwrap();
     keys(&mut rt, "C-SPC");
     rt.eval(&format!("(move! (current-session) (lambda (_) {to}))")).unwrap();

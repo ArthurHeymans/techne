@@ -101,7 +101,7 @@ fn version_control_sections_in_the_terminal_grid() {
     let path = dir.path().join("cache.scm");
     let init = std::process::Command::new("git").current_dir(dir.path()).args(["init", "-q", "-b", "topic/cache"]).output().unwrap();
     assert!(init.status.success());
-    std::fs::write(&path, "(define cache 0)\n").unwrap();
+    std::fs::write(&path, "(define cache 0)\n(define limit 1)\n").unwrap();
     let state = tempfile::tempdir().unwrap();
     let mut rt = Runtime::open(&path, &state.path().join("journal"), "emacs").unwrap().0;
     let mut term = Term::new(72, 24);
@@ -118,17 +118,34 @@ fn version_control_sections_in_the_terminal_grid() {
         t.redraw();
         assert!(start.elapsed() < Duration::from_secs(15), "{}", screen(&t));
     }
-    assert!(screen(&t).contains("\n  cache.scm"), "{}", screen(&t));
+    assert!(screen(&t).contains("\n  ▸ cache.scm"), "{}", screen(&t));
     assert!(screen(&t).contains("? all commands"), "{}", screen(&t));
     t.send(b"n\t");
     assert!(screen(&t).contains("▸ Untracked files (1)"), "{}", screen(&t));
-    assert!(!screen(&t).contains("\n  cache.scm"), "{}", screen(&t));
+    assert!(!screen(&t).contains("\n  ▸ cache.scm"), "{}", screen(&t));
     // A menu shows below the status, its keys in columns.
     t.send(b"c");
     assert!(screen(&t).contains("c  Commit") && screen(&t).contains("Arguments"), "{}", screen(&t));
     println!("Commit menu grid:\n{}", screen(&t));
     t.send(b"\x07");
     println!("Folded VC grid:\n{}", screen(&t));
+    t.send(b"\tn\t");
+    let start = std::time::Instant::now();
+    let (row, sign) = loop {
+        if let Some(found) = (0..t.grid.rows).find_map(|row| t.grid.row_text(row).find("+(define cache 0)").map(|col| (row, col))) {
+            break found;
+        }
+        t.rt.run_tasks(Duration::from_millis(5)).unwrap();
+        t.redraw();
+        assert!(start.elapsed() < Duration::from_secs(15), "{}", screen(&t));
+    };
+    assert_eq!(sign, 0, "an inline patch starts at the pane's left edge");
+    let styles = t.styles(row);
+    assert_ne!(fg(styles[sign]), fg(styles[sign + 2]), "the sign and the Scheme keyword keep their own foregrounds");
+    assert_eq!(bg(styles[sign]), Some([0x22, 0x35, 0x2d]));
+    assert_eq!(bg(styles[sign + 2]), bg(styles[sign]));
+    assert_eq!(bg(*styles.last().unwrap()), bg(styles[sign]), "the band extends to the edge");
+    println!("Open VC grid:\n{}", screen(&t));
 }
 
 #[test]

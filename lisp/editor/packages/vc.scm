@@ -23,8 +23,11 @@
 (require "vc/evidence.scm")
 (require "vc/transient.scm")
 (require "vc/refine.scm")
+(require "vc/log-columns.scm")
 (require "../views.scm")
 (require "../session.scm")
+(require "../help.scm")
+(require "../windows.scm")
 
 (define-face vc.section "A section's heading in a version control view." #:fg 'yellow #:weight 'bold)
 (define-face vc.hash "A commit's abbreviated ID." #:fg 'overlay2)
@@ -479,26 +482,88 @@ With #f refresh explicitly. Remote status always refreshes on demand."
                      (let ((part (cons (car rest) (before-hunk (cdr rest)))))
                        (cons part (loop (drop rest (length part)))))))))))
 
-(define (patch-display lines #:hunk [hunk #f] #:part [part 0] #:key [key 'patch] #:indent [indent ""])
+(define (patch-display lines #:hunk [hunk #f] #:part [part 0] #:key [key 'patch] #:indent [indent ""]
+                       #:path [path #f] #:skip [skip 0] #:stat [stat? #f])
   (map (lambda (runs i)
          (row (cons indent runs) #:key (list key part i)
               #:target (and hunk (target 'vc-hunk (append (target-value hunk) (list i))))))
-       (refine-patch-lines lines) (iota (length lines))))
+       (drop (refine-patch-lines lines #:path path #:stat stat?) skip) (iota (- (length lines) skip) skip)))
+
+(define-face diff.added-row "The background of an added patch line, behind its syntax." #:bg '("#22352d" 0) #:extend #t)
+(define-face diff.removed-row "The background of a removed patch line, behind its syntax." #:bg '("#382731" 0) #:extend #t)
+
+;; The first patch run retains the sign's diff face even when the rest
+;; has been syntax-coloured. Draw a band from that sign past the last
+;; token, then put the stronger word marks above the band.
+(define (patch-row-bands r start end)
+  (let* ((columns (and r (row-columns r)))
+         (runs (and (pair? columns) (car columns)))
+         (sign (and (pair? runs) (pair? (cdr runs)) (cadr runs)))
+         (band (and (pair? sign)
+                    (case (cadr sign) ((diff.added) 'diff.added-row) ((diff.removed) 'diff.removed-row)
+                          (else #f)))))
+    (if (not band) '()
+        (let ((from (+ start (bytevector-length (string->utf8 (car runs))))))
+          (cons (list from end band)
+                (let loop ((runs (cdr runs)) (at from) (out '()))
+                  (if (null? runs) (reverse out)
+                      (let* ((run (car runs)) (next (+ at (bytevector-length (string->utf8 (car run))))))
+                        (loop (cdr runs) next
+                              (if (memq (cadr run) '(diff.refine-added diff.refine-removed))
+                                  (cons (list at next (cadr run)) out) out))))))))))
+
+(define (vc-patch-bands p from to)
+  (let* ((st (buffer-state (document-buffer p)))
+         (rows (and (hash-table? st) (hash-table-ref/default st 'rows #f)))
+         (len (document-length p)))
+    (if (not rows) '()
+        (append-map (lambda (span)
+                      (patch-row-bands (hash-table-ref/default rows (car span) #f)
+                                       (cadr span) (min len (+ (caddr span) 1))))
+                    (presentation-rows-between p from to)))))
+
+(define (patch-path t)
+  (case (target-kind t)
+    ((vc-file) (cadr (target-value t)))
+    ((vc-jj-file vc-file-commit) (caddr (target-value t)))
+    (else #f)))
 
 (define-mode vc-diff-mode
   "A version control patch, with its comparison and Git hunk actions."
   #:parent 'special-mode
+  #:layer vc-patch-bands
   #:directory (lambda (b)
                 (let* ((st (buffer-state b)) (t (and (hash-table? st) (hash-table-ref/default st 'target #f)))
                        (v (and t (target-value t))))
                   (and (pair? v) (pair? (car v)) (string? (cadr (car v))) (normal-directory (cadr (car v))))))
   #:keys '(("s" vc-stage) ("u" vc-unstage) ("k" vc-discard-at-point) ("RET" vc-visit-at-point) ("n" vc-next-item) ("p" vc-previous-item)
-           ("?" vc-diff-help) ("q" quit-window))
+           ("?" vc-diff-help) ("q" vc-close-patch))
   #:normal '(("s" vc-stage) ("u" vc-unstage) ("k" vc-discard-at-point) ("RET" vc-visit-at-point) ("n" vc-next-item) ("p" vc-previous-item)
-             ("?" vc-diff-help) ("q" quit-window))
+             ("?" vc-diff-help) ("q" vc-close-patch))
   #:target-at (lambda (b pos)
                 (let ((r (row-at (buffer-document b) (hash-table-ref (buffer-state b) 'rows) pos)))
                   (and r (row-target r)))))
+
+(define %jj-patch-keys
+  '(("s" vc-jj-squash-menu) ("S" vc-jj-split-menu) ("F" vc-jj-files) ("?" vc-jj-patch-help)))
+
+(define-mode vc-jj-patch-mode
+  "Inspect a single recorded Jujutsu change or file."
+  #:parent 'vc-diff-mode
+  #:keys %jj-patch-keys #:normal %jj-patch-keys)
+
+(define (jj-patch-subject s)
+  (let ((b (session-buffer s)))
+    (and b (eq? (buffer-mode b) 'vc-jj-patch-mode)
+         (hash-table-ref/default (buffer-state b) 'target #f))))
+
+(define-command (vc-jj-patch-help s n)
+  "Show the rewrite and navigation commands for this Jujutsu patch."
+  (vc-transient! s
+    `("Jujutsu patch"
+      (,(jj-scope-label s) (suffix "s" "Squash…" vc-jj-squash-menu) (suffix "S" "Split…" vc-jj-split-menu))
+      ("Browse" (suffix "F" "Changed files" vc-jj-files) (suffix "n" "Next hunk" vc-next-item)
+                (suffix "p" "Previous hunk" vc-previous-item) (suffix "q" "Back or close patch" vc-close-patch)))))
 
 (define-command (vc-diff-help s n)
   "Show what can be done with the patch at point."
@@ -509,41 +574,49 @@ With #f refresh explicitly. Remote status always refreshes on demand."
         ("At point" (suffix "s" ,(string-append "Stage " scope) vc-stage ,(lambda (s) (git-index-action? (target-at (doc s) (point s)) #t)))
                     (suffix "u" ,(string-append "Unstage " scope) vc-unstage ,(lambda (s) (git-index-action? (target-at (doc s) (point s)) #f)))
                     (suffix "k" ,(string-append "Discard " scope) vc-discard-at-point ,(lambda (s) (and (file-target (target-at (doc s) (point s))) #t)))
-                    (suffix "RET" "Visit the file there" vc-visit-at-point))
-        ("Move" (suffix "n" "Next hunk" vc-next-item) (suffix "p" "Previous hunk" vc-previous-item) (suffix "q" "Quit" quit-window))))))
+                    (suffix "RET" "Visit the file there" vc-visit-at-point
+                             ,(lambda (s) (let ((t (target-at (doc s) (point s)))) (and t (eq? (target-kind t) 'vc-hunk))))))
+        ("Move" (suffix "n" "Next hunk" vc-next-item) (suffix "p" "Previous hunk" vc-previous-item) (suffix "q" "Back or close patch" vc-close-patch))))))
 
 (define (hunk-rows t text patch key indent)
   (apply append
          (map (lambda (part i)
                 (let ((fragment (string-append (string-join (append (car patch) part) "\n") "\n")))
-                  (patch-display part #:part i #:key key #:indent indent #:hunk (target 'vc-hunk (list t text fragment)))))
+                  (patch-display part #:part i #:key key #:indent indent #:path (patch-path t)
+                                  #:hunk (target 'vc-hunk (list t text fragment)))))
               (cdr patch) (iota (length (cdr patch)) 1))))
 
 (define (render-patch! b t text)
   (let* ((st (buffer-state b))
          (side (and (eq? (target-kind t) 'vc-file) (cadddr (target-value t))))
-         (editable (and (memq side '(worktree index)) (split-index-patch text)))
+         (jj? (memq (target-kind t) '(vc-change vc-jj-file)))
+         (editable (and (or (memq side '(worktree index))
+                            (and (eq? (target-kind t) 'vc-jj-file) (list-ref (target-value t) 4)))
+                        (split-index-patch text)))
          (rows (cond ((string=? text "") (list (row "No differences" #:key 'empty)))
                      (editable
                       (append (patch-display (car editable))
                               (hunk-rows t text editable 'patch "")))
-                     (else (patch-display (string-split (chomp text) "\n"))))))
+                     (else (patch-display (string-split (chomp text) "\n") #:path (patch-path t)
+                                           #:stat (memq (target-kind t) '(vc-git-commit vc-git-ref vc-reviewed vc-stash vc-git-range)))))))
     (hash-table-set! st 'target t)
     (hash-table-set! st 'rows
       (present! (buffer-document b)
                 (append (list (row (list (list (comparison t) 'heading)) #:key 'comparison)
                               (row (list (list (cond ((and editable (eq? side 'worktree)) "n/p hunks  ·  s stage hunk or region  ·  k discard  ·  RET visit  ·  ? menu")
                                                      ((and editable (eq? side 'index)) "n/p hunks  ·  u unstage hunk or region  ·  RET visit  ·  ? menu")
-                                                     (else "n/p hunks  ·  ? menu  ·  q quit")) 'vc.hint)) #:key 'keys))
+                                                     (jj? (if editable "n/p hunks · s squash · S split · C-SPC selects lines · q back"
+                                                               "F changed files · s squash · S split · q back"))
+                                                      (else "n/p hunks  ·  ? menu  ·  q back/close")) 'vc.hint)) #:key 'keys))
                         rows)))))
 
-;; The diff of the current target, shown beside the focused pane.
+;; The current change's patch, opened in place or previewed beside the pane.
 (define %diff-slot (make-request-slot))
 (define (target-diff t)
   (let ((v (target-value t)))
     (case (target-kind t)
       ((vc-file) (diff (car v) (cadr v) (cadddr v) (list-ref v 4)))
-      ((vc-change) (diff (car v) (cadr v) 'revision #f))
+      ((vc-change) (jj-read (car v) (list "show" "--git" "-r" (cadr v))))
       ((vc-jj-file) (jj-read (car v) (append (list "diff" "--git" "-r" (cadr v) "--") (cadddr v))))
       ((vc-jj-operation) (jj-read (car v) (list "op" "diff" "--git" "--op" (cadr v))))
       ((vc-file-commit) (let ((repo (car v)) (sha (cadr v)) (path (caddr v)))
@@ -569,17 +642,65 @@ With #f refresh explicitly. Remote status always refreshes on demand."
 
 (define (show-diff! s f) (show-target-diff! s (target 'vc-file f)))
 
-(define (show-target-diff! s t)
+(define (show-target-diff! s t #:open [open? #f])
+  (let ((origin (pane-view s)))
   (request! %diff-slot
             (lambda () (target-diff t))
             (lambda (text)
-              (let* ((name (string-append "*vc-diff " (cadr (car (target-value t))) "*"))
+              (let* ((name (string-append (cond ((eq? (target-kind t) 'vc-jj-file) (string-append (if open? "*jj file " "*jj preview ") (patch-path t) " · "))
+                                                             ((eq? (target-kind t) 'vc-change) (if open? "*vc-change " "*jj preview "))
+                                                             (open? "*vc-change ") (else "*vc-diff "))
+                                                       (cadr (car (target-value t))) "*"))
                      (b (or (buffer-named name)
-                            (make-generated-buffer! name (make-presentation) 'vc-diff-mode #:state (make-hash-table)))))
+                            (make-generated-buffer! name (make-presentation)
+                                                     (if (memq (target-kind t) '(vc-change vc-jj-file)) 'vc-jj-patch-mode 'vc-diff-mode)
+                                                     #:state (make-hash-table)))))
                 (guard (e (#t (message! s (error-text e))))
                   (render-patch! b t text)
-                  (display-buffer! s (buffer-document b)))))
-            #:fail (lambda (e) (message! s (error-text e)))))
+                  (if open?
+                      (when (view=? origin (pane-view s))
+                        (let* ((view (show-buffer! s b)) (origins (or (sget s 'vc-patch-origins) (make-hash-table))))
+                          (sset! s 'vc-patch-origins origins)
+                          (hash-table-set! origins (view-id view) origin)
+                          ;; A reused patch view remembers its scroll separately from point.
+                          (view-set-ranges! view '((0 0)) 0)
+                          (view-set-scroll! view 0)))
+                      (show-patch-preview! s origin (buffer-document b))))))
+            #:fail (lambda (e) (message! s (error-text e))))))
+
+(define (show-patch-preview! s origin p)
+  (display-buffer! s p)
+  (when (and (view=? origin (pane-view s)) (eq? (buffer-mode (session-buffer s)) 'vc-log-mode))
+    (let ((view (find (lambda (v) (and (not (view=? v origin)) (document=? (view-document v) p)))
+                      (session-panes s))))
+      (when view (sset! s 'vc-log-preview (cons origin view))))))
+
+(define (log-preview-view s)
+  (let ((pair (sget s 'vc-log-preview)))
+    (and pair (view=? (car pair) (pane-view s))
+         (find (lambda (v) (view=? v (cdr pair))) (session-panes s)))))
+
+(define (page-log-preview! s screens)
+  (let ((view (log-preview-view s)))
+    (if view (request-view! s (list 'page screens next-screen-context-lines) #:view view)
+        (message! s "No preview here; press SPC on a commit first"))))
+
+(define-command (vc-log-preview-next-page s n)
+  "Scroll the Git log preview down without leaving the log."
+  (page-log-preview! s (if (< n 0) -1.0 1.0)))
+
+(define-command (vc-log-preview-previous-page s n)
+  "Scroll the Git log preview up without leaving the log."
+  (page-log-preview! s (if (< n 0) 1.0 -1.0)))
+
+(define-command (vc-close-patch s n)
+  "Return to the view that opened this change, or close the preview."
+  (let* ((view (pane-view s)) (origins (sget s 'vc-patch-origins))
+         (origin (and origins (hash-table-ref/default origins (view-id view) #f))))
+    (when origin (hash-table-delete! origins (view-id view)))
+    (if (and origin (document-buffer (view-document origin)))
+        (unless (focus-view! s origin) (set-pane-view! s origin))
+        (if (> (length (session-panes s)) 1) (delete-pane! s (session-focus s)) (quit-window s n)))))
 
 ;;; Status buffers. Their state is plain data, a table, so the package's
 ;;; next generation reads it as this one does.
@@ -600,6 +721,7 @@ and graph.
 item at point, \\[vc-toggle-section] folds or shows it, \\[vc-status-refresh]
 refreshes."
   #:parent 'special-mode
+  #:layer vc-patch-bands
   #:directory (lambda (b) (normal-directory (cadr (hash-table-ref (buffer-state b) 'repo))))
   #:keys (append %section-keys '(("g" vc-status-refresh)))
   #:normal (append %section-keys '(("g r" vc-status-refresh)))
@@ -628,8 +750,8 @@ commits, \\[vc-push-menu] pushes, \\[vc-dispatch] shows every command."
   #:normal %git-status-keys)
 
 (define %jj-status-keys
-  '(("d" vc-jj-describe) ("c" vc-jj-commit) ("o" vc-jj-new-menu) ("O" vc-jj-new) ("e" vc-jj-edit)
-    ("s" vc-jj-squash-menu) ("S" vc-jj-split) ("R" vc-jj-restore) ("r" vc-jj-rebase-menu)
+  '(("SPC" vc-diff-at-point) ("w" vc-copy-history-id) ("d" vc-jj-describe) ("c" vc-jj-commit) ("o" vc-jj-new-menu) ("O" vc-jj-new) ("e" vc-jj-edit)
+    ("s" vc-jj-squash-menu) ("S" vc-jj-split-menu) ("R" vc-jj-restore) ("r" vc-jj-rebase-menu)
     ("b" vc-jj-bookmark-menu) ("f" vc-jj-fetch-menu) ("P" vc-jj-push-menu) ("x" vc-jj-abandon) ("k" vc-jj-abandon)
     ("u" vc-jj-undo) ("U" vc-jj-redo) ("X" vc-jj-operations-menu) ("m" vc-jj-mark) ("M" vc-jj-unmark-all)
     ("v" vc-jj-evolog) ("A" vc-jj-absorb) ("y" vc-jj-duplicate) ("C" vc-jj-conflicts)
@@ -679,7 +801,7 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
       (string-append text (make-string (- width (string-length text)) #\space))))
 
 (define (status-word code)
-  (case code ((#\M) "modified") ((#\A) "new file") ((#\D) "deleted") ((#\R) "renamed")
+  (case code ((#\M) #f) ((#\A) "new file") ((#\D) "deleted") ((#\R) "renamed")
         ((#\C) "copied") ((#\T) "typechange") ((#\?) "untracked") (else "changed")))
 
 (define (conflict-word xy)
@@ -688,7 +810,10 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
                      ("UD" . "deleted by them"))) => cdr)
         (else "unmerged")))
 
-(define (git-file-rows repo entries side)
+(define (patch-marker st f)
+  (list (if (hash-table-exists? (inline-patches st) (file-key f)) "▾ " "▸ ") 'vc.section))
+
+(define (git-file-rows repo entries side st)
   (map (lambda (e)
          (let* ((f (git-file repo e side)) (xy (car e)) (path (cadr e)) (old (list-ref (target-value f) 4))
                 (word (case side
@@ -697,7 +822,8 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
                         ((conflict) (conflict-word xy))
                         (else #f))))
            (row (append (list "  ")
-                        (if word (list (list (pad word 11) 'vc.file-status)) '())
+                        (if (eq? side 'conflict) '() (list (patch-marker st f)))
+                        (if word (list (list (string-append word "  ") 'vc.file-status)) '())
                         (list (if old (string-append (label old) " → " (label path)) (label path))))
                 #:key (list side path) #:target f)))
        entries))
@@ -831,13 +957,13 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
                (list (row (list (pad "Push:" 10) (list (label push) 'vc.remote)) #:key 'push)) '()))
          (let ((tag (get 'tag)))
            (if tag (list (row (list (pad "Tag:" 10) (list (label tag) 'vc.tag)) #:key 'tag)) '()))
-         (hint-rows "? all commands · s stage · u unstage · k discard · c commit · P push · TAB fold" 'hints)
+         (hint-rows "? all commands · TAB expand/fold · s/u stage/unstage · c commit" 'hints)
          (git-operation-rows repo operation summary closed)
          (if (and (null? entries) (null? operation)) (list (row "No changes" #:key 'none)) '())
-         (section 'conflict "Conflicts" (side-entries 'conflict) closed (lambda (es) (git-file-rows repo es 'conflict)))
-         (section 'untracked "Untracked files" (side-entries 'untracked) closed (lambda (es) (git-file-rows repo es 'untracked)))
-         (section 'worktree "Unstaged changes" (side-entries 'worktree) closed (lambda (es) (git-file-rows repo es 'worktree)))
-         (section 'index "Staged changes" (side-entries 'index) closed (lambda (es) (git-file-rows repo es 'index)))
+         (section 'conflict "Conflicts" (side-entries 'conflict) closed (lambda (es) (git-file-rows repo es 'conflict st)))
+         (section 'untracked "Untracked files" (side-entries 'untracked) closed (lambda (es) (git-file-rows repo es 'untracked st)))
+         (section 'worktree "Unstaged changes" (side-entries 'worktree) closed (lambda (es) (git-file-rows repo es 'worktree st)))
+         (section 'index "Staged changes" (side-entries 'index) closed (lambda (es) (git-file-rows repo es 'index st)))
          (section 'stashes "Stashes" (or (get 'stashes) '()) closed
                   (lambda (items)
                     (map (lambda (item)
@@ -858,14 +984,15 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
              '())))))
 
 ;; The marker of a jj change: its graph node, then its IDs and names.
-(define (jj-change-runs fields #:marked [marked #f])
+(define (jj-change-runs fields #:marked [marked #f] #:fold [fold #f])
   (let* ((prefix (car fields)) (commit (jj-entry-commit fields)) (change (jj-entry-change fields))
          (conflict (string=? (list-ref fields 3) "!")) (empty (string=? (list-ref fields 4) "empty"))
          (wc (string=? (list-ref fields 5) "@")) (immutable (string=? (list-ref fields 6) "immutable"))
          (words (lambda (s) (filter (lambda (w) (not (string=? w ""))) (string-split s " "))))
          (description (jj-entry-description fields)))
     (append (list (list prefix (if wc 'vc.working-copy 'vc.graph)))
-            (if marked (list (list "*" 'vc.marked) " ") '())
+            (if fold (list (list (if (eq? fold 'open) "▾ " "▸ ") 'vc.section)) '())
+             (if marked (list (list "*" 'vc.marked) " ") '())
             (list (list change 'vc.change-id) " " (list (substring commit 0 8) 'vc.commit-id) " ")
             (append-map (lambda (b) (list (list (label b) 'vc.branch) " ")) (words (list-ref fields 7)))
             ;; A colocated repository's @git bookmarks only echo the local ones.
@@ -881,21 +1008,24 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
                 (list (list (string-append "  " (label (list-ref fields 10)) ", " (list-ref fields 11)) 'vc.author))))))
 
 (define (jj-file-status-word status)
-  (cond ((string=? status "M") "modified") ((string=? status "A") "added") ((string=? status "D") "deleted")
+  (cond ((string=? status "M") #f) ((string=? status "A") "added") ((string=? status "D") "deleted")
         ((string=? status "R") "renamed") ((string=? status "C") "copied") (else status)))
 
 ;; Rows for the changed files of the recorded change COMMIT.
-(define (jj-file-rows repo commit files indent #:change [change #f])
+(define (jj-file-rows repo commit files indent st #:change [change #f])
   (map (lambda (entry)
          (let* ((path (dict-ref entry "path")) (source (dict-ref entry "source"))
                 (status (dict-ref entry "status"))
                 (paired? (member status '("R" "C")))
-                (paths (if (and paired? (not (string=? path source))) (list source path) (list path))))
-           (row (list indent (list (pad (jj-file-status-word status) 10) 'vc.file-status)
+                (paths (if (and paired? (not (string=? path source))) (list source path) (list path)))
+                (word (jj-file-status-word status))
+                (f (target 'vc-jj-file (list repo commit path (map exact-jj-file paths) (not paired?) change))))
+           (row (list indent (patch-marker st f)
+                      (if word (list (string-append word "  ") 'vc.file-status) "")
                       (if paired? (string-append (label source) " → ") "") (label path)
                       (if paired? (list "  (inspect only)" 'shadow) ""))
                 #:key (list 'jj-file (or change commit) path)
-                #:target (target 'vc-jj-file (list repo commit path (map exact-jj-file paths) (not paired?) change)))))
+                #:target f)))
        files))
 
 (define (jj-status-rows repo st closed)
@@ -922,14 +1052,14 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
                      #:key (list 'parent i) #:target (target 'vc-change (list repo (jj-entry-commit p)))))
               parents (iota (length parents)))
          (list (row (list (pad "Revset" 14) (list (label revset) 'keyword)) #:key 'revset))
-         (hint-rows "? all commands · d describe · o new · s squash · S split · r rebase · u undo · TAB fold"
+         (hint-rows "? all commands · TAB expand/fold · d describe · s squash · u undo"
                     'hints)
          (if wc
              (append
               (if (null? files)
                   (list (row (list (list "Working copy clean · g records edits since the last snapshot" 'shadow)) #:key 'clean))
                   (section 'wc-files "Working copy changes" files closed
-                           (lambda (fs) (jj-file-rows repo (jj-entry-commit wc) fs "  " #:change (jj-entry-change wc)))))
+                           (lambda (fs) (jj-file-rows repo (jj-entry-commit wc) fs "  " st #:change (jj-entry-change wc)))))
               (section 'wc-conflicts "Conflicts" conflicts closed
                        (lambda (paths)
                          (map (lambda (path)
@@ -957,13 +1087,13 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
                                   (change (jj-entry-change fields))
                                   (key (if (hash-table-ref/default seen change #f) (list 'jj change commit) (list 'jj change))))
                              (hash-table-set! seen change #t)
-                             (cons (row (jj-change-runs fields #:marked (member commit marks))
+                             (cons (row (jj-change-runs fields #:marked (member commit marks) #:fold (if open 'open 'closed))
                                         #:key key
                                         #:target (target 'vc-change (list repo commit change)))
                                    (cond ((not open) '())
                                          ((eq? open 'loading) (list (row (list (list "      Reading files…" 'shadow)) #:key (list 'loading commit))))
                                          ((null? open) (list (row (list (list "      No changed files" 'shadow)) #:key (list 'nofiles commit))))
-                                         (else (jj-file-rows repo commit open "      " #:change change)))))))
+                                         (else (jj-file-rows repo commit open "      " st #:change change)))))))
                      graph (iota (length graph)))
                     (if (>= (count jj-entry? graph) limit)
                         (hint-rows (string-append "Up to " (number->string limit) " changes shown · + more · / revset") 'limit)
@@ -997,18 +1127,16 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
                 (let* ((t (row-target r))
                        (key (and t (memq (target-kind t) '(vc-file vc-jj-file)) (file-key t)))
                        (text (and key (hash-table-ref/default cached key #f)))
-                       (patch (and (string? text) (split-index-patch text)))
-                       (first (and (pair? (row-columns r)) (car (row-columns r))))
-                       (indent (if (and (pair? first) (string? (car first))) (string-append (car first) "  ") "    ")))
+                       (patch (and (string? text) (split-index-patch text))))
                   (cons r (cond ((and (pair? text) (eq? (car text) 'loading))
-                                 (list (row (list (list (string-append indent "Reading patch…") 'shadow)) #:key (list key 'loading))))
-                                (patch (append (hint-rows (string-append indent (hunk-hint t)) (list key 'hunk-hint))
-                                               (hunk-rows t text patch key indent)))
+                                 (list (row (list (list "Reading patch…" 'shadow)) #:key (list key 'loading))))
+                                (patch (append (hint-rows (hunk-hint t) (list key 'hunk-hint))
+                                               (hunk-rows t text patch key "")))
                                 ;; Only the hunks: the row says which file.
                                 ((string? text)
-                                 (let* ((lines (nonempty-lines text))
+                                 (let* ((lines (string-split (chomp text) "\n"))
                                         (hunks (let loop ((ls lines)) (cond ((null? ls) lines) ((string-prefix? "@@" (car ls)) ls) (else (loop (cdr ls)))))))
-                                   (patch-display hunks #:key key #:indent indent)))
+                                   (patch-display hunks #:key key #:path (patch-path t))))
                                 (else '()))))) rows))
 
 (define (hunk-hint t)
@@ -1266,7 +1394,9 @@ patch; on a section's heading, fold the section."
   (let ((t (target-at (doc s) (point s))))
     (cond ((not t) (message! s "No item at point"))
           ((eq? (target-kind t) 'vc-section) (vc-toggle-section s n))
-          ((memq (target-kind t) '(vc-change vc-git-commit vc-stash)) (show-target-diff! s t))
+          ((memq (target-kind t) '(vc-change vc-git-commit vc-stash))
+           (show-target-diff! s t #:open (or (eq? (target-kind t) 'vc-change)
+                                            (eq? (buffer-mode (session-buffer s)) 'vc-log-mode))))
           ((eq? (target-kind t) 'vc-jj-conflict)
            (let ((v (target-value t)) (origin (session-buffer s)))
              (request! (make-request-slot)
@@ -1304,6 +1434,22 @@ patch; on a section's heading, fold the section."
             (presentation-rows-between p 0 (document-length p)))))
 
 (define (step-item! s direction)
+  (if (derived-mode? (buffer-mode (session-buffer s)) 'vc-diff-mode)
+      (step-diff-hunk! s direction)
+      (step-status-item! s direction)))
+
+(define (step-diff-hunk! s direction)
+  (let* ((p (doc s)) (at (point s))
+         (hunks (row-spans s (lambda (r span)
+                               (let ((line (document-substring p (cadr span) (caddr span))))
+                                 (or (string-prefix? "@@ " line) (string-prefix? "@@@ " line))))))
+         (found (if (> direction 0)
+                    (find (lambda (span) (> (cadr span) at)) hunks)
+                    (find (lambda (span) (< (caddr span) at)) (reverse hunks)))))
+    (if found (move! s (lambda (_) (cadr found)))
+        (message! s (if (> direction 0) "No next hunk" "No previous hunk")))))
+
+(define (step-status-item! s direction)
   (let* ((p (doc s)) (at (point s))
          (items (row-spans s (lambda (r span)
                                (and (row-target r)
@@ -1826,7 +1972,9 @@ Untracked files are deleted."
 
 (define (current-jj-repo s)
   (let* ((b (session-buffer s)) (st (and b (buffer-state b)))
-         (repo (and (hash-table? st) (hash-table-ref/default st 'repo #f))))
+         (subject (jj-patch-subject s))
+         (repo (or (and subject (car (target-value subject)))
+                   (and (hash-table? st) (hash-table-ref/default st 'repo #f)))))
     (unless repo (error "Open a Jujutsu workspace first"))
     (if (eq? (car repo) 'jj) repo (error "This is not a Jujutsu workspace"))))
 
@@ -1845,7 +1993,7 @@ Untracked files are deleted."
 ;; The recorded commit of the change at point: a change's row, or the
 ;; change of the file, hunk or conflict at point.
 (define (jj-change-at s)
-  (let ((t (target-at (doc s) (point s))))
+  (let ((t (or (target-at (doc s) (point s)) (jj-patch-subject s))))
     (and t (case (target-kind t)
              ((vc-change vc-jj-conflict) (cadr (target-value t)))
              ((vc-jj-file) (cadr (target-value t)))
@@ -2097,9 +2245,9 @@ That is the ancestor that last changed its lines."
 
 (define (jj-selection s f #:base [base 'left])
   (let* ((b (session-buffer s)) (selected (selected-patch-lines s b))
-         (t (if selected (first-hunk selected) (target-at (doc s) (point s))))
+         (t (if selected (first-hunk selected) (or (target-at (doc s) (point s)) (jj-patch-subject s))))
          (file (jj-file-target t)))
-    (cond ((not file) (f #f #f '() #f))
+    (cond ((not file) (if selected (error "Select lines in a single file patch") (f #f #f '() #f)))
           ((not (list-ref (target-value file) 4)) (error "Renames and copies are rewritten with their whole change"))
           ((and t (eq? (target-kind t) 'vc-hunk))
            (let* ((data (target-value t)) (shown (cadr data))
@@ -2115,66 +2263,93 @@ That is the ancestor that last changed its lines."
                 (lambda () (unless (string=? shown (target-diff file)) (error "The patch changed; look at it again"))))))
           (else (f (caddr (target-value file)) (cadddr (target-value file)) '() #f)))))
 
-(define (jj-squash! s into-rev-of)
-  (let ((marks (jj-marks s)) (repo (current-jj-repo s)) (keep (vc-transient-arg? s "--keep-emptied")))
+(define (jj-patch-back-after-write s)
+  (and (jj-patch-subject s)
+       (let ((view (pane-view s)))
+         (lambda () (when (view=? view (pane-view s)) (vc-close-patch s 1))))))
+
+(define (jj-rewrite-target s)
+  (or (target-at (doc s) (point s)) (jj-patch-subject s)))
+
+(define (jj-rewrite-at-point? s)
+  (let* ((target (jj-rewrite-target s)) (file (jj-file-target target)))
+    (and (jj-change-at s) (or (not file) (list-ref (target-value file) 4)))))
+
+(define (jj-scope-label s)
+  (let* ((target (jj-rewrite-target s)) (file (jj-file-target target)) (source (jj-change-at s)))
+    (cond ((and file (not (list-ref (target-value file) 4))) "Rename/copy: inspect only")
+          ((and file (region-active? s)) (string-append "Selected lines · " (label (caddr (target-value file)))))
+          ((and file (eq? (target-kind target) 'vc-hunk)) (string-append "Hunk at point · " (label (caddr (target-value file)))))
+          (file (string-append "Whole file · " (label (caddr (target-value file)))))
+          (source (string-append "Whole change · " (substring source 0 8)))
+          (else "No Jujutsu change at point"))))
+
+(define (jj-squash! s choose-destination)
+  (let ((repo (current-jj-repo s)) (marks (jj-marks s))
+        (keep? (vc-transient-arg? s "--keep-emptied")) (done (jj-patch-back-after-write s)))
     (jj-selection s
       (lambda (path files options check)
         (let* ((source (or (jj-change-at s) (error "Move to a Jujutsu change first")))
-               (sources (if (and (pair? marks) (not path)) marks (list source))))
-          (into-rev-of source
+               (marked? (and (not path) (pair? marks)))
+               (sources (if marked? marks (list source))))
+          (choose-destination repo source sources marked?
             (lambda (dest)
               (if (member dest sources) (message! s "A change cannot be squashed into itself")
-              (request! (make-request-slot)
-                        (lambda ()
-                          (list (jj-operation-id repo) (map (lambda (c) (jj-write-rev repo c)) sources) (jj-write-rev repo dest)
-                                (chomp (jj-read repo (list "log" "--no-graph" "-r" dest "-T" "description")))))
-                        (lambda (r)
-                          (clear-marks! s)
-                          (jj-write! s repo (car r)
-                                     (append '("squash") (append-map (lambda (rev) (list "--from" rev)) (cadr r))
-                                             (list "--into" (caddr r))
-                                             (if keep '("--keep-emptied") '())
-                                             (if (string=? (cadddr r) "") '() '("--use-destination-message"))
-                                             options (if path (cons "--" files) '()))
-                                     ;; Both described: keep the destination's
-                                     ;; message rather than wait for an editor.
-                                     #:check-files (and path #t) #:check check))
-                        #:fail (lambda (e) (message! s (error-text e))))))))))))
+                  (request! (make-request-slot)
+                    (lambda ()
+                      (list (jj-operation-id repo) (map (lambda (c) (jj-write-rev repo c)) sources) (jj-write-rev repo dest)
+                            (chomp (jj-read repo (list "log" "--no-graph" "-r" dest "-T" "description")))))
+                    (lambda (plan)
+                      (clear-marks! s)
+                      (jj-write! s repo (car plan)
+                                 (append '("squash") (append-map (lambda (rev) (list "--from" rev)) (cadr plan))
+                                         (list "--into" (caddr plan)) (if keep? '("--keep-emptied") '())
+                                         (if (string=? (cadddr plan) "") '() '("--use-destination-message"))
+                                         options (if path (cons "--" files) '()))
+                                 #:check-files (and path #t) #:check check #:after done))
+                    #:fail (lambda (e) (message! s (error-text e))))))))))))
 
 (define-command (vc-jj-squash s n)
   "Squash the change, file, hunk or lines at point into the parent.
-Marked changes are squashed into the change at point instead."
-  (let ((marks (jj-marks s)))
-    (if (pair? marks)
-        (let ((dest (jj-change-at s)))
-          (jj-squash! s (lambda (source go) (go dest))))
-        (let ((repo (current-jj-repo s)))
-          (jj-squash! s (lambda (source go)
-                          (request! (make-request-slot)
-                                    (lambda () (nonempty-lines (jj-read repo (list "log" "--no-graph" "-r" (string-append "parents(" source ")")
-                                                                                 "-T" "commit_id ++ \"\\n\""))))
-                                    (lambda (parents)
-                                      (if (= (length parents) 1) (go (car parents))
-                                          (message! s "A merge has several parents; squash into one with s i")))
-                                    #:fail (lambda (e) (message! s (error-text e))))))))))
+On a change, marked changes are squashed into the change at point instead."
+  (jj-squash! s
+    (lambda (repo source sources marked? go)
+      (if marked? (go source)
+          (request! (make-request-slot)
+            (lambda () (nonempty-lines (jj-read repo (list "log" "--no-graph" "-r" (string-append "parents(" source ")")
+                                                           "-T" "commit_id ++ \"\n\""))))
+            (lambda (parents)
+              (if (= (length parents) 1) (go (car parents))
+                  (message! s "No single parent; choose the destination with s i")))
+            #:fail (lambda (e) (message! s (error-text e))))))))
 
 (define-command (vc-jj-squash-into s n)
   "Squash the change, file, hunk or lines at point into a change read."
-  (jj-squash! s (lambda (source go) (read-change s "Squash into: " (list source) go))))
+  (jj-squash! s (lambda (repo source sources marked? go) (read-change s "Squash into: " sources go))))
 
 (define-command (vc-jj-squash-menu s n)
-  "Show the squash menu."
+  "Show what would be squashed and choose where it goes."
+  (let* ((marks (jj-marks s)) (marked? (and (pair? marks) (not (jj-file-target (jj-rewrite-target s)))))
+         (scope (if marked? (string-append (number->string (length marks)) " marked changes") (jj-scope-label s))))
+    (vc-transient! s
+      `("Squash · move edits into an existing change"
+        (,scope (suffix "s" ,(if marked? "Move into change at point" "Move into parent") vc-jj-squash ,jj-rewrite-at-point?)
+                (suffix "i" "Choose destination…" vc-jj-squash-into ,jj-rewrite-at-point?))
+        ("Options" (switch "-k" "Keep the emptied source" "--keep-emptied"))))))
+
+(define-command (vc-jj-split-menu s n)
+  "Review what would be split out before choosing a description."
   (vc-transient! s
-    '("Squash"
-      ("Arguments" (switch "-k" "Keep the emptied change" "--keep-emptied"))
-      ("Squash what is at point" (suffix "s" "Into its parent; marked into point" vc-jj-squash)
-                                 (suffix "i" "Into a change read" vc-jj-squash-into)))))
+    `("Split · put edits into a new change before this one"
+      (,(jj-scope-label s) (suffix "s" ,(if (jj-file-target (jj-rewrite-target s)) "Split this selection…" "Choose whole files…")
+                                   vc-jj-split ,jj-rewrite-at-point?))
+      ("Browse" (suffix "F" "Browse files and hunks first" vc-jj-files ,jj-change-at)))))
 
 (define-command (vc-jj-split s n)
   "Split the file, hunk or lines at point out of their change.
 They go into a change before it, with a description read. On a change,
 the files to split out are read, one after another."
-  (let ((repo (current-jj-repo s)))
+  (let ((repo (current-jj-repo s)) (done (jj-patch-back-after-write s)))
     (jj-selection s
       (lambda (path files options check)
         (let* ((commit (or (jj-change-at s) (error "Move to a change, file or hunk first")))
@@ -2184,7 +2359,7 @@ the files to split out are read, one after another."
                             (request! (make-request-slot) (lambda () (cons (jj-operation-id repo) (jj-write-rev repo commit)))
                                       (lambda (r)
                                         (jj-write! s repo (car r) (append (list "split" "-r" (cdr r) "-m" message) options (cons "--" files))
-                                                   #:check-files #t #:check check))
+                                                   #:check-files #t #:check check #:after done))
                                       #:fail (lambda (e) (message! s (error-text e)))))))))
           (if path (split files options check)
               (request! (make-request-slot) (lambda () (jj-file-entries repo commit))
@@ -2196,7 +2371,7 @@ the files to split out are read, one after another."
 
 (define (read-split-files s entries chosen f)
   (let ((left (filter (lambda (e) (not (member (exact-jj-file (dict-ref e "path")) chosen))) entries)))
-    (if (null? left) (f chosen)
+    (if (null? left) (if (null? chosen) (message! s "No changed files to split") (f chosen))
         (completing-read s (if (null? chosen) "Split out file: "
                                (string-append "Also split out (" (number->string (length chosen)) " chosen): "))
           (append (if (null? chosen) '() (list %split-done)) (map (lambda (e) (dict-ref e "path")) left))
@@ -2385,9 +2560,8 @@ On a change, discard all its edits."
 
 (define-command (vc-jj-files s n)
   "List changed files for the recorded Jujutsu change at point."
-  (let* ((t (target-at (doc s) (point s))) (origin (session-buffer s)))
-    (unless (and t (eq? (target-kind t) 'vc-change)) (error "Move to a Jujutsu change first"))
-    (let* ((v (target-value t)) (repo (car v)) (commit (cadr v)))
+  (let ((origin (session-buffer s)) (repo (current-jj-repo s)))
+    (let ((commit (or (jj-change-at s) (error "Move to a Jujutsu change first"))))
       (request! (make-request-slot) (lambda () (jj-file-entries repo commit))
                 (lambda (files)
                   (let* ((name (string-append "*jj files " commit " " (cadr repo) "*"))
@@ -2415,6 +2589,7 @@ On a change, discard all its edits."
 (define-mode vc-jj-hunks-mode
   "Select a hunk of a recorded Jujutsu file, not an index entry."
   #:parent 'special-mode
+  #:layer vc-patch-bands
   #:target-at (lambda (b pos)
                 (let ((r (row-at (buffer-document b) (hash-table-ref (buffer-state b) 'rows) pos)))
                   (and r (row-target r))))
@@ -2452,7 +2627,7 @@ On a change, discard all its edits."
                                         (let ((fragment (string-append (string-join (append header part) "\n") "\n")))
                                           (cons (row (list (list (car part) 'diff.hunk)) #:key (list 'hunk i)
                                                      #:target (target 'vc-jj-hunk fragment))
-                                                (patch-display (cdr part) #:part i))))
+                                                (patch-display part #:part i #:path (patch-path t) #:skip 1))))
                                       (cdr patch) (iota (length (cdr patch))))))))
               (show-buffer! s b)
               (move! s (lambda (_) 0)))))))
@@ -2603,7 +2778,7 @@ On a change, discard all its edits."
 
 (define-command (vc-jj-file-diff s n)
   "Show the selected file's recorded patch."
-  (show-target-diff! s (jj-file-at s)))
+  (show-target-diff! s (jj-file-at s) #:open #t))
 
 (define (with-reviewed-jj-file s f)
   (let* ((v (target-value (jj-file-at s))) (repo (car v)) (commit (cadr v)))
@@ -3422,6 +3597,7 @@ On a change, discard all its edits."
 (define-mode vc-review-mode
   "Inspect a read-only comparison pinned to published Git objects."
   #:parent 'special-mode
+  #:layer vc-patch-bands
   #:target-at (lambda (b pos)
                 (let ((r (row-at (buffer-document b) (hash-table-ref (buffer-state b) 'rows) pos)))
                   (and r (row-target r))))
@@ -4381,13 +4557,54 @@ What it says is in the process log, \\[vc-process-log]."
                     (suffix "RET" "Visit" vc-visit-at-point) (suffix "=" "Patch at point" vc-diff-at-point)
                     (suffix "y" "Branches and tags" vc-show-refs) (suffix "$" "Process log" vc-process-log)
                     (suffix "q" "Quit" quit-window))))
-        (vc-jj-dispatch s n))))
+        (if (and t (eq? (target-kind t) 'vc-change)) (vc-log-help s n) (vc-jj-dispatch s n)))))
 
 ;;; Log: the history graph of the refs chosen, each commit a target.
 
+(define (history-id-at s)
+  (let ((t (target-at (doc s) (point s))))
+    (and t (memq (target-kind t) '(vc-git-commit vc-change))
+         (let ((v (target-value t)))
+           (if (and (eq? (target-kind t) 'vc-change) (pair? (cddr v))) (caddr v) (cadr v))))))
+
+(define-command (vc-copy-history-id s n)
+  "Copy the selected commit or change ID."
+  (let ((id (history-id-at s)))
+    (if id (begin (kill-save! s id #f #f) (message! s id))
+        (message! s "No commit or change at point"))))
+
+(define-command (vc-log-help s n)
+  "Show the history commands available in this view and at point."
+  (let* ((bound (lambda (group)
+                  (filter (lambda (e) (eq? (effective-binding s (kbd (cadr e))) (cadddr e))) group)))
+         (selected (if (history-id-at s)
+                       (bound '((suffix "RET" "Open change" vc-visit-at-point)
+                                (suffix "SPC" "Preview beside history" vc-diff-at-point)
+                                (suffix "w" "Copy ID" vc-copy-history-id)
+                                (suffix "TAB" "Expand or fold files" vc-toggle-section)
+                                (suffix "A" "Cherry-pick" vc-cherry-pick-menu)
+                                (suffix "V" "Revert" vc-revert-menu)
+                                (suffix "X" "Reset to commit" vc-reset-menu)
+                                (suffix "r" "Rebase" vc-rebase-menu)))
+                       '()))
+         (browse (bound '((suffix "n" "Next entry" vc-next-item)
+                          (suffix "p" "Previous entry" vc-previous-item)
+                          (suffix "g" "Refresh history" vc-log-refresh)
+                          (suffix "g r" "Refresh history" vc-log-refresh)
+                          (suffix "+" "Show more" vc-log-more)
+                          (suffix "+" "Show more" vc-jj-more)
+                          (suffix "q" "Back to status" vc-return-to-status)
+                          (suffix "q" "Close status" quit-window)))))
+    (vc-transient! s (cons "History" (append (if (null? selected) '() (list (cons "At point" selected)))
+                                           (list (cons "Browse" browse))
+                                            (if (log-preview-view s)
+                                                '(("Preview" (suffix "M-<next>" "Page down" vc-log-preview-next-page)
+                                                             (suffix "M-<prior>" "Page up" vc-log-preview-previous-page)))
+                                                '()))))))
+
 (define-mode vc-log-mode
   "Browse a history graph of commits.
-\\[vc-visit-at-point] shows the commit at point; the
+\\[vc-visit-at-point] opens the commit at point in this pane. Space previews it beside history; the
 menus act on it: \\[vc-cherry-pick-menu] picks it, \\[vc-reset-menu]
 resets to it, \\[vc-rebase-menu] rewrites from it."
   #:parent 'special-mode
@@ -4396,11 +4613,13 @@ resets to it, \\[vc-rebase-menu] rewrites from it."
                 (let ((r (row-at (buffer-document b) (hash-table-ref (buffer-state b) 'rows) pos)))
                   (and r (row-target r))))
   #:keys '(("RET" vc-visit-at-point) ("=" vc-diff-at-point) ("SPC" vc-diff-at-point) ("n" vc-next-item) ("p" vc-previous-item)
-           ("g" vc-log-refresh) ("+" vc-log-more) ("q" vc-return-to-status) ("?" vc-dispatch) ("l" vc-log-menu)
+           ("M-<next>" vc-log-preview-next-page) ("M-<prior>" vc-log-preview-previous-page)
+           ("g" vc-log-refresh) ("+" vc-log-more) ("q" vc-return-to-status) ("?" vc-log-help) ("l" vc-log-menu) ("w" vc-copy-history-id)
            ("A" vc-cherry-pick-menu) ("V" vc-revert-menu) ("X" vc-reset-menu) ("r" vc-rebase-menu) ("c" vc-commit-menu)
            ("b" vc-branch-menu) ("t" vc-tag-menu) ("m" vc-merge-menu) ("d" vc-diff-menu) ("$" vc-process-log))
-  #:normal '(("RET" vc-visit-at-point) ("=" vc-diff-at-point) ("n" vc-next-item) ("p" vc-previous-item)
-             ("g r" vc-log-refresh) ("+" vc-log-more) ("q" vc-return-to-status) ("?" vc-dispatch)
+  #:normal '(("RET" vc-visit-at-point) ("=" vc-diff-at-point) ("SPC" vc-diff-at-point) ("n" vc-next-item) ("p" vc-previous-item)
+             ("M-<next>" vc-log-preview-next-page) ("M-<prior>" vc-log-preview-previous-page)
+             ("g r" vc-log-refresh) ("+" vc-log-more) ("q" vc-return-to-status) ("?" vc-log-help) ("w" vc-copy-history-id)
              ("A" vc-cherry-pick-menu) ("V" vc-revert-menu) ("X" vc-reset-menu) ("r" vc-rebase-menu) ("c" vc-commit-menu)
              ("b" vc-branch-menu) ("t" vc-tag-menu) ("d" vc-diff-menu) ("$" vc-process-log)))
 
@@ -4412,24 +4631,48 @@ resets to it, \\[vc-rebase-menu] rewrites from it."
                                    "--format=%x1f%H%x1f%h%x1f%D%x1f%s%x1f%an%x1f%ar")
                              args revs '("--"))))))
 
-(define (render-log! b)
+(define (log-commit-row repo fields i columns hash-width)
+  (if (< (length fields) 7)
+      (row (list (make-string (+ hash-width 1) #\space) (list (car fields) 'vc.graph)) #:key (list 'graph i))
+      (let* ((c (cdr fields)) (sha (car c)) (short (cadr c))
+             (prefix (list (list short 'vc.hash) (make-string (+ 1 (- hash-width (string-length short))) #\space)))
+             (subject (append (ref-runs (caddr c)) (list (label (cadddr c))))))
+        (row (vc-log-column-runs columns prefix (car fields) subject (label (list-ref c 4)) (label (list-ref c 5)))
+             #:key (list 'commit sha) #:target (target 'vc-git-commit (list repo sha))))))
+
+(define (log-pane-columns s i)
+  (let* ((place (list-ref (pane-places s) i)) (x (car place)) (right (+ x (caddr place)))
+         (columns (or (sget s 'viewport-columns) 100))
+         (cell (lambda (f) (exact (floor (+ (* f columns) 0.5))))))
+    (max 1 (- (cell right) (cell x) 1 (if (< right 0.9999) (or (sget s 'viewport-split-gap) 1) 0)))))
+
+(define (render-log! b columns)
   (let* ((st (buffer-state b)) (repo (hash-table-ref st 'repo)) (lines (hash-table-ref st 'lines))
-         (limit (hash-table-ref st 'limit)))
+         (limit (hash-table-ref st 'limit))
+         (hash-width (fold (lambda (f n) (if (< (length f) 7) n (max n (string-length (caddr f))))) 0 lines)))
+    (hash-table-set! st 'columns columns)
     (hash-table-set! st 'rows
       (present! (buffer-document b)
         (append (list (row (list (list (string-append "Commits in " (string-join (hash-table-ref st 'revs) " ")) 'heading)
                                  (let ((args (hash-table-ref st 'args)))
                                    (if (null? args) "" (list (string-append "  " (string-join args " ")) 'shadow))))
                            #:key 'head))
-                (hint-rows "RET show · A pick · V revert · X reset · r rebase from here · c f fixup · b c branch here · + more · q quit" 'hints)
+                (hint-rows "RET open · SPC preview · Alt+PgUp/PgDn scroll preview · ? actions" 'hints)
                 (map (lambda (fields i)
-                       (if (< (length fields) 7)
-                           (row (list (list (car fields) 'vc.graph)) #:key (list 'graph i))
-                           (commit-row repo (cdr fields) (list 'commit (cadr fields)) #:graph (car fields) #:author #t)))
+                       (log-commit-row repo fields i columns hash-width))
                      lines (iota (length lines)))
                 (if (>= (count (lambda (f) (>= (length f) 7)) lines) limit)
                     (hint-rows (string-append (number->string limit) " commits shown · + shows more") 'more)
                     '()))))))
+
+(add-hook! 'viewport-changed 'vc-log-columns
+  (lambda (s columns rows)
+    (for-each (lambda (view i)
+                (let* ((b (document-buffer (view-document view))) (width (log-pane-columns s i)))
+                  (when (and b (eq? (buffer-mode b) 'vc-log-mode)
+                             (not (equal? width (hash-table-ref/default (buffer-state b) 'columns #f))))
+                    (render-log! b width))))
+              (session-panes s) (iota (length (session-panes s))))))
 
 (define (show-log! s repo revs args #:limit [limit 256] #:show [show #t])
   (let ((origin (session-buffer s)))
@@ -4446,7 +4689,9 @@ resets to it, \\[vc-rebase-menu] rewrites from it."
                   (hash-table-set! st 'limit limit)
                   (hash-table-set! st 'lines lines)
                   (hash-table-set! st 'refresh (lambda () (show-log! s repo revs args #:limit limit #:show #f)))
-                  (render-log! b)
+                  (render-log! b (log-pane-columns s (or (list-index (lambda (v) (document=? (view-document v) (buffer-document b)))
+                                                                      (session-panes s))
+                                                          (session-focus s))))
                   (when show (message! s #f))
                   (when (and show (not (eq? (session-buffer s) b)) (eq? origin (session-buffer s)))
                     (show-buffer! s b))))
@@ -4903,7 +5148,7 @@ That is each commit it was, and the operation that made it."
       ("Change at point" (suffix "d" "Describe" vc-jj-describe) (suffix "c" "Commit the working copy" vc-jj-commit)
                          (suffix "e" "Edit" vc-jj-edit) (suffix "o" "New…" vc-jj-new-menu) (suffix "O" "New on point" vc-jj-new)
                          (suffix "x" "Abandon" vc-jj-abandon) (suffix "y" "Duplicate" vc-jj-duplicate))
-      ("Rewrite" (suffix "s" "Squash…" vc-jj-squash-menu) (suffix "S" "Split out" vc-jj-split)
+      ("Rewrite" (suffix "s" "Squash…" vc-jj-squash-menu) (suffix "S" "Split…" vc-jj-split-menu)
                  (suffix "R" "Restore (discard)" vc-jj-restore) (suffix "r" "Rebase…" vc-jj-rebase-menu)
                  (suffix "A" "Absorb into ancestors" vc-jj-absorb) (suffix "C" "Resolve a conflict" vc-jj-conflicts))
       ("Repository" (suffix "b" "Bookmarks…" vc-jj-bookmark-menu) (suffix "f" "Fetch…" vc-jj-fetch-menu)
@@ -4960,7 +5205,7 @@ done with it."
                              (if (pair? marks)
                                  (string-append (number->string (length marks)) " marked  ·  M unmark")
                                  "? menu  ·  TAB fold  ·  u undo")))
-      ((vc-log-mode) "RET show  ·  ? menu  ·  + more")
+      ((vc-log-mode) "RET open  ·  SPC preview  ·  ? actions")
       ((vc-refs-mode) "RET log  ·  b branch  ·  k delete")
       ((vc-rebase-todo-mode) "C-c C-c run  ·  C-c C-k cancel")
       ((vc-process-mode) "q quit")
