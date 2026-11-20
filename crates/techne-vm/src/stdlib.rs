@@ -1196,6 +1196,15 @@ pub fn install(vm: &mut Vm) {
             let directory = string(vm, arg(vm, a, 1), "%provide-libraries!")?;
             vm.provide_libraries(&name, std::path::Path::new(&directory))?;
             Ok(Value::VOID) };
+        // What the files of the package PACKAGE, in ROOT, import among the
+        // libraries packages provide: those of the packages NAMES, strings.
+        "(%package-imports! root package names)" => |vm: &mut Vm, a, _| {
+            let root = string(vm, arg(vm, a, 0), "%package-imports!")?;
+            let package = string(vm, arg(vm, a, 1), "%package-imports!")?;
+            let items = crate::builtins::list_values(arg(vm, a, 2)).ok_or_else(|| Error::new("%package-imports!: expected a list of names"))?;
+            let names = items.into_iter().map(|name| string(vm, name, "%package-imports!")).collect::<Result<Vec<_>, _>>()?;
+            vm.declare_imports(std::path::Path::new(&root), &package, &names)?;
+            Ok(Value::VOID) };
         // What `(techne package)` reads by the authority to load, which a
         // world deciding what it loads has, not that over files: a package's
         // manifest, as (directory text), DIRECTORY resolved and the text of

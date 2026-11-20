@@ -28,6 +28,17 @@ use crate::{
 
 type R<T> = Result<T, Error>;
 
+/// What the files of a package may import (`Vm::declare_imports`).
+#[derive(Clone)]
+pub(crate) struct PackageImports {
+    /// The package's directory.
+    root: PathBuf,
+    package: Box<str>,
+    /// The packages whose libraries its files import: itself and those
+    /// its manifest depends on.
+    names: Vec<Box<str>>,
+}
+
 fn err<T>(msg: impl Into<String>) -> R<T> {
     Err(Error::new(msg))
 }
@@ -307,6 +318,7 @@ impl Vm {
     /// The module of library `parts`, loading its `.sld` file if needed.
     fn library(&mut self, parts: &[String], dir: &Path) -> R<u32> {
         let name = module_name(parts);
+        self.check_declared(parts, dir)?;
         if let Some(m) = self.loaded_library(&name)? {
             return Ok(m);
         }
@@ -399,6 +411,8 @@ impl Vm {
                 continue;
             }
             let name = module_name(&parts);
+            // Before it loads: one refused is not run either.
+            self.check_declared(&parts, dir)?;
             if let Some(m) = self.loaded_library(&name)? {
                 self.exported(m, &name)?;
                 continue;
@@ -539,12 +553,18 @@ impl Vm {
     /// Find the libraries whose names begin with `name` under `dir`, and
     /// nowhere else: `(name a b)` is `dir/name/a/b.sld`. A package's
     /// manifest says so of its own (`(techne package)`); the libraries are
-    /// the world's, shared by every importer. It is an error if another
-    /// directory provides them already.
+    /// the world's, shared by every importer. `dir` need not be there yet,
+    /// in a directory that is: a package without libraries owns its name
+    /// all the same, and its first library is found once written. It is
+    /// an error if another directory provides them already.
     pub fn provide_libraries(&mut self, name: &str, dir: &Path) -> R<()> {
         self.check_loading()?;
         let missing = || Error::new(format!("{}: no such directory", dir.display()));
-        let dir = dir.canonicalize().ok().filter(|d| d.is_dir() && self.may_read(d)).ok_or_else(missing)?;
+        let resolved = match dir.canonicalize() {
+            Ok(dir) => Some(dir).filter(|d| d.is_dir()),
+            Err(_) => dir.parent().and_then(|parent| Some(parent.canonicalize().ok()?.join(dir.file_name()?))),
+        };
+        let dir = resolved.filter(|d| self.may_read(d.parent().unwrap_or(d))).ok_or_else(missing)?;
         if let Some(conflict) = self.library_conflict(name, &dir) {
             return err(conflict);
         }
@@ -571,6 +591,43 @@ impl Vm {
             return Some(format!("{} is not a directory", dir.display()));
         }
         self.library_loaded_outside(name, &dir).map(|library| format!("library {library} is loaded from elsewhere already"))
+    }
+
+    /// The files under `root`, the directory of the package `package`,
+    /// import the libraries of the packages `names` only, among those a
+    /// package provides (`provide_libraries`): its own and those of the
+    /// packages its manifest depends on. Libraries no package provides
+    /// (Techne's own, those beside the importing file) are not concerned.
+    /// Declared again for a directory, this replaces what was declared.
+    pub fn declare_imports(&mut self, root: &Path, package: &str, names: &[String]) -> R<()> {
+        self.check_loading()?;
+        let missing = || Error::new(format!("{}: no such directory", root.display()));
+        let root = root.canonicalize().ok().filter(|d| d.is_dir() && self.may_read(d)).ok_or_else(missing)?;
+        let declared = PackageImports { root, package: package.into(), names: names.iter().map(|n| n.as_str().into()).collect() };
+        match self.package_imports.iter_mut().find(|p| p.root == declared.root) {
+            Some(old) => *old = declared,
+            None => self.package_imports.push(declared),
+        }
+        Ok(())
+    }
+
+    /// Refuse the import of library `parts` from a file in `dir` if that
+    /// file is a package's and the library another's it does not depend on
+    /// (`declare_imports`): what a package needs is what its manifest says.
+    /// The innermost package holding `dir` is the file's.
+    fn check_declared(&self, parts: &[String], dir: &Path) -> R<()> {
+        let Some(first) = parts.first().filter(|first| !self.package_imports.is_empty() && self.library_provider(first).is_some()) else {
+            return Ok(());
+        };
+        let Ok(dir) = dir.canonicalize() else { return Ok(()) };
+        match self.package_imports.iter().filter(|p| dir.starts_with(&p.root)).max_by_key(|p| p.root.as_os_str().len()) {
+            Some(p) if !p.names.iter().any(|n| **n == **first) => err(format!(
+                "import: {}: the package {} does not depend on {first} (its techne-package.scm says what it depends on)",
+                module_name(parts),
+                p.package
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// The directory providing the libraries whose names begin with `name`.

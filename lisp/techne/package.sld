@@ -21,7 +21,7 @@
 
 (define-library (techne package)
   (export package-manifest-file read-package-manifest package-manifest? manifest-name manifest-directory
-          manifest-dependencies manifest-editor use-package-directory!)
+          manifest-dependencies manifest-editor use-package-directory! package-closure package-directories)
   (import (techne) (techne path) (techne schema))
   (begin
 
@@ -134,17 +134,16 @@ is an error if the manifest is missing or is not one."
     ;; The directory each package name was used from.
     (define names (make-hash-table eq?))
 
-    ;; Where the libraries of the package of manifest M are, or would be.
-    (define (library-directory m)
-      (let ((lib (path-join (manifest-directory m) "lib")))
-        (or (%loadable-path lib) lib)))
-
     ;; The manifests of the package in ROOT and of those it depends on
     ;; that are not used yet, each after the ones it depends on. Everything
     ;; is checked here and nothing changed: a package set that cannot be
-    ;; used leaves no part of itself behind.
-    (define (unused-closure root)
+    ;; used leaves no part of itself behind. With WITHIN, a directory, none
+    ;; of them may be outside it.
+    (define (unused-closure root within)
       (let ((found '()))
+        (define (check-within! root)
+          (unless (or (not within) (equal? root within) (string-prefix? (string-append within "/") root))
+            (error "A package depends on one outside its repository" root within)))
         (define (manifest-at root)
           (or (hash-table-ref/default used root #f)
               (let ((new (assoc root found))) (and new (cdr new)))))
@@ -169,6 +168,7 @@ is an error if the manifest is missing or is not one."
         (define (visit root above)
           (when (assoc root above)
             (error "Packages depend on each other in a circle" (reverse (cons root (map car above)))))
+          (check-within! root)
           (or (manifest-at root)
               (let ((m (read-package-manifest root)))
                 (check-name! m above)
@@ -185,21 +185,63 @@ is an error if the manifest is missing or is not one."
         (visit root '())
         (reverse (map cdr found))))
 
-    (define (use-package-directory! directory)
+    ;; Where the libraries of the package of manifest M are, or would be.
+    (define (library-directory m)
+      (let ((lib (path-join (manifest-directory m) "lib")))
+        (or (%loadable-path lib) lib)))
+
+    (define (resolved directory)
+      (or (%loadable-path directory) (error "No package directory at" directory)))
+
+    (define (package-closure directory #:within [within #f])
+      "Return the manifests `use-package-directory!` would make known.
+They are those of the package in DIRECTORY and of the packages it
+depends on that are not known yet, each after the ones it depends on:
+none, if DIRECTORY's is known. Everything that procedure checks is
+checked, WITHIN as it takes it, and nothing is changed."
+      (let ((root (resolved directory)))
+        (if (hash-table-ref/default used root #f)
+            '()
+            (unused-closure root (and within (resolved within))))))
+
+    (define (use-package-directory! directory #:within [within #f])
       "Make the package in DIRECTORY known here; return its manifest.
 Its libraries, those under its `lib` directory, whose names begin with
 its own, are found there from now on and nowhere else, and so are those
-of the packages it depends on, and of theirs. No code is loaded. It is
-an error, and nothing changes, if another directory holds a package of
-the same name, if a dependency is missing or is another package than
-the one named, or if packages depend on each other in a circle."
-      (let ((root (or (%loadable-path directory) (error "No package directory at" directory))))
+of the packages it depends on, and of theirs. Its files import, of the
+libraries packages provide, only its own and those of the packages it
+depends on itself: what it needs is what its manifest says. No code is
+loaded. It is an error, and nothing changes, if another directory holds
+a package of the same name, if a dependency is missing or is another
+package than the one named, if packages depend on each other in a
+circle, or, with WITHIN, a directory, if one of them is outside it (a
+repository's packages depend on each other, not on what is beside it)."
+      (let ((root (resolved directory)))
         (or (hash-table-ref/default used root #f)
             (begin
               (for-each (lambda (m)
-                          (let ((lib (%loadable-path (path-join (manifest-directory m) "lib"))))
-                            (when lib (%provide-libraries! (symbol->string (manifest-name m)) lib))
-                            (hash-table-set! names (manifest-name m) (manifest-directory m))
-                            (hash-table-set! used (manifest-directory m) m)))
-                        (unused-closure root))
-              (hash-table-ref/default used root #f)))))))
+                          (let ((dir (manifest-directory m))
+                                (name (manifest-name m)))
+                            (%provide-libraries! (symbol->string name) (library-directory m))
+                            (%package-imports! dir (symbol->string name)
+                                               (map symbol->string (cons name (map car (manifest-dependencies m)))))
+                            (hash-table-set! names name dir)
+                            (hash-table-set! used dir m)))
+                        (package-closure root #:within within))
+              (hash-table-ref/default used root #f)))))
+
+    (define (package-directories root)
+      "Return the directories under ROOT holding a package, relative to it.
+ROOT's own is \"\", and then the only one: a package's directory is not
+searched for others. Directories whose names begin with a dot are not
+searched, nor those more than four below ROOT."
+      (let walk ((relative "") (depth 0))
+        (let ((dir (path-join root relative)))
+          (cond ((file-exists? (path-join dir package-manifest-file)) (list relative))
+                ((= depth 4) '())
+                (else
+                 (append-map (lambda (entry)
+                               (if (and (string-suffix? "/" entry) (not (string-prefix? "." entry)))
+                                   (walk (path-join relative (substring entry 0 (- (string-length entry) 1))) (+ depth 1))
+                                   '()))
+                             (directory-list dir)))))))))
