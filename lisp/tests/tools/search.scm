@@ -65,6 +65,45 @@
     (fixture-write root "a" "changed")
     (expect "top\né needle\n\n" (tool-ref (tool-expand p h) 'text))))
 
+(with-tool-project "an explicit prefix under ignore rules is searched, and says so"
+  '((".gitignore" "out/\n") ("src.txt" "needle\n") ("out/gen.txt" "needle\n") ("out/deep/x.txt" "a\nneedle\n"))
+  (lambda (root p)
+    (define all (tool-search p "needle"))
+    (expect '(1 #f) (map (lambda (k) (tool-ref all k)) '(total ignored)))
+    (define out (tool-search p "needle" #:prefix "out/"))
+    (expect '(2 2 #t #t) (map (lambda (k) (tool-ref out k)) '(total scanned ignored complete)))
+    (expect '("out/deep/x.txt" "out/gen.txt") (map (lambda (i) (tool-ref i 'path)) (tool-ref out 'items)))
+    (expect #t (and (string-contains (tool-show out) "ignore rules (.gitignore, .ignore) leave these files out") #t))
+    ;; A file, a directory without its slash, and part of a name.
+    (expect 1 (tool-ref (tool-search p "needle" #:prefix "out/deep/x.txt") 'total))
+    (expect 2 (tool-ref (tool-search p "needle" #:prefix "out") 'total))
+    (expect 1 (tool-ref (tool-search p "needle" #:prefix "out/ge") 'total))
+    (expect '("out/gen.txt") (tool-ref (tool-files p #:prefix "out/g") 'items))
+    (expect #t (tool-ref (tool-files p #:prefix "out/") 'ignored))
+    ;; Nothing there, or outside the project: not walked.
+    (expect '(0 0 #f) (map (lambda (k) (tool-ref (tool-search p "needle" #:prefix "none/") k)) '(total scanned ignored)))
+    (expect '(0 #f) (map (lambda (k) (tool-ref (tool-search p "needle" #:prefix "../") k)) '(total ignored)))
+    ;; The listing does not change: the root still leaves them out.
+    (expect '("src.txt") (map (lambda (i) (tool-ref i 'path)) (tool-ref (tool-search p "needle") 'items)))))
+
+(with-tool-project "close hits share their context lines, shown once"
+  '(("c" "1\n2\nhit\nhit\n5\n6\n7\n8\nhit\n10\n"))
+  (lambda (root p)
+    (define found (tool-search p "hit" #:before 1 #:after 1))
+    (define items (tool-ref found 'items))
+    (expect '(3 4 9) (map (lambda (i) (tool-ref i 'line)) items))
+    ;; The second goes on after the first's lines; the third, past a gap, does not.
+    (expect '(#f #t #f) (map (lambda (i) (tool-ref i 'context-continues)) items))
+    (expect '("2\nhit\nhit\n" "5\n" "8\nhit\n10\n") (map (lambda (i) (tool-ref (tool-ref i 'context) 'text)) items))
+    (define shown (tool-show found))
+    (expect #t (string-suffix? "\n2: 2\n3: hit\n4: hit\n5: 5" (car (string-split shown "\n[snapshot" ))))
+    (expect 2 (length (filter (lambda (l) (string-prefix? "[snapshot" l)) (string-split shown "\n"))))
+    (expect 1 (length (filter (lambda (l) (string=? l "4: hit")) (string-split shown "\n"))))
+    (expect #t (string-suffix? "\n8: 8\n9: hit\n10: 10" shown))
+    ;; A page starts afresh.
+    (define second (car (tool-ref (tool-search p "hit" #:before 1 #:after 1 #:offset 1) 'items)))
+    (expect '(#f "hit\nhit\n5\n") (list (tool-ref second 'context-continues) (tool-ref (tool-ref second 'context) 'text)))))
+
 (with-tool-project "invalid search options are actionable" '()
   (lambda (root p)
     (for-each (lambda (query) (expect #t (fails query)))

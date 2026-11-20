@@ -31,10 +31,73 @@
     (expect 1048576 (tool-ref (tool-ref wide 'stdout) 'kept))
     (expect "😀" (tool-ref (tool-expand p (tool-ref (tool-ref wide 'stdout) 'handle) #:chars 1) 'text))
     (expect "😀" (tool-ref (tool-expand p (tool-ref (tool-ref wide 'stderr) 'handle) #:chars 1) 'text))
-    (expect #t (string-prefix? "status 0\n--- stdout (6 characters, last 3 shown; all 3 kept: \""
+    (expect #t (string-prefix? "status 0\n--- stdout (6 characters, last 3 shown; #:head #t shows the first; the first 3 kept: \""
                               (tool-show (tool-process-result (tool-run p "printf" '("abcdef") #:retain 3 #:keep 3)))))
     (expect "a\nb" (tool-show (list "a" 'b)))
     (expect "x" (tool-show (tool-batch (list (lambda () "x")))))))
+
+(with-tool-project "replies stand for their handles, and errors say what to pass" (quote ())
+  (lambda (root p)
+    (define (message thunk) (guard (e (#t (condition/report-string e))) (thunk) "no error"))
+    (define job (tool-run p "sh" '("-c" "seq 1 30; echo oops >&2") #:keep 1000))
+    (define r (tool-process-result job))
+    ;; A stream reply, or its handle: the same.
+    (expect (tool-find p (tool-ref (tool-ref r 'stdout) 'handle) "29") (tool-find p (tool-ref r 'stdout) "29"))
+    (expect 29 (tool-ref (car (tool-ref (tool-find p (tool-ref r 'stdout) "29") 'items)) 'line))
+    (expect "oops\n" (tool-ref (tool-expand p (tool-ref r 'stderr)) 'text))
+    (expect "3\n" (tool-ref (tool-lines p (tool-ref r 'stdout) #:from 3 #:lines 1) 'text))
+    ;; A result holds two streams; a job is not output; an unkept stream has no handle.
+    (expect #t (and (string-contains (message (lambda () (tool-find p r "29"))) "(tool-ref RESULT 'stdout)") #t))
+    ;; With one stream written, the result stands for it.
+    (define quiet (tool-process-result (tool-run p "seq" '("1" "30") #:keep 1000)))
+    (expect '(29) (map (lambda (i) (tool-ref i 'line)) (tool-ref (tool-find p quiet "29") 'items)))
+    (expect #t (and (string-contains (message (lambda () (tool-find p job "29"))) "a job is not its output") #t))
+    (define plain (tool-process-result (tool-run p "echo" '("x"))))
+    (expect #t (and (string-contains (message (lambda () (tool-find p (tool-ref plain 'stdout) "x"))) "#:keep") #t))
+    (expect #t (and (string-contains (message (lambda () (tool-find p 42 "x"))) "expected a handle string") #t))
+    (expect #t (and (string-contains (message (lambda () (tool-find p "nonsense" "x"))) "expired or foreign handle") #t))
+    ;; A keyword out of range is named.
+    (expect "tool-run: #:keep must be an integer from 1 to 1048576, not 20000000"
+            (message (lambda () (tool-run p "true" '() #:keep 20000000))))
+    (expect "tool-process-result: #:chars must be an integer from 1 to 8000, not 0"
+            (message (lambda () (tool-process-result job #:chars 0))))))
+
+(with-tool-project "the start of long output is one keyword away" (quote ())
+  (lambda (root p)
+    (define job (tool-run p "seq" '("1" "3000") #:retain 100))
+    (define tail (tool-ref (tool-process-result job #:chars 10) 'stdout))
+    (expect "2999\n3000\n" (tool-ref tail 'text))
+    (define head (tool-ref (tool-process-result job #:head #t #:chars 10) 'stdout))
+    (expect '("1\n2\n3\n4\n5\n" #t #t #t 100) (map (lambda (k) (tool-ref head k)) '(text head truncated dropped retained)))
+    ;; Short of #:retain, the head is all of it.
+    (define short (tool-ref (tool-process-result (tool-run p "printf" '("abc")) #:head #t) 'stdout))
+    (expect '("abc" #f) (map (lambda (k) (tool-ref short k)) '(text truncated)))
+    (define shown (tool-show (tool-process-result job #:chars 10)))
+    (expect #t (and (string-contains shown "last 10 shown; #:head #t shows the first") #t))
+
+    (expect #t (and (string-contains (tool-show (tool-process-result job #:head #t #:chars 10)) "first 10 shown; the last without #:head") #t))
+    ;; Kept, what is shown says how to read it from the start.
+    (define kept (tool-process-result (tool-run p "seq" '("1" "3000") #:keep 100) #:chars 10))
+    (expect #t (and (string-contains (tool-show kept) "the first 100 kept: ") #t))
+    (expect #t (and (string-contains (tool-show kept) "tool-expand reads it from #:offset 0") #t))))
+
+(with-tool-project "passing test summaries do not crowd out failures" (quote ())
+  (lambda (root p)
+    (define log "i=0; while [ $i -lt 40 ]; do echo 'test result: ok. 3 passed; 0 failed'; i=$((i+1)); done; echo 'thread main panicked at src/a.rs:1:1'; echo 'test a::b ... FAILED'; echo 'test result: FAILED. 0 passed; 1 failed'; exit 101")
+    (define c (tool-check p "sh" (list "-c" log) #:limit 5))
+    (define hits (tool-ref c 'hits))
+    (expect '(41 42 43) (map (lambda (i) (tool-ref i 'line)) (tool-ref hits 'items)))
+    (expect '(3 40 #f) (map (lambda (k) (tool-ref hits k)) '(total passing truncated)))
+    (expect #t (and (string-contains (tool-show c) "[40 passing summaries (#:passing) not listed") #t))
+    ;; Asked for, they are listed, and crowd as before.
+    (define all (tool-ref (tool-check p "sh" (list "-c" log) #:limit 5 #:passing '()) 'hits))
+    (expect '(43 0 #t) (map (lambda (k) (tool-ref all k)) '(total passing truncated)))
+    ;; With nothing else matching, they are what there is.
+    (define ok (tool-ref (tool-check p "sh" '("-c" "echo 'test result: ok. 1 passed'")) 'hits))
+    (expect '(1 0) (map (lambda (k) (tool-ref ok k)) '(total passing)))
+    ;; Techne's own test.scm says FAIL NAME.
+    (expect 1 (tool-ref (tool-ref (tool-check p "sh" '("-c" "echo 'FAIL some case #2'; exit 1")) 'hits) 'total))
+    (expect #t (fails (lambda () (tool-check p "true" '() #:passing '("")))))))
 
 (with-tool-project "timeout, wait and check" (quote ())
   (lambda (root p)
