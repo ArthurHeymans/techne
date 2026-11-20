@@ -20,7 +20,10 @@ Of such a one, say which to install with `(package NAME)` after the place:
 name says so too, and a repository holding one package needs neither. The
 packages it depends on must be beside it in the same repository: they come
 with the checkout, at the commit pinned, and are made known with it, their
-commands not advertised.
+commands not advertised. The packages installed from one source (the same
+place and revision) share one checkout, so two of them depending on a
+third find the same one. From two revisions of a repository they do not:
+a package is in one directory in an editor, and the second is refused.
 
 Installation fetches a private checkout and records the exact commit under
 `$XDG_DATA_HOME/techne/packages` (normally `~/.local/share/techne/packages`).
