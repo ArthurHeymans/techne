@@ -600,6 +600,128 @@ fn until(rt: &mut Runtime, what: &str, done: impl Fn(&Snapshot) -> bool) -> Snap
     }
 }
 
+#[test]
+fn remote_project_search_previews_and_exports_unsaved_and_disk_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let open = root.join("src/open.txt");
+    let disk = root.join("with:colon.txt");
+    std::fs::write(&open, "watchdog timeout old\n").unwrap();
+    std::fs::write(&disk, "nothing\ntimeout on WATCHDOG\n").unwrap();
+    std::fs::write(root.join("no.txt"), "just watchdog\n").unwrap();
+    let loc = format!("/pipe::{}", open.display());
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    eval(&mut rt, &format!("(define d (file-document {loc:?}))"));
+    eval(&mut rt, "(show-document! (current-session) d)");
+    eval(&mut rt, r#"(view-edit! (make-view d "me") (list (list 0 (document-length d) "watchdog timeout unsaved\n")) "new")"#);
+    eval(&mut rt, "(run-command (current-session) 'search-project 1)");
+    type_text(&mut rt, "watchdog timeout");
+    let found = until(&mut rt, "two remote candidates", |s| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 2));
+    let shown = format!("{:?}", found.minibuffer);
+    assert!(shown.contains("with:colon.txt:2"), "{shown}");
+    assert!(shown.contains("unsaved") && !shown.contains("timeout old"), "{shown}");
+    keys(&mut rt, "C-n");
+    until(&mut rt, "remote source preview", |s| s.pane().text.to_string().contains("timeout on WATCHDOG"));
+    keys(&mut rt, "C-c C-e");
+    until(&mut rt, "remote search lens", |s| s.minibuffer.is_none() && s.pane().text.to_string().contains("with:colon.txt:2"));
+    eval(
+        &mut rt,
+        r#"(let* ((v (session-view (current-session))) (p (string-contains (document-string (view-document v)) "WATCHDOG")))
+                       (view-edit! v (list (list p (+ p 8) "watchdog")) "new"))"#,
+    );
+    assert_eq!(std::fs::read_to_string(&disk).unwrap(), "nothing\ntimeout on WATCHDOG\n");
+    assert_eq!(eval(&mut rt, "(document-dirty? d)"), "#t");
+    keys(&mut rt, "C-x C-s");
+    until(&mut rt, "explicit lens save", |_| std::fs::read_to_string(&disk).unwrap().contains("on watchdog"));
+}
+
+#[test]
+fn remote_project_search_refuses_disconnected_and_stale_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("current.txt");
+    let hit = dir.path().join("hit.txt");
+    std::fs::write(&current, "start\n").unwrap();
+    std::fs::write(&hit, "timeout watchdog\n").unwrap();
+    let loc = format!("/pipe::{}", current.display());
+    let hit_loc = format!("/pipe::{}", hit.display());
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    eval(&mut rt, "(run-command (current-session) 'search-project 1)");
+    type_text(&mut rt, "timeout watchdog");
+    until(&mut rt, "cached remote preview", |s| s.pane().text.to_string() == "timeout watchdog\n");
+    eval(&mut rt, &format!("(node-close (location-endpoint {loc:?}))"));
+    keys(&mut rt, "C-c C-e");
+    until(&mut rt, "disconnected export refused", |s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Disconnected")));
+    keys(&mut rt, "C-c C-r");
+    until(&mut rt, "same query retried", |s| {
+        s.minibuffer.as_ref().is_some_and(|m| m.input == "timeout watchdog" && m.rows.len() == 1 && !m.prompt.contains("Disconnected"))
+    });
+    eval(&mut rt, &format!("(define hit (file-document {hit_loc:?}))"));
+    eval(&mut rt, r#"(view-edit! (make-view hit "me") (list (list 0 (document-length hit) "overwritten\n")) "new")"#);
+    keys(&mut rt, "RET");
+    until(&mut rt, "stale visit leaves query open", |s| s.minibuffer.is_some() && s.echo.contains("search result changed"));
+    keys(&mut rt, "C-g");
+    assert_eq!(rt.snapshot().pane().text.to_string(), "start\n");
+}
+
+#[test]
+fn remote_project_search_retries_after_in_flight_disconnect() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join(".search-started");
+    let bin = dir.path().join(".bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("rg");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nif [ ! -f .search-started ]; then\n  touch .search-started\n  exec sleep 30\nfi\nhead -c 2097152 /dev/zero >&2\nPATH=${PATH#*:}\nexec rg \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let current = dir.path().join("current.txt");
+    std::fs::write(&current, "start\n").unwrap();
+    std::fs::write(dir.path().join("hit.txt"), "watchdog timeout\n").unwrap();
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    let path = format!("PATH={}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let binary = env!("CARGO_BIN_EXE_techne");
+    eval(&mut rt, &format!(r#"(set-option! 'remote-node-command (list "env" {path:?} {binary:?} "node"))"#));
+    let loc = format!("/pipe::{}", current.display());
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    eval(&mut rt, "(run-command (current-session) 'search-project 1)");
+    type_text(&mut rt, "watchdog timeout");
+    until(&mut rt, "remote ripgrep started", |_| marker.is_file());
+    eval(&mut rt, &format!("(node-close (location-endpoint {loc:?}))"));
+    until(&mut rt, "failed search preserves input", |s| {
+        s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Search failed") && m.input == "watchdog timeout")
+    });
+    keys(&mut rt, "C-c C-r");
+    until(&mut rt, "retry drains stderr and previews the hit", |s| s.pane().text.to_string() == "watchdog timeout\n");
+    keys(&mut rt, "RET");
+    until(&mut rt, "async visit completes", |s| s.minibuffer.is_none() && s.pane().text.to_string() == "watchdog timeout\n");
+}
+
+#[test]
+fn remote_project_search_matches_unicode_lowercase_expansions() {
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("current.txt");
+    let hit = dir.path().join("hit.txt");
+    std::fs::write(&current, "start\n").unwrap();
+    std::fs::write(&hit, "åİx token\n").unwrap();
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    let loc = format!("/pipe::{}", current.display());
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    eval(&mut rt, "(run-command (current-session) 'search-project 1)");
+    type_text(&mut rt, "åi x");
+    until(&mut rt, "Unicode match and preview", |s| s.pane().text.to_string() == "åİx token\n");
+}
+
 // The keyboard reader accepts a remote directory in Find file, closes the
 // prompt, and opens a listing whose links still point to the same route.
 #[test]
