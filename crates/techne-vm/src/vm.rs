@@ -1991,6 +1991,21 @@ impl Vm {
         file.or_else(|| self.named_module(name))
     }
 
+    /// The name of a library loaded whose name begins with `first`, as
+    /// `(first ...)`, from a file not under `dir`.
+    pub(crate) fn library_loaded_outside(&self, first: &str, dir: &Path) -> Option<&str> {
+        let (whole, prefix) = (format!("({first})"), format!("({first} "));
+        self.modules
+            .iter()
+            .find(|m| {
+                !m.retired
+                    && m.library.is_some()
+                    && (*m.name == *whole || m.name.starts_with(&prefix))
+                    && !m.path.as_deref().is_some_and(|p| p.starts_with(dir))
+            })
+            .map(|m| &*m.name)
+    }
+
     /// The module called `name` a lookup here finds: the one of the newest
     /// generation. A generation not published yet is found by the load
     /// staging it only, and that load finds nothing else from the package's

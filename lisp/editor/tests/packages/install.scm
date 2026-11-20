@@ -78,6 +78,23 @@
     (unload-package 'pkg-test)
     (check "declaration survives unload" "Say hello." (command-doc 'pkg-hello))
     (check "load again" 15 (invoke (current-session) 'pkg-hello (dict 'value 8)))
+    ;; A checkout that cannot be made known here is not left in the store,
+    ;; where it would fail every later install and restore.
+    (let ((broken (path-join tmp "broken")) (before (directory-list dir)))
+      (create-directory broken #o700)
+      (git broken "init" "--quiet")
+      (call-with-output-file (path-join broken "entry.scm")
+        (lambda (p) (display "(import (techne editor))\n(define-command (pkg-broken s n) \"Broken.\" n)" p)))
+      (call-with-output-file (path-join broken "techne-package.scm")
+        (lambda (p) (write '(package pkg-broken
+                              (depends (pkg-absent (path "absent")))
+                              (editor "entry.scm" (commands (pkg-broken "Broken."))))
+                           p)))
+      (git broken "add" "entry.scm" "techne-package.scm")
+      (git broken "-c" "user.name=Test" "-c" "user.email=test@example.org" "-c" "commit.gpgSign=false" "commit" "-qm" "broken")
+      (check "a dependency that is missing" #t (bad? (lambda () (package-install! `(local ,broken) #:directory dir))))
+      (check "its checkout is not kept" before (directory-list dir))
+      (check "nor its command" #f (command-doc 'pkg-broken)))
     (let ((file (path-join tmp "incomplete.scm")))
       (call-with-output-file file (lambda (p) (display "(import (techne editor))\n(define-command (first-offer s n) \"First.\" n)\n(define-option incomplete-leak #t \"Never published.\")" p)))
       (register-command-package! 'incomplete file '((first-offer "First offer.") (another-offer "Another offer.")))

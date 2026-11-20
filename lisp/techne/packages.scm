@@ -132,9 +132,14 @@ DIRECTORY is the package store. First install pins a commit; repeats are offline
          (key (hex-encode (sha-256 (string->utf8 (call-with-output-string (lambda (p) (write datum p)))))))
          (dest (path-join dir key)) (expected (and recipe (recipe-name recipe))))
     (make-directory dir)
-    (unless (file-exists? dest) (fetch! dir dest datum source expected))
-    (unless (equal? (cadr (pin dest)) datum) (error "Pin does not match recipe"))
-    (announce! dest expected)))
+    (let ((fresh (not (file-exists? dest))))
+      (when fresh (fetch! dir dest datum source expected))
+      (unless (equal? (cadr (pin dest)) datum) (error "Pin does not match recipe"))
+      ;; A checkout just published that cannot be made known here (a
+      ;; dependency that is missing, say) is taken back: left in the
+      ;; store, it would fail every later install and restore.
+      (guard (e (fresh (delete-path dest #t) (raise e)))
+        (announce! dest expected)))))
 (define (package-restore! #:directory [directory (store)])
   "Advertise all packages installed in DIRECTORY without fetching or loading."
   (let ((dir directory))
