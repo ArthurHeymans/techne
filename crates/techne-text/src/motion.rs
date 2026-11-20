@@ -168,34 +168,44 @@ pub fn line_span(text: &Rope, pos: usize) -> Range<usize> {
     text.line_to_byte(line)..text.line_to_byte(line + 1)
 }
 
-/// Whether the `n` bytes of text from `from` are ASCII, where each byte is
-/// a grapheme: counting them one by one took a second on a 1 MB line.
-/// `from + n` need not be a character's boundary.
-fn ascii(text: &Rope, from: usize, n: usize) -> bool {
-    let mut left = n;
+/// How many of the `n` bytes of text from `from` are ASCII before the
+/// first that is not. Within a line each is a grapheme, but the last
+/// before another character, which may combine with it: counting them one
+/// by one took a second on a 1 MB line. `from + n` need not be a
+/// character's boundary.
+fn ascii_prefix(text: &Rope, from: usize, n: usize) -> usize {
+    let mut seen = 0;
     for chunk in text.byte_slice(from..).chunks() {
-        let part = &chunk.as_bytes()[..left.min(chunk.len())];
-        if !part.is_ascii() {
-            return false;
+        let part = &chunk.as_bytes()[..(n - seen).min(chunk.len())];
+        match part.iter().position(|b| !b.is_ascii()) {
+            Some(i) => return seen + i,
+            None => seen += part.len(),
         }
-        left -= part.len();
-        if left == 0 {
+        if seen == n {
             break;
         }
     }
-    true
+    seen
 }
 
-/// Graphemes from the start of the line to `pos`.
+fn ascii(text: &Rope, from: usize, n: usize) -> bool {
+    ascii_prefix(text, from, n) == n
+}
+
+/// Graphemes from the start of the line to `pos`. Runs of ASCII are
+/// counted at once, so that one character beyond it does not make a long
+/// line's every grapheme a search of its own.
 pub fn column(text: &Rope, pos: usize) -> usize {
-    let start = line_start(text, pos);
-    if ascii(text, start, pos - start) {
-        return pos - start;
-    }
-    let (mut p, mut n) = (start, 0);
+    let (mut p, mut n) = (line_start(text, pos), 0);
     while p < pos {
-        p = next_grapheme(text, p);
-        n += 1;
+        let run = ascii_prefix(text, p, pos - p);
+        if p + run == pos {
+            return n + run;
+        }
+        // The last ASCII byte may combine with what follows.
+        let alone = run.saturating_sub(1);
+        p = next_grapheme(text, p + alone);
+        n += alone + 1;
     }
     n
 }
@@ -211,11 +221,17 @@ pub fn line_down(text: &Rope, pos: usize, count: isize, goal: usize) -> usize {
     if ascii(text, p, at - p) && (at == end || text.byte(at).is_ascii()) {
         return at;
     }
-    for _ in 0..goal {
-        if p >= end {
-            break;
+    let mut left = goal;
+    while left > 0 && p < end {
+        // Enough to know the bytes up to the goal stand alone.
+        let run = ascii_prefix(text, p, (end - p).min(left.saturating_add(1)));
+        let alone = if p + run == end { run } else { run.saturating_sub(1) }.min(left);
+        p += alone;
+        left -= alone;
+        if left > 0 && p < end {
+            p = next_grapheme(text, p);
+            left -= 1;
         }
-        p = next_grapheme(text, p);
     }
     p
 }
@@ -372,6 +388,27 @@ mod tests {
         // Not between a letter and the mark combining with it.
         let t = r("x\na\u{301}b");
         assert_eq!(line_down(&t, 0, 1, 1), 5);
+    }
+
+    /// Runs of ASCII counted at once agree with counting each grapheme,
+    /// a mark combining with the run's last letter, across chunks.
+    #[test]
+    fn columns_over_ascii_runs_beyond_ascii() {
+        let line = format!("🙂{}e\u{301}{}日{}", "ab".repeat(3000), "x".repeat(2000), "y".repeat(10));
+        let t = r(&format!("{line}\n{line}\n"));
+        // Each grapheme, counted one by one.
+        let (mut p, mut goal) = (0, 0);
+        while p < line.len() {
+            assert_eq!(column(&t, p), goal, "the column at {p}");
+            assert_eq!(column(&t, line.len() + 1 + p), goal, "on the second line");
+            assert_eq!(line_down(&t, 0, 1, goal), line.len() + 1 + p, "line_down to {goal}");
+            p = next_grapheme(&t, p);
+            goal += 1;
+        }
+        assert_eq!(line_down(&t, 0, 1, goal + 5), line.len() + 1 + line.len(), "past the end");
+        // The largest goal, as a caller wanting the line's end gives it.
+        let t = r("aé\r\nb");
+        assert_eq!((line_down(&t, 0, 0, usize::MAX), line_down(&t, 5, -1, usize::MAX)), (3, 3));
     }
 
     #[test]
