@@ -172,6 +172,17 @@
 (check "nor used from there" #t (failed? (lambda () (use-package-directory! (at "inside") #:within (at "inside")))))
 (check "within it" 'inside (manifest-name (use-package-directory! (at "inside") #:within root)))
 (check "known, there is nothing to make known" '() (package-closure (at "inside")))
+;; One known already, and what it depends on, are held to it too.
+(check "known, and outside" #t (failed? (lambda () (use-package-directory! (at "inside") #:within (at "inside")))))
+(make-directory (at "repo"))
+(write-file! (at "repo" "upper" "techne-package.scm") '(package upper (depends (inside (path "../../inside")))))
+(write-file! (at "repo" "top" "techne-package.scm") '(package top (depends (upper (path "../upper")))))
+(use-package-directory! (at "repo" "upper"))
+(check "through a package known already" #t
+       (and (string-contains (or (why (lambda () (use-package-directory! (at "repo" "top") #:within (at "repo")))) "")
+                             "outside its repository")
+            #t))
+(check "which is not made known" #f (%library-provider "top"))
 
 ;; The packages of a repository, side by side or deeper, by directory.
 (check "a package's directory is its own" '("") (package-directories (at "alpha")))

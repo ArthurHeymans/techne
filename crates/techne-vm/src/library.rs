@@ -244,7 +244,9 @@ impl Vm {
         // This host/compiler fallback still nests if an environment loads
         // a library. Unlike top-level import, it has no forms loop to run
         // dependencies before returning the environment's module id.
-        self.import(m, sets, Path::new("."))?;
+        // From no file: libraries are found from the working directory,
+        // and the environment is no package's (`Vm::import_dir`).
+        self.import(m, sets, Path::new(""))?;
         Ok(m)
     }
 
@@ -360,7 +362,7 @@ impl Vm {
             let mut body = Vec::new();
             self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body)?;
             for (form, file) in imports {
-                let dir = self.form_source_dir(file);
+                let dir = self.import_dir(file);
                 self.import(m, &form.list().unwrap()[1..], &dir)?;
             }
             for (form, _) in &body {
@@ -614,8 +616,12 @@ impl Vm {
     /// Refuse the import of library `parts` from a file in `dir` if that
     /// file is a package's and the library another's it does not depend on
     /// (`declare_imports`): what a package needs is what its manifest says.
-    /// The innermost package holding `dir` is the file's.
+    /// The innermost package holding `dir` is the file's; an empty `dir`
+    /// is that of no file (`Vm::import_dir`), and no package's.
     fn check_declared(&self, parts: &[String], dir: &Path) -> R<()> {
+        if dir.as_os_str().is_empty() {
+            return Ok(());
+        }
         let Some(first) = parts.first().filter(|first| !self.package_imports.is_empty() && self.library_provider(first).is_some()) else {
             return Ok(());
         };

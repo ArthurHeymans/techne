@@ -169,6 +169,14 @@ is an error if the manifest is missing or is not one."
           (when (assoc root above)
             (error "Packages depend on each other in a circle" (reverse (cons root (map car above)))))
           (check-within! root)
+          ;; One known already was not held to WITHIN when it was made
+          ;; known: what it depends on is looked at now.
+          (let ((known (hash-table-ref/default used root #f)))
+            (when (and known within)
+              (for-each (lambda (dependency)
+                          (let ((dir (%loadable-path (cdr dependency))))
+                            (when dir (visit dir (cons (cons root (manifest-name known)) above)))))
+                        (manifest-dependencies known))))
           (or (manifest-at root)
               (let ((m (read-package-manifest root)))
                 (check-name! m above)
@@ -200,7 +208,7 @@ depends on that are not known yet, each after the ones it depends on:
 none, if DIRECTORY's is known. Everything that procedure checks is
 checked, WITHIN as it takes it, and nothing is changed."
       (let ((root (resolved directory)))
-        (if (hash-table-ref/default used root #f)
+        (if (and (hash-table-ref/default used root #f) (not within))
             '()
             (unused-closure root (and within (resolved within))))))
 
@@ -217,18 +225,18 @@ package than the one named, if packages depend on each other in a
 circle, or, with WITHIN, a directory, if one of them is outside it (a
 repository's packages depend on each other, not on what is beside it)."
       (let ((root (resolved directory)))
-        (or (hash-table-ref/default used root #f)
-            (begin
-              (for-each (lambda (m)
-                          (let ((dir (manifest-directory m))
-                                (name (manifest-name m)))
-                            (%provide-libraries! (symbol->string name) (library-directory m))
-                            (%package-imports! dir (symbol->string name)
-                                               (map symbol->string (cons name (map car (manifest-dependencies m)))))
-                            (hash-table-set! names name dir)
-                            (hash-table-set! used dir m)))
-                        (package-closure root #:within within))
-              (hash-table-ref/default used root #f)))))
+        ;; Nothing to make known of a package known already, which is
+        ;; held to WITHIN all the same.
+        (for-each (lambda (m)
+                    (let ((dir (manifest-directory m))
+                          (name (manifest-name m)))
+                      (%provide-libraries! (symbol->string name) (library-directory m))
+                      (%package-imports! dir (symbol->string name)
+                                         (map symbol->string (cons name (map car (manifest-dependencies m)))))
+                      (hash-table-set! names name dir)
+                      (hash-table-set! used dir m)))
+                  (package-closure root #:within within))
+        (hash-table-ref/default used root #f)))
 
     (define (package-directories root)
       "Return the directories under ROOT holding a package, relative to it.
