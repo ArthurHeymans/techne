@@ -105,7 +105,79 @@
       (delete-file file)
       (call-with-output-file file (lambda (p) (display "(import (techne editor))\n(define-command (first-offer s n) \"First.\" n)\n(define-command (another-offer s n) \"Another.\" n)" p)))
       (check "retry corrected package" 9 ((command 'first-offer) (current-session) 9))))
+  (install-from-subdirectory tmp)
   (test-failures))
+
+;; A repository of several packages, side by side: one is installed, by
+;; name, with the packages beside it that it depends on, at the same commit.
+(define (write-file! root relative . forms)
+  (let ((file (path-join root relative)))
+    (make-directory (path-directory file))
+    (call-with-output-file file (lambda (p) (for-each (lambda (f) (write f p) (newline p)) forms)))))
+(define (loaded? name) (and (member name (loaded-modules)) #t))
+(define (install-from-subdirectory tmp)
+  (let ((multi (path-join tmp "multi")) (dir (path-join tmp "store-multi")))
+    (check "the package wanted, in either place" '(x x)
+           (map (lambda (s) (package-source-package (parse-package-source s)))
+                '((github "a/b" (package x) (tag "v1")) (github "a/b" (tag "v1") (package x)))))
+    (check "none wanted" #f (package-source-package (parse-package-source '(github "a/b" (tag "v1")))))
+    (for-each (lambda (s) (check "invalid source" #t (bad? (lambda () (parse-package-source s)))))
+              '((github "a/b" (package x) (package y)) (github "a/b" (tag "a") (branch "b")) (github "a/b" (package "x"))
+                (github "a/b" (package ../x))))
+    (check "a recipe names the package its source does" #t
+           (bad? (lambda () (register-package-recipe! '(recipe multi-edit (github "a/b" (package multi-other)))))))
+    (create-directory multi #o700)
+    (git multi "init" "--quiet")
+    (write-file! multi "packages/multi-util/techne-package.scm" '(package multi-util))
+    (write-file! multi "packages/multi-util/lib/multi-util/words.sld"
+                 '(define-library (multi-util words) (export shout) (import (scheme base))
+                    (begin (define (shout s) (string-append s "!")))))
+    (write-file! multi "packages/multi-edit/techne-package.scm"
+                 '(package multi-edit
+                    (depends (multi-util (path "../multi-util")))
+                    (editor "entry.scm" (commands (multi-shout "Shout.")))))
+    (write-file! multi "packages/multi-edit/entry.scm"
+                 '(import (techne editor) (multi-util words))
+                 '(define-command (multi-shout s n) "Shout." (shout "hi")))
+    (write-file! multi "packages/multi-other/techne-package.scm"
+                 '(package multi-other (editor "entry.scm" (commands (multi-other "Another package.")))))
+    (write-file! multi "packages/multi-other/entry.scm"
+                 '(import (techne editor))
+                 '(define-command (multi-other s n) "Another package." 'other))
+    ;; One depending on a package outside the repository, which is there:
+    ;; beside the store, as far above the checkout as above a fetch of it.
+    (write-file! multi "packages/multi-stray/techne-package.scm"
+                 '(package multi-stray
+                    (depends (multi-outside (path "../../../../../multi-outside")))
+                    (editor "entry.scm" (commands (multi-stray "Stray.")))))
+    (write-file! multi "packages/multi-stray/entry.scm" '(import (techne editor)) '(define-command (multi-stray s n) "Stray." n))
+    (write-file! tmp "multi-outside/techne-package.scm" '(package multi-outside))
+    (git multi "add" ".")
+    (git multi "-c" "user.name=Test" "-c" "user.email=test@example.org" "-c" "commit.gpgSign=false" "commit" "-qm" "packages")
+    (for-each (lambda (case)
+                (check (car case) #t
+                       (and (string-contains (guard (e (#t (condition/report-string e))) (package-install! (cadr case) #:directory dir) "")
+                                             (car case))
+                            #t))
+                (check "no checkout published" '() (directory-list dir)))
+              `(("several packages" (local ,multi))
+                ("no package of this name" (local ,multi (package multi-none)))
+                ("outside its repository" (local ,multi (package multi-stray)))))
+    (check "nothing of them advertised" '(#f #f) (map command-doc '(multi-shout multi-stray)))
+    (check "nor made known" #f (%library-provider "multi-outside"))
+    (check "install the one named" 'multi-edit (package-install! `(local ,multi (package multi-edit)) #:directory dir))
+    (check "its command" "Shout." (command-doc 'multi-shout))
+    (check "not the one beside it" #f (command-doc 'multi-other))
+    (check "cold, its dependency too" '(#f #f) (list (and (find-package 'multi-edit) #t) (loaded? "(multi-util words)")))
+    (check "first use loads it, with the library of the package beside it" "hi!" ((command 'multi-shout) (current-session) 1))
+    (check "its dependency is of the checkout" #t
+           (string-prefix? (file-truename dir) (%library-provider "multi-util")))
+    (register-package-recipe! `(recipe multi-other (local ,multi)))
+    (check "a catalog name says which" 'multi-other (package-install! 'multi-other #:directory dir))
+    (check "that one runs" 'other ((command 'multi-other) (current-session) 1))
+    (delete-path multi #t)
+    (check "repeat without remote" 'multi-edit (package-install! `(local ,multi (package multi-edit)) #:directory dir))))
+
 (define (restore-offline tmp)
   (let ((owner (make-scope 'restore-option)))
     (with-scope owner (register-option! 'pkg-count "original" "Original option." #:type 'string))
@@ -117,4 +189,9 @@
   (check "restore into fresh editor" '(pkg-test) (package-restore! #:directory (path-join tmp "store")))
   (check "still cold" #f (find-package 'pkg-test))
   (check "real command" 5 (invoke (current-session) 'pkg-hello (dict 'value 3)))
+  ;; Packages from a repository's subdirectories, each where its pin says.
+  (check "restore those of a repository of several" '("multi-edit" "multi-other")
+         (sort (map symbol->string (package-restore! #:directory (path-join tmp "store-multi"))) string<?))
+  (check "cold" #f (and (find-package 'multi-edit) #t))
+  (check "with the package beside it" "hi!" ((command 'multi-shout) (current-session) 1))
   (test-failures))
