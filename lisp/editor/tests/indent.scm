@@ -65,6 +65,18 @@
   (press-keys s "C-e SPC [ RET")
   (check "indented under the bracket" (+ (string-length long) 3 1 (string-length long) 3)
          (view-point (session-view s))))
+;; `.` in a read-only buffer is refused once, not key by key, and leaves
+;; the next insertion recorded as ever.
+(let ((s (editing "modal" "dot.txt" "\n")))
+  (press-keys s "i") (type-text s "abc") (press-keys s "ESC")
+  (set-option! 'read-only #t #:buffer (current-buffer s))
+  (press-keys s ".")
+  (check "read-only: refused" "Buffer is read-only" (echo-line s))
+  (check "read-only: nothing typed again" "abc\n" (text s))
+  (check "read-only: no keys said typed again" #f (sget s 'repeated-keys))
+  (set-option! 'read-only #f #:buffer (current-buffer s))
+  (press-keys s "i") (type-text s "x") (press-keys s "ESC .")
+  (check "the next insertion typed again" "abxxc\n" (text s)))
 (let ((s (editing "modal" "a.scm" "(when x\n  (a))\n")))
   (press-keys s "o") (type-text s "(b\nc)") (press-keys s "ESC")
   (check "modal open and insert" "(when x\n  (b\n   c)\n  (a))\n" (text s)))
