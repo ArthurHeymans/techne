@@ -81,10 +81,23 @@ fn libraries_includes_and_runtime_procedures() {
 
 #[test]
 fn a_file_in_a_package_finds_the_packages_libraries() {
-    let dir = std::env::temp_dir().join(format!("techne-lsp-package-{}", std::process::id()));
+    let packages = std::env::temp_dir().join(format!("techne-lsp-packages-{}", std::process::id()));
+    let dir = packages.join("pkg");
     std::fs::create_dir_all(dir.join("lib/pkg")).unwrap();
     std::fs::create_dir_all(dir.join("tests")).unwrap();
-    std::fs::write(dir.join("techne-package.scm"), "(package pkg)").unwrap();
+    // The package depends on one beside it, not on the other there.
+    std::fs::write(dir.join("techne-package.scm"), "(package pkg (depends (dep (path \"../dep\"))))").unwrap();
+    for name in ["dep", "undeclared"] {
+        std::fs::create_dir_all(packages.join(format!("{name}/lib/{name}"))).unwrap();
+        std::fs::write(packages.join(format!("{name}/techne-package.scm")), format!("(package {name})")).unwrap();
+        std::fs::write(
+            packages.join(format!("{name}/lib/{name}/more.sld")),
+            format!(
+                "(define-library ({name} more) (export thrice-{name}) (import (scheme base)) (begin (define (thrice-{name} x) (* 3 x))))"
+            ),
+        )
+        .unwrap();
+    }
     // A file of another name under lib/ is there, and no library of pkg's.
     std::fs::create_dir_all(dir.join("lib/other")).unwrap();
     std::fs::write(dir.join("lib/other/tools.sld"), "(define-library (other tools) (export) (import (scheme base)) (begin))").unwrap();
@@ -93,9 +106,12 @@ fn a_file_in_a_package_finds_the_packages_libraries() {
         "(define-library (pkg tools) (export twice) (import (scheme base)) (begin (define (twice x) (* 2 x))))",
     )
     .unwrap();
-    let reply = diagnostics(&dir.join("tests/main.scm"), "(import (scheme base) (pkg tools) (other tools))\n(twice 2)");
+    let reply = diagnostics(
+        &dir.join("tests/main.scm"),
+        "(import (scheme base) (pkg tools) (dep more) (undeclared more) (other tools))\n(twice (thrice-dep 2))",
+    );
     let messages: Vec<&str> = reply.split("\"message\":\"").skip(1).map(|m| m.split('"').next().unwrap()).collect();
-    assert_eq!(messages, ["cannot find library (other tools)"], "{reply}");
+    assert_eq!(messages, ["cannot find library (undeclared more)", "cannot find library (other tools)"], "{reply}");
 }
 
 #[test]

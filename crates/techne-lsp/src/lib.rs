@@ -17,23 +17,38 @@ use std::{
     sync::Mutex,
 };
 
-use analysis::{Analysis, Def, DefKind, Span, analyze, checkdoc, head, ident, library_name, list, unbound};
+use analysis::{Analysis, Def, DefKind, Span, analyze, checkdoc, head, ident, library_name, list, string_lit, unbound};
 use techne_vm::reader::Syntax;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result, lsp_types::*};
 
-/// A library of the package `dir` is in: under `lib` beside the nearest
-/// manifest above, `techne-package.scm`, if its name begins with the
-/// package's, which the manifest, read as data, says: as the runtime
-/// finds it once the package is used (`(techne package)`). A file of
-/// another name under `lib` is no library of the package's. The
-/// libraries of the packages it depends on are not looked for.
+/// A library a file in `dir` imports as its package's: under `lib`
+/// beside the nearest manifest above, `techne-package.scm`, if its name
+/// begins with the package's; or under that of a package the manifest
+/// depends on by the name the library's begins with, `(depends (NAME
+/// (path "directory")) ...)`: as the runtime finds them once the package
+/// is used (`(techne package)`). The manifest is read as data. A file of
+/// another name under a `lib` is no library of that package's, and the
+/// packages a dependency depends on are not a file's to import.
 fn package_library(parts: &[String], dir: &Path) -> Option<PathBuf> {
     let root = dir.ancestors().find(|d| d.join("techne-package.scm").is_file())?;
     let text = std::fs::read_to_string(root.join("techne-package.scm")).ok()?;
     let forms = techne_vm::reader::read_syntax(&text).ok()?;
-    let package = ident(list(forms.first()?)?.get(1)?)?.0;
-    let own = package == *parts.first()?;
-    own.then(|| root.join("lib").join(format!("{}.sld", parts.join("/")))).filter(|p| p.is_file())
+    let manifest = list(forms.first()?)?;
+    let (first, file) = (parts.first()?, format!("{}.sld", parts.join("/")));
+    if ident(manifest.get(1)?)?.0 == *first {
+        return Some(root.join("lib").join(&file)).filter(|p| p.is_file());
+    }
+    let depends = manifest.iter().filter_map(list).filter(|clause| head(clause).as_deref() == Some("depends"));
+    depends
+        .flat_map(|clause| clause.iter().skip(1))
+        .filter_map(|dependency| {
+            let dependency = list(dependency)?;
+            let place = list(dependency.get(1)?)?;
+            let named = ident(dependency.first()?)?.0 == *first && head(place).as_deref() == Some("path");
+            named.then(|| string_lit(place.get(1)?)).flatten()
+        })
+        .map(|directory| root.join(directory).join("lib").join(&file))
+        .find(|p| p.is_file())
 }
 
 /// Byte offset to an LSP position (UTF-16 columns).
