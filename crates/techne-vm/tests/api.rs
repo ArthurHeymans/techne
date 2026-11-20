@@ -465,8 +465,34 @@ fn async_natives_and_tasks() {
 /// Interrupt `vm`'s evaluation of `src` from another thread after `ms`.
 /// One not interrupted within 20 s ends the test program.
 fn eval_interrupted(vm: &mut Vm, src: &str, ms: u64) -> Result<String, techne_vm::vm::Error> {
+    eval_interrupted_once(vm, src, ms, None)
+}
+
+/// The same, the clock starting once `ready` is set, if given: by the
+/// evaluation, when what is to catch the interrupt is in place. An
+/// evaluation ending first is not interrupted.
+fn eval_interrupted_once(
+    vm: &mut Vm,
+    src: &str,
+    ms: u64,
+    ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<String, techne_vm::vm::Error> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     let handle = vm.interrupt_handle();
+    let finished = Arc::new(AtomicBool::new(false));
+    let ended_early = finished.clone();
     let t = std::thread::spawn(move || {
+        // A hang before readiness is the watchdog's; an evaluation that
+        // failed before it ends the wait, leaving nothing to interrupt.
+        while ready.as_ref().is_some_and(|r| !r.load(Ordering::SeqCst)) {
+            if ended_early.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         std::thread::sleep(std::time::Duration::from_millis(ms));
         handle.interrupt();
     });
@@ -479,6 +505,7 @@ fn eval_interrupted(vm: &mut Vm, src: &str, ms: u64) -> Result<String, techne_vm
         }
     });
     let result = vm.eval_source(src).map(|v| vm.repr(&v));
+    finished.store(true, Ordering::SeqCst);
     drop(done);
     t.join().unwrap();
     watchdog.join().unwrap();
@@ -508,8 +535,15 @@ fn interrupts() {
                 let latency = start.elapsed().saturating_sub(std::time::Duration::from_millis(30));
                 assert!(latency < std::time::Duration::from_secs(1), "{what}: {src}: {latency:?}");
             }
-            // The condition is catchable, and the VM keeps working.
-            let caught = eval_interrupted(&mut vm, "(guard (e (#t (condition/report-string e))) (let loop () (loop)))", 30);
+            // The condition is catchable, and the VM keeps working. The
+            // clock starts once the handler is in place: expanding `guard`
+            // outlasted the 30 ms under coverage (nightly of 2026-11-20),
+            // and an interrupt before its handler is in place escapes it.
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let set = ready.clone();
+            vm.register_fn("handler-ready!", move || set.store(true, std::sync::atomic::Ordering::SeqCst));
+            let src = "(guard (e (#t (condition/report-string e))) (handler-ready!) (let loop () (loop)))";
+            let caught = eval_interrupted_once(&mut vm, src, 30, Some(ready));
             assert_eq!(caught.unwrap(), "\"interrupted\"", "{what}");
             assert_eq!(eval_str(&mut vm, "(+ 1 2)"), "3", "{what}");
         }
