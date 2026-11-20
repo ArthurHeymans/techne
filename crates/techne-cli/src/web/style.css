@@ -10,7 +10,9 @@ body { margin: 0; overflow: hidden; }
 .buffer:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
 .row { display: flex; min-height: 1.25em; }
 .gutter { user-select: none; flex: none; text-align: right; padding-right: 1ch; }
-.source { min-width: 0; flex: auto; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 8; }
+.source { min-width: 0; flex: auto; white-space: pre-wrap; word-break: break-all; tab-size: 8; }
+.source.words { word-break: normal; overflow-wrap: anywhere; }
+.source.truncate { white-space: pre; overflow: hidden; }
 .inlay { user-select: none; }
 .caret { display: inline-block; position: relative; width: 0; height: 1em; vertical-align: -.15em; pointer-events: none; }
 .caret::after { content: ""; display: block; width: 2px; height: 1.2em; background: currentColor; position: absolute; top: -.1em; }

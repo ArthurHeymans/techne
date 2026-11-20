@@ -165,6 +165,13 @@
            ((or (string=? key "<f12>") (semi-editor-key? b key)) #f)
            (else (send-key! s b state key))))))
 
+;; Committed browser text (a paste, an input method's) reaches the child
+;; as a paste, bracketed when it asked, never as an edit of its screen.
+(define (terminal-text s text)
+  (let* ((b (current-buffer s)) (state (session-of b)))
+    (and state (process state) (not (copying? state))
+         (begin (message! s #f) (fit! s b state) (send! s state (terminal-paste (screen state) text)) #t))))
+
 (define terminal-keys
   '(("C-c" "terminal") ("C-c C-e" terminal-emacs-mode) ("C-c C-j" terminal-semi-char-mode)
     ("C-c M-d" terminal-char-mode) ("C-c C-c" terminal-interrupt) ("C-c C-k" terminal-kill-process)
@@ -182,6 +189,7 @@ to resume input, or \\[terminal-char-mode] to pass most keys to the child."
   #:keys terminal-keys
   #:normal terminal-keys
   #:input terminal-input
+  #:text terminal-text
   #:options '((line-numbers . #f) (truncate-lines . #t) (eob-marker . ""))
   #:directory (lambda (b) (let ((state (session-of b))) (and state (directory state))))
   #:projections (lambda (d from to)

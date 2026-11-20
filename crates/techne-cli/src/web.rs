@@ -165,6 +165,8 @@ enum Browser {
     Scroll { view: u64, revision: u64, anchor: usize, caret: Option<usize> },
     Edge { view: u64, end: bool },
     Text { text: String },
+    Viewport { columns: usize, rows: usize, split_gap: usize },
+    Focus { focused: bool },
 }
 
 impl Browser {
@@ -176,6 +178,10 @@ impl Browser {
             Self::Scroll { view, revision, anchor, caret } => Input::Scroll { view, revision, anchor, caret },
             Self::Edge { view, end } => Input::Edge { view, end },
             Self::Text { text } if !text.is_empty() => Input::Text { text, at },
+            Self::Viewport { columns, rows, split_gap } => {
+                Input::Viewport { columns: columns.clamp(1, 4096), rows: rows.clamp(2, 4096), split_gap: split_gap.clamp(1, 64) }
+            }
+            Self::Focus { focused } => Input::Focus { focused },
             _ => return,
         };
         remote.send_in_generation(input, generation);

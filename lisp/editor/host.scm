@@ -57,12 +57,20 @@ CODE is an xterm button code, RELEASE true for releases."
   (run-hook! s 'frontend-focus focused))
 
 (define (editor-insert-text! s text)
-  "Insert committed TEXT in S at its selection, without changing the kill ring."
+  "Insert committed TEXT in S at its selection, without changing the kill ring.
+A private prompt gets it as typed characters; a buffer's text handler
+(`register-mode!' TEXT) before an edit, as a terminal takes a paste. A
+transient other than the minibuffer refuses it."
   (unless (string=? text "")
-    (message! s #f)
-    (if (minibuffer-open? s)
-        (minibuffer-insert-text! s text)
-        (insert-text! s text "new"))))
+    (let ((private (sget s 'private-key)) (transient (sget s 'transient)))
+      (cond (private (string-for-each (lambda (c) ((car private) (if (char=? c #\space) "SPC" (string c)))) text))
+            ((minibuffer-open? s) (message! s #f) (minibuffer-insert-text! s text))
+            (transient (message! s "Text input is not accepted here"))
+            (else
+             (let ((handle (buffer-text-input (current-buffer s))))
+               (unless (and handle (guard (e (#t (failed! s 'buffer-text-input e) #t)) (handle s text)))
+                 (message! s #f)
+                 (insert-text! s text "new"))))))))
 
 (define (editor-click s view pos extend)
   "Handle a click at POS in VIEW, which the frontend resolved, in S.

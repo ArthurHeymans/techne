@@ -99,6 +99,7 @@ function paint(node, f, relative = true) {
   s.textDecorationColor = color(f.underline?.[1]);
 }
 function caret(active, shape = "Bar") {
+  if (shape === "Hidden") return null;
   const node = make("span", `caret${shape === "Block" ? " block" : ""}`);
   const f = chrome(active ? "cursor" : "cursor_inactive");
   node.style.color = color(f.bg || f.fg);
@@ -282,13 +283,14 @@ function drawRows(item, p, active, base) {
   const current = lineAt(item.lines, selection[p.primary]?.head || 0);
   const count = item.lines.length;
   const gutter = p.display.line_numbers !== "Off";
+  const wrapping = `source${p.display.truncate_lines ? " truncate" : p.display.word_wrap ? " words" : ""}`;
   const width = Math.max(3, String(count).length) + 2;
   const output = document.createDocumentFragment();
   const rows = [];
   let layer = 0, hint = 0;
   for (let n = 0; n < count; n++) {
     const line = item.lines[n];
-    const row = make("div", "row"), source = make("div", "source");
+    const row = make("div", "row"), source = make("div", wrapping);
     row.dataset.line = n;
     if (gutter) {
       const label = make("span", "gutter");
@@ -320,8 +322,8 @@ function drawRows(item, p, active, base) {
     let h = layer;
     for (let i = 0; i < stops.length; i++) {
       const at = stops[i];
-      if (heads.has(at)) {
-        const point = caret(active, p.cursor);
+      const point = heads.has(at) && caret(active, p.cursor);
+      if (point) {
         if (at === selection[p.primary]?.head) point.classList.add("primary-caret");
         source.append(point);
       }
@@ -473,12 +475,34 @@ function render(next) {
   positionCompletion();
   positionInput();
   next.panes.forEach((p) => pageRequest(panes.get(p.view)));
+  viewport();
   status("Connected", true);
   if (document.activeElement === document.body || document.activeElement === get("reconnect")) keys.focus({preventScroll: true});
 }
 
+// Geometry in the editor's cells, as native frontends report it: Lisp
+// lays out splits and fits terminal programs from it.
+let reported = null;
+function viewport() {
+  if (!snapshot) return;
+  const probe = make("span", "");
+  probe.textContent = "0".repeat(64);
+  probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre";
+  frame.append(probe);
+  const cell = probe.getBoundingClientRect().width / 64 || 9;
+  probe.remove();
+  const line = parseFloat(getComputedStyle(frame).lineHeight) || 20;
+  const columns = Math.max(1, Math.floor((frame.clientWidth - 12) / cell));
+  const rows = Math.max(2, Math.floor(frame.clientHeight / line));
+  // A divider and both panes' padding fall between split panes.
+  const gap = Math.ceil(13 / cell) + 1;
+  const next = `${snapshot.generation}:${columns}x${rows}+${gap}`;
+  if (next !== reported && send({type: "viewport", columns, rows, split_gap: gap})) reported = next;
+}
+
 function invalidate() {
   snapshot = undefined;
+  reported = null;
   clipboard = "";
   composing = false;
   keys.value = "";
@@ -513,5 +537,7 @@ function connect() {
 }
 get("reconnect").addEventListener("click", connect);
 get("minibuffer").addEventListener("click", () => keys.focus({preventScroll: true}));
-window.addEventListener("resize", () => { positionCompletion(); positionInput(); });
+window.addEventListener("resize", () => { positionCompletion(); positionInput(); viewport(); });
+window.addEventListener("focus", () => send({type: "focus", focused: true}));
+window.addEventListener("blur", () => send({type: "focus", focused: false}));
 connect();

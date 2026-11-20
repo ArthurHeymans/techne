@@ -47,7 +47,7 @@ let socket;
 try {
   const run = join(root, "run");
   await mkdir(run, {mode: 0o700});
-  const env = {...process.env, XDG_RUNTIME_DIR: run, XDG_STATE_HOME: join(root, "state"), XDG_CONFIG_HOME: join(root, "config"), TERM: "xterm-256color"};
+  const env = {...process.env, SHELL: "sh", XDG_RUNTIME_DIR: run, XDG_STATE_HOME: join(root, "state"), XDG_CONFIG_HOME: join(root, "config"), TERM: "xterm-256color"};
   const file = join(root, "shared.scm");
   await writeFile(file, '\n(import (techne))\n\n;; Same faces and layout as the desktop editor.\n(define (greet name)\n  (string-append "Hello, " name))\n\n(greet "Techne")\n');
   start(exe, ["daemon"], env);
@@ -146,6 +146,22 @@ try {
     const shot = await cdp("Page.captureScreenshot", {format: "png"});
     await writeFile(image, Buffer.from(shot.data, "base64"));
   }
+  // Committed text reaches a terminal's child as a paste, not as an edit
+  // of its screen; the child sees the browser's reported size.
+  await key("g", "KeyG", 2);
+  await key("x", "KeyX", 1);
+  for (const c of "terminal") await key(c, `Key${c.toUpperCase()}`);
+  await key("Enter", "Enter");
+  await until(() => dom(`${active}?.closest(".pane")?.querySelector(".mode")?.textContent.includes("terminal")`), "a terminal opens in the browser");
+  await cdp("Input.insertText", {text: "echo pasted-$((6*7)); stty size"});
+  await key("Enter", "Enter");
+  await until(() => dom(`${active}?.textContent.includes("pasted-42")`), "browser text reaches the terminal's child");
+  const [rows, columns] = (await until(() => dom(`snapshot.panes[snapshot.focus].text.match(/^(\\d+) (\\d+) *$/m)?.slice(1)`), "the child reports its size")).map(Number);
+  assert.ok(columns > 20 && columns < 200 && rows > 5, `terminal fitted to the browser viewport: ${rows}x${columns}`);
+  if (image) {
+    const shot = await cdp("Page.captureScreenshot", {format: "png"});
+    await writeFile(image.replace(/(\.png)?$/, "-terminal.png"), Buffer.from(shot.data, "base64"));
+  }
   const wrapped = join(root, "wrapped.txt");
   await writeFile(wrapped, "some text with spaces ".repeat(800));
   await cdp("Page.navigate", {url: await web(wrapped)});
@@ -181,7 +197,7 @@ try {
   await cdp("Page.navigate", {url: await web(dense)});
   await until(() => dom('document.getElementById("connection-message")?.textContent.includes("size limit")'), "row budget rejects a dense buffer below the byte limit");
   assert.equal(await dom('document.querySelectorAll(".row").length'), 0);
-  console.log("Web smoke passed: endpoint guards, Unicode, shared edits and paste, saving, faces, splits, minibuffer, wrapped paging and wheel scroll, dense buffer budget.");
+  console.log("Web smoke passed: endpoint guards, Unicode, shared edits and paste, saving, faces, splits, minibuffer, wrapped paging and wheel scroll, terminal paste and size, dense buffer budget.");
 } finally {
   socket?.close();
   const ended = children.map((p) => new Promise((resolve) => {
