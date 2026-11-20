@@ -32,6 +32,39 @@
   (press-keys s "C-M-\\")
   (check "indent each line only once" "(when #t\n  (display 1))\n(when #t\n  (display 2))\n" (text s))
   (press-keys s "C-/") (check "one undo for all cursors" before (text s)))
+;; Each cursor goes past the blanks of its own line: the later line's
+;; blanks are found past those the earlier one gained.
+(let ((s (editing "emacs" "cursors.scm" "(f a)\n(g b)\n")))
+  (view-set-ranges! (session-view s) '((4 4) (10 10)) 0)
+  (press-keys s "RET")
+  (check "RET at each cursor" "(f a\n   )\n(g b\n   )\n" (text s))
+  (check "each cursor after its indentation" '((8 8) (18 18)) (view-ranges (session-view s))))
+;; Past characters of several bytes, and on a line already right, which
+;; no edit says where its blanks end.
+(let ((s (editing "emacs" "bytes.scm" "(é a\n   b)\n")))
+  (press-keys s "C-n TAB")
+  (check "a line already right is left" "(é a\n   b)\n" (text s))
+  (check "point after its indentation" '((9 9)) (view-ranges (session-view s)))
+  (press-keys s "C-p C-e RET")
+  (check "a line opened under the argument" "(é a\n   \n   b)\n" (text s))
+  (check "point counted in bytes" '((9 9)) (view-ranges (session-view s))))
+;; A mode's edit may make only the start of the blanks: point goes past
+;; all of them.
+(define-mode one-more-blank-mode "Indents by a blank more each time."
+  #:parent 'prog-mode
+  #:indent (lambda (d starts) (map (lambda (p) (list p p " ")) starts)))
+(let ((s (editing "emacs" "more.txt" "    x\n")))
+  (set-buffer-mode! (current-buffer s) 'one-more-blank-mode)
+  (press-keys s "TAB")
+  (check "a blank more" "     x\n" (text s))
+  (check "point past every blank" '((5 5)) (view-ranges (session-view s))))
+;; A bracket far out: the line it opens is indented under it, and the
+;; blanks are not looked at one by one.
+(let* ((long (make-string 200000 #\x))
+       (s (editing "emacs" "far.scm" (string-append "(" long "\n"))))
+  (press-keys s "C-e SPC [ RET")
+  (check "indented under the bracket" (+ (string-length long) 3 1 (string-length long) 3)
+         (view-point (session-view s))))
 (let ((s (editing "modal" "a.scm" "(when x\n  (a))\n")))
   (press-keys s "o") (type-text s "(b\nc)") (press-keys s "ESC")
   (check "modal open and insert" "(when x\n  (b\n   c)\n  (a))\n" (text s)))

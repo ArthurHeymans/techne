@@ -2,7 +2,8 @@
 ;;; its lines) as the buffer's mode does, RET indents the line it opens,
 ;;; C-M-\ indents the region, M-m goes to the line's indentation; the modal
 ;;; profile's = operator, o and O do the same. A mode indents with its
-;;; #:indent procedure, (document starts) -> edits; Scheme's is Lisp's
+;;; #:indent procedure, (document starts) -> edits, each giving a line's
+;;; leading blanks, or the start of them, blanks; Scheme's is Lisp's
 ;;; (techne-editor's lisp_indent), `set-indent!` saying how a form
 ;;; indents, as Emacs's `scheme-indent-function` property.
 
@@ -16,14 +17,21 @@
          lisp-indent-specs set-indent! lisp-indent
          indent-for-tab-command newline-and-indent indent-region back-to-indentation)
 
+(define not-blank (string->regexp "[^ \t]"))
+
+;; The first position from FROM, in its line's leading blanks, that is
+;; not a blank: one search over the rope, not a call a character, as a
+;; line indented under a bracket far out on a long line has a megabyte of
+;; blanks.
+(define (blanks-end d from)
+  (let ((end (line-end d from))
+        (m (search-text-regexp d from not-blank #t)))
+    (if m (min (car m) end) end)))
+
 (define (indentation d p)
   "Return the position of the first character not a blank on P's line.
 P is a position of document D; the line's end if it is all blanks."
-  (let ((end (line-end d p)))
-    (let loop ((i (line-start d p)))
-      (if (and (< i end) (member (document-substring d i (+ i 1)) '(" " "\t")))
-          (loop (+ i 1))
-          i))))
+  (blanks-end d (line-start d p)))
 
 (define (line-starts d from to)
   "Return the starts of the lines of document D from FROM to TO, in order.
@@ -38,17 +46,39 @@ They are FROM's line and those starting before TO."
   "Indent the lines of S's document at STARTS as its buffer's mode does.
 STARTS are sorted, or a procedure of no arguments giving them, called
 only if the mode indents; the edits are one change, GROUP as `edit!`
-takes it. Return #f if the mode does not indent."
+takes it. Return the edits made, each (from to text) in the text before
+them, or #f if the mode does not indent."
   (let ((indent (let ((b (current-buffer s))) (and b (buffer-indent b)))))
     (and indent
          (let ((edits (indent (doc s) (if (procedure? starts) (starts) starts))))
            (unless (null? edits) (edit! s edits group))
-           #t))))
+           edits))))
 
-;; Heads in their line's leading blanks go to its indentation.
-(define (to-indentation! s)
-  (let ((d (doc s)))
-    (move! s (lambda (h) (let ((i (indentation d h))) (if (<= h i) i h))))))
+;; The ends of the blanks EDITS made, keyed by their lines' starts after
+;; them: EDITS are sorted, each replacing a line's leading blanks, or the
+;; start of them, with blanks, whose characters are bytes (`string-length`
+;; is constant time on ASCII; `string->utf8` would copy a megabyte of
+;; them). More blanks may follow those an edit made.
+(define (indented-lines edits)
+  (let ((ends (make-hash-table)))
+    (let loop ((edits edits) (shift 0))
+      (unless (null? edits)
+        (let* ((e (car edits))
+               (from (+ (car e) shift))
+               (n (string-length (caddr e))))
+          (hash-table-set! ends from (+ from n))
+          (loop (cdr edits) (+ shift n (- (car e) (cadr e)))))))
+    ends))
+
+;; Heads in their line's leading blanks go to its indentation; on the
+;; lines EDITS indented, the blanks they made are not scanned again, as
+;; they may be a megabyte.
+(define (to-indentation! s edits)
+  (let ((d (doc s)) (ends (indented-lines edits)))
+    (move! s (lambda (h)
+               (let* ((start (line-start d h))
+                      (i (blanks-end d (hash-table-ref/default ends start start))))
+                 (if (<= h i) i h))))))
 
 ;; The starts of the lines the ranges of S are on, sorted, each once.
 (define (range-lines s whole)
@@ -74,8 +104,8 @@ Heads in a line's leading blanks go past them. GROUP is as `edit!`
 takes it. Return #f if the mode does not indent."
   ;; The lines found only where the mode indents: a line's start is far
   ;; on a long one.
-  (and (indent-lines! s (lambda () (range-lines s #f)) group)
-       (begin (to-indentation! s) #t)))
+  (let ((edits (indent-lines! s (lambda () (range-lines s #f)) group)))
+    (and edits (begin (to-indentation! s edits) #t))))
 
 (define (newline-indent! s group)
   "Break the line at every range of S, indenting the lines it opens.
