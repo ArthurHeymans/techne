@@ -31,7 +31,7 @@ fn reader_next_and_previous_keep_the_selected_title_visible_in_both_layouts() {
              (set-option! 'mail-reader-position '{position})
              (run-command (current-session) 'mail 1)
              (run-command (current-session) 'mail-all 1)",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-navigation-fixture.scm"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/mail/tests/fixtures/mail-navigation-fixture.scm"),
             dir.path().join("navigation.sqlite").display().to_string()
         ))
         .unwrap();
@@ -68,7 +68,7 @@ fn the_dashboard_is_a_full_frame_of_rows_with_a_highlight_not_a_caret() {
     let mut rt = Runtime::with_document(Document::new("previous"), "emacs").unwrap();
     rt.eval(&format!(
         "(require {:?}) (mail-test-seed-samples! {:?}) (run-command (current-session) 'mail 1)",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-sample-fixture.scm"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/mail/tests/fixtures/mail-sample-fixture.scm"),
         dir.path().join("samples.sqlite").display().to_string()
     ))
     .unwrap();
@@ -102,7 +102,7 @@ fn mail_cells_are_usable_wide_and_narrow_and_support_paging() {
         "(require {:?}) (mail-test-seed-samples! {:?})
          (run-command (current-session) 'mail 1)
          (run-command (current-session) 'mail-inbox 1)",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-sample-fixture.scm"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/mail/tests/fixtures/mail-sample-fixture.scm"),
         dir.path().join("samples.sqlite").display().to_string()
     ))
     .unwrap();

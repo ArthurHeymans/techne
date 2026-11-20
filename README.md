@@ -14,6 +14,9 @@ opens its dashboard of groups, accounts and folders.
 program in either frontend; open one with `M-x terminal`.
 
 [Editor packages](doc/packages.md) can be installed from Git and activated on first use.
+A package is a directory with a manifest, its libraries and the packages it
+depends on, for the editor or for a program without it; those Techne ships
+are in [packages](packages).
 
 The Lisp is meant to be a general-purpose language in its own right,
 embeddable from Rust. Its runtime is described in

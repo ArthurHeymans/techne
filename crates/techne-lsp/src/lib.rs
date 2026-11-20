@@ -21,6 +21,21 @@ use analysis::{Analysis, Def, DefKind, Span, analyze, checkdoc, head, ident, lib
 use techne_vm::reader::Syntax;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result, lsp_types::*};
 
+/// A library of the package `dir` is in: under `lib` beside the nearest
+/// manifest above, `techne-package.scm`, if its name begins with the
+/// package's, which the manifest, read as data, says: as the runtime
+/// finds it once the package is used (`(techne package)`). A file of
+/// another name under `lib` is no library of the package's. The
+/// libraries of the packages it depends on are not looked for.
+fn package_library(parts: &[String], dir: &Path) -> Option<PathBuf> {
+    let root = dir.ancestors().find(|d| d.join("techne-package.scm").is_file())?;
+    let text = std::fs::read_to_string(root.join("techne-package.scm")).ok()?;
+    let forms = techne_vm::reader::read_syntax(&text).ok()?;
+    let package = ident(list(forms.first()?)?.get(1)?)?.0;
+    let own = package == *parts.first()?;
+    own.then(|| root.join("lib").join(format!("{}.sld", parts.join("/")))).filter(|p| p.is_file())
+}
+
 /// Byte offset to an LSP position (UTF-16 columns).
 /// Byte `offset` of `text`, or the start of the character it falls in.
 fn boundary(text: &str, offset: usize) -> usize {
@@ -186,7 +201,9 @@ impl Backend {
                         .collect();
                     return Ok(exported(exports, defs));
                 }
-                let file = techne_vm::library::library_file(&parts, base).ok_or_else(|| format!("cannot find library {written}"))?;
+                let file = techne_vm::library::library_file(&parts, base)
+                    .or_else(|| package_library(&parts, base))
+                    .ok_or_else(|| format!("cannot find library {written}"))?;
                 let text = std::fs::read_to_string(&file).map_err(|_| format!("cannot read library {written}"))?;
                 let uri = Url::from_file_path(file.canonicalize().unwrap_or(file)).map_err(|_| written.clone())?;
                 let other = analyze(&text, &self.builtin_macros);

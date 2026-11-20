@@ -1,5 +1,5 @@
-(import (techne) (techne mail date) (techne time))
-(require "../test.scm")
+(import (techne) (mail date) (techne time))
+(import (techne test))
 (define now (civil->instant '(2026 11 5 15 0 0) "UTC"))
 (check "timezone" (civil->instant '(2026 11 5 13 32 0) "UTC") (mail-date->instant "Thu, 5 Nov 2026 14:32:00 +0100"))
 (check "today" "13:32" (mail-date-label "5 Nov 2026 14:32:00 +0100" #:now now))

@@ -1,5 +1,5 @@
 ;;; RFC 5322 dates for chronology; invalid dates never become today's clock.
-(define-library (techne mail date)
+(define-library (mail date)
   (export mail-date->instant mail-date-label)
   (import (techne) (techne time) (techne task))
   (begin

@@ -1193,8 +1193,10 @@ a setting comes from."
 
 ;; ----- packages -----
 
-;; A package is a file (and the files it requires from its directory)
-;; loaded as a generation: fresh modules and a scope of its own. Loading
+;; A package is a file (and the files it requires from its directory, and
+;; the libraries they define) loaded as a generation: fresh modules and a
+;; scope of its own. What it loads from elsewhere is the world's, loaded
+;; once whichever package asks first, and no part of a generation. Loading
 ;; it again loads the next generation beside the current one, its
 ;; registry entries held back; if that fails, the new generation is shut
 ;; and the current one is left as it was. If it succeeds, its modules and

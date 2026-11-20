@@ -1,5 +1,5 @@
-(import (techne) (techne mail smtp) (techne mail address) (techne mail mime))
-(require "../test.scm")
+(import (techne) (mail smtp) (mail address) (mail mime))
+(import (techne test))
 
 (check "addresses" '("ada@example.org" "ben@example.org") (mail-addresses "Ada <ada@example.org>, ben@example.org"))
 (check "quoted commas and escaped names" '("jane@example.org" "ben@example.org")
