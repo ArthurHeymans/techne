@@ -3,6 +3,9 @@
 
 (provide check check-true test-summary test-failures)
 
+;; Also the library (techne test) (lisp/techne/test.sld).
+(%name-library '(techne test))
+
 (define %failures 0)
 (define %count 0)
 

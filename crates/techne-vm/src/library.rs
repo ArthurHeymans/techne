@@ -9,7 +9,9 @@
 //! they import, not the root module. The R7RS libraries `(scheme base)` and
 //! the like are views of the root module's bindings, `(techne)` is all of
 //! them. Any other library is defined where it is first imported from, or
-//! else searched for as `a/b.sld` (for `(a b)`) in the importing file's
+//! else searched for as `a/b.sld` (for `(a b)`): under the directory that
+//! provides the libraries named `(a ...)` and nowhere else, if a package
+//! does (`Vm::provide_libraries`); otherwise in the importing file's
 //! directory, then in the directories of `TECHNE_LIBRARY_PATH`, then in
 //! Techne's own Lisp ([`lisp_dir`]). Ordinary modules
 //! (files, the REPL's) also see the root module, imports or not.
@@ -308,7 +310,7 @@ impl Vm {
         if let Some(m) = self.loaded_library(&name)? {
             return Ok(m);
         }
-        let file = library_file(parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
+        let file = self.library_file(parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
         self.check_loading().map_err(|e| Error::new(format!("import {name}: {}", e.msg)))?;
         let result = self.load_module(&file).and_then(|_| {
             self.loaded_library(&name)?.ok_or_else(|| Error::new(format!("import: {} does not define {name}", file.display())))
@@ -402,7 +404,7 @@ impl Vm {
                 continue;
             }
             self.check_loading()?;
-            let path = library_file(&parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
+            let path = self.library_file(&parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
             let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
             match self.module_forms_from(&path, text) {
                 Ok(Some(forms)) => return Ok(Some(forms)),
@@ -528,9 +530,44 @@ impl Vm {
                 // File discovery still establishes availability; a dead
                 // inline registration does not, even before any import.
                 self.abandon_dead_libraries();
-                Ok(builtin(&parts).is_some() || self.loaded_module(&name).is_some() || library_file(&parts, dir).is_some())
+                Ok(builtin(&parts).is_some() || self.loaded_module(&name).is_some() || self.library_file(&parts, dir).is_some())
             }
             _ => err(format!("cond-expand: bad requirement {}", display_sexp(req))),
+        }
+    }
+
+    /// Find the libraries whose names begin with `name` under `dir`, and
+    /// nowhere else: `(name a b)` is `dir/name/a/b.sld`. A package's
+    /// manifest says so of its own (`(techne package)`); the libraries are
+    /// the world's, shared by every importer. It is an error if another
+    /// directory provides them already.
+    pub fn provide_libraries(&mut self, name: &str, dir: &Path) -> R<()> {
+        self.check_loading()?;
+        let missing = || Error::new(format!("{}: no such directory", dir.display()));
+        let dir = dir.canonicalize().ok().filter(|d| d.is_dir() && self.may_read(d)).ok_or_else(missing)?;
+        match self.library_provider(name) {
+            Some(old) if old == dir => Ok(()),
+            Some(old) => err(format!("libraries ({name} ...) are provided from {} already", old.display())),
+            None => {
+                self.library_providers.push((name.into(), dir));
+                Ok(())
+            }
+        }
+    }
+
+    /// The directory providing the libraries whose names begin with `name`.
+    pub fn library_provider(&self, name: &str) -> Option<&Path> {
+        self.library_providers.iter().find(|(n, _)| &**n == name).map(|(_, dir)| &**dir)
+    }
+
+    /// Where library `parts` is defined: under its provider's directory if
+    /// its name has one, else where [`library_file`] finds it.
+    pub(crate) fn library_file(&self, parts: &[String], dir: &Path) -> Option<PathBuf> {
+        match parts.first().and_then(|name| self.library_provider(name)) {
+            Some(provider) => {
+                Some(provider.join(format!("{}.sld", parts.join("/")))).filter(|p| p.is_file()).and_then(|p| p.canonicalize().ok())
+            }
+            None => library_file(parts, dir),
         }
     }
 }

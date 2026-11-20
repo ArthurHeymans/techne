@@ -36,7 +36,8 @@
          find-mode mode-names mode? mode-name mode-doc mode-parent mode-minor? mode-map
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          register-mode-line-segment! mode-line-segments
-         define-option register-option! find-option option-names option-name option-default option-doc option-type
+         define-option register-option! advertise-package!
+         find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
          buffer-directory buffer-input buffer-display-options)
@@ -298,6 +299,21 @@ TYPE is the schema of its values, as `valid?` takes it: boolean, natural,
     "Declare the option NAME, its DEFAULT and documentation DOC.
 The other arguments are keywords, as `register-option!` takes them."
     ((_ name default doc arg ...) (register-option! 'name default doc arg ...))))
+
+(define (advertise-package! name entry commands options)
+  "Advertise the package NAME without loading the file ENTRY; return NAME.
+What a package's manifest declares for the editor (doc/packages.md) is
+there from now on: OPTIONS, each (name default schema documentation),
+are declared, and COMMANDS, each (name documentation), offered, the
+first use of one loading ENTRY as the package
+(`register-command-package!`). A scope of the package's name owns the
+declarations: if one of them fails, none is left."
+  (let ((scope (make-scope name #:parent %root-scope)))
+    (guard (e (#t (scope-shutdown! scope) (raise e)))
+      (with-scope scope
+        (for-each (lambda (o) (register-option! (car o) (cadr o) (cadddr o) #:type (caddr o))) options)
+        (register-command-package! name entry commands)))
+    name))
 
 ;; Raise an error unless VALUE is a value of the option NAME.
 (define (check-option name value)

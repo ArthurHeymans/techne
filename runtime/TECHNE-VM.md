@@ -694,7 +694,11 @@ fully hygienic.
   loaded as a generation into fresh modules and a scope of its own. A file
   or library from elsewhere (the library path, Techne's own Lisp) is the
   world's, not the package's that loads it first: it loads once, and stays
-  when that package is reloaded or unloaded. Loading again stages the next
+  when that package is reloaded or unloaded. So do the libraries a package
+  provides under `lib/` in its directory, which its manifest's name owns
+  (`(techne package)`, doc/packages.md): `(mail imap)` is found there and
+  nowhere else, by the package itself, by those depending on it and by a
+  program `techne run` starts from its directory. Loading again stages the next
   generation, holding back its registry entries; a failure shuts it and
   leaves the current one as it was, a success publishes its modules and
   entries at once, each in its predecessor's place among stacked entries,
