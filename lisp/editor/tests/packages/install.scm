@@ -139,6 +139,13 @@
     (write-file! multi "packages/multi-edit/entry.scm"
                  '(import (techne editor) (multi-util words))
                  '(define-command (multi-shout s n) "Shout." (shout "hi")))
+    (write-file! multi "packages/multi-more/techne-package.scm"
+                 '(package multi-more
+                    (depends (multi-util (path "../multi-util")))
+                    (editor "entry.scm" (commands (multi-more "Shout more.")))))
+    (write-file! multi "packages/multi-more/entry.scm"
+                 '(import (techne editor) (multi-util words))
+                 '(define-command (multi-more s n) "Shout more." (shout (shout "more"))))
     (write-file! multi "packages/multi-other/techne-package.scm"
                  '(package multi-other (editor "entry.scm" (commands (multi-other "Another package.")))))
     (write-file! multi "packages/multi-other/entry.scm"
@@ -172,9 +179,17 @@
     (check "first use loads it, with the library of the package beside it" "hi!" ((command 'multi-shout) (current-session) 1))
     (check "its dependency is of the checkout" #t
            (string-prefix? (file-truename dir) (%library-provider "multi-util")))
+    ;; Another package of the repository depending on the same one beside
+    ;; it: both find it in the one checkout they share.
+    (check "another, with the same dependency" 'multi-more (package-install! `(local ,multi (package multi-more)) #:directory dir))
+    (check "which it finds too" "more!!" ((command 'multi-more) (current-session) 1))
     (register-package-recipe! `(recipe multi-other (local ,multi)))
     (check "a catalog name says which" 'multi-other (package-install! 'multi-other #:directory dir))
     (check "that one runs" 'other ((command 'multi-other) (current-session) 1))
+    (check "one checkout for the repository" 1 (length (directory-list dir)))
+    ;; One that cannot be installed, asked of the checkout that is there.
+    (check "refused beside them" #t (bad? (lambda () (package-install! `(local ,multi (package multi-stray)) #:directory dir))))
+    (check "and not advertised" #f (command-doc 'multi-stray))
     (delete-path multi #t)
     (check "repeat without remote" 'multi-edit (package-install! `(local ,multi (package multi-edit)) #:directory dir))))
 
@@ -190,8 +205,9 @@
   (check "still cold" #f (find-package 'pkg-test))
   (check "real command" 5 (invoke (current-session) 'pkg-hello (dict 'value 3)))
   ;; Packages from a repository's subdirectories, each where its pin says.
-  (check "restore those of a repository of several" '("multi-edit" "multi-other")
+  (check "restore those of a repository of several" '("multi-edit" "multi-more" "multi-other")
          (sort (map symbol->string (package-restore! #:directory (path-join tmp "store-multi"))) string<?))
   (check "cold" #f (and (find-package 'multi-edit) #t))
   (check "with the package beside it" "hi!" ((command 'multi-shout) (current-session) 1))
+  (check "which another shares" "more!!" ((command 'multi-more) (current-session) 1))
   (test-failures))
