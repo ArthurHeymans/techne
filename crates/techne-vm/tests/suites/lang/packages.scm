@@ -90,6 +90,87 @@
 (test #f (find-package 'demo))
 (delete-file path)
 
+;; Packages in directories of their own, beside this program.
+(define (package-dir name) (string-append path "." (symbol->string name) "/"))
+(define (package-main name) (string-append (package-dir name) "main.scm"))
+(define (write-forms! file . forms)
+  (call-with-output-file file (lambda (port) (for-each (lambda (f) (write f port) (newline port)) forms))))
+
+;; What a package loads from outside its directory (a file it requires, a
+;; library found among the shipped ones) is the world's, not the package's
+;; that happened to load it first: it loads once, whatever the order, and
+;; stays when that package is reloaded or unloaded.
+(define shared (string-append path ".shared.scm"))
+(write-forms! shared '(provide token) '(define token (list 'instance)))
+(define (write-user! name)
+  (make-directory (package-dir name))
+  (write-forms! (package-main name)
+                `(require ,shared)
+                '(import (techne path))
+                `(registry-add! demo-commands ',name (lambda () (cons token path-join)))))
+(define (same? a b)
+  (let ((x (command a)) (y (command b)))
+    (and (eq? (car x) (car y)) (eq? (cdr x) (cdr y)))))
+(for-each write-user! '(first second third))
+(load-package 'first (package-main 'first))
+(load-package 'second (package-main 'second))
+(test #t (same? 'first 'second))
+;; The one that loaded them first is reloaded: the others keep them, and
+;; so does its next generation, and one loaded after.
+(load-package 'first (package-main 'first))
+(test #t (same? 'first 'second))
+(load-package 'third (package-main 'third))
+(test #t (same? 'third 'second))
+;; It is unloaded: nothing changes for the others, reloaded or not.
+(unload-package 'first)
+(load-package 'second (package-main 'second))
+(test #t (same? 'third 'second))
+(for-each unload-package '(second third))
+(for-each (lambda (name) (delete-file (package-main name))) '(first second third))
+(delete-file shared)
+
+;; The libraries a package's files define are its own: they load afresh
+;; with each generation, as its files do.
+(define own-library (string-append (package-dir 'own) "own/lib.sld"))
+(define (write-own! version . forms)
+  (write-forms! own-library
+                `(define-library (own lib) (export version) (import (scheme base)) (begin (define (version) ',version))))
+  (apply write-forms! (package-main 'own) '(import (own lib)) forms))
+(define own-command '(registry-add! demo-commands 'own (lambda () (version))))
+(make-directory (string-append (package-dir 'own) "own"))
+(write-own! 'v1 own-command)
+(load-package 'own (package-main 'own))
+(test 'v1 (command 'own))
+(write-own! 'v2 own-command)
+(load-package 'own (package-main 'own))
+(test 'v2 (command 'own))
+(write-own! 'v3 own-command)
+(load-package 'own (package-main 'own))
+(test 'v3 (command 'own))
+(test 'v3 (eval '(version) "(own lib)"))
+;; While the next generation loads, its library is its own still: another
+;; task finds the published one by its name.
+(eval '(define own-go (make-channel)) "root")
+(write-own! 'v4 '(channel-recv own-go) own-command)
+(define own-loader (spawn (lambda () (load-package 'own (package-main 'own)))))
+(sleep 5)
+(test 'v3 (task-join (spawn (lambda () (eval '(version) "(own lib)")))))
+(channel-send own-go #t)
+(task-join own-loader)
+(test 'v4 (eval '(version) "(own lib)"))
+(test 'v4 (command 'own))
+;; A generation that fails takes its library with it.
+(write-own! 'v5 '(car '()))
+(test-error (load-package 'own (package-main 'own)))
+(test 'v4 (eval '(version) "(own lib)"))
+(test 'v4 (command 'own))
+;; Unloaded, the library goes with the package.
+(unload-package 'own)
+(test-error (eval '(version) "(own lib)"))
+(test '() (registry-keys demo-commands))
+(delete-file own-library)
+(delete-file (package-main 'own))
+
 ;; Primitives are sealed: shadowed by a definition, never changed.
 (test-error (eval '(set! car cdr)))
 (test 'shadowed (eval '(begin (define (car x) 'shadowed) (car '(1)))))

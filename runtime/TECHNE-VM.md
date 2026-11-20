@@ -690,8 +690,11 @@ fully hygienic.
   deadlines on reading requests and handler failures answered where they
   were raised; bodies streamed in chunks, and server-sent events).
 - **Packages** (`load-package`, `unload-package`, `find-package`): a file,
-  and the files it requires from its directory, loaded as a generation into
-  fresh modules and a scope of its own. Loading again stages the next
+  the files it requires from its directory and the libraries those define,
+  loaded as a generation into fresh modules and a scope of its own. A file
+  or library from elsewhere (the library path, Techne's own Lisp) is the
+  world's, not the package's that loads it first: it loads once, and stays
+  when that package is reloaded or unloaded. Loading again stages the next
   generation, holding back its registry entries; a failure shuts it and
   leaves the current one as it was, a success publishes its modules and
   entries at once, each in its predecessor's place among stacked entries,
