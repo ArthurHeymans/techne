@@ -870,7 +870,8 @@ deltas, layers, projections) is added only when a slice needs it.
    `buffers` reproducer fell from 28.33 M to 20.66 M, with named
    `completion-filter` and `completion-delete` workloads (20.67 M and
    20.36 M). Other known cases are indenting after an open bracket (as
-   on main), a session's first definition motion, which compiles its
+   on main, by TAB, RET or C-M-\: the scan starts at the list's opening
+   line), a session's first definition motion, which compiles its
    language's definitions query (the plan: compile it on the worker when
    the language is first used), and indent-sexp on an unclosed list
    (50 M, as on main: it reindents to the end of the buffer; the plan,
