@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795160555689,
+  "lastUpdate": 1795160557212,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -59869,6 +59869,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 105287,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e73250f33cb388610461f88f37c5f90ee90fe6cc",
+          "message": "Merge pull request #386 from ArthurHeymans/editor/remote-dired\n\nBrowse remote directories from Find file",
+          "timestamp": "2026-11-20T08:36:16+01:00",
+          "tree_id": "b751877d563eab23e9e80c69eed9d9ffc6524144",
+          "url": "https://github.com/ArthurHeymans/techne/commit/e73250f33cb388610461f88f37c5f90ee90fe6cc"
+        },
+        "date": 1795160557153,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 689327118,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 641567846,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 105508,
             "unit": "data"
           }
         ]
