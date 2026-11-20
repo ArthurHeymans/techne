@@ -66,19 +66,29 @@
                   (unless (eqv? 0 (process-wait p)) (error "Package Git operation failed" (car args)))
                   (string-trim out))) #:directory dir #:stdin 'null #:stderr 'inherit
     #:environment '(("GIT_TERMINAL_PROMPT" . "0"))))
-;; (pin SOURCE COMMIT [DIRECTORY]): the package's directory in the checkout,
-;; relative, left out for the checkout's own.
+;; A store entry is one checkout of a repository at a commit, shared by the
+;; packages installed from it: what they depend on beside them is one
+;; directory for all. Its pin is (pin SOURCE COMMIT DIRECTORY ...): the
+;; source without the package wanted, and the directories in the checkout
+;; of the packages installed, relative; none, for a checkout that is itself
+;; the one package.
 (define (pin path)
   (let ((d (one-datum (path-join path "pin"))))
-    (unless (and (list? d) (memv (length d) '(3 4)) (eq? (car d) 'pin) (oid? (caddr d))
-                 (or (= 3 (length d))
-                     (and (string? (cadddr d)) (every component? (string-split (cadddr d) "/")))))
+    (unless (and (list? d) (>= (length d) 3) (eq? (car d) 'pin) (oid? (caddr d))
+                 (every (lambda (sub) (and (string? sub) (every component? (string-split sub "/")))) (cdddr d)))
       (error "Invalid package pin"))
     d))
-;; The directory of the package installed at PATH, in its checkout.
-(define (package-tree path)
-  (let ((d (pin path)))
-    (if (= 4 (length d)) (path-join path "tree" (cadddr d)) (path-join path "tree"))))
+(define (pin-directories d) (if (null? (cdddr d)) '("") (cdddr d)))
+;; SOURCE, a source datum, without the package it wants: what is fetched.
+(define (checkout-datum datum)
+  (remove (lambda (e) (and (pair? e) (eq? (car e) 'package))) datum))
+;; An installation: (ENTRY . DIRECTORY), a store entry and the directory in
+;; its checkout of a package installed from it.
+(define (installations path) (map (lambda (sub) (cons path sub)) (pin-directories (pin path))))
+(define (installation-checkout i) (path-join (car i) "tree"))
+(define (installation-tree i)
+  (if (string=? (cdr i) "") (installation-checkout i) (path-join (installation-checkout i) (cdr i))))
+(define (all-installations dir) (append-map installations (installed-paths dir)))
 ;; Where the package wanted is in the checkout TREE, relative: TREE itself
 ;; if it is a package, else the directory under it of the package WANTED,
 ;; or of the only one. A manifest that does not read is no candidate.
@@ -111,9 +121,12 @@
 (define (commands m) (cadr (manifest-editor m)))
 (define (options m) (caddr (manifest-editor m)))
 
-;; One immutable checkout per recipe. Publish pin + tree by renaming the
+;; One immutable checkout per source. Publish pin + tree by renaming the
 ;; temporary directory. Never overwrite another install or fetch on restore.
-(define (fetch! dir dest datum source expected)
+;; DATUM is what is fetched (`checkout-datum`), WANTED the package to
+;; install from it, or #f. Return whether this published DEST: not if
+;; another editor did meanwhile.
+(define (fetch! dir dest datum source wanted)
   (let* ((tmp (path-join dir (string-append ".install-" (hex-encode (random-bytes 12)))))
          (tree (path-join tmp "tree")) (ref (package-source-ref source))
          (protocol (if (eq? (package-source-kind source) 'local) "file" "https")))
@@ -128,26 +141,55 @@
         (let ((oid (git tree protocol "rev-parse" "--verify" "FETCH_HEAD^{commit}")))
           (unless (oid? oid) (error "Git returned an invalid commit"))
           (git tree protocol "checkout" "--quiet" "--detach" oid)
-          (let* ((sub (package-subdirectory tree (or (package-source-package source) expected)))
-                 (d (manifest (path-join tree sub))) (lock (path-join dir ".publishing")))
+          (let* ((sub (package-subdirectory tree wanted))
+                 (d (manifest (path-join tree sub))))
             (call-with-output-file (path-join tmp "pin")
               (lambda (p) (write (if (string=? sub "") (list 'pin datum oid) (list 'pin datum oid sub)) p)))
             ;; Two editors may have fetched different sources at the same time.
             ;; Serialize only the local preflight and atomic rename, not fetch.
-            (dynamic-wind (lambda () (create-directory lock #o700))
-                          (lambda ()
-                            (unless (file-exists? dest)
-                              (check-declarations! d (or (package-source-package source) expected))
-                              (check-contained! tree (path-join tree sub))
-                              (check-disjoint! (cons d (map stored-manifest (installed-paths dir))))
-                              (rename-file tmp dest)))
-                          (lambda () (delete-path lock #f))))))
+            (publishing dir
+              (lambda ()
+                (and (not (file-exists? dest))
+                     (begin
+                       (check-declarations! d wanted)
+                       (check-contained! tree (path-join tree sub))
+                       (check-disjoint! (cons d (map stored-manifest (all-installations dir))))
+                       (rename-file tmp dest)
+                       #t)))))))
       (lambda () (when (file-exists? tmp) (delete-path tmp #t))))))
+
+;; Call THUNK as the store DIR's only publisher (doc/packages.md).
+(define (publishing dir thunk)
+  (let ((lock (path-join dir ".publishing")))
+    (dynamic-wind (lambda () (create-directory lock #o700)) thunk (lambda () (delete-path lock #f)))))
+(define (write-pin! path d)
+  (replace-file (path-join path "pin") (call-with-output-string (lambda (p) (write d p)))))
+;; Install the package in the directory SUB of the checkout already at
+;; DEST, beside those installed from it: checked as a fetched one is, then
+;; added to the pin. Return whether it was added: not if it is there.
+(define (add-installation! dir dest sub wanted)
+  (publishing dir
+    (lambda ()
+      (let ((p (pin dest)) (i (cons dest sub)))
+        (and (not (member sub (pin-directories p)))
+             (let ((d (stored-manifest i)))
+               (check-declarations! d wanted)
+               (check-contained! (installation-checkout i) (installation-tree i))
+               (check-disjoint! (cons d (map stored-manifest (all-installations dir))))
+               (write-pin! dest (append p (list sub)))
+               #t))))))
+;; Take the installation of SUB added to DEST back: it could not be made
+;; known here. The others installed from the checkout stay.
+(define (remove-installation! dir dest sub)
+  (publishing dir
+    (lambda ()
+      (let ((p (pin dest)))
+        (write-pin! dest (append (list 'pin (cadr p) (caddr p)) (delete sub (cdddr p))))))))
 
 (define (installed-paths dir)
   (map (lambda (key) (path-join dir key))
        (filter oid? (map path-file-name (filter (lambda (entry) (string-suffix? "/" entry)) (directory-list dir))))))
-(define (stored-manifest path) (manifest (package-tree path)))
+(define (stored-manifest i) (manifest (installation-tree i)))
 (define (check-disjoint! manifests)
   (let ((unique! (lambda (names)
                    (unless (= (length names) (length (delete-duplicates names))) (error "Conflicting package declarations" names)))))
@@ -162,46 +204,54 @@
     (when (or (find-package name) (package-declared? name)) (error "Package name already installed" name))
     (for-each (lambda (c) (when (memq (car c) (command-names)) (error "Command already registered" (car c)))) (commands d))
     (for-each (lambda (o) (when (find-option (car o)) (error "Option already declared" (car o)))) (options d))))
-(define (announce! dest expected)
-  (let* ((tree (package-tree dest)) (d (manifest tree)) (name (manifest-name d)) (old (hash-table-ref/default indexed name #f)))
+;; Advertise the installation I; EXPECTED is the name it must have, or #f.
+(define (announce! i expected)
+  (let* ((tree (installation-tree i)) (d (manifest tree)) (name (manifest-name d)) (old (hash-table-ref/default indexed name #f)))
     (when (and expected (not (eq? expected name))) (error "Package name mismatch" name expected))
-    (cond (old (unless (equal? old dest) (error "Package name already installed" name)))
+    (cond (old (unless (equal? old i) (error "Package name already installed" name)))
           (else
            (check-declarations! d expected)
-           (check-contained! (path-join dest "tree") tree)
+           (check-contained! (installation-checkout i) tree)
            ;; As a package directory Techne ships is advertised, its
            ;; libraries and those of what it depends on found first: the
            ;; packages beside it in its checkout, at the commit pinned.
-           (use-package-directory! tree #:within (path-join dest "tree"))
+           (use-package-directory! tree #:within (installation-checkout i))
            (advertise-package! name (car (manifest-editor d)) (commands d) (options d))
-           (hash-table-set! indexed name dest))) name))
+           (hash-table-set! indexed name i))) name))
 (define (package-install! spec #:directory [directory (store)])
   "Install SPEC (a source datum or catalog name) and advertise its commands.
 DIRECTORY is the package store. First install pins a commit; repeats are offline.
 Of a repository holding several packages, the one installed is the one
-the source names with (package NAME), else the one of the catalog name."
+the source names with (package NAME), else the one of the catalog name.
+The packages installed from one source share its checkout, and so the
+packages beside them that they depend on."
   (let* ((recipe (and (symbol? spec) (or (hash-table-ref/default catalog spec #f) (error "Unknown recipe" spec))))
          (datum (if recipe (recipe-source recipe) spec)) (source (parse-package-source datum)) (dir directory)
-         (key (hex-encode (sha-256 (string->utf8 (call-with-output-string (lambda (p) (write datum p)))))))
-         (dest (path-join dir key)) (expected (and recipe (recipe-name recipe))))
+         (wanted (or (package-source-package source) (and recipe (recipe-name recipe))))
+         ;; The package wanted is no part of what is fetched, nor of its key.
+         (checkout (checkout-datum datum))
+         (key (hex-encode (sha-256 (string->utf8 (call-with-output-string (lambda (p) (write checkout p)))))))
+         (dest (path-join dir key)))
     (make-directory dir)
-    (let ((fresh (not (file-exists? dest))))
-      (when fresh (fetch! dir dest datum source expected))
-      (unless (equal? (cadr (pin dest)) datum) (error "Pin does not match recipe"))
-      ;; A checkout just published that cannot be made known here after
-      ;; all is taken back: left in the store, it would fail every later
-      ;; install and restore.
-      (guard (e (fresh (delete-path dest #t) (raise e)))
-        (announce! dest (or (package-source-package source) expected))))))
+    (let ((published (and (not (file-exists? dest)) (fetch! dir dest checkout source wanted))))
+      (unless (equal? (cadr (pin dest)) checkout) (error "Pin does not match recipe"))
+      (let* ((sub (package-subdirectory (path-join dest "tree") wanted))
+             ;; A repeat takes no part in publishing.
+             (added (and (not (member sub (pin-directories (pin dest)))) (add-installation! dir dest sub wanted))))
+        ;; What was just put in the store and cannot be made known here
+        ;; after all is taken back: left there, it would fail every later
+        ;; install and restore.
+        (guard (e (published (delete-path dest #t) (raise e))
+                  (added (remove-installation! dir dest sub) (raise e)))
+          (announce! (cons dest sub) wanted))))))
 (define (package-restore! #:directory [directory (store)])
   "Advertise all packages installed in DIRECTORY without fetching or loading."
   (let ((dir directory))
     (if (file-exists? dir)
-        (let* ((paths (installed-paths dir)) (manifests (map stored-manifest paths)))
+        (let* ((all (all-installations dir)) (manifests (map stored-manifest all)))
           (check-disjoint! manifests)
-          (for-each (lambda (path d)
-                      (pin path)
+          (for-each (lambda (i d)
                       (let ((old (hash-table-ref/default indexed (manifest-name d) #f)))
-                        (if old (unless (equal? old path) (error "Package name already installed" (manifest-name d)))
-                            (check-declarations! d #f)))) paths manifests)
-          (map (lambda (path) (announce! path #f)) paths)) '())))
+                        (if old (unless (equal? old i) (error "Package name already installed" (manifest-name d)))
+                            (check-declarations! d #f)))) all manifests)
+          (map (lambda (i) (announce! i #f)) all)) '())))
