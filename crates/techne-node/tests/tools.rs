@@ -401,8 +401,11 @@ fn an_edit_that_leaves_scheme_unreadable_is_refused() {
         (define rev (tool-ref (tool-read p "a.scm") 'revision))
         (check #t (has? (message (lambda () (tool-edit! p "a.scm" rev '(("(g x))" "(g x)")))))
                         "a.scm would not read as Scheme"))
-        ;; A revision too short to check is named as such, not as stale.
+        ;; A revision too short to check is named as such, not as stale,
+        ;; as is one with digits of another script.
         (check #t (has? (message (lambda () (tool-edit! p "a.scm" (substring rev 0 4) '(("y 1" "y 2")))))
+                        "8 or more characters"))
+        (check #t (has? (message (lambda () (tool-edit! p "a.scm" (string-append (substring rev 0 8) "\x0663;") '(("y 1" "y 2")))))
                         "8 or more characters"))
         ;; A new file must read; other files are not Lisp, and one already
         ;; unreadable may be edited as it is.

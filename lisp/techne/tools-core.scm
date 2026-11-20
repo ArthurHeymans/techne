@@ -167,7 +167,8 @@
 ;;; or more characters of its start, as a reply abbreviates it.
 (define (%revision! expected s who path)
   (unless (and (string? expected) (>= (string-length expected) 8)
-               (every (lambda (c) (or (char-numeric? c) (memv c '(#\a #\b #\c #\d #\e #\f)))) (string->list expected)))
+               ;; Not char-numeric?, which takes any script's digits.
+               (every (lambda (c) (memv c (string->list "0123456789abcdef"))) (string->list expected)))
     (error (string-append who ": a revision is the lowercase hex a read returns, or 8 or more characters of its start") expected))
   (unless (string-prefix? expected (%revision s)) (error (string-append who ": stale revision; read again") path)))
 ;;; Checked replacements, planned without writing: the snapshot, the
