@@ -3,7 +3,7 @@
 //! `--start` starts `techne daemon` there when none runs. The machine is
 //! this one, the command a plain one instead of ssh.
 
-#![cfg(any(feature = "window", feature = "term"))]
+#![cfg(any(feature = "window", feature = "term", feature = "web"))]
 
 use std::{
     path::Path,

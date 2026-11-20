@@ -213,8 +213,8 @@ impl Host {
             f.backlog.discard();
             return false;
         }
-        if let Input::Key { at, .. } | Input::Click { at, .. } = &input {
-            f.waiting.push_back(*at);
+        if let Some(at) = input.instant() {
+            f.waiting.push_back(at);
         }
         f.sent += 1;
         s.sent += 1;

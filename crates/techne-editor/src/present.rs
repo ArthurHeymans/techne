@@ -464,6 +464,12 @@ pub enum Input {
     /// Input the key normalizer could not name (an escape sequence it does
     /// not know), as it came: reported rather than dropped.
     Unrecognized { input: String },
+    /// Insert exactly this committed text, without consulting the kill ring.
+    Text {
+        text: String,
+        #[serde(skip, default = "Instant::now")]
+        at: Instant,
+    },
     /// What the system clipboard holds, when it may have changed (another
     /// program put text there): it becomes the newest kill.
     Clipboard { text: String },
@@ -473,6 +479,16 @@ pub enum Input {
     Focus { focused: bool },
     /// The frontend is closing: it detaches.
     Close,
+}
+
+impl Input {
+    /// Inputs that participate in frontend-to-frame latency and acknowledgments.
+    pub(crate) fn instant(&self) -> Option<Instant> {
+        match self {
+            Self::Key { at, .. } | Self::Click { at, .. } | Self::Text { at, .. } => Some(*at),
+            _ => None,
+        }
+    }
 }
 
 /// Pixels captured from a successfully drawn frame, encoded as sRGB PNG.

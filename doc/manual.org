@@ -55,6 +55,30 @@ the editor you have open. =*Server log*= shows what programs evaluated
 and what came of it. Any program running as you can do this, as with
 Emacs's server; the option ~server-eval~ turns it off.
 
+* Browser frontend
+
+Start ~techne daemon~ in one terminal and ~techne web [FILE]~ in another,
+then open the private URL that ~techne web~ prints. It also works with an
+editor already running in a window or terminal. The browser has a session
+of its own and shares the editor's buffers with other frontends. Reloading
+reconnects to the same runtime; it doesn't restore the tab's pane layout.
+
+Use the editor's usual keys: =C-x C-f= to open a file, =C-x C-s= to save,
+=C-x 2= or =C-x 3= to split, =M-x= to run a command and =C-g= to cancel.
+Some chords remain reserved by the browser. Browser paste and committed
+text insert at the editor selection without changing the kill ring.
+
+The browser draws the editor's faces, panes, mode lines, minibuffer and
+completion. Exact font shaping, embedded images and editor-driven capture
+are not supported yet. Pane snapshots are limited to 2 MiB and 4,000
+logical lines of document text in total, with separate limits for drawing
+metadata and the complete encoded message.
+
+The gateway binds only to IPv4 loopback. Treat its URL like a password:
+anyone with it can operate the editor. Do not share it or publish the
+gateway through a proxy. End ~techne web~ to revoke access; this doesn't
+stop the editor. The gateway doesn't expose the ~techne eval~ endpoint.
+
 * Screenshots and recordings
 
 In the window frontend, =M-x screenshot= saves the next rendered editor

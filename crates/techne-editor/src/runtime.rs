@@ -303,8 +303,8 @@ impl Attached {
     /// was handled or not (discarded by C-g, or its session failed), so
     /// the frontend never waits on it.
     fn taken(&mut self, input: &Input) {
-        if let Input::Key { at, .. } | Input::Click { at, .. } = input {
-            self.pending.push(*at);
+        if let Some(at) = input.instant() {
+            self.pending.push(at);
         }
     }
 }
@@ -454,7 +454,7 @@ pub(crate) fn weight(input: &Input) -> usize {
             Input::Unsendable { keys } => {
                 keys.capacity() * std::mem::size_of::<String>() + keys.iter().map(String::capacity).sum::<usize>()
             }
-            Input::Unrecognized { input: text } | Input::Clipboard { text } => text.capacity(),
+            Input::Unrecognized { input: text } | Input::Clipboard { text } | Input::Text { text, .. } => text.capacity(),
             Input::Click { .. }
             | Input::Scroll { .. }
             | Input::Edge { .. }
@@ -467,7 +467,7 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 44] = [
+const PROCS: [&str; 45] = [
     "editor-pointer!",
     "editor-focus-event!",
     "editor-cancel-capture!",
@@ -507,6 +507,7 @@ const PROCS: [&str; 44] = [
     "editor-key-hints",
     "editor-take-request!",
     "editor-paged!",
+    "editor-insert-text!",
     "editor-session-state",
     "editor-restore!",
     "editor-clipboard!",
@@ -763,6 +764,7 @@ impl Runtime {
                 }
             }
             Input::Focus { focused } => self.call("editor-focus-event!", &[Arg::Session, Arg::Bool(focused)]).map(drop),
+            Input::Text { text, .. } => self.call("editor-insert-text!", &[Arg::Session, Arg::Str(text)]).map(drop),
             Input::Close => Ok(()),
         }
     }

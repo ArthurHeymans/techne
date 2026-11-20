@@ -505,10 +505,18 @@ a grant of access. Logical excerpts are preferred unless visibility matters.
 1. **GPU** (section 7), first; in the runtime's process for the hosted editor.
 2. **Terminal**, small and early in the probe: it tests cell geometry, key
    limits and the protocol before the protocol freezes. Its tests run headless.
-3. **Browser**, later: a remote frontend to a native runtime (WebGPU, which
-   `wgpu` targets, or a canvas). Before it ships: authentication, who may attach
-   to a session, and rules for clipboard and disclosure. Local latency budgets
-   do not extend to it. Compiling all of Techne to WebAssembly is not a goal.
+3. **Browser**: a DOM frontend to a native runtime. `techne web` serves static
+   assets on loopback, authenticates an exact-origin WebSocket with an ephemeral
+   token, then attaches through the existing private editor socket. The gateway
+   is Scheme (`lisp/web/gateway.scm`): HTTP, the WebSocket, authentication,
+   which inputs a browser may send, and the bounded JSON it is shown. Rust only
+   attaches it to the editor, whose socket speaks the editor's own protocol. It
+   accepts only frontend input, not editor-server requests. The browser draws
+   the desktop's panes, faces, gutters, cursors, mode lines, minibuffer and
+   completion in HTML so the text remains accessible. Browser input resolves
+   clicks and page/scroll requests to source positions. It sends bounded full
+   text snapshots over loopback. Compiling Techne to WebAssembly or serving
+   untrusted remote users is not a goal of this frontend.
 
 **What survives what.** A frontend in the runtime's process dies with it: after
 a runtime crash the hosted window is recreated with views, scroll anchors and
