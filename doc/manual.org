@@ -159,8 +159,14 @@ when next needed.
 The node must be on the other machine, in =~/.cache/techne/bin= or on
 its PATH (=remote-node-command=). ssh does not ask for passwords, nor
 sudo: a key or an agent must do for ssh, and sudo must not need one.
-Listing a remote directory (\[dired]) and searching a remote project
-are not supported yet.
+\[dired] lists remote names without file management. \[search-project]
+searches on the same route, using =rg= on the endpoint's PATH. The
+prompt names the project root when resolved. Open buffers replace
+on-disk matches, including unsaved edits. Remote disk search skips
+non-UTF-8 result text and oversized files or lines.
+Move to preview, use RET to visit, or use \[minibuffer-export] to edit
+matches in a source-backed lens before saving explicitly. After a
+connection or search failure, C-c C-r retries the same query and route.
 
 * Version control
 

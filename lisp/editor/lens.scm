@@ -110,7 +110,9 @@ Editing them edits the buffers."
   "Show the candidates matching as a lens of their lines.
 This is for candidates that are locations in text, which a lens can
 excerpt: not in another lens or a view's rows."
-  (open-minibuffer s)
+  (unless (minibuffer-custom-export! s) (export-locations! s)))
+
+(define (export-locations! s)
   (check-lens-size (minibuffer-match-count s))
   (let ((targets (map candidate-target (minibuffer-candidates s))) (input (minibuffer-input s)))
     (if (and (pair? targets)

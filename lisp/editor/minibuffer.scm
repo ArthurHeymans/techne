@@ -41,7 +41,7 @@
          minibuffer-map minibuffer-keymaps minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          minibuffer-history add-history! history-length history-save-interval keep-histories! save-histories!
-         take-target pattern-parts matches? match-spans candidate-row)
+         take-target pattern-parts matches? match-spans candidate-row minibuffer-retry minibuffer-custom-export! minibuffer-set-prompt!)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
 ;;; an annotation in a column of its own, as Marginalia aligns them, and a
@@ -104,26 +104,27 @@ or asked for."
 ;;; A source whose candidates come later.
 
 (define-record-type async-source
-  (%async-source produce min-input)
+  (%async-source produce min-input fresh-only)
   async-source?
   (produce async-produce)
-  (min-input async-min-input))
+  (min-input async-min-input)
+  (fresh-only async-fresh-only?))
 
-(define (async-source produce #:min-input [min-input 3])
+(define (async-source produce #:min-input [min-input 3] #:fresh-only [fresh-only #f])
   "Return a source of candidates for `completing-read` that come later.
 (PRODUCE input) returns the candidates for the input, as a list; it
 runs in a task, so it can wait, for a service's answer say. The input
 changing cancels it, for the new input. An input shorter than
 MIN-INPUT has no candidates. Until they come, those for the input
-before are shown."
-  (%async-source produce min-input))
+before are shown unless FRESH-ONLY is true."
+  (%async-source produce min-input fresh-only))
 
 ;;; The open minibuffer.
 
 (define-record-type minibuffer
   (make-minibuffer prompt view source pattern accept preview require-match restore)
   minibuffer?
-  (prompt mb-prompt)
+  (prompt mb-prompt set-mb-prompt!)
   ;; The input: a view of a document of its own.
   (view mb-view)
   ;; A list of candidates, a candidate table, a procedure
@@ -148,6 +149,10 @@ before are shown."
   (table mb-table set-mb-table!)
   ;; (session) -> undoes what previews did beyond moving in panes.
   (abort mb-abort set-mb-abort!)
+  (export mb-export set-mb-export!)
+  (submit mb-submit set-mb-submit!)
+  (invalidate mb-invalidate set-mb-invalidate!)
+  (failure mb-failure set-mb-failure!)
   ;; For an async source: its request slot, the input last asked for,
   ;; and (thunk) -> calls THUNK in the scope `completing-read` was
   ;; called in, so that the request's task is owned there.
@@ -198,6 +203,9 @@ The prompt's own keymap first, then `minibuffer-map`."
 (define (completing-read s prompt source
                          #:accept [accept take-target]
                          #:preview [preview #f]
+                         #:export [export #f]
+                         #:submit [submit #f]
+                         #:invalidate [invalidate #f]
                          #:initial [initial ""]
                          #:pattern [pattern (lambda (input) input)]
                          #:require-match [require-match #t]
@@ -217,7 +225,12 @@ one made of the input when nothing matches and REQUIRE-MATCH is false
 the default action on the candidate's target is done. PREVIEW, if
 given, is called the same way for each candidate selected while
 reading; \\[minibuffer-abort] undoes what it did to the panes, and
-calls ABORT, if given, for what else they did. PATTERN gives the part
+calls ABORT, if given, for what else they did. EXPORT, if given, is
+called with the session instead of the default export. SUBMIT, if given,
+receives the session, chosen candidate and a continuation accepting a
+prepared candidate; the prompt closes only when it calls the continuation.
+INVALIDATE, if given, is called before an async source is asked for new
+input and on close, to cancel related work. PATTERN gives the part
 of the input candidates are matched against (the file name after its
 directory). KEYMAP, if given, holds the keys of what is being read
 (a file name's, say): it is looked up before `minibuffer-map`.
@@ -237,7 +250,8 @@ minibuffer is open, and aborting cancels it."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
          (source (cond ((procedure? source) (owned source))
-                       ((async-source? source) (%async-source (owned (async-produce source)) (async-min-input source)))
+                       ((async-source? source) (%async-source (owned (async-produce source)) (async-min-input source)
+                                                              (async-fresh-only? source)))
                        ;; Its own matcher: filtering is the minibuffer's.
                        ((candidate-table? source)
                         (%candidate-table (matcher-copy (table-matcher source)) (owned (table-make source)) (table-made source)))
@@ -265,6 +279,10 @@ minibuffer is open, and aborting cancels it."
                             ((async-source? source) (list-table '()))
                             (else (list-table (history-first mb initial source)))))
     (set-mb-abort! mb abort)
+    (set-mb-export! mb (owned export))
+    (set-mb-submit! mb (owned submit))
+    (set-mb-invalidate! mb (owned invalidate))
+    (set-mb-failure! mb #f)
     (set-mb-slot! mb (and (async-source? source) (make-request-slot)))
     (set-mb-asked! mb #f)
     (set-mb-in-scope! mb (owned (lambda (thunk) (thunk))))
@@ -288,6 +306,7 @@ minibuffer is open, and aborting cancels it."
   "Close the minibuffer of session S, keeping what it previewed.
 It releases the operation it read for."
   (let ((mb (minibuffer s)))
+    (when (and mb (mb-invalidate mb)) ((mb-invalidate mb)))
     (when (and mb (mb-slot mb)) (cancel-request! (mb-slot mb)))
     (when (and mb (mb-owned mb)) (scope-disown! (mb-owned mb)))
     (when (and mb (mb-hold mb))
@@ -300,6 +319,10 @@ It releases the operation it read for."
   (sset! s 'transient-map #f)
   (sset! s 'mb-pending '())
   (sset! s 'extend #f))
+
+(define (minibuffer-set-prompt! s prompt)
+  "Change the label of session S's open minibuffer to PROMPT."
+  (set-mb-prompt! (open-minibuffer s) prompt))
 
 (define (minibuffer-input s)
   "Return the input of the open minibuffer of session S."
@@ -409,8 +432,11 @@ Return #f if one does not occur."
 ;; and previewed, if the minibuffer is still open.
 (define (ask! mb input)
   (unless (equal? input (mb-asked mb))
+    (when (mb-invalidate mb) ((mb-invalidate mb)))
     (set-mb-asked! mb input)
+    (set-mb-failure! mb #f)
     (let ((source (mb-source mb)) (slot (mb-slot mb)) (s (mb-session mb)))
+      (when (async-fresh-only? source) (set-mb-table! mb (list-table '())))
       (if (< (string-length input) (async-min-input source))
           (begin (cancel-request! slot) (set-mb-table! mb (list-table '())))
           ;; Candidates are the reading's, not work of the operation it
@@ -425,7 +451,23 @@ Return #f if one does not occur."
                             (set-mb-table! mb (list-table cs))
                             (set-mb-revision! mb #f)
                             (when (eq? (minibuffer s) mb) (preview! s)))
-                          #:fail (lambda (e) (failed! s 'candidates e)))))))))))
+                          #:fail (lambda (e)
+                                   (when (async-fresh-only? source) (set-mb-failure! mb #t))
+                                   (failed! s 'candidates e)))))))))))
+
+(define (minibuffer-custom-export! s)
+  "Call the export of S's minibuffer, if any; return whether it had one."
+  (let ((export (mb-export (open-minibuffer s))))
+    (and export (begin (export s) #t))))
+
+(define-command (minibuffer-retry s n)
+  "Ask the minibuffer's asynchronous source again for the current input."
+  (let ((mb (open-minibuffer s)))
+    (when (mb-slot mb)
+      (set-mb-asked! mb #f)
+      (set-mb-revision! mb #f)
+      (matches mb)
+      (preview! s))))
 
 ;; The Kth candidate matching the input.
 (define (match-ref mb k)
@@ -521,6 +563,13 @@ It goes after the part the pattern leaves out."
 ;; remembering it in its history. ENTRY is what a choice is remembered
 ;; as: the input completed with it.
 (define (accept! s chosen entry)
+  (let* ((mb (open-minibuffer s)) (submit (mb-submit mb)))
+    (if submit
+        (submit s chosen (lambda (prepared)
+                           (when (eq? (minibuffer s) mb) (finish-accept! s prepared entry))))
+        (finish-accept! s chosen entry))))
+
+(define (finish-accept! s chosen entry)
   (let* ((mb (minibuffer s)) (remember (mb-remember mb)))
     (when (mb-history mb)
       (let ((entry (cond ((eq? remember 'input) (minibuffer-input* mb))
@@ -849,7 +898,9 @@ the selected one."
            ;; The count, unless the input is read without candidates.
            (list (if (equal? (mb-source mb) '())
                      (mb-prompt mb)
-                     (string-append (if (and (mb-slot mb) (request-pending? (mb-slot mb))) "… " "")
+                     (string-append (cond ((mb-failure mb) "Search failed · C-c C-r retry · ")
+                                           ((and (mb-slot mb) (request-pending? (mb-slot mb))) "… ")
+                                           (else ""))
                                     (if (and i (>= i 0)) (number->string (+ i 1)) "*") "/" (number->string n) " " (mb-prompt mb)))
                  (mb-view mb)
                  (map (lambda (c) (candidate-row c (or (match-spans c (pattern-parts ((mb-pattern mb) (minibuffer-input* mb)))) '())))
