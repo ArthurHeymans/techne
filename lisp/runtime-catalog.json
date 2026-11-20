@@ -681,7 +681,7 @@
       "is_macro": false
     },
     "keymap-sequences": {
-      "description": "(keymap-sequences km)  procedure, @lisp@/editor/keymaps.scm:155\n\nReturn every key sequence bound in the keymap KM.\nEach is a string as `kbd` reads it.",
+      "description": "(keymap-sequences km)  procedure, @lisp@/editor/keymaps.scm:157\n\nReturn every key sequence bound in the keymap KM.\nEach is a string as `kbd` reads it.",
       "is_macro": false
     },
     "keymap-sources": {
@@ -841,7 +841,7 @@
       "is_macro": false
     },
     "lookup-key": {
-      "description": "(lookup-key map keys)  procedure, @lisp@/editor/keymaps.scm:175\n\nReturn the binding of KEYS, a list of keys, in MAP.\nThat is a command's name, a keymap (KEYS is a prefix), or #f.",
+      "description": "(lookup-key map keys)  procedure, @lisp@/editor/keymaps.scm:177\n\nReturn the binding of KEYS, a list of keys, in MAP.\nThat is a command's name, a keymap (KEYS is a prefix), or #f.",
       "is_macro": false
     },
     "lsp-attach!": {

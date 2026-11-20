@@ -1134,16 +1134,24 @@ published."
 ;; predecessor had, below overrides made since), else on top.
 (define (%registry-add! reg key value s)
   (let* ((table (%registry-table reg))
-         (p (%scope-predecessor s))
          (stack (hash-table-ref/default table key '()))
-         (old (and (pair? stack) (find (lambda (r) (let ((o (scope-of r))) (or (eq? o s) (and p (eq? o p))))) stack)))
          (entry (list value)))
     ;; ENTRY is fresh: nothing could already own it.
     (%scope-own! s entry (lambda (r) (%registry-swap! reg key r #f #t)) %registration-ended?)
     (hash-table-set! %owners entry s)
+    (if (null? stack)
+        (begin
+          (hash-table-set! table key (list entry))
+          (let ((changed (%registry-changed reg))) (when changed (changed key value))))
+        (%registry-add-shadow! reg key value s entry stack))))
+
+;; Replacing or shadowing a binding is not part of the fresh-entry path.
+(define (%registry-add-shadow! reg key value s entry stack)
+  (let* ((p (%scope-predecessor s))
+         (old (find (lambda (r) (let ((o (scope-of r))) (or (eq? o s) (and p (eq? o p))))) stack)))
     (if old (%registry-swap! reg key old entry p)
         (begin
-          (hash-table-set! table key (cons entry stack))
+          (hash-table-set! (%registry-table reg) key (cons entry stack))
           (let ((changed (%registry-changed reg))) (when changed (changed key value)))))))
 
 (define (%registration-ended? entry) #f)
