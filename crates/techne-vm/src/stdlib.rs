@@ -1217,6 +1217,15 @@ pub fn install(vm: &mut Vm) {
                 Some(p) => Ok(vm.make_string_raw(&p.display().to_string())),
                 None => Ok(Value::FALSE),
             } };
+        // Why NAME's libraries cannot be provided from DIRECTORY, or #f.
+        "(%library-conflict name directory)" => |vm: &mut Vm, a, _| {
+            let name = string(vm, arg(vm, a, 0), "%library-conflict")?;
+            let directory = string(vm, arg(vm, a, 1), "%library-conflict")?;
+            vm.check_loading()?;
+            match vm.library_conflict(&name, std::path::Path::new(&directory)) {
+                Some(conflict) => Ok(vm.make_string_raw(&conflict)),
+                None => Ok(Value::FALSE),
+            } };
         "(%library-provider name)" => |vm: &mut Vm, a, _| {
             let name = string(vm, arg(vm, a, 0), "%library-provider")?;
             match vm.library_provider(&name).map(|dir| dir.display().to_string()) {

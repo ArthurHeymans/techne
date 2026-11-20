@@ -545,14 +545,32 @@ impl Vm {
         self.check_loading()?;
         let missing = || Error::new(format!("{}: no such directory", dir.display()));
         let dir = dir.canonicalize().ok().filter(|d| d.is_dir() && self.may_read(d)).ok_or_else(missing)?;
-        match self.library_provider(name) {
-            Some(old) if old == dir => Ok(()),
-            Some(old) => err(format!("libraries ({name} ...) are provided from {} already", old.display())),
-            None => {
-                self.library_providers.push((name.into(), dir));
-                Ok(())
-            }
+        if let Some(conflict) = self.library_conflict(name, &dir) {
+            return err(conflict);
         }
+        if self.library_provider(name).is_none() {
+            self.library_providers.push((name.into(), dir));
+        }
+        Ok(())
+    }
+
+    /// Why the libraries whose names begin with `name` cannot be provided
+    /// from `dir` (`provide_libraries`), or None if they can: another
+    /// directory provides them, `dir` is something else than a directory,
+    /// or one of them is loaded from elsewhere already, which importers
+    /// would go on finding whatever `dir` holds. What makes several
+    /// packages known at once asks before it changes anything.
+    pub fn library_conflict(&self, name: &str, dir: &Path) -> Option<String> {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        match self.library_provider(name) {
+            Some(old) if old == dir => return None,
+            Some(old) => return Some(format!("libraries ({name} ...) are provided from {} already", old.display())),
+            None => {}
+        }
+        if dir.exists() && !dir.is_dir() {
+            return Some(format!("{} is not a directory", dir.display()));
+        }
+        self.library_loaded_outside(name, &dir).map(|library| format!("library {library} is loaded from elsewhere already"))
     }
 
     /// The directory providing the libraries whose names begin with `name`.

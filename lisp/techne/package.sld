@@ -134,6 +134,11 @@ is an error if the manifest is missing or is not one."
     ;; The directory each package name was used from.
     (define names (make-hash-table eq?))
 
+    ;; Where the libraries of the package of manifest M are, or would be.
+    (define (library-directory m)
+      (let ((lib (path-join (manifest-directory m) "lib")))
+        (or (%loadable-path lib) lib)))
+
     ;; The manifests of the package in ROOT and of those it depends on
     ;; that are not used yet, each after the ones it depends on. Everything
     ;; is checked here and nothing changed: a package set that cannot be
@@ -143,24 +148,35 @@ is an error if the manifest is missing or is not one."
         (define (manifest-at root)
           (or (hash-table-ref/default used root #f)
               (let ((new (assoc root found))) (and new (cdr new)))))
-        (define (check-name! m)
+        ;; ABOVE: the packages depending on this one that are being
+        ;; visited, each (directory . name), not in FOUND yet.
+        (define (check-name! m above)
           (let* ((name (manifest-name m))
+                 (dir (manifest-directory m))
                  (same (filter (lambda (entry) (eq? name (manifest-name (cdr entry)))) found))
-                 (other (or (hash-table-ref/default names name #f) (and (pair? same) (caar same)))))
+                 (visiting (filter (lambda (entry) (eq? name (cdr entry))) above))
+                 (other (or (hash-table-ref/default names name #f) (and (pair? same) (caar same))
+                            (and (pair? visiting) (caar visiting))))
+                 ;; Asked now: refused when the libraries are provided, a
+                 ;; set of packages would be left half made known.
+                 (conflict (%library-conflict (symbol->string name) (library-directory m))))
             (when (memq name '(scheme srfi techne))
               (error "A package cannot take the name of Techne's own libraries" name))
-            (when (and other (not (equal? other (manifest-directory m))))
-              (error "Another directory holds a package of this name" name other (manifest-directory m)))))
+            (when (and other (not (equal? other dir)))
+              (error "Another directory holds a package of this name" name other dir))
+            (when conflict
+              (error (string-append "A package's libraries cannot be found in its directory: " conflict) name dir))))
         (define (visit root above)
-          (when (member root above)
-            (error "Packages depend on each other in a circle" (reverse (cons root above))))
+          (when (assoc root above)
+            (error "Packages depend on each other in a circle" (reverse (cons root (map car above)))))
           (or (manifest-at root)
               (let ((m (read-package-manifest root)))
-                (check-name! m)
+                (check-name! m above)
                 (for-each (lambda (dependency)
                             (unless (%loadable-path (path-join (cdr dependency) package-manifest-file))
                               (error "No package where a dependency says" (car dependency) (cdr dependency)))
-                            (let ((name (manifest-name (visit (%loadable-path (cdr dependency)) (cons root above)))))
+                            (let ((name (manifest-name (visit (%loadable-path (cdr dependency))
+                                                              (cons (cons root (manifest-name m)) above)))))
                               (unless (eq? name (car dependency))
                                 (error "A dependency names another package than its directory holds" (car dependency) name))))
                           (manifest-dependencies m))

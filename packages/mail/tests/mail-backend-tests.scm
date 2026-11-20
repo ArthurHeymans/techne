@@ -1,4 +1,4 @@
-;;; Run: TECHNE_LIBRARY_PATH=$PWD/lisp /absolute/path/to/techne run lisp/tests/mail-backend-tests.scm
+;;; Run: techne run packages/mail/tests/mail-backend-tests.scm
 (import (techne test))
 (import (mail imap) (mail maildir) (mail mime) (techne uuid))
 

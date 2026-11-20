@@ -85,6 +85,9 @@ fn a_file_in_a_package_finds_the_packages_libraries() {
     std::fs::create_dir_all(dir.join("lib/pkg")).unwrap();
     std::fs::create_dir_all(dir.join("tests")).unwrap();
     std::fs::write(dir.join("techne-package.scm"), "(package pkg)").unwrap();
+    // A file of another name under lib/ is there, and no library of pkg's.
+    std::fs::create_dir_all(dir.join("lib/other")).unwrap();
+    std::fs::write(dir.join("lib/other/tools.sld"), "(define-library (other tools) (export) (import (scheme base)) (begin))").unwrap();
     std::fs::write(
         dir.join("lib/pkg/tools.sld"),
         "(define-library (pkg tools) (export twice) (import (scheme base)) (begin (define (twice x) (* 2 x))))",

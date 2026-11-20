@@ -114,5 +114,38 @@
 (check "mended, it is used" 'ring-a (manifest-name (use-package-directory! (at "ring-a"))))
 (check "and provides" (file-truename (at "ring-a" "lib")) (%library-provider "ring-a"))
 
+;; Packages of one name in two directories, one depending on the other
+;; through a third: the first is not made known yet when the second is met.
+(package! 'twin '(depends (between (path "../between"))))
+(package! 'between '(depends (twin (path "../far/twin"))))
+(write-file! (at "far" "twin" "techne-package.scm") '(package twin))
+(library! 'between 'x '(export x) '(import (scheme base)) '(begin (define x 1)))
+(check "a name met again below itself" #t
+       (and (string-contains (or (why (lambda () (use-package-directory! (at "twin")))) "") "Another directory holds") #t))
+(check "leaves nothing" #f (%library-provider "between"))
+
+;; What cannot be provided is found before anything changes: libraries
+;; provided from elsewhere, loaded from elsewhere already, or a `lib` that
+;; is no directory, each in the package another one depends on.
+(define (left-whole? name dependency reason)
+  (package! name `(depends (,dependency (path ,(string-append "../" (symbol->string dependency))))))
+  (library! name 'x '(export x) '(import (scheme base)) '(begin (define x 1)))
+  (list (and (string-contains (or (why (lambda () (use-package-directory! (at (symbol->string name))))) "") reason) #t)
+        (%library-provider (symbol->string name))))
+(make-directory (at "taken"))
+(%provide-libraries! "omega" (at "taken"))
+(package! 'omega)
+(library! 'omega 'x '(export x) '(import (scheme base)) '(begin (define x 1)))
+(check "libraries provided from elsewhere" '(#t #f) (left-whole? 'zeta 'omega "are provided from"))
+(write-file! (at "loose" "early" "x.sld") '(define-library (early x) (export x) (import (scheme base)) (begin (define x 1))))
+(write-file! (at "loose" "main.scm") '(import (early x)))
+(load-package 'loose (at "loose" "main.scm"))
+(package! 'early)
+(library! 'early 'x '(export x) '(import (scheme base)) '(begin (define x 2)))
+(check "a library loaded from elsewhere" '(#t #f) (left-whole? 'eta 'early "library (early x) is loaded from elsewhere"))
+(package! 'flat)
+(write-file! (at "flat" "lib") 'not-a-directory)
+(check "a lib that is no directory" '(#t #f) (left-whole? 'theta 'flat "is not a directory"))
+
 (delete-path root #t)
 (test-summary)
