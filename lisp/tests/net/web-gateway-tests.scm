@@ -1,0 +1,108 @@
+;;; The browser gateway's Scheme (lisp/web/gateway.scm): the handshake,
+;;; WebSocket frames, what a browser may send and what it is shown.
+(require "../../test.scm")
+(require "../../http/http.scm")
+(require "../../web/gateway.scm")
+(import (techne crypto) (srfi 151))
+
+;; SHA-1 (FIPS 180-4 examples) and the RFC 6455 handshake's example.
+(check "sha-1 empty" "da39a3ee5e6b4b0d3255bfef95601890afd80709" (hex-encode (sha-1 #u8())))
+(check "sha-1 abc" "a9993e364706816aba3e25717850c26c9cd0d89d" (hex-encode (sha-1 (string->utf8 "abc"))))
+(check "sha-1 two blocks" "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+       (hex-encode (sha-1 (string->utf8 "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))))
+(check "sha-1 at the padding boundary" "c1c8bbdc22796e28c0e15163d20899b65621d65a" (hex-encode (sha-1 (make-bytevector 55 97))))
+(check "sha-1 one past it" "c2db330f6083854c99d4b5bfb6e8f29f201be699" (hex-encode (sha-1 (make-bytevector 56 97))))
+(check "accept" "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" (websocket-accept "dGhlIHNhbXBsZSBub25jZQ=="))
+
+;; A browser's frames: masked, maybe fragmented, with pings between.
+(define (masked fin opcode payload)
+  (let* ((n (bytevector-length payload)) (mask (bytevector 1 2 3 4))
+         (head (cond ((< n 126) (bytevector (bitwise-ior (if fin #x80 0) opcode) (bitwise-ior #x80 n)))
+                     (else (bytevector (bitwise-ior (if fin #x80 0) opcode) (bitwise-ior #x80 126)
+                                       (arithmetic-shift n -8) (bitwise-and n 255)))))
+         (body (bytevector-copy payload)))
+    (do ((i 0 (+ i 1))) ((= i n))
+      (bytevector-u8-set! body i (bitwise-xor (bytevector-u8-ref body i) (bytevector-u8-ref mask (remainder i 4)))))
+    (bytevector-append head mask body)))
+;; A reader of BYTES, a few at a time, as a socket gives them.
+(define (reading bytes)
+  (let ((at 0))
+    (make-frame-reader
+     (lambda ()
+       (if (= at (bytevector-length bytes))
+           (eof-object)
+           (let ((end (min (bytevector-length bytes) (+ at 3))))
+             (let ((piece (bytevector-copy bytes at end))) (set! at end) piece)))))))
+(define controls '())
+(define (control opcode payload) (set! controls (cons (list opcode payload) controls)))
+(define long (make-string 300 #\é))
+(define r (reading (bytevector-append (masked #t 1 (string->utf8 "{\"a\":1}"))
+                                      (masked #f 1 (string->utf8 "café "))
+                                      (masked #t 9 (string->utf8 "ping"))
+                                      (masked #t 0 (string->utf8 "🦀"))
+                                      (masked #t 1 (string->utf8 long))
+                                      (masked #t 8 #u8(3 232)))))
+(check "a text message" "{\"a\":1}" (read-message r control))
+(check "fragments joined around a ping" "café 🦀" (read-message r control))
+(check "the ping reaches control" (list 9 (string->utf8 "ping")) (car (reverse controls)))
+(check "a 16-bit length" long (read-message r control))
+(check "a close ends the stream" #t (eof-object? (read-message r control)))
+(check "unmasked is refused" #t (eof-object? (read-message (reading (frame->bytes 1 (string->utf8 "x"))) control)))
+(check "binary is refused" #t (eof-object? (read-message (reading (masked #t 2 #u8(1))) control)))
+(check "past the limit is refused" #t
+       (eof-object? (read-message (reading (masked #t 1 (make-bytevector 200 97))) control #:max 100)))
+(check "fragments past the limit are refused" #t
+       (eof-object? (read-message (reading (bytevector-append (masked #f 1 (make-bytevector 60 97)) (masked #t 0 (make-bytevector 60 97))))
+                                  control #:max 100)))
+(check "an unmasked frame's length" (bytevector #x81 126 1 44) (bytevector-copy (frame->bytes 1 (make-bytevector 300 0)) 0 4))
+(check "a 64-bit length" (bytevector #x81 127 0 0 0 0 0 1 0 0) (bytevector-copy (frame->bytes 1 (make-bytevector 65536 0)) 0 10))
+
+;; What a browser may send.
+(define (asked text) (browser-input text))
+(check "a key" (cons 3 (dict "Key" (dict "key" "C-x"))) (asked "{\"generation\":3,\"input\":{\"type\":\"key\",\"key\":\"C-x\"}}"))
+(check "a click" (cons 0 (dict "Click" (dict "view" 1 "revision" 2 "pos" 3 "extend" #f)))
+       (asked "{\"generation\":0,\"input\":{\"type\":\"click\",\"view\":1,\"revision\":2,\"pos\":3,\"extend\":false}}"))
+(check "a scroll without caret" (cons 0 (dict "Scroll" (dict "view" 1 "revision" 2 "anchor" 3 "caret" 'null)))
+       (asked "{\"generation\":0,\"input\":{\"type\":\"scroll\",\"view\":1,\"revision\":2,\"anchor\":3,\"caret\":null}}"))
+(check "a viewport, clamped" (cons 0 (dict "Viewport" (dict "columns" 4096 "rows" 2 "split_gap" 2)))
+       (asked "{\"generation\":0,\"input\":{\"type\":\"viewport\",\"columns\":99999,\"rows\":0,\"split_gap\":2}}"))
+(check "empty text changes nothing" (cons 0 #f) (asked "{\"generation\":0,\"input\":{\"type\":\"text\",\"text\":\"\"}}"))
+(check "an unknown field" #f (asked "{\"generation\":0,\"input\":{\"type\":\"key\",\"key\":\"a\",\"extra\":1}}"))
+(check "a missing field" #f (asked "{\"generation\":0,\"input\":{\"type\":\"click\",\"view\":1}}"))
+(check "an editor-only input" #f (asked "{\"generation\":0,\"input\":{\"type\":\"clipboard\",\"text\":\"x\"}}"))
+(check "a negative position" #f (asked "{\"generation\":0,\"input\":{\"type\":\"edge\",\"view\":-1,\"end\":true}}"))
+(check "a key too long" #f (asked (string-append "{\"generation\":0,\"input\":{\"type\":\"key\",\"key\":\"" (make-string 65 #\a) "\"}}")))
+(check "not JSON" #f (asked "{"))
+(check "no generation" #f (asked "{\"input\":{\"type\":\"key\",\"key\":\"a\"}}"))
+
+;; What it is shown, within the budgets.
+(define (pane view) (dict "view" view "layers" #() "inlays" #() "blocks" #() "hangs" #() "selections" (vector (vector 0 0))))
+(define (snapshot . panes)
+  (dict "id" 7 "panes" (list->vector panes) "focus" 0 "echo" "" "minibuffer" 'null "completion" 'null
+        "key_hints" #() "styles" #() "chrome" (dict)))
+(define asked-text '())
+(define (shown s sizes)
+  (set! asked-text '())
+  (presentation s (lambda (i) (list-ref sizes i)) (lambda (i) (set! asked-text (cons i asked-text)) (string-append "text " (number->string i))) 2))
+(define m (shown (snapshot (pane 1) (pane 2)) '((10 2) (20 3))))
+(check "the message" '("snapshot" 2 7) (list (dict-ref m "type") (dict-ref m "generation") (dict-ref m "id")))
+(check "the panes' text" '("text 0" "text 1") (map (lambda (p) (dict-ref p "text")) (dict-ref m "panes")))
+(check "too many bytes" #f (shown (snapshot (pane 1) (pane 2)) '((2000000 1) (200000 1))))
+(check "too many lines" #f (shown (snapshot (pane 1)) '((5000 4001))))
+(check "no text asked for past the budget" '(0) (begin (shown (snapshot (pane 1) (pane 2)) '((10 2) (3000000 1))) asked-text))
+(check "too many panes" #f (shown (apply snapshot (map pane (iota 33))) (map (lambda (i) '(1 1)) (iota 33))))
+(check "too many parts" #f
+       (shown (snapshot (dict-set (pane 1) "selections" (make-vector 10 (vector 0 0)))) '((4000 1700))))
+(check "the message encodes" #t (string? (json->string m)))
+
+;; Who may attach.
+(define (upgrade host origin protocols)
+  (dict 'method "GET" 'path "/attach" 'query #f 'version "HTTP/1.1" 'body #u8()
+        'headers (dict "host" host "origin" origin "sec-websocket-protocol" protocols)))
+(check "the page" #t (authorized? "127.0.0.1:9" "secret" (upgrade "127.0.0.1:9" "http://127.0.0.1:9" "techne-v3, secret")))
+(check "another origin" #f (authorized? "127.0.0.1:9" "secret" (upgrade "127.0.0.1:9" "http://other.example" "techne-v3, secret")))
+(check "another host" #f (authorized? "127.0.0.1:9" "secret" (upgrade "evil.example" "http://127.0.0.1:9" "techne-v3, secret")))
+(check "a wrong secret" #f (authorized? "127.0.0.1:9" "secret" (upgrade "127.0.0.1:9" "http://127.0.0.1:9" "techne-v3, wrong")))
+(check "another protocol too" #f
+       (authorized? "127.0.0.1:9" "secret" (upgrade "127.0.0.1:9" "http://127.0.0.1:9" "techne-v3, secret, more")))
+(test-summary)

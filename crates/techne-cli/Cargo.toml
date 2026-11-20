@@ -16,12 +16,10 @@ default = ["window", "term", "web"]
 # a GPU stack and windowing libraries.
 window = ["dep:techne-window", "dep:techne-editor"]
 term = ["dep:techne-term", "dep:techne-editor"]
-web = ["dep:techne-editor", "dep:axum", "dep:getrandom", "dep:serde", "dep:serde_json", "tokio/net", "tokio/macros", "tokio/sync"]
+# The browser's gateway is Scheme (lisp/web); Rust attaches it to the editor.
+web = ["dep:techne-editor", "dep:serde_json", "tokio/sync"]
 
 [dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"], optional = true }
-getrandom = { version = "0.4", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 # Their own binaries, which their tests run, are built with the counting

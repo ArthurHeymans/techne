@@ -507,14 +507,16 @@ a grant of access. Logical excerpts are preferred unless visibility matters.
    limits and the protocol before the protocol freezes. Its tests run headless.
 3. **Browser**: a DOM frontend to a native runtime. `techne web` serves static
    assets on loopback, authenticates an exact-origin WebSocket with an ephemeral
-   token, then attaches through the existing private editor socket. It projects
-   presentations to a small versioned JSON interface and accepts only frontend
-   input, not editor-server requests. The browser draws the desktop's panes,
-   faces, gutters, cursors, mode lines, minibuffer and completion in HTML so
-   the text remains accessible. Browser input resolves clicks and page/scroll
-   requests to source positions. It sends bounded full text snapshots over
-   loopback. Compiling Techne to WebAssembly or serving untrusted remote users
-   is not a goal of this frontend.
+   token, then attaches through the existing private editor socket. The gateway
+   is Scheme (`lisp/web/gateway.scm`): HTTP, the WebSocket, authentication,
+   which inputs a browser may send, and the bounded JSON it is shown. Rust only
+   attaches it to the editor, whose socket speaks the editor's own protocol. It
+   accepts only frontend input, not editor-server requests. The browser draws
+   the desktop's panes, faces, gutters, cursors, mode lines, minibuffer and
+   completion in HTML so the text remains accessible. Browser input resolves
+   clicks and page/scroll requests to source positions. It sends bounded full
+   text snapshots over loopback. Compiling Techne to WebAssembly or serving
+   untrusted remote users is not a goal of this frontend.
 
 **What survives what.** A frontend in the runtime's process dies with it: after
 a runtime crash the hosted window is recreated with views, scroll anchors and
