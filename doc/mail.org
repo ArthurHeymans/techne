@@ -28,8 +28,10 @@ nix develop .#window --command target/release/techne window
 #+end_src
 
 The application, protocols, MIME parsing, private HTML renderer, schema, search,
-threading and delivery policy are Scheme under =lisp/techne/mail/= and
-=lisp/editor/mail/runtime.scm=, loaded when you first use mail. Rust supplies verified TLS streams and a
+threading and delivery policy are Scheme in the package =packages/mail=: its
+libraries, =(mail imap)=, =(mail smtp)=, =(mail mime)= and the rest under
+=lib/=, which a program without the editor imports too, and =editor.scm=,
+loaded when you first use mail. Rust supplies verified TLS streams and a
 bounded asynchronous SQLite boundary. No mu, external IMAP fetcher or Rust mail
 library is involved.
 

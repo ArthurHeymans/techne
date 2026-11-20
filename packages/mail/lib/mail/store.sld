@@ -1,5 +1,5 @@
 ;;; Mail policy and persistence are Scheme; SQLite is only the storage mechanism.
-(define-library (techne mail store)
+(define-library (mail store)
   (export mail-store-open mail-store-close mail-store-import! mail-store-import-batch! mail-store-import-maildir! mail-store-source-keys mail-store-query
           mail-store-message mail-store-source-cached? mail-store-state! mail-store-counts mail-store-count mail-store-folders
           mail-store-dedupe! mail-store-copy-mailboxes mail-store-forget! mail-store-senders mail-store-recipients
@@ -8,7 +8,7 @@
           mail-store-draft-state mail-store-claim-draft! mail-store-finish-draft!
           mail-store-ambiguous-attempt mail-store-resolve-draft! call-with-mail-store-lease
           mail-store-skip-imap! mail-ref)
-  (import (techne) (techne task) (techne sqlite) (techne mail mime) (techne mail date) (techne mail maildir))
+  (import (techne) (techne task) (techne sqlite) (mail mime) (mail date) (mail maildir))
   (begin
     (define (mail-ref object key . default)
       "Return KEY in mail alist OBJECT, or DEFAULT (otherwise #f)."

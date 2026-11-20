@@ -1,7 +1,7 @@
 ;;; SMTP submission is Scheme. TLS is the network host's small mechanism.
-(define-library (techne mail smtp)
+(define-library (mail smtp)
   (export mail-submit! mail-compose-message mail-addresses smtp-session smtp-submit!)
-  (import (techne) (techne crypto) (techne uuid) (techne time) (techne mail address) (techne task))
+  (import (techne) (techne crypto) (techne uuid) (techne time) (mail address) (techne task))
   (begin
     (define (clean-header text)
       (unless (every (lambda (c) (let ((n (char->integer c))) (and (or (>= n 32) (= n 9)) (not (= n 127)))))

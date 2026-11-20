@@ -5,20 +5,15 @@ use std::{path::Path, process::Command};
 fn mail_scheme_suites() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for suite in [
-        "mail-mime-tests.scm",
-        "mail-backend-tests.scm",
-        "mail-smtp-tests.scm",
-        "host/mail-store-tests.scm",
-        "host/mail-smtp-timeout-tests.scm",
-        "mail-date-tests.scm",
-        "authinfo-tests.scm",
+        "packages/mail/tests/mail-mime-tests.scm",
+        "packages/mail/tests/mail-backend-tests.scm",
+        "packages/mail/tests/mail-smtp-tests.scm",
+        "packages/mail/tests/host/mail-store-tests.scm",
+        "packages/mail/tests/host/mail-smtp-timeout-tests.scm",
+        "packages/mail/tests/mail-date-tests.scm",
+        "lisp/tests/authinfo-tests.scm",
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_techne"))
-            .current_dir(&root)
-            .arg("run")
-            .arg(root.join("lisp/tests").join(suite))
-            .output()
-            .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_techne")).current_dir(&root).arg("run").arg(root.join(suite)).output().unwrap();
         assert!(
             output.status.success(),
             "{suite}:\n{}\n{}",

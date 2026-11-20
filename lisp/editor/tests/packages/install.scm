@@ -17,7 +17,14 @@
                   (load-package boot path)
                   (check "bootstrap reload leaves runtime cold" #f (find-package runtime))
                   (check-true "entry remains advertised" (command-doc boot))))
-              '((mail mail-runtime) (ibuffer ibuffer-runtime) (compile compile-runtime)))
+              '((ibuffer ibuffer-runtime) (compile compile-runtime)))
+    ;; A built-in in a directory of its own is advertised from its manifest,
+    ;; as what is installed below: no bootstrap is loaded for it.
+    (check "a package directory stays cold" #f (find-package 'mail))
+    (check-true "its identity is reserved" (package-declared? 'mail))
+    (check-true "its command is advertised" (command-doc 'mail))
+    (check "its option is declared early" 'bottom (option #f 'mail-reader-position))
+    (check "its libraries are found, none loaded" #f (and (member "(mail store)" (loaded-modules)) #t))
     (run-command (current-session) 'ibuffer 1)
     (let ((runtime (find-package 'ibuffer-runtime)) (override (make-scope 'reload-override)))
       (check-true "buffer list activated" runtime)

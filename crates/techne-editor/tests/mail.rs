@@ -57,7 +57,7 @@ fn pump_until(rt: &mut Runtime, mut done: impl FnMut(&mut Runtime) -> bool) {
 fn samples(rt: &mut Runtime, dir: &std::path::Path) {
     rt.eval(&format!(
         "(require {:?}) (mail-test-seed-samples! {:?})",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-sample-fixture.scm"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/mail/tests/fixtures/mail-sample-fixture.scm"),
         dir.join("samples.sqlite").display().to_string()
     ))
     .unwrap();
@@ -67,7 +67,7 @@ fn samples(rt: &mut Runtime, dir: &std::path::Path) {
 fn real_accounts(rt: &mut Runtime, dir: &std::path::Path) {
     let database = dir.join("mail.sqlite").display().to_string();
     rt.eval(&format!(
-        "(import (techne mail store)) (set-option! 'mail-database {database:?})
+        "(import (mail store)) (set-option! 'mail-database {database:?})
       (set-option! 'mail-accounts '(((id . \"test\") (kind . maildir) (path . \"/missing-techne-mail-fixture\")
         (from . \"ada@example.org\") (smtp-host . \"smtp.invalid\") (smtp-user . \"ada@example.org\"))))"
     ))
@@ -380,7 +380,7 @@ fn reader_navigation_tracks_the_unfocused_summary_without_moving_focus() {
         rt.eval(&format!(
             "(require {:?}) (mail-test-seed-navigation! {:?} 100)
              (set-option! 'mail-reader-position '{position})",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-navigation-fixture.scm"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/mail/tests/fixtures/mail-navigation-fixture.scm"),
             dir.path().join("navigation.sqlite").display().to_string()
         ))
         .unwrap();
@@ -662,7 +662,7 @@ fn a_maildir_account_reads_the_folders_under_its_path() {
     enter(&mut rt, "All mail");
     assert_eq!(
         rt.eval(
-            "(import (techne mail store)) (map (lambda (m) (list (cdr (assq 'mailbox m)) (cdr (assq 'subject m)) (cdr (assq 'tree m))))
+            "(import (mail store)) (map (lambda (m) (list (cdr (assq 'mailbox m)) (cdr (assq 'subject m)) (cdr (assq 'tree m))))
                    (hash-table-ref (sget (current-session) 'mail) 'messages))"
         )
         .unwrap(),
@@ -875,10 +875,10 @@ fn mail_accounts_can_be_configured_with_eval_buffer() {
 #[test]
 fn unconfigured_mail_stays_on_the_dashboard_and_uses_normal_mode_help() {
     let (_dir, mut rt) = editor();
-    assert_eq!(rt.eval("(not (find-package 'mail-runtime))").unwrap(), "#t");
+    assert_eq!(rt.eval("(not (find-package 'mail))").unwrap(), "#t");
     rt.eval("(set-option! 'mail-database \":memory:\")").unwrap();
     command(&mut rt, "mail");
-    assert_eq!(rt.eval("(not (find-package 'mail-runtime))").unwrap(), "#f");
+    assert_eq!(rt.eval("(not (find-package 'mail))").unwrap(), "#f");
     assert!(pane(&mut rt, 0).contains("No accounts yet"));
     key(&mut rt, "g");
     assert!(rt.snapshot().echo.contains("Set mail-accounts"));
@@ -1188,7 +1188,7 @@ fn the_dashboard_lists_every_account_and_its_folders_and_opens_them_as_lists() {
     rt.handle(Input::Viewport { columns: 120, rows: 50, split_gap: 1 });
     let database = dir.path().join("mail.sqlite").display().to_string();
     rt.eval(&format!(
-        "(import (techne mail store)) (set-option! 'mail-database {database:?})
+        "(import (mail store)) (set-option! 'mail-database {database:?})
          (set-option! 'mail-accounts '(((id . \"work\") (kind . imap) (host . \"imap.invalid\"))
                                        ((id . \"home\") (kind . maildir) (path . \"/missing-home\"))
                                        ((id . \"lists\") (kind . maildir) (path . \"/missing-lists\"))))
@@ -1246,7 +1246,7 @@ fn composing_is_from_the_account_shown_and_completes_whom_you_write_to() {
     rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
     let database = dir.path().join("mail.sqlite").display().to_string();
     rt.eval(&format!(
-        "(import (techne mail store)) (set-option! 'mail-database {database:?})
+        "(import (mail store)) (set-option! 'mail-database {database:?})
          (set-option! 'mail-accounts '(((id . \"work\") (kind . maildir) (path . \"/missing-work\"))
                                        ((id . \"home\") (kind . maildir) (path . \"/missing-home\"))))
          (let ((db (mail-store-open {database:?})))
@@ -1587,7 +1587,7 @@ fn a_group_chosen_from_outside_mail_opens_as_from_the_dashboard() {
     rt.handle(Input::Viewport { columns: 160, rows: 50, split_gap: 1 });
     rt.eval(&format!(
         "(require {:?}) (mail-test-seed-samples! {:?})",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp/tests/fixtures/mail/mail-sample-fixture.scm"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/mail/tests/fixtures/mail-sample-fixture.scm"),
         dir.path().join("samples.sqlite").display().to_string()
     ))
     .unwrap();
