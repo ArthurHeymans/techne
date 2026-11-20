@@ -162,6 +162,183 @@ sudo: a key or an agent must do for ssh, and sudo must not need one.
 Listing a remote directory (\[dired]) and searching a remote project
 are not supported yet.
 
+* Version control
+
+\[vc-status] (also =C-x g=) opens the status of the repository of the
+current directory: Git's, as Magit shows it, or Jujutsu's, as Majutsu
+does. It is made of sections that fold. \[vc-next-item] and
+\[vc-previous-item] move between items (sections, files, hunks, commits,
+changes), \[vc-next-section] and \[vc-previous-section] between section
+headings, \[vc-parent-section] to the heading of the section point is in.
+\[vc-toggle-section] folds the section at point, opens a file's patch
+inline, or a change's files. =1= to =4= show the sections' headings only,
+their items, or every file's patch too. \[vc-visit-at-point] visits what
+is at point: a file at the line of the hunk point is in, a commit's or a
+change's patch. \[vc-diff-at-point] shows the patch of what is at point in
+another pane. Triangles mark rows that can be opened (▸) or folded (▾).
+Patches keep source syntax colours over green and red backgrounds for
+added and removed lines. Changed words get a stronger tint. In Git
+history or on a Jujutsu change,
+=RET= opens the change in the current pane and =SPC= previews it beside
+history without moving focus. In the Git log, =Alt+Page Down= and
+=Alt+Page Up= scroll that preview without moving focus. In the open patch,
+=n= and =p= visit hunks
+and =q= returns to the same history position. =?= in history shows
+commands for that view and the change at point.
+\[vc-status-refresh] reads the repository again; open sections and patches
+stay open. Saving a file of the repository refreshes its status when it
+is shown (the option =vc-refresh-on-save=).
+
+Commands act on what point is on. Most are reached through menus, as
+Magit's transients: a key shows, below the panes, the commands that can
+follow it and the switches and options that change them; the next key
+runs one (with the switches set), =-= then a letter toggles a switch, and
+=C-g= or =q= leaves. \[vc-dispatch] shows every menu and command. The
+process log, \[vc-process-log], lists every write run and what it said;
+\[vc-run-menu] runs any git or jj subcommand, or a shell command, in the
+repository's root.
+
+** Git
+
+Status shows the branch with its last commit, its upstream with its
+last commit and how far ahead and behind it is, and the push branch and
+last tag if any; then any merge, rebase, cherry-pick or revert in
+progress (a rebase with its steps done and to do), and the sections
+Untracked files, Unstaged changes, Staged changes, Stashes, Unpulled
+from and Unmerged into the upstream, and Recent commits.
+
+\[vc-stage] stages the file, hunk or the lines of the region at point, or
+every file of the section at point; \[vc-unstage] unstages them;
+\[vc-stage-all] stages every change to a tracked file (with a prefix
+argument, untracked files too) and \[vc-unstage-all] unstages everything.
+\[vc-discard-at-point] discards the lines, hunk, file or section at point
+after asking with one key; an untracked file is deleted, a staged one
+reset to HEAD. A file or hunk is staged from its inline patch or from the
+patch pane \[vc-diff-at-point] opens. A region may span multiple text
+hunks in one file.
+
+The menus: =c= commit (commit, extend, amend, reword; fixup, squash and
+instant fixup of the commit at point; =-a= stages all first, =-n= skips
+hooks), =b= branch (checkout, create, rename, delete, upstream), =f=
+fetch, =F= pull (or fast-forward to the fetched upstream), =P= push (to
+the upstream, publishing a new branch, elsewhere, with a lease, a tag),
+=m= merge, =r= rebase (onto the upstream or elsewhere; from the commit at
+point interactively, autosquashing, editing, rewording or removing one
+commit; continue, skip, abort), =A= cherry-pick, =V= revert, =X= reset
+(mixed, soft, hard after asking, keep), =z= stash (both, index, worktree;
+apply, pop, drop, show, branch), =t= tag, =l= log, =d= diff, =y= the
+branches and tags, =N= forge. Each acts on the commit, branch or stash at
+point, or asks for one.
+
+\[vc-commit] opens a message buffer beside a preview of exactly what is
+staged; \[vc-commit-finish] commits, refusing an index that changed since
+the preview, and \[vc-commit-cancel] keeps the draft. \[vc-git-amend] and
+\[vc-git-reword] edit HEAD the same way.
+
+=l l= shows the history graph of the current branch (=l o= another, =l b=
+all branches, =l a= all refs; =-n= limits it, =-A= and =-F= filter by
+author and message); \[vc-log-more] shows more. From a commit in it, the
+menus pick, revert, reset to, branch at, fix up or rebase from it.
+=r i= opens the plan of an interactive rebase from the commit at point:
+\[vc-todo-pick], \[vc-todo-reword], \[vc-todo-edit], \[vc-todo-squash],
+\[vc-todo-fixup] and \[vc-todo-drop] set a commit's action,
+\[vc-todo-up] and \[vc-todo-down] move it, \[vc-todo-finish] runs the
+rebase and \[vc-todo-cancel] leaves it. No editor is opened: a rewording
+is given as the plan is made.
+
+During a merge or rebase, status shows the operation and its next
+action. \[vc-conflicts-at-point] on a conflicted file previews each
+complete text conflict, including the ancestor in a diff3 conflict: =1=
+keeps the top side, =2= the bottom, =3= both in order, RET edits it.
+Choices edit the visiting buffer only; save it, then \[vc-stage] stages
+the resolution, refusing a file that still has conflict markers.
+
+From a file buffer, \[vc-file-diff] compares the file's saved changes,
+\[vc-file-history] lists its history, \[vc-file-annotate] annotates it,
+\[vc-file-stage] and \[vc-file-unstage] stage and unstage it.
+
+** Jujutsu
+
+Status shows the working-copy change and its parents, the revset of the
+graph, the working copy's changed files and conflicts, and the graph
+(=Log=) of the revset. Reading never snapshots the working copy;
+\[vc-status-refresh] records it first, as jj does, and so does saving a
+file. \[vc-toggle-section] on a change opens its files, and on a file its
+hunks, whatever change it is in.
+
+Commands act on the change, file, hunk or region at point, or on the
+changes marked with \[vc-jj-mark] (\[vc-jj-unmark-all] unmarks them).
+None asks to confirm what \[vc-jj-undo] undoes, except abandoning;
+\[vc-jj-redo] redoes. \[vc-jj-describe] edits a change's description in a
+message buffer beside its patch, \[vc-jj-commit] describes the working
+copy and starts a new change on it. =o= is the menu for new changes (on
+point or the marked as a merge, inserted after or before),
+\[vc-jj-new] starts one on point at once. \[vc-jj-edit] edits the change
+at point, \[vc-jj-abandon] abandons it, \[vc-jj-duplicate] copies it,
+\[vc-jj-absorb] moves each of its edits into the ancestor that last
+changed those lines.
+
+=s= opens Squash and shows what will move: the whole change, a file,
+a hunk, selected lines, or the marked changes. =s s= moves that selection
+into its parent (marked changes go into the change at point); =s i=
+lets you choose a destination. =S= opens Split; =S s= puts the selection
+in a new change before the original. On a change, it asks which whole
+files to split out. For a smaller selection, use =F= from the change,
+=RET= on a file, then =n= or =p= to reach a hunk. Use the same Squash and
+Split menus there. =C-SPC= selects lines if you only want part of a hunk.
+\[vc-jj-restore] discards them from their change, after asking. Hunks and
+lines are selected with Git's patch applied in jj's temporary diff tree,
+for regular text files. =r= rebases the change at point or the marked
+ones (=-w= with descendants, the change alone, or its branch) onto, after
+or before a change read, or the marked ones onto the change at point.
+=b= is the bookmark menu (set, delete, forget, rename, track, untrack),
+=f= fetches, =P= previews or pushes one bookmark of the change at point.
+To publish a change without a bookmark, set one first with =b=.
+\[vc-jj-conflicts] resolves a supported two-sided text conflict by taking
+one side for the whole file. =l= chooses the revset (all, mine, trunk,
+bookmarks), \[vc-jj-filter] edits it, \[vc-jj-more] shows more changes.
+\[vc-jj-evolog] shows how the change at point evolved, =X= the operation
+log, where \[vc-jj-revert-operation] reverts an operation.
+\[vc-jj-files] lists a change's files in a buffer of their own, as before.
+
+If a working-copy snapshot changes the reviewed operation, or a patch
+changed since it was shown, a rewrite is refused and the view refreshed.
+
+** Forge
+
+=N l= lists open pull requests of a public GitHub repository, up to
+30 per page; \[vc-forge-next-page] and \[vc-forge-previous-page] browse
+pages. =N b= filters by the current Git branch or a local bookmark on
+the selected Jujutsu change, as published at =origin=.
+\[vc-forge-inspect] reads the comparison pinned to the selected
+base and head. Use \[vc-forge-discussion] to see general and line comments,
+with line comments labelled when they refer to another revision. Use
+=]= and =[= to page through the current discussion.
+\[vc-forge-checks] reads check runs for the displayed head; =]= and =[=
+page through runs without changing the reviewed revision.
+Move by item and use \[vc-review-return] to return to the previous view.
+\[vc-forge-jump] opens the exact reviewed commit if available
+locally. This uses =curl= here even for an SSH checkout.
+It reads without credentials and never modifies a pull request.
+
+** Remote repositories
+
+Remote buffers refresh on demand and keep their last rows, marked
+stale, if a refresh fails. When a remote write has no exit status,
+\[vc-remote-outcome] opens a separate pane with before and after observations
+without retrying the write. It summarizes changes to HEAD, the index,
+the Jujutsu operation, or the destination tip when that evidence is
+available. Use =j= to inspect the exact observed commit if it is in the
+checkout. New writes stay blocked until you acknowledge
+with =a= and explicitly confirm. The evidence remains
+available in the editor's private state directory, including after
+reopening status or restarting Techne. Use the same repository route to
+find the attempt again. For Git and Jujutsu pushes, including from local
+checkouts, the evidence includes the requested source and destination
+and that ref's tip before and after inspection. If the destination changed,
+confirm the push again; recovery will not read the replacement endpoint.
+Observed state is evidence, not proof of what ran.
+
 * Directories and the buffer list
 
 \[dired] lists a directory, as Emacs's dired does; \[dired-jump] lists

@@ -105,7 +105,9 @@ A binding made in a scope other than the root is owned by it: shutting
 the scope removes it, unless it has been rebound since. While a package
 loads, the binding waits until the package is published. KEYS bound as
 the prefix of longer bindings stays a prefix while they last."
-  (registry-add! (keymap-bindings map) (string-join (kbd keys) " ") binding))
+  ;; kbd splits on a literal space and preserves empty fields, so joining
+  ;; the pieces again would give KEYS back unchanged.
+  (registry-add! (keymap-bindings map) keys binding))
 
 ;; The bindings registered in a keymap are materialized as a tree of
 ;; keymaps, one per prefix: a binding's own keymap, or a prefix map made

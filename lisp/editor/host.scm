@@ -62,10 +62,12 @@ With EXTEND, the click extends the selection."
   (let ((private (sget s 'private-key))) (when private ((cdr private))))
   (focus-view! s view)
   ((profile-click (sget s 'profile)) s pos extend))
-;; The frontend paged VIEW: its caret goes to POS, extending a region.
 (define (editor-paged! s view pos)
-  "Put the caret of VIEW at POS in session S, where paging left it."
-  (editor-click s view pos (or (sget s 'extend) (eq? (sget s 'mode) 'visual))))
+  "Put the caret of VIEW at POS in session S, where paging left it.
+Paging another pane does not focus it or extend the focused pane's selection."
+  (if (view=? view (pane-view s))
+      (editor-click s view pos (or (sget s 'extend) (eq? (sget s 'mode) 'visual)))
+      (view-set-ranges! view (list (list pos pos)) 0)))
 (define (editor-message! s text)
   "Show TEXT, a message from the frontend, in session S."
   (message! s text))

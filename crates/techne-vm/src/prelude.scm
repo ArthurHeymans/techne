@@ -1107,7 +1107,10 @@ at all, for a registry whose entries are read together."
 (define (registry-add! reg key value)
   "Map KEY to VALUE in REG, owned by the current scope; return VALUE.
 While a package generation loads, the entry waits until it is published."
-  (%registry-staged (lambda () (%registry-add! reg key value)))
+  (let* ((s (current-scope)) (pending (%scope-pending s)))
+    (if pending
+        (%set-scope-pending! s (cons (lambda () (%registry-add! reg key value (current-scope))) pending))
+        (%registry-add! reg key value s)))
   value)
 
 (define (registry-remove! reg key)
@@ -1129,11 +1132,29 @@ published."
 ;; The current scope's entry replaces its own or its predecessor's: in
 ;; place while a generation succeeds another (it keeps the place its
 ;; predecessor had, below overrides made since), else on top.
-(define (%registry-add! reg key value)
-  (let* ((s (current-scope)) (p (%scope-predecessor s))
-         (stack (hash-table-ref/default (%registry-table reg) key '()))
+(define (%registry-add! reg key value s)
+  (let* ((table (%registry-table reg))
+         (stack (hash-table-ref/default table key '()))
+         (entry (list value)))
+    ;; ENTRY is fresh: nothing could already own it.
+    (%scope-own! s entry (lambda (r) (%registry-swap! reg key r #f #t)) %registration-ended?)
+    (hash-table-set! %owners entry s)
+    (if (null? stack)
+        (begin
+          (hash-table-set! table key (list entry))
+          (let ((changed (%registry-changed reg))) (when changed (changed key value))))
+        (%registry-add-shadow! reg key value s entry stack))))
+
+;; Replacing or shadowing a binding is not part of the fresh-entry path.
+(define (%registry-add-shadow! reg key value s entry stack)
+  (let* ((p (%scope-predecessor s))
          (old (find (lambda (r) (let ((o (scope-of r))) (or (eq? o s) (and p (eq? o p))))) stack)))
-    (%registry-swap! reg key old (scope-own! (list value) (lambda (r) (%registry-swap! reg key r #f #t))) p)))
+    (if old (%registry-swap! reg key old entry p)
+        (begin
+          (hash-table-set! (%registry-table reg) key (cons entry stack))
+          (let ((changed (%registry-changed reg))) (when changed (changed key value)))))))
+
+(define (%registration-ended? entry) #f)
 
 ;; Replace registration OLD (or #f) of KEY by NEW (#f: by nothing), in
 ;; OLD's place when IN-PLACE, else NEW on top; tell the registry when the
