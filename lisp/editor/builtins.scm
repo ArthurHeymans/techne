@@ -31,9 +31,10 @@
                     (error "No package shipped as" name)))
          (root (car found))
          (editor (cdr (assq (quote editor) (cddr (read (open-input-string (cadr found)))))))
-         (options (assq (quote options) (cdr editor)))
-         (lib (%loadable-path (string-append root "/lib"))))
-    (when lib (%provide-libraries! (symbol->string name) lib))
+         (options (assq (quote options) (cdr editor))))
+    (%provide-libraries! (symbol->string name) (string-append root "/lib"))
+    ;; It depends on nothing: its files import its own libraries only.
+    (%package-imports! root (symbol->string name) (list (symbol->string name)))
     (advertise-package! name (string-append root "/" (car editor))
                         (cdr (assq (quote commands) (cdr editor))) (if options (cdr options) (quote ())))))
 

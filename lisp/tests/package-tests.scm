@@ -67,7 +67,7 @@
 (check "the same one again" #t (eq? (use-package-directory! (at "gamma")) (use-package-directory! (at "gamma"))))
 (check "its dependency's libraries" (file-truename (at "beta" "lib")) (%library-provider "beta"))
 (check "and that one's" (file-truename (at "alpha" "lib")) (%library-provider "alpha"))
-(check "a package without libraries provides none" #f (%library-provider "gamma"))
+(check "a package without libraries owns its name too" (path-join (file-truename (at "gamma")) "lib") (%library-provider "gamma"))
 (define (loaded? name) (and (member name (loaded-modules)) #t))
 (check "nothing was loaded" #f (loaded? "(alpha greet)"))
 (import (beta twice) (alpha greet))
@@ -94,7 +94,8 @@
 ;; A name belongs to one directory: its libraries are found there only.
 (write-file! (at "elsewhere" "alpha" "other.sld") '(define-library (alpha other) (export x) (import (scheme base)) (begin (define x 1))))
 (write-file! (at "elsewhere" "main.scm") '(import (alpha other)))
-(check "not beside the importer" #t (failed? (lambda () (load (at "elsewhere" "main.scm")))))
+(check "not beside the importer" "import: no library (alpha other)"
+       (why (lambda () (load-package 'elsewhere (at "elsewhere" "main.scm")))))
 (write-file! (at "copy" "alpha" "techne-package.scm") '(package alpha))
 (check "not in another directory" #t (failed? (lambda () (use-package-directory! (at "copy" "alpha")))))
 (package! 'techne)
@@ -146,6 +147,38 @@
 (package! 'flat)
 (write-file! (at "flat" "lib") 'not-a-directory)
 (check "a lib that is no directory" '(#t #f) (left-whole? 'theta 'flat "is not a directory"))
+
+;; A package's files import, of what packages provide, its own libraries
+;; and those of the packages it depends on itself: not those further on,
+;; loaded already or not, which are not run for the attempt either.
+(define (refused? thunk) (and (string-contains (or (why thunk) "") "does not depend on alpha") #t))
+(library! 'alpha 'fresh '(export fresh) '(import (scheme base)) '(begin (define fresh 1)))
+(library! 'gamma 'own '(export own) '(import (scheme base) (beta twice)) '(begin (define own (twice "me"))))
+(write-file! (at "gamma" "direct.scm") '(import (beta twice) (gamma own)) '(define direct (list own (twice "a"))))
+(write-file! (at "gamma" "beyond.scm") '(import (alpha greet)))
+(write-file! (at "gamma" "unloaded.scm") '(import (only (alpha fresh) fresh)))
+(check "what it depends on, and its own" 1 (load-package 'gamma-direct (at "gamma" "direct.scm")))
+(check "not what that one depends on" #t (refused? (lambda () (load-package 'gamma-beyond (at "gamma" "beyond.scm")))))
+(check "nor one not loaded yet" #t (refused? (lambda () (load-package 'gamma-unloaded (at "gamma" "unloaded.scm")))))
+(check "which stays unloaded" #f (loaded? "(alpha fresh)"))
+(check "a file in no package imports any" 1 (eval 'fresh (environment '(alpha fresh))))
+(unload-package 'gamma-direct)
+
+;; `package-closure` makes the checks of `use-package-directory!` without
+;; making anything known; neither goes outside the directory it is given.
+(package! 'inside '(depends (alpha (path "../alpha"))))
+(check "the packages to make known" '(inside) (map manifest-name (package-closure (at "inside"))))
+(check "not outside a repository" #t (failed? (lambda () (package-closure (at "inside") #:within (at "inside")))))
+(check "nor used from there" #t (failed? (lambda () (use-package-directory! (at "inside") #:within (at "inside")))))
+(check "within it" 'inside (manifest-name (use-package-directory! (at "inside") #:within root)))
+(check "known, there is nothing to make known" '() (package-closure (at "inside")))
+
+;; The packages of a repository, side by side or deeper, by directory.
+(check "a package's directory is its own" '("") (package-directories (at "alpha")))
+(let ((found (package-directories root)))
+  (check "side by side" #t (and (member "alpha" found) (member "beta" found) #t))
+  (check "below a directory that is none" #t (and (member "copy/alpha" found) #t))
+  (check "not a package's own files" #f (and (member "alpha/lib" found) #t)))
 
 (delete-path root #t)
 (test-summary)
