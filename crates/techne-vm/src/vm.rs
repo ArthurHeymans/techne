@@ -2222,7 +2222,10 @@ impl Vm {
                     forms.forms.borrow_mut().pop_front();
                     return Ok(Some(library));
                 }
-                "import" => return self.pinning(|vm| vm.next_imported(specs, &dir)),
+                "import" => {
+                    let dir = self.import_dir(file);
+                    return self.pinning(|vm| vm.next_imported(specs, &dir));
+                }
                 "require" => break (head, specs.to_vec()),
                 _ => return Ok(None),
             };
@@ -2268,6 +2271,23 @@ impl Vm {
     /// included file may load another include beside itself.
     pub(crate) fn form_source_dir(&self, file: u32) -> PathBuf {
         Path::new(&*self.files[file as usize].name).parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), Path::to_path_buf)
+    }
+
+    /// Where an `import` in the source `file` looks for libraries, and
+    /// whose it is (`check_declared`): its file's directory, as
+    /// `form_source_dir`, but empty for what comes from no file (the REPL,
+    /// `eval`, an environment). That finds libraries from the working
+    /// directory all the same, and is no package's: the directory a
+    /// program happens to run in does not make its evaluations a
+    /// package's files.
+    pub(crate) fn import_dir(&self, file: u32) -> PathBuf {
+        let path = Path::new(&*self.files[file as usize].name);
+        match path.parent().filter(|p| p.is_dir()) {
+            Some(dir) => dir.to_path_buf(),
+            // A file named without a directory is in the working one.
+            None if path.is_file() => ".".into(),
+            None => PathBuf::new(),
+        }
     }
 
     /// Drop ownership state a killed library loader could not clean up.
