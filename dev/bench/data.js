@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795194962331,
+  "lastUpdate": 1795194964016,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -60908,6 +60908,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 627829210,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104418,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2f52c3beb0585f25f1f275bcd9786f326420332a",
+          "message": "Merge pull request #389 from ArthurHeymans/tool/fences\n\nLet Techne's tools resolve merge conflicts and take short revisions",
+          "timestamp": "2026-11-20T18:00:13+01:00",
+          "tree_id": "acccbb98e2179c82dd8ee5fffd8023a4b58acb58",
+          "url": "https://github.com/ArthurHeymans/techne/commit/2f52c3beb0585f25f1f275bcd9786f326420332a"
+        },
+        "date": 1795194963965,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697379276,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 627836839,
             "unit": "instructions"
           },
           {
