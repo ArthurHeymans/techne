@@ -890,6 +890,8 @@ pub struct Vm {
     /// Whose libraries are found where (`provide_libraries`): the first
     /// part of their names, and the directory their files are under.
     pub(crate) library_providers: Vec<(Box<str>, PathBuf)>,
+    /// What the files of each package may import (`declare_imports`).
+    pub(crate) package_imports: Vec<crate::library::PackageImports>,
     /// A package generation being loaded: its files load into fresh
     /// modules, kept apart until published.
     staging: Option<Staging>,
@@ -1526,6 +1528,7 @@ impl Vm {
             generations: 0,
             module_paths: FxHashMap::default(),
             library_providers: Vec::new(),
+            package_imports: Vec::new(),
             staging: None,
             staged: None,
             staged_by: None,
