@@ -89,9 +89,9 @@
 (define (%tool-edit! p path expected edits)
   (let* ((plan (%edit-plan p path expected edits "tool-edit!"))
          (s (car plan)) (changes (cadr plan)) (source (caddr plan)) (starts (%line-starts (%source s))))
-      (let* ((revision (%repository-write (%project-root p) (%path s) expected source))
+      (let* ((revision (%repository-write (%project-root p) (%path s) (%revision s) source))
              (next (%remember! p `((path ,(%path s)) (revision ,revision) (text ,source) (bytes ,(%utf8-size source))))))
-        `((path ,(%path s)) (revision ,revision) (previous ,expected)
+        `((path ,(%path s)) (revision ,revision) (previous ,(%revision s))
           (changes ,(map (lambda (c) `((line ,(%line-at starts (car c))) (old ,(%clip (cadddr c) 240))
                         (new ,(%clip (caddr c) 240)) (truncated ,(or (> (string-length (cadddr c)) 240) (> (string-length (caddr c)) 240))))) changes))
           (handle ,(%handle p next 0 (string-length source)))))))
@@ -163,12 +163,20 @@
       (when (or (> start end) (and (= start end) (< a b)))
         (error "tool-lines: those lines are outside the handle's region"))
       (%tool-expand p (%handle p s start end) 0 chars))))
+;;; A revision as a caller gives it: the whole one a read returned, or 8
+;;; or more characters of its start, as a reply abbreviates it.
+(define (%revision! expected s who path)
+  (unless (and (string? expected) (>= (string-length expected) 8)
+               ;; Not char-numeric?, which takes any script's digits.
+               (every (lambda (c) (memv c (string->list "0123456789abcdef"))) (string->list expected)))
+    (error (string-append who ": a revision is the lowercase hex a read returns, or 8 or more characters of its start") expected))
+  (unless (string-prefix? expected (%revision s)) (error (string-append who ": stale revision; read again") path)))
 ;;; Checked replacements, planned without writing: the snapshot, the
 ;;; changes ordered by place, and the text they make.
 (define (%edit-plan p path expected edits who)
   (unless (and (list? edits) (<= 1 (length edits) 100)) (error (string-append who ": expected 1 to 100 replacements")))
   (let* ((s (%read-snapshot p path)) (original (%source s)))
-    (unless (string=? expected (%revision s)) (error (string-append who ": stale revision; read again") path))
+    (%revision! expected s who path)
     (let ((changes
             (sort (map (lambda (edit)
                          (unless (and (list? edit) (= (length edit) 2) (every string? edit) (not (string=? (car edit) "")))
@@ -218,22 +226,32 @@
 ;;;   >>>>>>> REPLACE
 ;;; A block without a file line uses the previous block's file; Markdown
 ;;; fence lines between blocks are ignored. An empty SEARCH creates a
-;;; file that must not exist.
+;;; file that must not exist. Markers may be longer than seven, all three
+;;; of a block alike: text holding a seven-character marker (a merge
+;;; conflict) is edited inside longer ones.
 (define (%marker? line marker) (string=? (string-trim-right line) marker))
+;; The length of LINE's opening marker, or #f.
+(define (%opening line)
+  (let* ((line (string-trim-right line)) (k (- (string-length line) 7)))
+    (and (>= k 7) (string=? (substring line k (string-length line)) " SEARCH")
+         (every (lambda (c) (char=? c #\<)) (string->list (substring line 0 k)))
+         k)))
 (define (%parse-blocks text)
   (let loop ((lines (string-split text "\n")) (file #f) (blocks '()))
     (cond ((null? lines) (reverse blocks))
-          ((%marker? (car lines) "<<<<<<< SEARCH")
-           (unless file (error "tool-apply!: a SEARCH block needs its file on a line before it"))
-           (let collect ((rest (cdr lines)) (old '()) (new #f))
-             (cond ((null? rest) (error "tool-apply!: a block has no >>>>>>> REPLACE" (car file)))
-                   ((and (not new) (%marker? (car rest) "=======")) (collect (cdr rest) old '()))
-                   ((and new (%marker? (car rest) ">>>>>>> REPLACE"))
-                    (loop (cdr rest) file
-                          (cons (list (car file) (cdr file) (string-join (reverse old) "\n") (string-join (reverse new) "\n"))
-                                blocks)))
-                   (new (collect (cdr rest) old (cons (car rest) new)))
-                   (else (collect (cdr rest) (cons (car rest) old) new)))))
+          ((%opening (car lines))
+           => (lambda (k)
+                (unless file (error "tool-apply!: a SEARCH block needs its file on a line before it"))
+                (let ((divider (make-string k #\=)) (closing (string-append (make-string k #\>) " REPLACE")))
+                  (let collect ((rest (cdr lines)) (old '()) (new #f))
+                    (cond ((null? rest) (error (string-append "tool-apply!: a block has no " closing) (car file)))
+                          ((and (not new) (%marker? (car rest) divider)) (collect (cdr rest) old '()))
+                          ((and new (%marker? (car rest) closing))
+                           (loop (cdr rest) file
+                                 (cons (list (car file) (cdr file) (string-join (reverse old) "\n") (string-join (reverse new) "\n"))
+                                       blocks)))
+                          (new (collect (cdr rest) old (cons (car rest) new)))
+                          (else (collect (cdr rest) (cons (car rest) old) new)))))))
           (else
            (let ((line (string-trim (car lines))))
              (loop (cdr lines)
@@ -270,9 +288,7 @@
                            (%creatable! p path source)
                            (list 'create path source))
                          (let ((s (%read-snapshot p path)))
-                           (when (and (pair? wanted)
-                                      (not (and (>= (string-length (car wanted)) 8) (string-prefix? (car wanted) (%revision s)))))
-                             (error "tool-apply!: stale revision; read again" path))
+                           (when (pair? wanted) (%revision! (car wanted) s "tool-apply!" path))
                            (list 'edit path (%revision s)
                                  (%edit-plan p path (%revision s) (map (lambda (b) (list (caddr b) (cadddr b))) mine) "tool-apply!"))))))
                  paths))

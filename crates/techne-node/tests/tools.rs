@@ -332,6 +332,21 @@ fn search_replace_blocks_check_every_file_before_writing_any() {
         (define rev (tool-ref (tool-read p "two") 'revision))
         (tool-apply! p (block (string-append "two @" (substring rev 0 12)) "delta" "epsilon"))
         (check "epsilon\n" (tool-ref (tool-read p "two") 'text))
+        ;; Longer markers edit text holding seven-character ones, a conflict.
+        (tool-apply! p (block "two" "epsilon" "<<<<<<< ours\nmine\n=======\ntheirs\n>>>>>>> theirs"))
+        (tool-apply! p (string-append "two\n<<<<<<<<< SEARCH\n<<<<<<< ours\nmine\n=======\ntheirs\n>>>>>>> theirs\n"
+                                      "=========\nepsilon\n>>>>>>>>> REPLACE\n"))
+        (check "epsilon\n" (tool-ref (tool-read p "two") 'text))
+        ;; A block's markers are one length: a shorter divider is text.
+        (check #t (fails (lambda () (tool-apply! p "two\n<<<<<<<< SEARCH\nepsilon\n=======\nx\n>>>>>>> REPLACE\n"))))
+        ;; tool-edit! takes a revision as tool-apply! does, and says when one is not.
+        (define rev (tool-ref (tool-read p "two") 'revision))
+        (tool-edit! p "two" (substring rev 0 8) '(("epsilon" "eta")))
+        (check "eta\n" (tool-ref (tool-read p "two") 'text))
+        (check #t (fails (lambda () (tool-edit! p "two" (substring rev 0 8) '(("eta" "theta"))))))
+        (define rev (tool-ref (tool-read p "two") 'revision))
+        (check #t (fails (lambda () (tool-edit! p "two" (substring rev 0 7) '(("eta" "theta"))))))
+        (tool-edit! p "two" rev '(("eta" "epsilon")))
         ;; An empty SEARCH creates, in new directories, but never replaces.
         (check #t (tool-ref (car (tool-apply! p (block "new/dir/three" "" "made"))) 'created))
         (check "made\n" (tool-ref (tool-read p "new/dir/three") 'text))
@@ -386,6 +401,12 @@ fn an_edit_that_leaves_scheme_unreadable_is_refused() {
         (define rev (tool-ref (tool-read p "a.scm") 'revision))
         (check #t (has? (message (lambda () (tool-edit! p "a.scm" rev '(("(g x))" "(g x)")))))
                         "a.scm would not read as Scheme"))
+        ;; A revision too short to check is named as such, not as stale,
+        ;; as is one with digits of another script.
+        (check #t (has? (message (lambda () (tool-edit! p "a.scm" (substring rev 0 4) '(("y 1" "y 2")))))
+                        "8 or more characters"))
+        (check #t (has? (message (lambda () (tool-edit! p "a.scm" (string-append (substring rev 0 8) "\x0663;") '(("y 1" "y 2")))))
+                        "8 or more characters"))
         ;; A new file must read; other files are not Lisp, and one already
         ;; unreadable may be edited as it is.
         (check #t (has? (message (lambda () (tool-apply! p (block "new.sld" "" "(define-library (x)")))) "new.sld"))

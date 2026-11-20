@@ -179,6 +179,7 @@ Invalid arguments, missing paths and non-text files are errors."
 
     (define (tool-edit! project path revision edits)
       "Apply checked replacements EDITS to PATH in PROJECT at REVISION.
+REVISION is a read's, whole or 8 or more characters of its start.
 EDITS is a list of (old new) strings. Every old text must occur exactly
 once in the original file, and replacements must not overlap. Validate
 all edits before writing; stale or invalid requests change nothing, as
@@ -513,12 +514,15 @@ most CHARS characters, 1 to 16000, with an expandable handle."
       "Apply PATCH, search/replace blocks, to files of PROJECT.
 Each block is a file line, optionally FILE @REVISION (8 or more hex
 characters of it), then <<<<<<< SEARCH, the old lines, =======, the new
-lines, >>>>>>> REPLACE. A block without a file line uses the previous
-one's file. Each old text must occur exactly once. An empty SEARCH
-creates a new file, refused if it exists. A Scheme file the patch would
-leave unreadable is refused, with the reader's line. Every file is checked
-before any is written, but writes are not one transaction: a failure part way
-names the files written. From the CLI, pass PATCH on stdin with
+lines, >>>>>>> REPLACE. The three markers may be longer, alike within
+a block, to edit text holding seven-character ones (a merge conflict):
+<<<<<<<< SEARCH, ========, >>>>>>>> REPLACE. A block without a file
+line uses the previous one's file. Each old text must occur exactly
+once. An empty SEARCH creates a new file, refused if it exists. A
+Scheme file the patch would leave unreadable is refused, with the
+reader's line. Every file is checked before any is written, but writes
+are not one transaction: a failure part way names the files written.
+From the CLI, pass PATCH on stdin with
 `techne tool --stdin ROOT (tool-apply! project input)`; nothing needs escaping."
       (%response (%tool-apply! project patch)))
 
