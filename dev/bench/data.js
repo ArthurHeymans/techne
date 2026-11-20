@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795085933338,
+  "lastUpdate": 1795160555689,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -57032,6 +57032,315 @@ window.BENCHMARK_DATA = {
           {
             "name": "keys: completion-delete (jit)",
             "value": 20190257,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "http: plaintext request (jit)",
+            "value": 7403,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: plaintext request (interp)",
+            "value": 8723,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: /work request (jit)",
+            "value": 227008,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "http: /work request (interp)",
+            "value": 684163,
+            "unit": "instructions per request"
+          },
+          {
+            "name": "compile: read",
+            "value": 20093,
+            "unit": "instructions per form"
+          },
+          {
+            "name": "compile: load",
+            "value": 60543,
+            "unit": "instructions per form"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e73250f33cb388610461f88f37c5f90ee90fe6cc",
+          "message": "Merge pull request #386 from ArthurHeymans/editor/remote-dired\n\nBrowse remote directories from Find file",
+          "timestamp": "2026-11-20T08:36:16+01:00",
+          "tree_id": "b751877d563eab23e9e80c69eed9d9ffc6524144",
+          "url": "https://github.com/ArthurHeymans/techne/commit/e73250f33cb388610461f88f37c5f90ee90fe6cc"
+        },
+        "date": 1795160554340,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "startup (jit)",
+            "value": 13907932,
+            "unit": "instructions"
+          },
+          {
+            "name": "startup (interp)",
+            "value": 13878952,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (jit)",
+            "value": 472495042,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (interp)",
+            "value": 2046210561,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (jit)",
+            "value": 535051264,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (interp)",
+            "value": 2561703364,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (jit)",
+            "value": 846477001,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (interp)",
+            "value": 3107651953,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens GC pause",
+            "value": 276,
+            "unit": "words"
+          },
+          {
+            "name": "bintrees (jit)",
+            "value": 3461989852,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees (interp)",
+            "value": 10389764929,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees GC pause",
+            "value": 393093,
+            "unit": "words"
+          },
+          {
+            "name": "hof (jit)",
+            "value": 814128422,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof (interp)",
+            "value": 3336989995,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof GC pause",
+            "value": 1048549,
+            "unit": "words"
+          },
+          {
+            "name": "qsort (jit)",
+            "value": 623220038,
+            "unit": "instructions"
+          },
+          {
+            "name": "qsort (interp)",
+            "value": 4235337666,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (jit)",
+            "value": 153700741,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (interp)",
+            "value": 2546356898,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (jit)",
+            "value": 535114504,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (interp)",
+            "value": 768325517,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash GC pause",
+            "value": 229418,
+            "unit": "words"
+          },
+          {
+            "name": "orgparse (jit)",
+            "value": 345161604,
+            "unit": "instructions"
+          },
+          {
+            "name": "orgparse (interp)",
+            "value": 1556735791,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (jit)",
+            "value": 436919288,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (interp)",
+            "value": 1725838528,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks GC pause",
+            "value": 327556,
+            "unit": "words"
+          },
+          {
+            "name": "numstr (jit)",
+            "value": 246946005,
+            "unit": "instructions"
+          },
+          {
+            "name": "numstr (interp)",
+            "value": 685756883,
+            "unit": "instructions"
+          },
+          {
+            "name": "tasks (jit)",
+            "value": 242524883,
+            "unit": "instructions"
+          },
+          {
+            "name": "tasks (interp)",
+            "value": 108192524,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor load (jit)",
+            "value": 6533,
+            "unit": "instructions per datum"
+          },
+          {
+            "name": "editor load (interp)",
+            "value": 6080,
+            "unit": "instructions per datum"
+          },
+          {
+            "name": "keys: type (jit)",
+            "value": 827074,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-long-line (jit)",
+            "value": 846124,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-long-word (jit)",
+            "value": 908807,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-rust (jit)",
+            "value": 32385250,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-rust (jit)",
+            "value": 9210476,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-rust-big (jit)",
+            "value": 32393873,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-rust-big (jit)",
+            "value": 9206695,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: indent-after-long-line (jit)",
+            "value": 16295344,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move (jit)",
+            "value": 760545,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-modal (jit)",
+            "value": 735131,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-open (jit)",
+            "value": 16277139,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-first-key (jit)",
+            "value": 8034923,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-narrow (jit)",
+            "value": 6839668,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-delete (jit)",
+            "value": 1188305,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-yank-line (jit)",
+            "value": 25296795,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: command-first-key (jit)",
+            "value": 1248409,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: completion-filter (jit)",
+            "value": 20486902,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: completion-delete (jit)",
+            "value": 20191351,
             "unit": "instructions per key"
           },
           {
