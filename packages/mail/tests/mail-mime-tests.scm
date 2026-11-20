@@ -1,11 +1,11 @@
 ;;; Fixtures are relative to this suite, independent of the working directory.
-(require "../test.scm")
-(import (techne mail mime) (techne mail html) (techne path))
+(import (techne test))
+(import (mail mime) (mail html) (techne path))
 
 (define (field msg key) (cdr (assq key msg)))
 (define (raises? thunk) (guard (e (#t #t)) (thunk) #f))
 (define (mail-fixture name)
-  (file->string (path-join (path-directory (car (procedure-location mail-fixture))) "fixtures/mail" name)))
+  (file->string (path-join (path-directory (car (procedure-location mail-fixture))) "fixtures" name)))
 (define (text-of tree)
   (cond ((string? tree) tree) ((pair? tree) (string-append (text-of (car tree)) (text-of (cdr tree)))) (else "")))
 (define (nodes-of tree tag)
