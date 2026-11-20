@@ -17,7 +17,7 @@
 ;;; the entries whose names changed, C-c C-k leaves them.
 
 (import (techne editor))
-(import (techne time))
+(import (techne time) (techne task))
 
 (define-option dired-details #t
   "Whether a directory's listing shows each entry's mode, size and date.
@@ -41,14 +41,23 @@ first); \\[dired-cycle-sort] goes to the next in one listing."
 
 ;;; Entries: (name kind size modified mode target), NAME as
 ;;; `directory-list` gives it (a directory's with a slash), the rest as
-;;; `file-attributes` does.
+;;; `file-attributes` does. For a remote entry, only the name and whether
+;;; it leads to a directory are known.
 
 (define (without-slash path)
   (if (and (string-suffix? "/" path) (> (string-length path) 1))
       (substring path 0 (- (string-length path) 1))
       path))
 
+(define (remote-entry name)
+  (list name (if (string-suffix? "/" name) 'directory 'other) #f #f #f #f))
+
 (define (entries dir)
+  (if (remote-path? dir)
+      (map remote-entry (directory-entries dir))
+      (local-entries dir)))
+
+(define (local-entries dir)
   (filter-map (lambda (name)
                 (let ((a (guard (e (#t #f)) (file-attributes (string-append dir (without-slash name))))))
                   (and a (cons name a))))
@@ -140,19 +149,21 @@ first); \\[dired-cycle-sort] goes to the next in one listing."
 
 (define (dired-rows b)
   (let* ((dir (listing-dir b))
-         (details (setting b 'details 'dired-details))
-         (by (setting b 'sort 'dired-sort))
+         (remote (remote-path? dir))
+         (details (and (not remote) (setting b 'details 'dired-details)))
+         (by (if remote 'name (setting b 'sort 'dired-sort)))
          (zone (guard (e (#t "UTC")) (local-zone)))
-         (found (guard (e (#t (error-text e))) (entries dir)))
+         (found (guard (e ((not (task-cancelled-condition? e)) (error-text e))) (entries dir)))
          (head (row #:key "" (list (list (abbreviate-path dir) 'keyword)
-                                   (list (string-append "  by " (symbol->string by)) 'comment)))))
+                                   (list (if remote "  (browse only)" (string-append "  by " (symbol->string by))) 'comment)))))
     (if (string? found)
         (list head (row #:key "error" (list (list found 'error))))
         (let* ((shown (sorted (if (setting b 'dotfiles 'dired-hide-dotfiles) (remove dotfile? found) found) by))
-               (parent (and (not (string=? dir "/"))
-                            (guard (e (#t #f)) (cons "../" (file-attributes (string-append dir ".."))))))
+               (parent (and (not (root-directory? dir))
+                            (if remote (remote-entry "../")
+                                 (guard (e (#t #f)) (cons "../" (file-attributes (string-append dir "..")))))))
                (all (if parent (cons parent shown) shown))
-               (width (fold (lambda (e w) (max w (string-length (size-text e)))) 0 all))
+               (width (and details (fold (lambda (e w) (max w (string-length (size-text e)))) 0 all)))
                (names (listing-get b 'names))
                (spans (and names (name-spans b))))
           (cons head
@@ -227,16 +238,19 @@ time or size; \\[dired-toggle-read-only] edits the names."
            reuse)
           (else name))))
 
+(define (root-directory? dir) (string=? (location-path dir) "/"))
+
 (define (dired! s dir #:select [select #f] #:reuse [reuse #f])
   "Show the listing of the directory DIR in the focused pane of S.
 The caret goes to the entry named SELECT, else the first. REUSE, a
 listing, is moved to DIR rather than another made."
-  (when (remote-path? dir)
-    (error "Listing a directory on another machine is not supported yet" dir))
   (let* ((dir (normal-directory dir))
-         (found (listing-for dir reuse))
+         (remote (remote-path? dir))
+         ;; Do not move a live listing before a remote read that can be cancelled.
+         (found (listing-for dir (and (not remote) reuse)))
          (b (make-listing-buffer! (if (string? found) found (buffer-name found)) 'dired-mode dired-rows
                                   #:state (list (cons 'dir dir)))))
+    (when remote (dirvish-quit! s))
     (show-buffer! s b)
     (goto-name! s b (or (and select (presentation-row-span (buffer-document b) select) select)
                         (first-entry b)))
@@ -279,7 +293,7 @@ listing, is moved to DIR rather than another made."
     (if (dired? b) b (error "Not a directory's listing"))))
 
 (define (refresh-all!)
-  (for-each listing-redisplay! (dired-buffers)))
+  (for-each listing-redisplay! (remove (lambda (b) (remote-path? (listing-dir b))) (dired-buffers))))
 
 ;;; Moving and visiting
 
@@ -324,7 +338,7 @@ In dirvish, a file is opened where the panes were before."
 (define-command (dired-up-directory s n)
   "Go up to the parent directory, the caret on this one's entry."
   (let ((dir (listing-dir (current s))))
-    (unless (string=? dir "/")
+    (unless (root-directory? dir)
       (go-to-directory! s (normal-directory (string-append dir "..")) (base-name (without-slash dir) #:slash #t)))))
 
 (define (base-name path #:slash [slash #f])
@@ -344,6 +358,11 @@ The directory of this buffer is offered first."
     (dired! s (default-directory s) #:select (and path (base-name path)))))
 
 ;;; Acting on entries
+
+;; File mutations still use local primitives. Never give them a remote
+;; location, whether it came from a listing or was typed in a prompt.
+(define (require-local! path)
+  (when (remote-path? path) (error "This Dired operation is only supported on local paths" path)))
 
 ;; The paths of the entries marked with MARK, else the one at point.
 (define (paths s mark)
@@ -385,6 +404,7 @@ The directory of this buffer is offered first."
                                (if (null? problems) "" (string-append "; " (car problems)))))))
 
 (define (delete! s paths)
+  (for-each require-local! paths)
   (confirm s (string-append "Delete " (describe paths)
                             (if (any (lambda (p) (string-suffix? "/" p)) paths) " (directories with all they hold)" "")
                             "? ")
@@ -411,6 +431,7 @@ left."
 
 ;; Read where PATHS go and do (F from to) with each.
 (define (transfer! s paths verb done f)
+  (for-each require-local! paths)
   (let* ((dir (listing-dir (current s)))
          (one (null? (cdr paths))))
     (completing-read s (string-append verb " " (describe paths) " to: ") '()
@@ -418,7 +439,9 @@ left."
                      #:keymap file-name-map
                      #:require-match #f
                      #:accept (lambda (s c)
-                                (let ((to (absolute-path (candidate-text c))))
+                                (let* ((input (candidate-text c))
+                                        (_ (require-local! input))
+                                        (to (absolute-path input)))
                                   (each! s paths done
                                          (lambda (p) (f (without-slash p) (destination p to)))))))))
 
@@ -436,12 +459,15 @@ Directories are copied with all they hold."
 (define-command (dired-create-directory s n)
   "Make a directory, reading its name."
   (let ((b (current s)))
+    (require-local! (listing-dir b))
     (completing-read s "Create directory: " '()
                      #:initial (abbreviate-path (listing-dir b))
                      #:keymap file-name-map
                      #:require-match #f
                      #:accept (lambda (s c)
-                                (let ((dir (absolute-path (candidate-text c))))
+                                (let* ((input (candidate-text c))
+                                        (_ (require-local! input))
+                                        (dir (absolute-path input)))
                                   (make-directory dir)
                                   (refresh-all!)
                                   (goto-name! s b (string-append (base-name (without-slash dir)) "/")))))))
@@ -492,6 +518,7 @@ anywhere in the name; a directory's has no slash."
 
 (define-command (dired-toggle-details s n)
   "Show or hide each entry's mode, size and date in this listing."
+  (require-local! (listing-dir (current s)))
   (toggle! s 'details 'dired-details))
 
 (define-command (dired-toggle-dotfiles s n)
@@ -501,6 +528,7 @@ anywhere in the name; a directory's has no slash."
 (define-command (dired-cycle-sort s n)
   "Sort this listing by the next of name, time and size."
   (let* ((b (current s)) (by (setting b 'sort 'dired-sort)))
+    (require-local! (listing-dir b))
     (listing-set! b 'sort (case by ((name) 'time) ((time) 'size) (else 'name)))
     (listing-redisplay! b)
     (goto-name! s b (listing-key-at b (point s)))))
@@ -527,6 +555,7 @@ anywhere in the name; a directory's has no slash."
 \\[dired-finish-edit] renames the entries whose names changed,
 \\[dired-abort-edit] leaves them as they were."
   (let* ((b (current s))
+         (_ (require-local! (listing-dir b)))
          (keys (filter (lambda (k) (not (member k '("" "../" "error")))) (map car (sorted-rows b))))
          (names (map without-slash keys))
          (d (make-document (string-join names "\n"))))
@@ -657,6 +686,7 @@ the right, following the caret. Opening a file or
          (b (session-buffer s))
          (select (if (dired? b) (listing-key-at b (point s)) (and path (base-name path))))
          (dir (default-directory s)))
+    (require-local! dir)
     (unless (dirvish? s) (dirvish-on! s))
     (dired! s dir #:select select)
     (let ((v (session-view s)))
@@ -734,7 +764,13 @@ the right, following the caret. Opening a file or
     (if (not (= (length panes) 3))
         (dirvish-off! s)
         (let* ((mid (list-ref panes 1)) (b (document-buffer (view-document mid))))
-          (when (dired? b)
+          (cond
+           ;; Buffer switching can select an existing remote listing without
+           ;; calling dired!. Do not feed its paths to local Dirvish previews.
+           ((and (dired? b) (remote-path? (listing-dir b)))
+            (dirvish-quit! s)
+            (show-buffer! s b))
+           ((dired? b)
             (let* ((dir (listing-dir b))
                    (pb (parent-buffer s))
                    (pv (list-ref panes 0))
@@ -748,7 +784,7 @@ the right, following the caret. Opening a file or
                   (view-set-ranges! pv (list (list at at)) 0)))
               (unless (equal? path (sget s 'dirvish-shown))
                 (sset! s 'dirvish-shown path)
-                (when path (show-preview! s (list-ref panes 2) path)))))))))
+                (when path (show-preview! s (list-ref panes 2) path))))))))))
 
 ;; The sessions showing dirvish. The hook following their carets is
 ;; added only while one does: it would run on every key.
