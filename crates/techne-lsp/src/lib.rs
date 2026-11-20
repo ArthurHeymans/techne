@@ -21,6 +21,15 @@ use analysis::{Analysis, Def, DefKind, Span, analyze, checkdoc, head, ident, lib
 use techne_vm::reader::Syntax;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result, lsp_types::*};
 
+/// A library of the package `dir` is in: under `lib` beside the nearest
+/// manifest above, `techne-package.scm`, as the runtime finds it once the
+/// package is used (`(techne package)`). The libraries of the packages
+/// it depends on are not looked for: no manifest is read here.
+fn package_library(parts: &[String], dir: &Path) -> Option<PathBuf> {
+    let root = dir.ancestors().find(|d| d.join("techne-package.scm").is_file())?;
+    Some(root.join("lib").join(format!("{}.sld", parts.join("/")))).filter(|p| p.is_file())
+}
+
 /// Byte offset to an LSP position (UTF-16 columns).
 /// Byte `offset` of `text`, or the start of the character it falls in.
 fn boundary(text: &str, offset: usize) -> usize {
@@ -186,7 +195,9 @@ impl Backend {
                         .collect();
                     return Ok(exported(exports, defs));
                 }
-                let file = techne_vm::library::library_file(&parts, base).ok_or_else(|| format!("cannot find library {written}"))?;
+                let file = techne_vm::library::library_file(&parts, base)
+                    .or_else(|| package_library(&parts, base))
+                    .ok_or_else(|| format!("cannot find library {written}"))?;
                 let text = std::fs::read_to_string(&file).map_err(|_| format!("cannot read library {written}"))?;
                 let uri = Url::from_file_path(file.canonicalize().unwrap_or(file)).map_err(|_| written.clone())?;
                 let other = analyze(&text, &self.builtin_macros);

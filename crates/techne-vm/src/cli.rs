@@ -2,7 +2,7 @@
 //! Scheme file, or start a REPL without one.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc,
@@ -30,7 +30,7 @@ pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), cr
     let stopped = signals(vm.interrupt_handle(), file.is_some());
     crate::stdlib::set_command_line(args);
     let result = match file {
-        Some(path) => vm.eval_file(Path::new(&path)).map(|_| ()),
+        Some(path) => use_package_of(&mut vm, Path::new(&path)).and_then(|()| vm.eval_file(Path::new(&path)).map(|_| ())),
         None => {
             crate::repl::run(&mut vm);
             Ok(())
@@ -66,6 +66,26 @@ pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), cr
             eprintln!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The directory of the package the file at PATH is in: the nearest one
+/// above it holding a manifest, `techne-package.scm`.
+pub fn package_root(path: &Path) -> Option<PathBuf> {
+    let file = path.canonicalize().ok()?;
+    file.ancestors().skip(1).find(|dir| dir.join("techne-package.scm").is_file()).map(Path::to_path_buf)
+}
+
+/// Make the package the file at PATH is in known to VM, with those it
+/// depends on, as `(techne package)` reads its manifest: the file then
+/// imports their libraries. A file in no package changes nothing, and
+/// loads no code.
+pub fn use_package_of(vm: &mut Vm, path: &Path) -> Result<(), crate::vm::Error> {
+    match package_root(path) {
+        Some(root) => vm
+            .eval_source(&format!("((eval 'use-package-directory! (environment '(techne package))) {:?})", root.display().to_string()))
+            .map(|_| ()),
+        None => Ok(()),
     }
 }
 
