@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795182320713,
+  "lastUpdate": 1795182322206,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -60565,6 +60565,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 105508,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "392e53c7fc72a4bb7810b630585e1f24d7a19c40",
+          "message": "Merge pull request #385 from ArthurHeymans/editor/vcs-interface\n\nWork with Git and Jujutsu from the editor",
+          "timestamp": "2026-11-20T14:37:07+01:00",
+          "tree_id": "a7d4e409e17f9d2079eba8a4cdb2bc4cd57cd2ac",
+          "url": "https://github.com/ArthurHeymans/techne/commit/392e53c7fc72a4bb7810b630585e1f24d7a19c40"
+        },
+        "date": 1795182322157,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697419628,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 627829210,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104418,
             "unit": "data"
           }
         ]
