@@ -18,6 +18,15 @@ fn installed_packages() {
 }
 
 #[test]
+fn forge_package() {
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/forge/tests/forge-editor-tests.scm");
+    let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    rt.eval(&format!("(require {:?})", suite.display().to_string())).unwrap();
+    let failures = rt.eval("(run-forge-tests)").unwrap();
+    assert_eq!(failures, "0", "forge editor tests failed");
+}
+
+#[test]
 fn editor_suites() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/editor/tests");
     let mut suites: Vec<_> =

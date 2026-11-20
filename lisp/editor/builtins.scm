@@ -18,7 +18,7 @@
 (require "terminal-options.scm")
 (require "secrets-options.scm")
 
-(define builtin-packages (quote (compile dired ibuffer vc markdown-preview mail terminal))
+(define builtin-packages (quote (compile dired ibuffer vc markdown-preview mail forge terminal))
   "The editor's own packages, loaded at start in this order.")
 
 ;; This file, which packages/ is beside.
@@ -49,6 +49,6 @@
                            (terminal-serial "Open a local serial console using socat at the configured baud rate.")))))
                 ((markdown-preview)
                  (register-command-package! name path (quote ((markdown-preview "Show this markdown buffer rendered, beside it.")))))
-                ((mail) (advertise-shipped-package! name))
+                ((mail forge) (advertise-shipped-package! name))
                 (else (load-package name path)))))
           builtin-packages)

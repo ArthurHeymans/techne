@@ -20,6 +20,11 @@ A Jujutsu working copy is recorded first, as Magit and Majutsu do."
   "Override the GitHub repository for this buffer, as owner/repo."
   #:type '(or (one-of #f) string))
 
+(define-hook vc-status-sections
+  "Called while building a VC status buffer.
+Arguments: (session repo state closed add-rows!). Call (add-rows! rows)
+with presentation rows for extra foldable sections.")
+
 (register-command-package! 'vc-runtime
   (string-append (directory-of (current-module)) "vc/runtime.scm")
   '((vc-status "Show the state of the repository of this buffer's file.")

@@ -50,6 +50,7 @@
 (require "diff.scm")
 (require "recovery.scm")
 (require "capture.scm")
+(require "transient.scm")
 
 (provide screenshot! recording-start! recording-stop!
          define-command register-command! register-command-package! advertise-package!
@@ -72,7 +73,8 @@
          kill-ring kill-save! yank-text current-prefix
          file-document show-document! show-buffer! visit! file-visit! cancel-file-visit! file-visit-pending? save-document-in-session! buffer-list add-buffer! eval-region!
          completing-read async-source candidate candidate-text candidate-annotation candidate-target take-target candidate-table minibuffer-history
-         target target? target-kind target-value target-at define-action actions-for act-on!
+         target target? target-kind target-value target-at define-action actions-for act-on! act-default!
+         transient! transient-args transient-arg? transient-value transient-open? read-char-choice!
          location file-location location? location-document location-position line-candidate
          default-directory file-name show-lens! row excerpt define-view show-view! present! row-at row-target
          error-text make-generated-buffer! buffer-named set-buffer-state! session-buffer display-buffer!

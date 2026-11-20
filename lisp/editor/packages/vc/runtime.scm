@@ -1095,11 +1095,16 @@ marked with \\[vc-jj-mark]. \\[vc-jj-undo] undoes the last operation;
       (let ((table (make-hash-table))) (hash-table-set! st 'expanded table) table)))
 
 (define (status-rows repo st)
-  (let ((closed (hash-table-ref/default st 'closed '())) (failure (hash-table-ref/default st 'failure #f)))
+  (let ((closed (hash-table-ref/default st 'closed '())) (failure (hash-table-ref/default st 'failure #f))
+        (extra '()))
+    (when (current-session)
+      (run-hook! (current-session) 'vc-status-sections repo st closed
+                 (lambda (rows) (when (pair? rows) (set! extra (append extra rows))))))
     (append (list (row (list (list (if (eq? (car repo) 'git) "Git status" "Jujutsu workspace") 'heading)) #:key 'head)
                   (row (list (list (cadr repo) 'shadow)) #:key 'directory))
             (if failure (list (row (list (list (string-append "Stale: " (label failure)) 'warning)) #:key 'stale)) '())
-            (if (eq? (car repo) 'git) (git-status-rows repo st closed) (jj-status-rows repo st closed)))))
+            (if (eq? (car repo) 'git) (git-status-rows repo st closed) (jj-status-rows repo st closed))
+            extra)))
 
 ;; The key an inline patch is kept under: a Git file's side and path, a
 ;; jj file's commit and path.
@@ -1408,6 +1413,7 @@ patch; on a section's heading, fold the section."
                  (show-document! s (file-document (file-path (list (car v) (caddr v)))))
                  (show-target-diff! s t))))
           ((file-target t) => (lambda (f) (show-document! s (file-document (file-path (target-value f))))))
+          ((pair? (actions-for (target-kind t))) (act-default! s t))
           (else (message! s "Nothing to visit at point")))))
 
 (define (jj-working-copy-commit? s commit)
@@ -5044,11 +5050,21 @@ The plan is edited in a buffer of its own, then \\[vc-todo-finish] runs it."
 ;;; Forge menu
 
 (define-command (vc-forge-menu s n)
-  "Show the forge menu: pull requests on GitHub, read only."
+  "Show the forge menu for GitHub topics, pull requests, and review."
   (vc-transient! s
-    '("Forge · GitHub, read only"
-      ("Pull requests" (suffix "l" "List open pull requests" vc-forge) (suffix "N" "List open pull requests" vc-forge)
-                       (suffix "b" "Of this branch or bookmark" vc-forge-local-topic)))))
+    '("Forge · GitHub"
+      ("Forge" (suffix "F" "Forge dispatch…" forge-dispatch)
+               (suffix "f" "Pull topics" forge-pull)
+               (suffix "t" "List topics" forge-list-topics)
+               (suffix "p" "List pull requests" forge-list-pullreqs)
+               (suffix "i" "List issues" forge-list-issues))
+      ("Create & Review" (suffix "c" "Create issue" forge-create-issue)
+                         (suffix "P" "Create pull request" forge-create-pullreq)
+                         (suffix "r" "Code review PR" code-review-start)
+                         (suffix "o" "Browse in browser" forge-browse))
+      ("Live (read only)" (suffix "l" "List open pull requests" vc-forge)
+                          (suffix "N" "List open pull requests" vc-forge)
+                          (suffix "b" "Of this branch or bookmark" vc-forge-local-topic)))))
 
 ;;; Jujutsu's remotes, operations and evolution.
 

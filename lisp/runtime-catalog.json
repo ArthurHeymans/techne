@@ -12,6 +12,10 @@
       "description": "(accept-operation-proposals! s r ids seen)  procedure, @lisp@/editor/staging.scm:39\n\nAccept the staged proposals IDS of operation record R in S.\nSEEN gives each proposal's preview revision. Every revision and conflict\nis checked before anything changes; a later journal failure can leave a\npartial result, recorded as such. Acceptance is a child operation of R.\nRefuse while R is pending or its pending proposal set changed.",
       "is_macro": false
     },
+    "act-default!": {
+      "description": "(act-default! s t)  procedure, @lisp@/editor/targets.scm:82\n\nDo the default action on target T in session S.",
+      "is_macro": false
+    },
     "act-on!": {
       "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:755\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
       "is_macro": false
@@ -1824,6 +1828,10 @@
       "description": "(ranges s)  procedure, @lisp@/editor/commands.scm:26\n\nReturn the ranges of the selection of session S, each (anchor head).",
       "is_macro": false
     },
+    "read-char-choice!": {
+      "description": "(read-char-choice! s prompt choices)  procedure, @lisp@/editor/transient.scm:256\n\nAsk PROMPT in the echo area of session S, answered by one key.\nCHOICES are (KEY . THUNK); the thunk of the key typed runs. Quitting,\nor a key not among them, answers nothing.",
+      "is_macro": false
+    },
     "read-directory-name": {
       "description": "(read-directory-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:759\n\nRead a directory's name in the minibuffer of S with PROMPT and INITIAL.\nIt is completed a directory at a time, as `read-file-name` completes:\nthe candidates are ./, the directory of the input itself, then ../ and\nthe subdirectories. Taking ./ calls (ACCEPT session directory) with its\nabsolute name, with a slash; taking another goes into it. The input\nnaming a directory that exists is selected first, so that RET takes\nit, whatever subdirectory was taken before and is listed first.\n\\[minibuffer-accept-input] takes the input as it is, also a directory\nthat does not exist yet.",
       "is_macro": false
@@ -2510,6 +2518,26 @@
     },
     "traced-operation-records": {
       "description": "(traced-operation-records)  procedure, @lisp@/editor/operations.scm:691\n\nReturn the records of the operations in the trace, newest first.",
+      "is_macro": false
+    },
+    "transient!": {
+      "description": "(transient! s menu #:values (initial (quote ())))  procedure, @lisp@/editor/transient.scm:221\n\nShow MENU in session S until a key runs one of its commands or quits.\nINITIAL is a list of (KEY . VALUE): switches on, options with values.",
+      "is_macro": false
+    },
+    "transient-arg?": {
+      "description": "(transient-arg? s argument)  procedure, @lisp@/editor/transient.scm:51\n\nReturn #t when the transient menu of session S set the switch ARGUMENT.\nARGUMENT is as the menu writes it, \"--all\".",
+      "is_macro": false
+    },
+    "transient-args": {
+      "description": "(transient-args s)  procedure, @lisp@/editor/transient.scm:46\n\nReturn the arguments the menu of session S set for the command it runs.\nOutside a menu, no arguments: the commands' defaults.",
+      "is_macro": false
+    },
+    "transient-open?": {
+      "description": "(transient-open? s)  procedure, @lisp@/editor/transient.scm:62\n\nReturn #t while a transient menu is shown in session S.",
+      "is_macro": false
+    },
+    "transient-value": {
+      "description": "(transient-value s argument)  procedure, @lisp@/editor/transient.scm:56\n\nReturn the value session S's menu gave ARGUMENT, or #f.\nARGUMENT ends in =, as \"--author=\".",
       "is_macro": false
     },
     "undo-operation!": {
