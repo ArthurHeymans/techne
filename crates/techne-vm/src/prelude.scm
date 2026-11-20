@@ -1132,8 +1132,12 @@ published."
 (define (%registry-add! reg key value)
   (let* ((s (current-scope)) (p (%scope-predecessor s))
          (stack (hash-table-ref/default (%registry-table reg) key '()))
-         (old (find (lambda (r) (let ((o (scope-of r))) (or (eq? o s) (and p (eq? o p))))) stack)))
-    (%registry-swap! reg key old (scope-own! (list value) (lambda (r) (%registry-swap! reg key r #f #t))) p)))
+         (old (and (pair? stack) (find (lambda (r) (let ((o (scope-of r))) (or (eq? o s) (and p (eq? o p))))) stack)))
+         (entry (scope-own! (list value) (lambda (r) (%registry-swap! reg key r #f #t)))))
+    (if old (%registry-swap! reg key old entry p)
+        (begin
+          (hash-table-set! (%registry-table reg) key (cons entry stack))
+          (let ((changed (%registry-changed reg))) (when changed (changed key value)))))))
 
 ;; Replace registration OLD (or #f) of KEY by NEW (#f: by nothing), in
 ;; OLD's place when IN-PLACE, else NEW on top; tell the registry when the
