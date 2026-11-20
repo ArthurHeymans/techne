@@ -30,8 +30,9 @@
                                   (if (zero? end) out (cons (if (string? r) part (list part (cadr r))) out)))))))))))
 
 (define (vc-log-column-runs columns prefix graph subject author age)
-  "Lay out a Git log row in COLUMNS after PREFIX, with GRAPH and SUBJECT runs.
-Keep AUTHOR and AGE in the right columns when there is enough room."
+  "Lay out a Git log row in COLUMNS.
+Put GRAPH and SUBJECT runs after PREFIX. Keep AUTHOR and AGE in the
+right columns when there is enough room."
   (let* ((left (append prefix (list (list graph 'vc.graph))))
          (room (- columns (runs-width left)))
          (age-width (if (and (>= columns 52) (>= room 38)) 13 0))

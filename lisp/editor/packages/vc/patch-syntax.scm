@@ -1,7 +1,7 @@
 ;;; Source faces in a unified patch. Parse the old and new snippets separately,
 ;;; without their signs, and map captures back to the displayed lines.
 
-(import (techne editor) (only (srfi 1) take-while drop-while))
+(import (techne editor))
 (provide patch-syntax paint-patch-line)
 
 (define (bytes text) (bytevector-length (string->utf8 text)))
@@ -17,8 +17,10 @@
       (let loop ((lines lines) (start 0) (faces faces))
         (unless (or (null? lines) (null? faces))
           (let* ((line (car lines)) (end (+ start (bytes (cdr line))))
-                 (live (drop-while (lambda (f) (<= (caddr f) start)) faces))
-                 (here (take-while (lambda (f) (< (cadr f) end)) live)))
+                 (live (let skip ((fs faces))
+                         (if (and (pair? fs) (<= (caddar fs) start)) (skip (cdr fs)) fs)))
+                 (here (let take ((fs live))
+                         (if (and (pair? fs) (< (cadar fs) end)) (cons (car fs) (take (cdr fs))) '()))))
             (unless (null? here)
               (hash-table-set! marks (car line)
                 (filter-map (lambda (f)

@@ -31,7 +31,7 @@
 (define (refine-patch-lines lines #:path [path #f] #:stat [stat? #f])
   "Return the presentation runs for each patch line in LINES.
 Mark differing words, colour source syntax using file headers or PATH,
-and colour Git's stat bars before the patch when STAT is true."
+and colour Git's stat bars before the patch when STAT? is true."
   (let ((marks (patch-syntax lines path)))
     (let loop ((lines lines) (runs (refine-lines lines)) (i 0) (stat? stat?) (out '()))
       (if (null? lines) (reverse out)

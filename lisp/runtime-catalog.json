@@ -108,6 +108,10 @@
       "description": "(cancel-request! slot)  procedure, @lisp@/editor/requests.scm:45\n\nCancel the request in flight in SLOT, if any.\nIts result is never delivered.",
       "is_macro": false
     },
+    "cancelled-condition?": {
+      "description": "(cancelled-condition? e)  procedure, @lisp@/editor/operations.scm:302\n\nReturn #t if E is the condition a cancelled task ends with.",
+      "is_macro": false
+    },
     "candidate": {
       "description": "(candidate text #:suffix (suffix #f) #:annotation (annotation \"\") #:target (target #f))  procedure, @lisp@/editor/minibuffer.scm:61\n\nReturn a candidate of the minibuffer, showing TEXT.\nSUFFIX is shown right after it, not matched (a command's key);\nANNOTATION in a column of its own; TARGET is what it stands for.",
       "is_macro": false

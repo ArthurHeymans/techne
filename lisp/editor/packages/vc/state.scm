@@ -20,7 +20,7 @@
   (call-with-output-file path (lambda (port) (write evidence port))))
 
 (define (call-with-vc-write-lease repo thunk)
-  "Run THUNK while this runtime owns the repository's private write lease."
+  "Run THUNK while this runtime holds the private lease for REPO."
   (let ((db (sqlite-open (string-append (recovery-path repo) ".lease.sqlite") #:private? #t)))
     (dynamic-wind (lambda () #f)
                   (lambda () (call-with-sqlite-lease db thunk))
@@ -33,7 +33,8 @@
     (and (file-exists? pending) (read-evidence (string-append pending "/attempt") %unknown-attempt))))
 
 (define (vc-recovery-state repo)
-  "Return the current write recovery evidence for REPO, including other runtimes' writes."
+  "Return the current write recovery evidence for REPO.
+Include writes made by other runtimes."
   (let* ((state (or (hash-table-ref/default %recovery repo #f) (make-hash-table)))
          (path (recovery-path repo)) (attempt (pending-attempt path)))
     (unless (equal? attempt (hash-table-ref/default state 'unresolved #f))
@@ -56,7 +57,8 @@ is a list of the source commit, remote name, ref and endpoint digest."
     attempt))
 
 (define (vc-recovery-complete! repo attempt)
-  "Release exactly ATTEMPT after receiving an exit status, under the write lease."
+  "Release ATTEMPT for REPO after receiving its exit status.
+The caller must hold the write lease."
   (let ((path (recovery-path repo)))
     (unless (and attempt (equal? attempt (pending-attempt path)))
       (error "The pending write changed; inspect it again"))

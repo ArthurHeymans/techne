@@ -137,6 +137,9 @@ fn the_manual() {
     assert!(manual.starts_with("#+title: The Techne Manual\n"), "{manual}");
     assert!(manual.contains("SPC . is the key that opens a file."), "{manual}");
     assert!(manual.contains("keys are written ~\\\\[command]~"), "{manual}");
+    // Also check the manual's references to commands local to lazy VC views.
+    let vc = techne_editor::runtime::lisp_dir().join("packages/vc/runtime.scm");
+    rt.eval(&format!("(load-package 'vc-runtime {:?})", vc.display().to_string())).unwrap();
     let problems = rt
         .eval("(map (lambda (p) (string-append (symbol->string (problem-name p)) \": \" (problem-text p))) (manual-problems (call-with-input-file (manual-file) read-string-all)))")
         .unwrap();

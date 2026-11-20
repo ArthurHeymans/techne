@@ -1,5 +1,5 @@
 //! The vertical slice of the architecture review: a version control status
-//! view (`lisp/editor/packages/vc.scm`) whose rows come from a process in
+//! view (`lisp/editor/packages/vc/runtime.scm`) whose rows come from a process in
 //! the background, keep the caret on its row as they change, reload with
 //! their package while work is in flight, and whose targets' actions work
 //! wherever the targets come from.
@@ -1362,15 +1362,17 @@ fn jj_browsing_does_not_snapshot_the_working_copy() {
 fn reloading_while_a_refresh_is_in_flight() {
     let (_dir, _state, root, mut rt) = repository();
     let scopes = "(sort (map (lambda (s) (symbol->string (scope-name s))) (scope-children %root-scope)) string<?)";
-    let builtins = rt.eval(scopes).unwrap();
-    let path = lisp_dir().join("packages/vc.scm").display().to_string();
+    let path = lisp_dir().join("packages/vc/runtime.scm").display().to_string();
+    assert_eq!(rt.eval("(find-package 'vc-runtime)").unwrap(), "#f");
+    assert_eq!(rt.eval("(and (memq 'vc-status (command-names)) #t)").unwrap(), "#t");
     keys(&mut rt, "C-x v d");
     until(&mut rt, "the status", |s| text(s).contains("a.txt"));
+    let builtins = rt.eval(scopes).unwrap();
     std::fs::write(root.join("c.txt"), "new\n").unwrap();
     keys(&mut rt, "g");
     assert_eq!(rt.eval("(request-pending? (hash-table-ref (buffer-state (session-buffer (current-session))) 'slot))").unwrap(), "#t");
-    rt.eval(&format!("(load-package 'vc {path:?})")).unwrap();
-    assert_eq!(rt.eval("(package-generation (find-package 'vc))").unwrap(), "2");
+    rt.eval(&format!("(load-package 'vc-runtime {path:?})")).unwrap();
+    assert_eq!(rt.eval("(package-generation (find-package 'vc-runtime))").unwrap(), "2");
     let s = until(&mut rt, "the new generation's refresh", |s| text(s).contains("c.txt"));
     assert!(text(&s).contains("▾ Untracked files (1)\n  ▸ c.txt\n▾ Unstaged changes (1)\n  ▸ a.txt"), "{}", text(&s));
     // It refreshes by itself: a file written later shows up.
@@ -1384,13 +1386,14 @@ fn reloading_while_a_refresh_is_in_flight() {
         assert!(start.elapsed() < Duration::from_secs(20), "the last refresh never finished");
         rt.run_tasks(Duration::from_millis(5)).unwrap();
     }
-    let live =
-        "(length (filter (lambda (r) (guard (e (#t #f)) (not (task-done? r)))) (scope-resources (package-scope (find-package 'vc)))))";
+    let live = "(length (filter (lambda (r) (guard (e (#t #f)) (not (task-done? r)))) (scope-resources (package-scope (find-package 'vc-runtime)))))";
     assert_eq!(rt.eval(live).unwrap(), "1", "the package runs its timer, nothing more");
     assert_eq!(rt.eval(scopes).unwrap(), builtins, "the old generation is gone");
-    // Unloaded, its keys and commands go; the buffer stays, inert.
-    rt.eval("(unload-package 'vc)").unwrap();
-    assert_eq!(rt.eval("(memq 'vc-status (command-names))").unwrap(), "#f");
+    // Unloading leaves the global declaration; the next command loads it again.
+    rt.eval("(unload-package 'vc-runtime)").unwrap();
+    assert_eq!(rt.eval("(find-package 'vc-runtime)").unwrap(), "#f");
+    assert_eq!(rt.eval("(and (memq 'vc-status (command-names)) #t)").unwrap(), "#t");
+    assert_eq!(rt.eval("(memq 'vc-status-refresh (command-names))").unwrap(), "#f");
 }
 
 /// A refresh slower than the interval is left to finish: the timer does
