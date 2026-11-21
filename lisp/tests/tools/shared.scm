@@ -107,3 +107,11 @@
     (expect "<stdout of sh>:1: a" (tool-show output-line #:numbered #t))
     (expect '(2 2 #f)
       (map (lambda (key) (tool-ref (tool-read p "<stdout of sh>" #:lines 1) key)) '(file-lines next-line file-eof)))))
+
+(with-tool-project "a marker outside a block is refused, not skipped"
+  '(("f" "one\ntwo\n"))
+  (lambda (root p)
+    (define (message thunk) (guard (e (#t (condition/report-string e))) (thunk) "no error"))
+    (define patch "f\n<<<<<<< SEARCH\none\n=======\nONE\n>>>>>>> REPLACE\ntwo\n=======\nTWO\n>>>>>>> REPLACE\n")
+    (expect #t (and (string-contains (message (lambda () (tool-apply! p patch))) "SEARCH line is missing") #t))
+    (expect "one\ntwo\n" (tool-ref (tool-read p "f") 'text))))

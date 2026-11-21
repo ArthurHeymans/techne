@@ -254,6 +254,12 @@
                           (else (collect (cdr rest) (cons (car rest) old) new)))))))
           (else
            (let ((line (string-trim (car lines))))
+             ;; A divider or closing marker outside a block is a block
+             ;; whose SEARCH line is missing, not a file's name: refused,
+             ;; not quietly skipped with its edit.
+             (when (or (and (>= (string-length line) 7) (every (lambda (c) (char=? c #\=)) (string->list line)))
+                       (and (string-suffix? " REPLACE" line) (string-prefix? ">>>>>>>" line)))
+               (error "tool-apply!: a ======= or >>>>>>> REPLACE outside a block: its <<<<<<< SEARCH line is missing" line))
              (loop (cdr lines)
                    (if (or (string=? line "") (string-prefix? "```" line)) file
                        (let ((at (string-contains line " @")))
