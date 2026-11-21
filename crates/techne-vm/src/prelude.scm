@@ -78,17 +78,26 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
             ((procedure? next) (loop (next)))
             (else (%load-forms next) (loop last))))))
 
-;; The forms of a module loading, evaluated in it.
+;; The forms of a module loading, evaluated in it. One that is the
+;; world's, loading because a package being staged needs it (a file from
+;; outside its directory, a library a package provides), is evaluated in
+;; the root scope: the tasks it starts and what it registers are the
+;; world's as it is, not the package's that loads it first, whose
+;; unloading would take them from every other importer.
 (define (%load-forms forms)
-  (dynamic-wind
-      (lambda () (%enter-module forms))
-   (lambda ()
-     (let ((value (%eval-forms forms)))
-       ;; Only this successful path publishes a library. The wind's
-       ;; cleanup also runs on failure, and unregisters it then.
-       (%forms-evaluated forms)
-       value))
-   (lambda () (%leave-module) (%module-loaded forms))))
+  (define (load)
+    (dynamic-wind
+        (lambda () (%enter-module forms))
+     (lambda ()
+       (let ((value (%eval-forms forms)))
+         ;; Only this successful path publishes a library. The wind's
+         ;; cleanup also runs on failure, and unregisters it then.
+         (%forms-evaluated forms)
+         value))
+     (lambda () (%leave-module) (%module-loaded forms))))
+  (if (%forms-of-world? forms)
+      (%call-in-scope %root-scope load)
+      (load)))
 
 (define (eval-source source module file)
   "Evaluate the forms of the string SOURCE in MODULE.

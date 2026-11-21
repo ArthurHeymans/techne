@@ -171,6 +171,34 @@
 (delete-file own-library)
 (delete-file (package-main 'own))
 
+;; What a file from elsewhere starts and registers as it loads is the
+;; world's too, as the file is: not the package's that happened to load it
+;; first, whose unloading would stop it for the others.
+(define worker (string-append path ".worker.scm"))
+(write-forms! worker
+              '(provide worker-task)
+              '(define worker-task (spawn (lambda () (let loop () (sleep 1) (loop)))))
+              '(registry-add! demo-commands 'from-elsewhere (lambda () 'elsewhere)))
+(define (write-worker-user! name)
+  (make-directory (package-dir name))
+  (write-forms! (package-main name) `(require ,worker) `(registry-add! demo-commands ',name (lambda () worker-task))))
+(for-each write-worker-user! '(starts joins))
+(load-package 'starts (package-main 'starts))
+(load-package 'joins (package-main 'joins))
+(define the-worker (command 'starts))
+(test #t (eq? the-worker (command 'joins)))
+(unload-package 'starts)
+(sleep 5)
+(test #f (task-done? the-worker))
+(test 'elsewhere (command 'from-elsewhere))
+(test #f (command 'starts))
+(unload-package 'joins)
+(task-kill the-worker)
+(registry-remove! demo-commands 'from-elsewhere)
+(test '() (registry-keys demo-commands))
+(for-each (lambda (name) (delete-file (package-main name))) '(starts joins))
+(delete-file worker)
+
 ;; Primitives are sealed: shadowed by a definition, never changed.
 (test-error (eval '(set! car cdr)))
 (test 'shadowed (eval '(begin (define (car x) 'shadowed) (car '(1)))))

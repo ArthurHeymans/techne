@@ -245,7 +245,7 @@
       "is_macro": false
     },
     "current-operation": {
-      "description": "(current-operation)  procedure, @source@/crates/techne-vm/src/prelude.scm:247\n\nReturn the operation the running code is part of, or #f: a parameter.",
+      "description": "(current-operation)  procedure, @source@/crates/techne-vm/src/prelude.scm:256\n\nReturn the operation the running code is part of, or #f: a parameter.",
       "is_macro": false
     },
     "current-prefix": {
