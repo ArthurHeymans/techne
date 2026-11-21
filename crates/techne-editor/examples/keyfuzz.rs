@@ -75,33 +75,51 @@ const LARGE_INPUT: usize = 64 << 10;
 const LONG_REPEAT: usize = 64;
 
 /// Keys over the budget that are known, each with its plan (PLAN.md,
-/// Stage 1, slice 7): (corpus, `*` for any, command, why). Listed, not
-/// failed on.
-const KNOWN_SLOW: &[(&str, &str, &str)] = &[
-    // As on main: the minibuffer's input matched against a 1 MB line.
-    ("long-line", "search-all-buffers", "matching a line of a megabyte"),
-    // The same over this buffer's lines (some 39 M), met once LSP's keys
-    // changed which keys the traces press.
-    ("long-line", "search-lines", "matching a line of a megabyte"),
+/// Stage 1, slice 7): (text, `*` for any, command, ceiling, why), the
+/// text a corpus's `text` names, so that each profile, and the corpora
+/// opening the minibuffer over the same text, share what is known of it.
+/// Listed, not failed on, up to the ceiling, about half again the most
+/// each was seen to take: past it, a key is a regression of its own.
+const KNOWN_SLOW: &[(&str, &str, u64, &str)] = &[
+    // As on main: the minibuffer's input matched against a 1 MB line
+    // (72 M narrowing).
+    ("long-line", "search-all-buffers", 110_000_000, "matching a line of a megabyte"),
+    // The same over this buffer's lines (some 39 M, 42.6 M seen), met
+    // once LSP's keys changed which keys the traces press.
+    ("long-line", "search-lines", 65_000_000, "matching a line of a megabyte"),
     // In any corpus: completing at point in a Scheme buffer, some 28.5 M
-    // since commands became operations (#286, #289), 2% over.
-    ("*", "completion-at-point", "at the budget's edge"),
+    // since commands became operations (#286, #289), 2% over; 35.8 M seen
+    // in `buffers-modal`.
+    ("*", "completion-at-point", 55_000_000, "at the budget's edge"),
     // As on main: indenting after an open bracket scans the lines above
-    // (the `keys` workload indent-after-long-line).
-    ("lines", "indent-for-tab-command", "indenting scans back over the text"),
+    // (the `keys` workload indent-after-long-line), whichever key indents:
+    // 56 M for `search`'s `[ C-g <left> C-M-f M-> é C-n 0 C-M-\` (nightly
+    // of 2026-11-18) and for `lines`'s `[ C-<end> RET`, 57.5 M at most.
+    ("lines", "indent-for-tab-command", 85_000_000, "indenting scans back over the text"),
+    ("lines", "indent-region", 85_000_000, "indenting scans back over the text"),
+    ("lines", "newline-and-indent", 85_000_000, "indenting scans back over the text"),
+    // TAB completing the input to a whole line of words common to most
+    // lines, at once, as the `keys` workload search-yank-line yanks one:
+    // each word is searched over every line (29.3 M for `lines`'s `C-c s
+    // B TAB`, two passes over the text and a search from nearly every
+    // line in each; 41 M before, nightly of 2026-11-15). Other
+    // completions in these corpora are far below the budget; the ceiling
+    // is near this one's cost.
+    ("lines", "minibuffer-complete", 40_000_000, "a line of common words matched at once"),
     // In any corpus: help listing every name, more of them with each
     // feature (some 39 M on CI's runner); for symbols too (28.0 M in
     // `buffers`, nightly of 2026-11-03).
-    ("*", "describe-function", "listing every name"),
-    ("*", "describe-symbol", "listing every name"),
+    ("*", "describe-function", 60_000_000, "listing every name"),
+    ("*", "describe-symbol", 60_000_000, "listing every name"),
     // In any corpus (`*`): the first definition motion of a session
-    // compiles its language's definitions query (some 23 M), kept after.
-    ("*", "beginning-of-defun", "the definitions query compiled on first use"),
-    ("*", "end-of-defun", "the definitions query compiled on first use"),
-    ("*", "mark-defun", "the definitions query compiled on first use"),
-    // As on main (50 M for `scheme-modal o ( C-M-q`): a list left open
-    // is indented to the end of the buffer.
-    ("*", "indent-sexp", "an unclosed list reindents to the end"),
+    // compiles its language's definitions query (some 23 M), kept after;
+    // in `unicode`, up to 177 M (nightly of 2026-11-20).
+    ("*", "beginning-of-defun", 260_000_000, "the definitions query compiled on first use"),
+    ("*", "end-of-defun", 260_000_000, "the definitions query compiled on first use"),
+    ("*", "mark-defun", 260_000_000, "the definitions query compiled on first use"),
+    // As on main (50 M for `scheme-modal o ( C-M-q`, 53 M seen): a list
+    // left open is indented to the end of the buffer.
+    ("*", "indent-sexp", 80_000_000, "an unclosed list reindents to the end"),
 ];
 
 /// Probes a shrink may make, at most.
@@ -111,7 +129,8 @@ const PROBES_COUNTED: usize = 30;
 struct Corpus {
     name: &'static str,
     profile: &'static str,
-    text: fn() -> String,
+    /// The text's name, as `KNOWN_SLOW` has it, and the text.
+    text: (&'static str, fn() -> String),
     /// Lisp evaluated before the keys, with `(current-session)` the session.
     setup_lisp: &'static str,
     /// Keys pressed before the random ones.
@@ -122,22 +141,27 @@ const MANY_BUFFERS: &str = "(do ((i 0 (+ i 1))) ((= i 40))
   (make-generated-buffer! (string-append \"b\" (number->string i)) (make-document (make-string (* i 50) #\\x)) 'scheme-mode))";
 
 const CORPUS: &[Corpus] = &[
-    Corpus { name: "lines", profile: "emacs", text: lines, setup_lisp: "", setup_keys: "" },
-    Corpus { name: "lines-modal", profile: "modal", text: lines, setup_lisp: "", setup_keys: "" },
-    Corpus { name: "long-line", profile: "emacs", text: long_line, setup_lisp: "", setup_keys: "C-n" },
-    Corpus { name: "long-line-modal", profile: "modal", text: long_line, setup_lisp: "", setup_keys: "j" },
-    Corpus { name: "unicode", profile: "emacs", text: unicode, setup_lisp: "", setup_keys: "" },
-    Corpus { name: "unicode-modal", profile: "modal", text: unicode, setup_lisp: "", setup_keys: "" },
-    Corpus { name: "scheme", profile: "emacs", text: scheme, setup_lisp: "", setup_keys: "" },
-    Corpus { name: "scheme-modal", profile: "modal", text: scheme, setup_lisp: "", setup_keys: "" },
-    Corpus { name: "buffers", profile: "emacs", text: scheme, setup_lisp: MANY_BUFFERS, setup_keys: "" },
-    Corpus { name: "buffers-modal", profile: "modal", text: scheme, setup_lisp: MANY_BUFFERS, setup_keys: "" },
-    Corpus { name: "minibuffer", profile: "emacs", text: lines, setup_lisp: "", setup_keys: "M-x" },
-    Corpus { name: "minibuffer-modal", profile: "modal", text: lines, setup_lisp: "", setup_keys: "SPC :" },
-    Corpus { name: "search", profile: "emacs", text: lines, setup_lisp: "", setup_keys: "C-c s s a" },
-    Corpus { name: "search-modal", profile: "modal", text: lines, setup_lisp: "", setup_keys: "SPC s s a" },
-    Corpus { name: "search-line-modal", profile: "modal", text: lines, setup_lisp: "", setup_keys: "/ a" },
+    Corpus { name: "lines", profile: "emacs", text: LINES, setup_lisp: "", setup_keys: "" },
+    Corpus { name: "lines-modal", profile: "modal", text: LINES, setup_lisp: "", setup_keys: "" },
+    Corpus { name: "long-line", profile: "emacs", text: LONG_LINE, setup_lisp: "", setup_keys: "C-n" },
+    Corpus { name: "long-line-modal", profile: "modal", text: LONG_LINE, setup_lisp: "", setup_keys: "j" },
+    Corpus { name: "unicode", profile: "emacs", text: UNICODE, setup_lisp: "", setup_keys: "" },
+    Corpus { name: "unicode-modal", profile: "modal", text: UNICODE, setup_lisp: "", setup_keys: "" },
+    Corpus { name: "scheme", profile: "emacs", text: SCHEME, setup_lisp: "", setup_keys: "" },
+    Corpus { name: "scheme-modal", profile: "modal", text: SCHEME, setup_lisp: "", setup_keys: "" },
+    Corpus { name: "buffers", profile: "emacs", text: SCHEME, setup_lisp: MANY_BUFFERS, setup_keys: "" },
+    Corpus { name: "buffers-modal", profile: "modal", text: SCHEME, setup_lisp: MANY_BUFFERS, setup_keys: "" },
+    Corpus { name: "minibuffer", profile: "emacs", text: LINES, setup_lisp: "", setup_keys: "M-x" },
+    Corpus { name: "minibuffer-modal", profile: "modal", text: LINES, setup_lisp: "", setup_keys: "SPC :" },
+    Corpus { name: "search", profile: "emacs", text: LINES, setup_lisp: "", setup_keys: "C-c s s a" },
+    Corpus { name: "search-modal", profile: "modal", text: LINES, setup_lisp: "", setup_keys: "SPC s s a" },
+    Corpus { name: "search-line-modal", profile: "modal", text: LINES, setup_lisp: "", setup_keys: "/ a" },
 ];
+
+const LINES: (&str, fn() -> String) = ("lines", lines);
+const LONG_LINE: (&str, fn() -> String) = ("long-line", long_line);
+const UNICODE: (&str, fn() -> String) = ("unicode", unicode);
+const SCHEME: (&str, fn() -> String) = ("scheme", scheme);
 
 /// 100,000 lines of words, as `keys` makes them.
 fn lines() -> String {
@@ -230,7 +254,7 @@ fn start(c: &Corpus) -> Runtime {
     ]
     .into_iter()
     .fold(Grants::ALL, Grants::without);
-    let mut rt = Runtime::with_document_granted(Document::new(&(c.text)()), c.profile, grants).expect("the editor starts");
+    let mut rt = Runtime::with_document_granted(Document::new(&(c.text.1)()), c.profile, grants).expect("the editor starts");
     // No deadline: under callgrind parts run far slower, and a part past it
     // is not called again, so that runs would differ. A hang is the
     // trace's timeout's.
@@ -666,9 +690,11 @@ fn count(o: &Options) -> bool {
                 let input = trace.inputs[i].max(if i > 0 { trace.inputs[i - 1] } else { 0 });
                 let large = input > LARGE_INPUT;
                 let repeat = trace.repeats[i];
-                let known = large
-                    || repeat >= LONG_REPEAT
-                    || KNOWN_SLOW.iter().any(|&(corpus, command, _)| (corpus == "*" || corpus == c.name) && command == trace.commands[i]);
+                let listed = KNOWN_SLOW
+                    .iter()
+                    .find(|&&(text, command, _, _)| (text == "*" || text == c.text.0) && command == trace.commands[i])
+                    .map(|&(_, _, ceiling, _)| ceiling);
+                let known = large || repeat >= LONG_REPEAT || listed.is_some_and(|ceiling| n <= ceiling);
                 println!(
                     "  key {} ({}, {}): {n} instructions{}",
                     i + 1,
@@ -680,6 +706,8 @@ fn count(o: &Options) -> bool {
                         format!(" (known: {repeat} keys typed again)")
                     } else if known {
                         " (known)".to_string()
+                    } else if let Some(ceiling) = listed {
+                        format!(" (known up to {ceiling}: past it)")
                     } else {
                         String::new()
                     }

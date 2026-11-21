@@ -653,7 +653,7 @@
       "is_macro": false
     },
     "indent-lines!": {
-      "description": "(indent-lines! s starts group)  procedure, @lisp@/editor/indent.scm:37\n\nIndent the lines of S's document at STARTS as its buffer's mode does.\nSTARTS are sorted, or a procedure of no arguments giving them, called\nonly if the mode indents; the edits are one change, GROUP as `edit!`\ntakes it. Return #f if the mode does not indent.",
+      "description": "(indent-lines! s starts group)  procedure, @lisp@/editor/indent.scm:45\n\nIndent the lines of S's document at STARTS as its buffer's mode does.\nSTARTS are sorted, or a procedure of no arguments giving them, called\nonly if the mode indents; the edits are one change, GROUP as `edit!`\ntakes it. Return the edits made, each (from to text) in the text before\nthem, or #f if the mode does not indent.",
       "is_macro": false
     },
     "indent-spec-set!": {
@@ -661,7 +661,7 @@
       "is_macro": false
     },
     "indentation": {
-      "description": "(indentation d p)  procedure, @lisp@/editor/indent.scm:19\n\nReturn the position of the first character not a blank on P's line.\nP is a position of document D; the line's end if it is all blanks.",
+      "description": "(indentation d p)  procedure, @lisp@/editor/indent.scm:31\n\nReturn the position of the first character not a blank on P's line.\nP is a position of document D; the line's end if it is all blanks.",
       "is_macro": false
     },
     "insert-text!": {
@@ -733,7 +733,7 @@
       "is_macro": false
     },
     "line-starts": {
-      "description": "(line-starts d from to)  procedure, @lisp@/editor/indent.scm:28\n\nReturn the starts of the lines of document D from FROM to TO, in order.\nThey are FROM's line and those starting before TO.",
+      "description": "(line-starts d from to)  procedure, @lisp@/editor/indent.scm:36\n\nReturn the starts of the lines of document D from FROM to TO, in order.\nThey are FROM's line and those starting before TO.",
       "is_macro": false
     },
     "lines-containing": {
@@ -749,7 +749,7 @@
       "is_macro": false
     },
     "lisp-indent": {
-      "description": "(lisp-indent d starts)  procedure, @lisp@/editor/indent.scm:118\n\nReturn the edits (from to text) indenting the lines at STARTS as Lisp.\nSTARTS are sorted line starts of document D.",
+      "description": "(lisp-indent d starts)  procedure, @lisp@/editor/indent.scm:148\n\nReturn the edits (from to text) indenting the lines at STARTS as Lisp.\nSTARTS are sorted line starts of document D.",
       "is_macro": false
     },
     "lisp-indent-edits": {
@@ -1841,7 +1841,7 @@
       "is_macro": false
     },
     "set-indent!": {
-      "description": "(set-indent! name n)  procedure, @lisp@/editor/indent.scm:112\n\nMake the form NAME indent its first N arguments by 4, its body by 2.\nNAME is a symbol, as Emacs's `scheme-indent-function` property is put;\nwith N #f it indents as a call. Names starting with \"def\" have a body.",
+      "description": "(set-indent! name n)  procedure, @lisp@/editor/indent.scm:142\n\nMake the form NAME indent its first N arguments by 4, its body by 2.\nNAME is a symbol, as Emacs's `scheme-indent-function` property is put;\nwith N #f it indents as a call. Names starting with \"def\" have a body.",
       "is_macro": false
     },
     "set-option!": {

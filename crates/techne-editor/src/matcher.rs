@@ -56,9 +56,10 @@ struct Entries {
     /// The entries' texts, at `spans` of `text`.
     text: String,
     spans: Vec<(u32, u32)>,
-    /// The same, folded to lower case, once a pattern needs it: at the
-    /// same spans when the text is ASCII (folding keeps its length), else
-    /// each entry folded on its own, as Lisp's `string-downcase` folds it.
+    /// The same, folded to lower case: at the same spans when the text is
+    /// ASCII (folding keeps its length), else each entry beyond ASCII
+    /// folded on its own, as Lisp's `string-downcase` folds it, after the
+    /// others.
     folded: OnceCell<Folded>,
     /// For documents' lines: each entry's start and line number in its
     /// document, and which document it is.
@@ -124,13 +125,11 @@ impl Matcher {
     }
 
     fn of(entries: Entries) -> Matcher {
-        // ASCII text is folded now, with the entries, at once, rather than
-        // on the first key filtering, which has the keystroke budget to
-        // itself. Other text is folded entry by entry, several times
-        // slower, and not searched as a whole: when a key needs it.
-        if entries.text.is_ascii() {
-            let _ = entries.folded.set((entries.text.to_ascii_lowercase(), None));
-        }
+        // The text is folded now, with the entries, rather than on the
+        // first key filtering, which has the keystroke budget to itself:
+        // 5.6 M of the 41 M that completing the input took over the lines
+        // of a 100k-line file with one character beyond ASCII.
+        let _ = entries.folded();
         Matcher::sharing(Rc::new(entries))
     }
 
@@ -204,22 +203,20 @@ impl Matcher {
                 }
                 let entries = found.as_deref().unwrap_or(within);
                 let f = &Needle::new(part.as_bytes());
-                let in_place = if *fold { e.folded_in_place() } else { Some((e.text.as_str(), e.spans.as_slice())) };
-                found = match in_place {
-                    Some((text, spans)) if entries.len() * 16 >= spans.len() => Some(entries_with(text, spans, f, entries)),
-                    _ => {
-                        let (text, spans) = if *fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
-                        Some(
-                            entries
-                                .iter()
-                                .copied()
-                                .filter(|&i| {
-                                    let (from, to) = spans[i as usize];
-                                    f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
-                                })
-                                .collect(),
-                        )
-                    }
+                let (text, spans) = if *fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
+                found = match entries.len() * 16 >= spans.len() {
+                    // Entries folding lengthened are after the text.
+                    true => Some(entries_with(text, spans, f, entries, e.text.len())),
+                    false => Some(
+                        entries
+                            .iter()
+                            .copied()
+                            .filter(|&i| {
+                                let (from, to) = spans[i as usize];
+                                f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
+                            })
+                            .collect(),
+                    ),
                 };
             }
             let found = found.unwrap_or_else(|| within.clone());
@@ -234,15 +231,50 @@ impl Matcher {
     }
 }
 
-/// Those of `entries`, in order, at `spans` of `text` in order, that
-/// `finder`'s needle occurs in. The text is searched from an entry only
-/// when the occurrence found last is before it: no byte is searched twice.
-fn entries_with(text: &str, spans: &[(u32, u32)], finder: &Needle, entries: &[u32]) -> Vec<u32> {
+/// Those of `entries`, in order, at `spans` of `text`, that `finder`'s
+/// needle occurs in. The spans before `split` are in order, and so are
+/// those after it (a folded text's entries that folding lengthened). In
+/// each part the text is searched, up to the part's end, from an entry
+/// only when the occurrence found last is before it: no byte is searched
+/// twice, and none once no part has an occurrence left.
+fn entries_with(text: &str, spans: &[(u32, u32)], finder: &Needle, entries: &[u32], split: usize) -> Vec<u32> {
+    if split >= text.len() {
+        return entries_in_place(text.as_bytes(), spans, finder, entries);
+    }
+    const NONE: usize = usize::MAX;
     let (text, n) = (text.as_bytes(), finder.needle().len());
-    let mut next: Option<usize> = None;
+    let ends = [split.min(text.len()), text.len()];
+    // In each part, the first occurrence at or after the entry searched
+    // from last, NONE for none.
+    let mut next: [Option<usize>; 2] = [None, if split < text.len() { None } else { Some(NONE) }];
     // Taken when many entries are left, and most usually match: growing
     // by doubling would copy the list over and over (an allocator cannot
     // always grow it in place). The excess goes once the count is known.
+    let mut found = Vec::with_capacity(entries.len());
+    for &entry in entries {
+        let (from, to) = (spans[entry as usize].0 as usize, spans[entry as usize].1 as usize);
+        let part = usize::from(from >= split);
+        // The first occurrence at or after `from`.
+        if next[part].is_none_or(|i| i < from) {
+            next[part] = Some(finder.find(&text[from..ends[part]]).map_or(NONE, |i| from + i));
+        }
+        match next[part] {
+            Some(i) if i != NONE && i + n <= to => found.push(entry),
+            _ if next == [Some(NONE); 2] => break,
+            _ => {}
+        }
+    }
+    found.shrink_to_fit();
+    found
+}
+
+/// `entries_with` where every span is in order, as in a text folded in
+/// place: one cursor, the loop run for each of 100k lines with a few
+/// instructions to spare (the two parts' bookkeeping took 20 more an
+/// entry, 4 M of the keys workload search-yank-line).
+fn entries_in_place(text: &[u8], spans: &[(u32, u32)], finder: &Needle, entries: &[u32]) -> Vec<u32> {
+    let n = finder.needle().len();
+    let mut next: Option<usize> = None;
     let mut found = Vec::with_capacity(entries.len());
     for &entry in entries {
         let (from, to) = (spans[entry as usize].0 as usize, spans[entry as usize].1 as usize);
@@ -268,32 +300,37 @@ impl Entries {
             }
             // Most entries are ASCII even where one is not: they keep their
             // spans in the text folded as ASCII, and the others, which
-            // folding may lengthen, are folded after it.
+            // folding may lengthen, are folded after it, in order. They are
+            // found from the bytes beyond ASCII, skipped a block at a time,
+            // not by asking each entry: some 75 instructions an entry, 7.5 M
+            // for a 100k-line file with one character beyond ASCII.
             let mut folded = self.text.to_ascii_lowercase();
-            let spans = self
-                .spans
-                .iter()
-                .map(|&(from, to)| {
-                    let entry = &self.text[from as usize..to as usize];
-                    if entry.is_ascii() {
-                        return (from, to);
-                    }
-                    let at = folded.len();
-                    folded.push_str(&techne_text::motion::lowered(entry).0);
-                    (at as u32, folded.len() as u32)
-                })
-                .collect();
+            let mut spans = self.spans.clone();
+            let bytes = self.text.as_bytes();
+            let mut at = 0;
+            while let Some(p) = beyond_ascii(bytes, at) {
+                // The entry holding it, if a line break is not where it is.
+                let k = self.spans.partition_point(|&(_, to)| to as usize <= p);
+                let Some(&(from, to)) = self.spans.get(k).filter(|&&(from, _)| from as usize <= p) else {
+                    at = p + 1;
+                    continue;
+                };
+                let start = folded.len();
+                folded.push_str(&techne_text::motion::lowered(&self.text[from as usize..to as usize]).0);
+                spans[k] = (start as u32, folded.len() as u32);
+                at = to as usize;
+            }
             (folded, Some(spans))
         });
         (folded, spans.as_deref().unwrap_or(&self.spans))
     }
+}
 
-    /// The text folded, if its entries are where they are in the text, in
-    /// order: when it is ASCII.
-    fn folded_in_place(&self) -> Option<(&str, &[(u32, u32)])> {
-        let folded = self.folded();
-        matches!(self.folded.get(), Some((_, None))).then_some(folded)
-    }
+/// The first byte of `bytes` from `at` that is not ASCII.
+fn beyond_ascii(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = bytes.get(at..)?;
+    let skipped = rest.chunks(64).take_while(|c| c.is_ascii()).count() * 64;
+    rest[skipped.min(rest.len())..].iter().position(|b| !b.is_ascii()).map(|i| at + skipped + i)
 }
 
 #[cfg(test)]
@@ -320,6 +357,25 @@ mod tests {
         assert_eq!((matching(&mut copy, "gamma"), m.matches()), (vec![1], &[0, 1, 2][..]));
     }
 
+    /// Folding that changes an entry's length, empty entries at the end,
+    /// and a needle across two entries, which matches neither.
+    #[test]
+    fn entries_fold_apart_and_end_empty() {
+        let texts = ["ab", "İx", "cd", "x", "İX", "", ""].map(String::from).to_vec();
+        let m = Matcher::new(texts.clone());
+        assert_eq!(matching(&mut m.copy(), "bc"), Vec::<u32>::new(), "across entries");
+        assert_eq!(matching(&mut m.copy(), "dx"), Vec::<u32>::new(), "across entries, one folded");
+        assert_eq!(matching(&mut m.copy(), "x"), [1, 3, 4]);
+        assert_eq!(matching(&mut m.copy(), "i\u{307}x"), [1, 4], "İ folds to two characters");
+        assert_eq!(matching(&mut m.copy(), "X"), [4]);
+        // Many entries, so that the text is searched at once, the folded
+        // ones among them, ending empty.
+        let many: Vec<String> = (0..64).flat_map(|_| texts.iter().cloned()).collect();
+        let x: Vec<u32> = (0..many.len() as u32).filter(|&i| many[i as usize].to_lowercase().contains('x')).collect();
+        assert_eq!(matching(&mut Matcher::new(many.clone()), "x"), x);
+        assert_eq!(matching(&mut Matcher::new(many), "zz"), Vec::<u32>::new());
+    }
+
     #[test]
     fn lines_skip_empty_ones() {
         let mut m = Matcher::of_lines(&techne_text::ropey::Rope::from_str("one\n\ntwo\r\nthree"));
@@ -341,7 +397,8 @@ mod tests {
     /// Typed a key at a time, patterns of common words, repeated and in
     /// either case, match as each entry searched on its own would: through
     /// the text at once among many entries, each among few, and each where
-    /// a non-ASCII entry folds out of place.
+    /// non-ASCII entries fold out of place, among the others, and whole
+    /// patterns at once (as completing the input gives them).
     #[test]
     fn several_common_parts_match_as_each_entry_would() {
         let words = ["alpha", "Beta", "gamma", "let", "fn", "mut", "é"];
@@ -355,21 +412,29 @@ mod tests {
         let patterns = ["gamma let alpha gamma", "beta Beta mut fn", "let fn mut alpha beta gamma", "Beta é"];
         for ascii in [true, false] {
             if !ascii {
-                entries[1000].push_str(" é");
+                for i in (3..entries.len()).step_by(97) {
+                    entries[i].push_str(if i % 2 == 0 { " é" } else { " Gamma É" });
+                }
             }
+            let expected = |typed: &str| -> Vec<u32> {
+                (0..entries.len() as u32)
+                    .filter(|&i| {
+                        typed.split(' ').filter(|p| !p.is_empty()).all(|p| match p.chars().any(char::is_uppercase) {
+                            true => entries[i as usize].contains(p),
+                            false => entries[i as usize].to_lowercase().contains(p),
+                        })
+                    })
+                    .collect()
+            };
             let mut m = Matcher::new(entries.clone());
             for pattern in patterns {
                 for typed in pattern.char_indices().map(|(i, c)| &pattern[..i + c.len_utf8()]) {
-                    let expected: Vec<u32> = (0..entries.len() as u32)
-                        .filter(|&i| {
-                            typed.split(' ').filter(|p| !p.is_empty()).all(|p| match p.chars().any(char::is_uppercase) {
-                                true => entries[i as usize].contains(p),
-                                false => entries[i as usize].to_lowercase().contains(p),
-                            })
-                        })
-                        .collect();
-                    assert_eq!(matching(&mut m, typed), expected, "{typed:?}");
+                    assert_eq!(matching(&mut m, typed), expected(typed), "{typed:?}");
                 }
+                assert_eq!(matching(&mut m.copy(), pattern), expected(pattern), "{pattern:?} at once");
+            }
+            for pattern in ["gamma é", "é", "gamma", "é gamma alpha"] {
+                assert_eq!(matching(&mut Matcher::new(entries.clone()), pattern), expected(pattern), "{pattern:?} first");
             }
         }
     }
