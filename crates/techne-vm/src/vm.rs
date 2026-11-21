@@ -2480,6 +2480,14 @@ impl Vm {
         }
     }
 
+    /// Whether `forms` are those of a module that is the world's, loading
+    /// while this execution stages a package: a file or library from
+    /// outside its directory, or one a package provides. What it starts
+    /// and registers as it loads is the world's with it (`%load-forms`).
+    pub(crate) fn forms_of_world(&self, forms: &Forms) -> bool {
+        self.staging_here().is_some() && self.modules[forms.module as usize].generation == 0
+    }
+
     /// Whether a module of the file at `path` is the staged package's own:
     /// from its directory, but for the libraries a package provides to the
     /// world (`provide_libraries`), which every importer shares and no
