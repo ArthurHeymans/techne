@@ -694,7 +694,9 @@ fully hygienic.
   loaded as a generation into fresh modules and a scope of its own. A file
   or library from elsewhere (the library path, Techne's own Lisp) is the
   world's, not the package's that loads it first: it loads once, and stays
-  when that package is reloaded or unloaded. So do the libraries a package
+  when that package is reloaded or unloaded, with the tasks it started
+  and what it registered as it loaded, which the root scope owns. So do
+  the libraries a package
   provides under `lib/` in its directory, which its manifest's name owns
   (`(techne package)`, doc/packages.md): `(mail imap)` is found there and
   nowhere else, by the package itself, by those depending on it and by a
