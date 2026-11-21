@@ -140,7 +140,10 @@ is an error if the manifest is missing or is not one."
     ;; used leaves no part of itself behind. With WITHIN, a directory, none
     ;; of them may be outside it.
     (define (unused-closure root within)
-      (let ((found '()))
+      (let ((found '())
+            ;; The packages known already whose dependencies were looked
+            ;; at: once each, however many depend on them.
+            (walked (make-hash-table equal?)))
         (define (check-within! root)
           (unless (or (not within) (equal? root within) (string-prefix? (string-append within "/") root))
             (error "A package depends on one outside its repository" root within)))
@@ -172,11 +175,12 @@ is an error if the manifest is missing or is not one."
           ;; One known already was not held to WITHIN when it was made
           ;; known: what it depends on is looked at now.
           (let ((known (hash-table-ref/default used root #f)))
-            (when (and known within)
+            (when (and known within (not (hash-table-ref/default walked root #f)))
               (for-each (lambda (dependency)
                           (let ((dir (%loadable-path (cdr dependency))))
                             (when dir (visit dir (cons (cons root (manifest-name known)) above)))))
-                        (manifest-dependencies known))))
+                        (manifest-dependencies known))
+              (hash-table-set! walked root #t)))
           (or (manifest-at root)
               (let ((m (read-package-manifest root)))
                 (check-name! m above)

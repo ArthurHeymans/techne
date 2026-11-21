@@ -80,13 +80,16 @@ pub fn package_root(path: &Path) -> Option<PathBuf> {
 /// depends on, as `(techne package)` reads its manifest: the file then
 /// imports their libraries. A file in no package changes nothing, and
 /// loads no code.
+///
+/// `(techne package)` is loaded from Techne's own Lisp
+/// (`library::lisp_dir`), by its file: an import of it from here, which
+/// is no file, would look in the working directory first, and run what a
+/// `techne/package.sld` there says before the program asked for anything.
 pub fn use_package_of(vm: &mut Vm, path: &Path) -> Result<(), crate::vm::Error> {
-    match package_root(path) {
-        Some(root) => vm
-            .eval_source(&format!("((eval 'use-package-directory! (environment '(techne package))) {:?})", root.display().to_string()))
-            .map(|_| ()),
-        None => Ok(()),
-    }
+    let Some(root) = package_root(path) else { return Ok(()) };
+    vm.find_module(&crate::library::lisp_dir().join("techne/package.sld").to_string_lossy())?;
+    vm.eval_source(&format!("((eval 'use-package-directory! (environment '(techne package))) {:?})", root.display().to_string()))
+        .map(|_| ())
 }
 
 /// Watch the signals that ask this to stop, for the VM HANDLE interrupts.

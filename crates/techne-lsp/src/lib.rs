@@ -21,22 +21,27 @@ use analysis::{Analysis, Def, DefKind, Span, analyze, checkdoc, head, ident, lib
 use techne_vm::reader::Syntax;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result, lsp_types::*};
 
-/// A library a file in `dir` imports as its package's: under `lib`
-/// beside the nearest manifest above, `techne-package.scm`, if its name
-/// begins with the package's; or under that of a package the manifest
-/// depends on by the name the library's begins with, `(depends (NAME
-/// (path "directory")) ...)`: as the runtime finds them once the package
-/// is used (`(techne package)`). The manifest is read as data. A file of
-/// another name under a `lib` is no library of that package's, and the
-/// packages a dependency depends on are not a file's to import.
-fn package_library(parts: &[String], dir: &Path) -> Option<PathBuf> {
+/// Where a file in `dir` finds library `parts` if a package provides it,
+/// as the runtime does once the file's package is used (`(techne
+/// package)`): the package the file is in, by the nearest manifest above,
+/// `techne-package.scm`, for the libraries of its own name, under its
+/// `lib`; or a package that manifest depends on, `(depends (NAME (path
+/// "directory")) ...)`, for those of that name, under its `lib`. Some:
+/// the library is such a package's, found there or, None inside, missing:
+/// it is looked for nowhere else, whatever the library path holds. None:
+/// no package the file may import from provides it. The manifest is read
+/// as data; a file of another name under a `lib` is no library of that
+/// package's, and the packages a dependency depends on are not a file's
+/// to import.
+fn package_library(parts: &[String], dir: &Path) -> Option<Option<PathBuf>> {
     let root = dir.ancestors().find(|d| d.join("techne-package.scm").is_file())?;
     let text = std::fs::read_to_string(root.join("techne-package.scm")).ok()?;
     let forms = techne_vm::reader::read_syntax(&text).ok()?;
     let manifest = list(forms.first()?)?;
     let (first, file) = (parts.first()?, format!("{}.sld", parts.join("/")));
+    let under = |package: PathBuf| Some(package.join("lib").join(&file)).filter(|p| p.is_file());
     if ident(manifest.get(1)?)?.0 == *first {
-        return Some(root.join("lib").join(&file)).filter(|p| p.is_file());
+        return Some(under(root.to_path_buf()));
     }
     let depends = manifest.iter().filter_map(list).filter(|clause| head(clause).as_deref() == Some("depends"));
     depends
@@ -47,8 +52,8 @@ fn package_library(parts: &[String], dir: &Path) -> Option<PathBuf> {
             let named = ident(dependency.first()?)?.0 == *first && head(place).as_deref() == Some("path");
             named.then(|| string_lit(place.get(1)?)).flatten()
         })
-        .map(|directory| root.join(directory).join("lib").join(&file))
-        .find(|p| p.is_file())
+        .next()
+        .map(|directory| under(root.join(directory)))
 }
 
 /// Byte offset to an LSP position (UTF-16 columns).
@@ -216,8 +221,10 @@ impl Backend {
                         .collect();
                     return Ok(exported(exports, defs));
                 }
-                let file = techne_vm::library::library_file(&parts, base)
-                    .or_else(|| package_library(&parts, base))
+                // A package's, where the package has it and nowhere else;
+                // any other where the library path finds it.
+                let file = package_library(&parts, base)
+                    .unwrap_or_else(|| techne_vm::library::library_file(&parts, base))
                     .ok_or_else(|| format!("cannot find library {written}"))?;
                 let text = std::fs::read_to_string(&file).map_err(|_| format!("cannot read library {written}"))?;
                 let uri = Url::from_file_path(file.canonicalize().unwrap_or(file)).map_err(|_| written.clone())?;

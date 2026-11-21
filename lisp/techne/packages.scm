@@ -91,9 +91,11 @@
 (define (all-installations dir) (append-map installations (installed-paths dir)))
 ;; Where the package wanted is in the checkout TREE, relative: TREE itself
 ;; if it is a package, else the directory under it of the package WANTED,
-;; or of the only one. A manifest that does not read is no candidate.
+;; or of the only one. A manifest that does not read is no candidate, nor
+;; a directory a pin would not hold (`pin`): a name with a space, say.
 (define (package-subdirectory tree wanted)
-  (let ((found (package-directories tree)))
+  (let ((found (filter (lambda (dir) (or (string=? dir "") (every component? (string-split dir "/"))))
+                       (package-directories tree))))
     (cond ((null? found) (error "Repository holds no package: no techne-package.scm"))
           ((equal? found '("")) "")
           (else
@@ -178,13 +180,16 @@
                (check-disjoint! (cons d (map stored-manifest (all-installations dir))))
                (write-pin! dest (append p (list sub)))
                #t))))))
-;; Take the installation of SUB added to DEST back: it could not be made
-;; known here. The others installed from the checkout stay.
+;; Take the installation of SUB put in DEST back: it could not be made
+;; known here. The others installed from the checkout stay, another editor's
+;; added meanwhile too; the checkout goes with the last.
 (define (remove-installation! dir dest sub)
   (publishing dir
     (lambda ()
-      (let ((p (pin dest)))
-        (write-pin! dest (append (list 'pin (cadr p) (caddr p)) (delete sub (cdddr p))))))))
+      (let* ((p (pin dest)) (others (delete sub (pin-directories p))))
+        (if (null? others)
+            (delete-path dest #t)
+            (write-pin! dest (append (list 'pin (cadr p) (caddr p)) others)))))))
 
 (define (installed-paths dir)
   (map (lambda (key) (path-join dir key))
@@ -241,8 +246,7 @@ packages beside them that they depend on."
         ;; What was just put in the store and cannot be made known here
         ;; after all is taken back: left there, it would fail every later
         ;; install and restore.
-        (guard (e (published (delete-path dest #t) (raise e))
-                  (added (remove-installation! dir dest sub) (raise e)))
+        (guard (e ((or published added) (remove-installation! dir dest sub) (raise e)))
           (announce! (cons dest sub) wanted))))))
 (define (package-restore! #:directory [directory (store)])
   "Advertise all packages installed in DIRECTORY without fetching or loading."
