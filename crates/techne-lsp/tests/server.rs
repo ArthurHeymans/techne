@@ -82,8 +82,14 @@ fn libraries_includes_and_runtime_procedures() {
 #[test]
 fn a_file_in_a_package_finds_the_packages_libraries() {
     let packages = std::env::temp_dir().join(format!("techne-lsp-packages-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&packages);
     let dir = packages.join("pkg");
     std::fs::create_dir_all(dir.join("lib/pkg")).unwrap();
+    // A library of the package's name beside the importing file, where a
+    // file in no package would find it: not the package's, which is in lib/.
+    std::fs::create_dir_all(dir.join("tests/pkg")).unwrap();
+    std::fs::write(dir.join("tests/pkg/tools.sld"), "(define-library (pkg tools) (export) (import (scheme base)) (begin))").unwrap();
+    std::fs::write(dir.join("tests/pkg/absent.sld"), "(define-library (pkg absent) (export) (import (scheme base)) (begin))").unwrap();
     std::fs::create_dir_all(dir.join("tests")).unwrap();
     // The package depends on one beside it, not on the other there.
     std::fs::write(dir.join("techne-package.scm"), "(package pkg (depends (dep (path \"../dep\"))))").unwrap();
@@ -108,10 +114,15 @@ fn a_file_in_a_package_finds_the_packages_libraries() {
     .unwrap();
     let reply = diagnostics(
         &dir.join("tests/main.scm"),
-        "(import (scheme base) (pkg tools) (dep more) (undeclared more) (other tools))\n(twice (thrice-dep 2))",
+        "(import (scheme base) (pkg tools) (dep more) (undeclared more) (other tools) (pkg absent))\n(twice (thrice-dep 2))",
     );
     let messages: Vec<&str> = reply.split("\"message\":\"").skip(1).map(|m| m.split('"').next().unwrap()).collect();
-    assert_eq!(messages, ["cannot find library (undeclared more)", "cannot find library (other tools)"], "{reply}");
+    let _ = std::fs::remove_dir_all(&packages);
+    assert_eq!(
+        messages,
+        ["cannot find library (undeclared more)", "cannot find library (other tools)", "cannot find library (pkg absent)"],
+        "{reply}"
+    );
 }
 
 #[test]

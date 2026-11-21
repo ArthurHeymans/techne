@@ -159,6 +159,10 @@
                     (editor "entry.scm" (commands (multi-stray "Stray.")))))
     (write-file! multi "packages/multi-stray/entry.scm" '(import (techne editor)) '(define-command (multi-stray s n) "Stray." n))
     (write-file! tmp "multi-outside/techne-package.scm" '(package multi-outside))
+    ;; A package in a directory a pin would not name: no candidate.
+    (write-file! multi "packages/multi spaced/techne-package.scm"
+                 '(package multi-spaced (editor "entry.scm" (commands (multi-spaced "Spaced.")))))
+    (write-file! multi "packages/multi spaced/entry.scm" '(import (techne editor)) '(define-command (multi-spaced s n) "Spaced." n))
     (git multi "add" ".")
     (git multi "-c" "user.name=Test" "-c" "user.email=test@example.org" "-c" "commit.gpgSign=false" "commit" "-qm" "packages")
     (for-each (lambda (case)
@@ -169,6 +173,7 @@
                 (check "no checkout published" '() (directory-list dir)))
               `(("several packages" (local ,multi))
                 ("no package of this name" (local ,multi (package multi-none)))
+                ("no package of this name" (local ,multi (package multi-spaced)))
                 ("outside its repository" (local ,multi (package multi-stray)))))
     (check "nothing of them advertised" '(#f #f) (map command-doc '(multi-shout multi-stray)))
     (check "nor made known" #f (%library-provider "multi-outside"))
