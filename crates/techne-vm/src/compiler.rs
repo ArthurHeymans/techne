@@ -665,7 +665,7 @@ impl<'v> Compiler<'v> {
                 Ok(Expr::Void)
             }
             "import" => {
-                let dir = self.source_dir();
+                let dir = self.vm.import_dir(self.file);
                 self.vm.import(self.module, &items[1..], &dir)?;
                 Ok(Expr::Void)
             }

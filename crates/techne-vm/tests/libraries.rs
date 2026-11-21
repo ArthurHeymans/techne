@@ -138,6 +138,42 @@ fn bundled_libraries() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// A program in a package directory imports the package's libraries, the
+/// manifest above it read first (`cli::use_package_of`), by Techne's own
+/// `(techne package)`: not one in the working directory the program is
+/// started from, which would run before the program asked for anything.
+#[test]
+fn a_package_is_used_by_techne_s_own_library() {
+    let root = std::env::temp_dir().join(format!("techne-package-run-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    for d in ["pkg/lib/pkg", "elsewhere/techne"] {
+        fs::create_dir_all(root.join(d)).unwrap();
+    }
+    fs::write(root.join("pkg/techne-package.scm"), "(package pkg)").unwrap();
+    fs::write(
+        root.join("pkg/lib/pkg/say.sld"),
+        "(define-library (pkg say) (export said) (import (scheme base)) (begin (define said \"ran\")))",
+    )
+    .unwrap();
+    fs::write(root.join("pkg/main.scm"), "(import (scheme base) (scheme write) (pkg say)) (display said)").unwrap();
+    fs::write(
+        root.join("elsewhere/techne/package.sld"),
+        "(define-library (techne package) (export use-package-directory!) (import (scheme base) (scheme write))
+           (begin (display \"hijacked \") (define (use-package-directory! directory) #f)))",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
+        .arg(root.join("pkg/main.scm"))
+        .current_dir(root.join("elsewhere"))
+        .env_remove("TECHNE_LIBRARY_PATH")
+        .env_remove("TECHNE_LISP_DIR")
+        .output()
+        .unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "ran");
+}
+
 /// Techne's own Lisp is found where an installation puts it, beside the
 /// program, or where `TECHNE_LISP_DIR` says, before the source tree.
 #[test]

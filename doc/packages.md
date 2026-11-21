@@ -14,6 +14,17 @@ revision. The default is the repository's HEAD. To give a source a catalog
 name, `(register-package-recipe! '(recipe rust-mode (github "alice/techne-rust")))`
 then `(package-install! 'rust-mode)`. The name must match the manifest.
 
+A repository may hold several packages, each in a directory of its own (below).
+Of such a one, say which to install with `(package NAME)` after the place:
+`(github "alice/techne-tools" (tag "v0.3") (package rust-mode))`. A catalog
+name says so too, and a repository holding one package needs neither. The
+packages it depends on must be beside it in the same repository: they come
+with the checkout, at the commit pinned, and are made known with it, their
+commands not advertised. The packages installed from one source (the same
+place and revision) share one checkout, so two of them depending on a
+third find the same one. From two revisions of a repository they do not:
+a package is in one directory in an editor, and the second is refused.
+
 Installation fetches a private checkout and records the exact commit under
 `$XDG_DATA_HOME/techne/packages` (normally `~/.local/share/techne/packages`).
 The same declaration reuses its pin offline. In a fresh editor call
@@ -27,7 +38,8 @@ only after confirming that no install is in progress.
 The store is managed data, not a working tree to edit. There is no central
 catalog, dependency solver or automatic update of moving branches in this version.
 
-In the root of the repository put **one datum**, `techne-package.scm`:
+In the package's directory, the root of a repository holding one package,
+put **one datum**, `techne-package.scm`:
 
 ```scheme
 (package rust-mode
@@ -49,7 +61,8 @@ The form this was first written in, `(package rust-mode "rust.scm" (COMMAND
 
 A package is a directory with that manifest, for the editor or without it;
 `(techne package)` reads one and needs no editor (`lisp/techne/package.sld`).
-A repository can hold several, side by side, as `packages/` does here.
+A repository can hold several, side by side, as `packages/` does here; a
+package's directory holds no other package.
 
 ```
 mail/
@@ -67,9 +80,12 @@ mail/
   another directory already has.
 - **Dependencies.** `(depends (mail (path "../mail")))` names the packages
   whose libraries this one imports, each by its directory relative to this
-  one, which must hold a package of that name. There are no versions and
-  no fetching of dependencies in this version, and nothing checks yet that
-  a package imports only what it declares.
+  one, which must hold a package of that name. A package's files import
+  its own libraries and those of the packages it depends on itself: an
+  import of another package's, one a dependency depends on included, is
+  refused, saying what the manifest lacks. Libraries no package provides
+  (Techne's own) and files in no package are not concerned. There are no
+  versions and no fetching of dependencies in this version.
 - **Without the editor.** `techne run FILE` looks for the nearest manifest
   above FILE and uses that package and what it depends on first, so a
   package's programs and tests import its libraries and its dependencies'.
