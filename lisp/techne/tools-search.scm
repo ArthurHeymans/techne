@@ -1,10 +1,15 @@
 ;;; Context handles use the same immutable source as the matching line.
-(define (%search-context-handle p s starts line before after)
-  (let* ((first (max 1 (- line before)))
-         (last (min (vector-length starts) (+ line after))))
-    (%handle p s (vector-ref starts (- first 1))
-             (if (< last (vector-length starts)) (vector-ref starts last)
-                 (string-length (%source s))))))
+;;; SHOWN is the last line the previous hit's context in S showed, or 0:
+;;; a context starts after it, so that close hits do not repeat their
+;;; shared lines; one that would show only those is empty. Return the
+;;; handle and the last line it shows.
+(define (%search-context-handle p s starts line before after shown)
+  (let* ((n (vector-length starts)) (size (string-length (%source s)))
+         (first (max 1 (- line before) (+ shown 1)))
+         (last (max (- first 1) (min n (+ line after)))))
+    (list (%handle p s (if (<= first n) (vector-ref starts (- first 1)) size)
+                   (if (< last n) (vector-ref starts last) size))
+          (max shown last))))
 (define (%search-contexts p items chars)
   ;; Allocate a shared character budget in result order, not map's order.
   (let loop ((rest items) (out '()) (remaining chars) (used 0) (clipped #f))
@@ -17,7 +22,7 @@
                 (- remaining n) (+ used n)
                 (or clipped (not context) (tool-ref context 'truncated)))))))
 (define (%tool-search p query prefix limit offset before after chars group-by enclosing)
-  (%count limit 50 "tool-search") (%offset offset) (%count chars 16000 "tool-search")
+  (%count limit 50 "tool-search" "#:limit") (%offset offset) (%count chars 16000 "tool-search" "#:chars")
   (unless (and (integer? before) (exact? before) (<= 0 before 8)
                (integer? after) (exact? after) (<= 0 after 8))
     (error "tool-search: BEFORE and AFTER must be integers from 0 to 8"))
@@ -28,12 +33,14 @@
   (when (and group-by (or (> before 0) (> after 0) (eq? enclosing #t)))
     (error "tool-search: grouped counts do not take source context or enclosing definitions"))
   (when (string=? query "") (error "tool-search: query must not be empty"))
-  (let* ((listed (%files p)) (items '()) (selected '()) (selected-bytes 0) (page-full #f)
+  (let* ((listed (%prefix-files p prefix)) (items '()) (selected '()) (selected-bytes 0) (page-full #f)
          (context? (or (> before 0) (> after 0)))
+         ;; The snapshot and last line of the previous hit's context.
+         (context-shown (cons #f 0))
          (total 0) (matched-files 0) (scanned 0) (work 0) (binary 0)
          (skipped (tool-ref listed 'skipped)) (problems (tool-ref listed 'problems))
          (complete (tool-ref listed 'complete)))
-    (let files ((paths (filter (lambda (path) (string-prefix? prefix path)) (tool-ref listed 'items))))
+    (let files ((paths (tool-ref listed 'items)))
       (unless (null? paths)
         (let ((data (guard (e (#t (set! skipped (+ skipped 1))
                                 (when (< (length problems) 3) (set! problems (append problems (list (%clip (condition/report-string e) 240))))) #f))
@@ -67,7 +74,13 @@
                                            (handle ,(%handle p s at end)))))
                                     (when context?
                                       (unless starts (set! starts (%line-starts source)))
-                                      (set! item (append item `((context-handle ,(%search-context-handle p s starts line before after))))))
+                                      (let* ((shown (if (eq? (car context-shown) s) (cdr context-shown) 0))
+                                             (context (%search-context-handle p s starts line before after shown)))
+                                        (set! context-shown (cons s (cadr context)))
+                                        (set! item (append item `((context-handle ,(car context)))
+                                                           ;; Its context goes on from the previous one's.
+                                                           (if (and (> shown 0) (<= (- line before) (+ shown 1)))
+                                                               '((context-continues #t)) '())))))
                                     (set! items (cons item items)))))
                               (set! total (+ total 1)))
                             (lines (cdr rest) end (+ line 1)))))
@@ -88,7 +101,8 @@
                 (truncated ,(or (< next page-total) (not complete))) (next ,(and (< next page-total) next))
                 (scanned ,scanned) (binary ,binary) (skipped ,skipped) (problems ,problems)
                 (match-mode literal) (query ,(%clip query 240)) (query-truncated ,(> (string-length query) 240))
-                (prefix ,(%clip prefix 240)) (prefix-truncated ,(> (string-length prefix) 240)))
+                (prefix ,(%clip prefix 240)) (prefix-truncated ,(> (string-length prefix) 240))
+                (ignored ,(tool-ref listed 'ignored)))
               (if group-by `((group-by path) (unit matching-lines) (files ,matched-files)) '())
               (if contexts `((context-characters ,(cadr contexts)) (context-truncated ,(caddr contexts))) '())
               (if owners? `((enclosing-complete ,(every (lambda (i) (or (not (assq 'enclosing-status i)) (tool-ref i 'enclosing-complete))) annotated))) '())))))

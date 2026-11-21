@@ -36,12 +36,65 @@
     (%remember! p data)))
 (define (%files p)
   (or (%listing p) (let ((listed (%repository-list (%project-root p) 10000))) (%listing-set! p listed) listed)))
-(define (%tool-files p prefix limit offset)
-  (%count limit 50 "tool-files") (%offset offset)
+;;; The files PREFIX names, as a listing: the project's, or, where none
+;;; of those starts with it and it names an ignored directory or file
+;;; (`target/`), those there, walked without ignore rules, with ignored
+;;; #t. A caller naming them asks for them; a prefix naming nothing on
+;;; disk, or the root, is not walked.
+(define (%prefix-files p prefix)
   (let* ((listed (%files p))
          (files (filter (lambda (path) (string-prefix? prefix path)) (tool-ref listed 'items))))
+    (or (and (null? files) (%ignored-files p prefix))
+        `((items ,files) (complete ,(tool-ref listed 'complete)) (revision ,(tool-ref listed 'revision))
+          (skipped ,(tool-ref listed 'skipped)) (problems ,(tool-ref listed 'problems)) (ignored #f)))))
+(define (%ignored-files p prefix)
+  (let* ((root (%project-root p))
+         (kind (lambda (path)
+                 (let ((a (guard (e (#t #f)) (file-attributes (string-append root "/" path)))))
+                   (and a (car a)))))
+         (slash (let loop ((i (- (string-length prefix) 1)))
+                  (cond ((< i 0) #f) ((char=? (string-ref prefix i) #\/) i) (else (loop (- i 1))))))
+         ;; The directory to walk: PREFIX itself, or the one its last part is in.
+         (dir (cond ((string-suffix? "/" prefix) (substring prefix 0 (- (string-length prefix) 1)))
+                    ((memq (kind prefix) '(directory file)) prefix)
+                    (slash (substring prefix 0 slash))
+                    (else #f)))
+         (files '()) (count 0) (complete #t) (skipped 0) (problems '()))
+    (define (entries dir)
+      (guard (e (#t (set! skipped (+ skipped 1)) (set! complete #f)
+                    (when (< (length problems) 3)
+                      (set! problems (append problems (list (%clip (condition/report-string e) 240)))))
+                    '()))
+        (directory-list (string-append root "/" dir))))
+    (define (walk dirs)
+      (when (pair? dirs)
+        (let loop ((rest (entries (car dirs))) (below '()))
+          (cond ((null? rest) (walk (append (reverse below) (cdr dirs))))
+                ((>= count 10000) (set! complete #f))
+                (else
+                  (let* ((name (car rest)) (sub? (string-suffix? "/" name))
+                         (path (string-append (car dirs) "/" (if sub? (substring name 0 (- (string-length name) 1)) name)))
+                         (k (kind path)))
+                    (cond ((and sub? (eq? k 'directory) (string-prefix? prefix (string-append path "/"))
+                                (not (member name '(".git/" ".jj/" ".hg/" ".svn/"))))
+                           (loop (cdr rest) (cons path below)))
+                          ((and (not sub?) (eq? k 'file) (string-prefix? prefix path))
+                           (set! files (cons path files))
+                           (set! count (+ count 1))
+                           (loop (cdr rest) below))
+                          (else (loop (cdr rest) below)))))))))
+    (and dir (not (string=? dir "")) (not (string-prefix? "/" prefix))
+         (every (lambda (part) (not (member part '("." ".." ".git" ".jj" ".hg" ".svn")))) (string-split prefix "/"))
+         (memq (kind dir) '(directory file))
+         (begin
+           (if (eq? (kind dir) 'file) (set! files (list dir)) (walk (list dir)))
+           `((items ,(sort files string<?)) (complete ,complete) (revision #f)
+             (skipped ,skipped) (problems ,problems) (ignored #t))))))
+(define (%tool-files p prefix limit offset)
+  (%count limit 50 "tool-files" "#:limit") (%offset offset)
+  (let* ((listed (%prefix-files p prefix)) (files (tool-ref listed 'items)))
     (append (%page files limit offset #:complete (tool-ref listed 'complete))
-      (map (lambda (key) (list key (tool-ref listed key))) '(revision skipped problems)))))
+      (map (lambda (key) (list key (tool-ref listed key))) '(revision skipped problems ignored)))))
 (define (%handle p s start end)
   (string-join (list (%namespace p) (%id s) (number->string start) (number->string end)) ":"))
 (define (%line-starts source)
@@ -57,7 +110,7 @@
         (let ((mid (quotient (+ lo hi) 2)))
           (if (<= (vector-ref starts mid) at) (loop (+ mid 1) hi) (loop lo mid))))))
 (define (%tool-expand p handle offset chars)
-  (%offset offset) (%count chars 16000 "tool-expand")
+  (%offset offset) (%count chars 16000 "tool-expand" "#:chars")
   (let* ((found (%snapshot-at p handle "tool-expand")) (s (car found)) (a (cadr found)) (b (caddr found)))
       (let* ((source (%source s)) (starts (%line-starts source))
              (size (- b a)) (end (min size (+ offset chars)))
@@ -75,7 +128,7 @@
                            (= b (vector-ref starts (- following 1))) following))))))
 (define (%tool-read p path from lines chars)
   (%offset from) (when (= from 0) (error "tool-read: expected a positive line"))
-  (%count lines 200 "tool-read") (%count chars 16000 "tool-read")
+  (%count lines 200 "tool-read" "#:lines") (%count chars 16000 "tool-read" "#:chars")
   (let* ((s (%read-snapshot p path)) (starts (%line-starts (%source s))) (n (vector-length starts)))
     (when (> from n) (error "tool-read: line past end"))
     (%tool-expand p (%handle p s (vector-ref starts (- from 1))
@@ -95,10 +148,31 @@
           (changes ,(map (lambda (c) `((line ,(%line-at starts (car c))) (old ,(%clip (cadddr c) 240))
                         (new ,(%clip (caddr c) 240)) (truncated ,(or (> (string-length (cadddr c)) 240) (> (string-length (caddr c)) 240))))) changes))
           (handle ,(%handle p next 0 (string-length source)))))))
+;;; The handle a caller means: a handle, or a reply that has one; else
+;;; an error saying what to pass.
+(define (%handle-of x who)
+  (define (refuse . why) (error (apply string-append who ": " why)))
+  (cond ((string? x) x)
+        ((tool-job? x)
+         (refuse "a job is not its output; pass a stream of its result, "
+                 "(tool-ref (tool-process-result JOB) 'stdout), run with tool-run #:keep"))
+        ((not (%reply? x)) (refuse "expected a handle string, or a reply that has one"))
+        ((tool-ref x 'handle) => (lambda (h) (%handle-of h who)))
+        ;; A process result: the one stream that has output, else say
+        ;; which to name.
+        ((and (assq 'stdout x) (assq 'stderr x))
+         (let ((wrote (filter (lambda (s) (positive? (or (tool-ref (tool-ref x s) 'characters) 0))) '(stdout stderr))))
+           (if (= (length wrote) 1) (%handle-of (tool-ref x (car wrote)) who)
+               (refuse "a process result holds two streams; pass one, (tool-ref RESULT 'stdout) or (tool-ref RESULT 'stderr)"))))
+        ((assq 'characters x)
+         (refuse "this output was not kept; run it with tool-run #:keep CHARACTERS to search or read it"))
+        ((assq 'items x) (refuse "a reply of items has no one handle; pass an item, or its handle"))
+        (else (refuse "this reply has no handle"))))
 ;;; One snapshot's region, named by a handle from any reply.
 (define (%snapshot-at p handle who)
-  (let ((parts (if (string? handle) (string-split handle ":") '()))
-        (expired (string-append who ": expired or foreign handle; query again")))
+  (let* ((handle (%handle-of handle who))
+         (parts (string-split handle ":"))
+         (expired (string-append who ": expired or foreign handle; query again")))
     (unless (and (= (length parts) 4) (string=? (car parts) (%namespace p))) (error expired))
     (let* ((s (find (lambda (s) (string=? (%id s) (cadr parts))) (%cache p)))
            (a (string->number (caddr parts))) (b (string->number (cadddr parts))))
@@ -106,55 +180,66 @@
       (unless (and (integer? a) (exact? a) (integer? b) (exact? b) (<= 0 a b (string-length (%source s))))
         (error (string-append who ": invalid range")))
       (list s a b))))
+;;; Call (PROC BODY LINE START END) for each line of SOURCE's region A to
+;;; B, BODY without its newline, LINE its number in SOURCE, START and END
+;;; its place there, newline included.
+(define (%each-line source a b proc)
+  (let ((size (- b a)))
+    (let lines ((rest (string-split (substring source a b) "\n")) (at 0)
+                (line (%line-at (%line-starts source) a)))
+      (unless (or (null? rest) (>= at size))
+        (let* ((body (car rest)) (end (min size (+ at (string-length body) 1))))
+          (proc body line (+ a at) (+ a end))
+          (lines (cdr rest) end (+ line 1)))))))
+;;; A found line's item: a preview around column HIT, and its handle.
+(define (%line-item p s body line hit start end)
+  (let* ((before (max 0 (- hit 60))) (preview (%clip (substring body before (string-length body)) 240)))
+    `((path ,(%path s)) (line ,line) (text ,preview) (column ,(+ hit 1))
+      (preview-offset ,before)
+      (preview-truncated ,(or (> before 0) (< (+ before (string-length preview)) (string-length body))))
+      (handle ,(%handle p s start end)))))
 ;;; Lines of one snapshot region containing QUERY: a file read, a search
-;;; hit's line, or a process's kept output.
-(define (%tool-find p handle query limit offset)
-  (%count limit 50 "tool-find") (%offset offset)
+;;; hit's line, or a process's kept output; with WHOLE, all its snapshot.
+;;; A region's reply counts the matching lines outside it: a read of one
+;;; line that finds nothing says what the rest of the file holds.
+(define (%tool-find p handle query limit offset whole)
+  (%count limit 50 "tool-find" "#:limit") (%offset offset)
   (when (string=? query "") (error "tool-find: query must not be empty"))
   (let* ((found (%snapshot-at p handle "tool-find"))
-         (s (car found)) (a (cadr found)) (b (caddr found)) (size (- b a))
-         (items '()) (total 0))
-    (let lines ((rest (string-split (substring (%source s) a b) "\n")) (at 0)
-                (line (%line-at (%line-starts (%source s)) a)))
-      (unless (or (null? rest) (>= at size))
-        (let* ((body (car rest)) (end (min size (+ at (string-length body) 1))) (hit (%index body query 0)))
+         (s (car found)) (source (%source s)) (size (string-length source))
+         (a (if whole 0 (cadr found))) (b (if whole size (caddr found)))
+         (items '()) (shown 0) (total 0))
+    (%each-line source a b
+      (lambda (body line start end)
+        (let ((hit (%index body query 0)))
           (when hit
-            (when (and (>= total offset) (< (length items) limit))
-              (let* ((before (max 0 (- hit 60))) (preview (%clip (substring body before (string-length body)) 240)))
-                (set! items (cons `((path ,(%path s)) (line ,line) (text ,preview) (column ,(+ hit 1))
-                                    (preview-offset ,before)
-                                    (preview-truncated ,(or (> before 0) (< (+ before (string-length preview)) (string-length body))))
-                                    (handle ,(%handle p s (+ a at) (+ a end))))
-                                  items))))
-            (set! total (+ total 1)))
-          (lines (cdr rest) end (+ line 1)))))
-    (let ((next (+ offset (length items))))
+            (when (and (>= total offset) (< shown limit))
+              (set! items (cons (%line-item p s body line hit start end) items))
+              (set! shown (+ shown 1)))
+            (set! total (+ total 1))))))
+    (let ((next (+ offset shown))
+          (outside (if (and (= a 0) (= b size)) 0
+                       (let ((n 0))
+                         (%each-line source 0 size
+                           (lambda (body line start end) (when (%index body query 0) (set! n (+ n 1)))))
+                         (max 0 (- n total))))))
       `((items ,(reverse items)) (total ,total) (complete #t)
-        (truncated ,(< next total)) (next ,(and (< next total) next))))))
+        (truncated ,(< next total)) (next ,(and (< next total) next))
+        (outside ,outside)))))
 ;;; Every line of a snapshot region containing any of PATTERNS, in one
 ;;; pass: as `%tool-find`'s items, unpaged.
 (define (%matching-lines p handle patterns)
-  (let* ((found (%snapshot-at p handle "tool-check"))
-         (s (car found)) (a (cadr found)) (b (caddr found)) (size (- b a)) (acc '()))
-    (let lines ((rest (string-split (substring (%source s) a b) "\n")) (at 0)
-                (line (%line-at (%line-starts (%source s)) a)))
-      (unless (or (null? rest) (>= at size))
-        (let* ((body (car rest)) (end (min size (+ at (string-length body) 1)))
-               (hit (any (lambda (q) (%index body q 0)) patterns)))
-          (when hit
-            (let* ((before (max 0 (- hit 60))) (preview (%clip (substring body before (string-length body)) 240)))
-              (set! acc (cons `((path ,(%path s)) (line ,line) (text ,preview) (column ,(+ hit 1))
-                                (preview-offset ,before)
-                                (preview-truncated ,(or (> before 0) (< (+ before (string-length preview)) (string-length body))))
-                                (handle ,(%handle p s (+ a at) (+ a end))))
-                              acc))))
-          (lines (cdr rest) end (+ line 1)))))
+  (let* ((found (%snapshot-at p handle "tool-check")) (s (car found)) (acc '()))
+    (%each-line (%source s) (cadr found) (caddr found)
+      (lambda (body line start end)
+        (let ((hit (any (lambda (q) (%index body q 0)) patterns)))
+          (when hit (set! acc (cons (%line-item p s body line hit start end) acc))))))
     (reverse acc)))
 ;;; Lines FROM.. of a snapshot, by its file's line numbers, within the
 ;;; handle's region: around a `tool-find` hit in kept output, say.
 (define (%tool-lines p handle from lines chars)
   (%offset from) (when (= from 0) (error "tool-lines: expected a positive line"))
-  (%count lines 200 "tool-lines") (%count chars 16000 "tool-lines")
+  (%count lines 200 "tool-lines" "#:lines") (%count chars 16000 "tool-lines" "#:chars")
   (let* ((found (%snapshot-at p handle "tool-lines")) (s (car found)) (a (cadr found)) (b (caddr found))
          (source (%source s)) (starts (%line-starts source)) (n (vector-length starts)))
     (when (> from n) (error "tool-lines: line past end"))
@@ -254,6 +339,12 @@
                           (else (collect (cdr rest) (cons (car rest) old) new)))))))
           (else
            (let ((line (string-trim (car lines))))
+             ;; A divider or closing marker outside a block is a block
+             ;; whose SEARCH line is missing, not a file's name: refused,
+             ;; not quietly skipped with its edit.
+             (when (or (and (>= (string-length line) 7) (every (lambda (c) (char=? c #\=)) (string->list line)))
+                       (and (string-suffix? " REPLACE" line) (string-prefix? ">>>>>>>" line)))
+               (error "tool-apply!: a ======= or >>>>>>> REPLACE outside a block: its <<<<<<< SEARCH line is missing" line))
              (loop (cdr lines)
                    (if (or (string=? line "") (string-prefix? "```" line)) file
                        (let ((at (string-contains line " @")))
@@ -336,10 +427,13 @@
            (string-append (if (or (not signature) (equal? signature "")) (%str (tool-ref item 'name)) (%str signature))
                           "  ; " (%str (tool-ref item 'doc)))))
         (else (%str item))))
-(define (%show-search-context item)
+;; CONTINUED: the hit's context goes on from the previous hit's, under
+;; its header.
+(define (%show-search-context item [continued #f])
   (let* ((context (tool-ref item 'context))
          (summary (%show-item-base (remove (lambda (entry) (memq (car entry) '(context context-handle))) item))))
-    (cond ((not context)
+    (cond ((and continued context (not (tool-ref context 'truncated))) (%numbered-text context #f))
+          ((not context)
            (string-append summary "\n[context omitted; (tool-expand project "
                           (%written (tool-ref item 'context-handle)) ")]"))
           ((tool-ref context 'truncated)
@@ -348,10 +442,36 @@
                           (%written (tool-ref item 'context-handle)) " #:offset "
                           (%str (tool-ref context 'next)) ")]"))
           (else (%numbered-text context)))))
+;;; Items, a hit whose context continues the previous hit's joined to it:
+;;; one header, each one's new lines, then their enclosing definitions,
+;;; each once, so that close hits do not repeat their shared lines.
+(define (%show-runs items)
+  (let loop ((rest items) (out '()))
+    (if (null? rest) (reverse out)
+        (let collect ((more (cdr rest)) (run (list (car rest))))
+          (if (and (pair? more) (%reply? (car more)) (tool-ref (car more) 'context-continues))
+              (collect (cdr more) (cons (car more) run))
+              (if (null? (cdr run))
+                  (loop more (cons (%show-item (car run)) out))
+                  (let* ((run (reverse run))
+                         (texts (cons (%show-item-base (car run))
+                                      (map (lambda (i) (%show-search-context i #t)) (cdr run))))
+                         (notes (delete-duplicates
+                                  (filter-map (lambda (i) (and (assq 'enclosing-status i) (%show-enclosing i))) run))))
+                    (loop more (cons (string-append (string-join (remove (lambda (t) (string=? t "")) texts) "\n")
+                                                    (apply string-append notes))
+                                     out)))))))))
 (define (%show-items reply)
-  (let* ((items (tool-ref reply 'items)) (shown (map %show-item items))
+  (let* ((items (tool-ref reply 'items)) (shown (%show-runs items))
          (notes (filter-map (lambda (x) x)
-                  (list (and (eq? (tool-ref reply 'match-mode) 'literal) (= 0 (tool-ref reply 'total))
+                  (list (and (tool-ref reply 'ignored)
+                             (string-append "ignore rules (.gitignore, .ignore) leave these files out of the project; "
+                                            "named by the prefix, they were walked without them"))
+                        (let ((outside (tool-ref reply 'outside)))
+                          (and outside (> outside 0)
+                               (string-append (%str outside) " more matching " (if (= outside 1) "line" "lines")
+                                              " outside this handle's region; #:whole #t searches all of its snapshot")))
+                        (and (eq? (tool-ref reply 'match-mode) 'literal) (= 0 (tool-ref reply 'total))
                              (string-append "0 matches in scanned text; literal query " (%written (tool-ref reply 'query))
                                             (if (tool-ref reply 'query-truncated) " (query clipped)" "")
                                             "; prefix " (%written (tool-ref reply 'prefix))
@@ -367,8 +487,10 @@
                              (string-append (%str (length items)) " of " (%str (or (tool-ref reply 'files) (tool-ref reply 'total)))
                                             "; more with #:offset " (%str (tool-ref reply 'next))))
                         (and (assq 'complete reply) (not (tool-ref reply 'complete))
-                             (string-append "incomplete: skipped " (%str (or (tool-ref reply 'skipped) 0))
-                                            " " (%str (or (tool-ref reply 'problems) '()))))
+                             (if (eqv? 0 (or (tool-ref reply 'skipped) 0))
+                                 "incomplete: a walk or scan limit was reached (tool-help 'guide lists them); narrow the prefix"
+                                 (string-append "incomplete: skipped " (%str (or (tool-ref reply 'skipped) 0))
+                                                " " (%str (or (tool-ref reply 'problems) '())))))
                         ;; Discovery short of every word.
                         (let ((partial (tool-ref reply 'partial)))
                           (and partial
@@ -388,19 +510,26 @@
                                                   ""))))))))
     (string-join (append (if (null? items) '("(none)") shown) (map (lambda (n) (string-append "[" n "]")) notes)) "\n")))
 (define (%show-stream name stream)
-  (let ((text (tool-ref stream 'text)))
-    (string-append "--- " name " (" (%str (tool-ref stream 'characters)) " characters"
-                   (if (tool-ref stream 'truncated) (string-append ", last " (%str (string-length text)) " shown") "")
+  (let ((text (tool-ref stream 'text)) (head (tool-ref stream 'head))
+        (kept (tool-ref stream 'kept)) (seen (tool-ref stream 'characters)))
+    (string-append "--- " name " (" (%str seen) " characters"
+                   (if (tool-ref stream 'truncated)
+                       (string-append (if head ", first " ", last ") (%str (string-length text)) " shown"
+                                      (if head "; the last without #:head" "; #:head #t shows the first"))
+                       "")
                    (if (tool-ref stream 'handle)
-                       (string-append "; all " (%str (tool-ref stream 'kept)) " kept: " (%written (tool-ref stream 'handle))
+                       (string-append (if (= kept seen) "; all " "; the first ") (%str kept) " kept: "
+                                      (%written (tool-ref stream 'handle))
                                       (if (tool-ref stream 'truncated)
-                                          "; tool-find searches it, tool-expand reads it from #:offset"
+                                          "; tool-find searches it, tool-expand reads it from #:offset 0"
                                           ""))
                        "")
                    ") ---" (if (string=? text "") "" (string-append "\n" (%chomp text))))))
-(define (%numbered-text reply)
+;; HEADED #f leaves out a disk source's header: a block going on under
+;; the previous one's.
+(define (%numbered-text reply [headed #t])
   (let* ((disk? (tool-ref reply 'file-lines))
-         (header (and disk?
+         (header (and disk? headed
                       (string-append "[snapshot file-lines: " (%str disk?) "; "
                                      (%written (tool-ref reply 'path)) "; revision "
                                      (%str (tool-ref reply 'revision)) "]")))
@@ -452,6 +581,12 @@
                     (cond ((pair? (tool-ref hits 'items))
                            (string-append (%show-items hits)
                                           (if (tool-ref hits 'truncated) "\n[more matching lines than shown: raise #:limit, or tool-find a handle]" "")
+                                          (let ((passing (or (tool-ref hits 'passing) 0)))
+                                            (if (> passing 0)
+                                                (string-append "\n[" (%str passing) " passing "
+                                                               (if (= passing 1) "summary" "summaries")
+                                                               " (#:passing) not listed, as other lines matched; #:passing '() lists them]")
+                                                ""))
                                           (if (tool-ref reply 'lost) "\n[output past the 1048576 characters kept was not searched]" "")))
                           ((and (eqv? 0 (tool-ref reply 'status)) (not (tool-ref reply 'timed-out))) "(nothing matched)")
                           (else (string-append "(nothing matched; the tails)\n--- stdout\n" (%chomp (tool-ref out 'tail))
@@ -547,7 +682,7 @@
     (end-line ,(%line-at starts (max (caddr d) (- (cadddr d) 1))))
     (handle ,(%handle p s (caddr d) (cadddr d)))))
 (define (%tool-symbols p path name limit offset chars)
-  (%count limit 50 "tool-symbols") (%offset offset) (%count chars 16000 "tool-symbols")
+  (%count limit 50 "tool-symbols" "#:limit") (%offset offset) (%count chars 16000 "tool-symbols" "#:chars")
   (let* ((s (%read-snapshot p path)) (parsed (%snapshot-definitions s))
          (found (filter (lambda (d) (or (string=? name "") (string=? name (car d))))
                         (tool-ref parsed 'definitions)))
