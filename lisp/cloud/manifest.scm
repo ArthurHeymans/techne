@@ -22,7 +22,7 @@
 
 (require "kv.scm")
 
-(provide read-bindings manifest-file secrets-file)
+(provide read-bindings validate-bindings manifest-file secrets-file)
 
 (define manifest-file "manifest.scm"
   "The name of a deployment's manifest, in its directory.")
@@ -37,25 +37,77 @@
         (if (eof-object? data) default data))
       default))
 
-(define (read-bindings directory)
+(define (valid-binding-kind? kind)
+  (and (symbol? kind) (memq kind '(kv secret text)) #t))
+
+(define (check-binding-entry name what)
+  (unless (symbol? name) (error "A binding's name is a symbol:" name))
+  (unless (and (list? what) (= (length what) 2) (valid-binding-kind? (car what)) (string? (cadr what)))
+    (error "A binding is (kv NAMESPACE), (secret NAME) or (text STRING):" name what))
+  (car what))
+
+(define (validate-bindings bindings declared)
+  "Validate BINDINGS from `manifest.scm` against DECLARED.
+BINDINGS is the `bindings` dict of `manifest.scm`, and DECLARED is a
+list of `(NAME KIND)` pairs from a package's `(cloud ...)` clause,
+where NAME is a symbol and KIND is `kv`, `secret`, or `text`.
+Every declared binding must be present in BINDINGS with the exact
+matching kind, and BINDINGS may not contain extra undeclared bindings.
+Signals an error naming the binding, expected kind, and actual kind on
+any mismatch."
+  (unless (dict? bindings) (error "The manifest's bindings are not a dict:" bindings))
+  (unless (list? declared) (error "Declared bindings are a list of (NAME KIND):" declared))
+  (let ((expected (fold (lambda (entry table)
+                          (unless (and (list? entry) (= (length entry) 2)
+                                       (symbol? (car entry)) (valid-binding-kind? (cadr entry)))
+                            (error "A declared binding is (NAME kv|secret|text):" entry))
+                          (when (dict-ref table (car entry) #f)
+                            (error "Binding declared twice:" (car entry)))
+                          (dict-set table (car entry) (cadr entry)))
+                        (dict) declared)))
+    (for-each (lambda (name)
+                (let* ((what (dict-ref bindings name))
+                       (actual (check-binding-entry name what))
+                       (want (dict-ref expected name #f)))
+                  (unless want
+                    (error (string-append "Undeclared binding " (symbol->string name)
+                                          ": expected none, got " (symbol->string actual))))
+                  (unless (eq? actual want)
+                    (error (string-append "Binding " (symbol->string name)
+                                          " has kind " (symbol->string actual)
+                                          ", expected " (symbol->string want))))))
+              (dict-keys bindings))
+    (for-each (lambda (entry)
+                (let ((name (car entry))
+                      (want (cadr entry)))
+                  (unless (dict-ref bindings name #f)
+                    (error (string-append "Missing binding " (symbol->string name)
+                                          ": expected " (symbol->string want) ", got none")))))
+              declared)
+    #t))
+
+(define (read-bindings directory [declared #f])
   "Return the bindings of the deployment in DIRECTORY, from its manifest.
 A dict of `env`, what its requests are given, by the bindings' names,
 and `stores`, the namespace of each KV binding by the binding's name, a
-string. A deployment without a manifest has none. A manifest that is
-not one, a binding of no known kind, or a secret that is not among the
-secrets is an error that says which."
+string. When DECLARED is given (not `#f`), it is a list of `(NAME KIND)`
+pairs from a package's `(cloud ...)` clause and `manifest.scm` is
+validated against it via `validate-bindings` before resolving secrets.
+A deployment without a manifest has none (which fails if DECLARED is
+non-empty). A manifest that is not one, a binding of no known kind, a
+contract mismatch, or a secret that is not among the secrets is an error
+that says which."
   (let* ((manifest (read-data (string-append directory "/" manifest-file) (dict)))
          (secrets (read-data (string-append directory "/" secrets-file) (dict)))
          (bindings (if (dict? manifest) (dict-ref manifest 'bindings (dict)) (error "The manifest is not a dict:" manifest))))
     (unless (dict? bindings) (error "The manifest's bindings are not a dict:" bindings))
     (unless (dict? secrets) (error "The secrets are not a dict:" secrets))
+    (when declared
+      (validate-bindings bindings declared))
     (fold (lambda (name result)
             (let ((what (dict-ref bindings name))
                   (bound (lambda (value) (dict-set result 'env (dict-set (dict-ref result 'env) name value)))))
-              (unless (symbol? name) (error "A binding's name is a symbol:" name))
-              (unless (and (list? what) (= (length what) 2) (string? (cadr what)))
-                (error "A binding is (kv NAMESPACE), (secret NAME) or (text STRING):" name what))
-              (case (car what)
+              (case (check-binding-entry name what)
                 ((kv)
                  (unless (kv-namespace-name? (cadr what)) (error "Not a namespace name:" (cadr what)))
                  (dict-set (bound (dict 'kind 'kv 'name (symbol->string name)))
@@ -64,7 +116,6 @@ secrets is an error that says which."
                  (let ((value (dict-ref secrets (cadr what) #f)))
                    (unless (string? value) (error "No such secret, for the binding:" (cadr what) name))
                    (bound value)))
-                ((text) (bound (cadr what)))
-                (else (error "A binding is (kv NAMESPACE), (secret NAME) or (text STRING):" name what)))))
+                ((text) (bound (cadr what))))))
           (dict 'env (dict) 'stores (dict))
           (dict-keys bindings))))

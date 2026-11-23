@@ -564,12 +564,56 @@ impl State {
 /// The most bytes of a manifest, and of the secrets beside it.
 const MANIFEST_BYTES: u64 = 256 << 10;
 
+/// The kind of binding declared in a package's `(cloud ...)` clause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BindingKind {
+    Kv,
+    Secret,
+    Text,
+}
+
+impl BindingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BindingKind::Kv => "kv",
+            BindingKind::Secret => "secret",
+            BindingKind::Text => "text",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "kv" => Ok(BindingKind::Kv),
+            "secret" => Ok(BindingKind::Secret),
+            "text" => Ok(BindingKind::Text),
+            other => Err(format!("unknown binding kind: {other}")),
+        }
+    }
+}
+
+/// A binding declared in a package's `(cloud ENTRY (bindings ...))` contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredBinding {
+    pub name: String,
+    pub kind: BindingKind,
+}
+
 /// The bindings of the deployment in `dir`, as its manifest and secrets
 /// say (`lisp/cloud/manifest.scm`): read in a world of their own, made
 /// for it and dropped after, of bounded memory. A manifest is its
 /// tenant's to write: what reading it interns and allocates goes with
 /// that world, and nothing of it but the bindings, as data, comes out.
 pub fn read_bindings(dir: &Path) -> Result<Bindings, String> {
+    read_bindings_checked(dir, None)
+}
+
+/// [`read_bindings`], validating `manifest.scm` against a package's declared
+/// `(cloud ENTRY (bindings ...))` contract before resolving secrets.
+pub fn read_bindings_with_contract(dir: &Path, declared: &[DeclaredBinding]) -> Result<Bindings, String> {
+    read_bindings_checked(dir, Some(declared))
+}
+
+fn read_bindings_checked(dir: &Path, declared: Option<&[DeclaredBinding]>) -> Result<Bindings, String> {
     for file in ["manifest.scm", ".secrets.scm"] {
         if std::fs::metadata(dir.join(file)).is_ok_and(|m| m.len() > MANIFEST_BYTES) {
             return Err(format!("{file} is larger than a manifest may be"));
@@ -582,7 +626,16 @@ pub fn read_bindings(dir: &Path) -> Result<Bindings, String> {
     vm.eval_source(&format!("(require {manifest:?})")).map_err(failed)?;
     let read = vm.eval_source("read-bindings").map_err(failed)?;
     let dir = vm.from_data(&Data::String(dir.display().to_string())).map_err(failed)?;
-    let found = vm.call(&read, &[dir]).map_err(failed)?;
+    let found = match declared {
+        None => vm.call(&read, &[dir]).map_err(failed)?,
+        Some(declared) => {
+            let contract = Data::List(
+                declared.iter().map(|b| Data::List(vec![Data::Symbol(b.name.clone()), Data::Symbol(b.kind.as_str().into())])).collect(),
+            );
+            let contract = vm.from_data(&contract).map_err(failed)?;
+            vm.call(&read, &[dir, contract]).map_err(failed)?
+        }
+    };
     Bindings::from_data(&vm.to_data(&found, 4 << 20).map_err(failed)?)
 }
 
@@ -1946,5 +1999,74 @@ mod tests {
         }
         let names: Vec<String> = bundle(dir.path()).unwrap().into_iter().map(|(name, _)| name).collect();
         assert_eq!(names, ["app.scm", "lib/a.scm"]);
+    }
+
+    #[test]
+    fn binding_contract_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.scm"),
+            r#"{bindings {cache (kv "my-cache") api-key (secret "API_KEY") greeting (text "hello")}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".secrets.scm"), r#"{"API_KEY" "s3cret"}"#).unwrap();
+
+        let decl = |name: &str, kind: BindingKind| DeclaredBinding { name: name.into(), kind };
+
+        // Exact match succeeds for all three kinds.
+        let bindings = read_bindings_with_contract(
+            dir.path(),
+            &[decl("cache", BindingKind::Kv), decl("api-key", BindingKind::Secret), decl("greeting", BindingKind::Text)],
+        )
+        .unwrap();
+        assert_eq!(bindings.stores.get("cache").map(String::as_str), Some("my-cache"));
+
+        // Missing declared binding fails clearly with binding name and expected kind.
+        let err = read_bindings_with_contract(
+            dir.path(),
+            &[
+                decl("cache", BindingKind::Kv),
+                decl("api-key", BindingKind::Secret),
+                decl("greeting", BindingKind::Text),
+                decl("extra", BindingKind::Kv),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("extra") && err.contains("kv"), "{err}");
+
+        // Extra undeclared binding fails clearly with binding name and actual kind.
+        let err =
+            read_bindings_with_contract(dir.path(), &[decl("cache", BindingKind::Kv), decl("api-key", BindingKind::Secret)]).unwrap_err();
+        assert!(err.contains("greeting") && err.contains("text"), "{err}");
+
+        // Mismatched kind (text where secret expected) fails clearly naming binding, expected, and actual.
+        let err = read_bindings_with_contract(
+            dir.path(),
+            &[decl("cache", BindingKind::Kv), decl("api-key", BindingKind::Secret), decl("greeting", BindingKind::Secret)],
+        )
+        .unwrap_err();
+        assert!(err.contains("greeting") && err.contains("secret") && err.contains("text"), "{err}");
+
+        // Mismatched kind (kv where text expected) fails clearly.
+        let err = read_bindings_with_contract(
+            dir.path(),
+            &[decl("cache", BindingKind::Text), decl("api-key", BindingKind::Secret), decl("greeting", BindingKind::Text)],
+        )
+        .unwrap_err();
+        assert!(err.contains("cache") && err.contains("text") && err.contains("kv"), "{err}");
+
+        // Omitted (bindings ...) defaults to empty contract: manifest bindings are rejected.
+        let err = read_bindings_with_contract(dir.path(), &[]).unwrap_err();
+        assert!(err.contains("Undeclared"), "{err}");
+
+        // Legacy 1-arg read_bindings (no contract) preserves existing behavior.
+        let legacy = read_bindings(dir.path()).unwrap();
+        assert_eq!(legacy.stores.get("cache").map(String::as_str), Some("my-cache"));
+
+        // Empty directory with empty contract succeeds, with non-empty contract fails.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(read_bindings_with_contract(empty.path(), &[]).is_ok());
+        let err = read_bindings_with_contract(empty.path(), &[decl("cache", BindingKind::Kv)]).unwrap_err();
+        assert!(err.contains("cache") && err.contains("kv"), "{err}");
     }
 }
