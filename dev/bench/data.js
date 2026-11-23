@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795455168643,
+  "lastUpdate": 1795455170545,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -61957,6 +61957,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 104418,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0c109c16d09c282e32bc67e0c054f91512ae22dc",
+          "message": "Merge pull request #398 from ArthurHeymans/perf/vm-jit-v8-parity\n\nSpeed up VM, GC, and JIT by 1.29x to reach 1.03x of V8",
+          "timestamp": "2026-11-23T17:59:31+01:00",
+          "tree_id": "d387e0573ecd4207c86657cd6f25ed1876c4f708",
+          "url": "https://github.com/ArthurHeymans/techne/commit/0c109c16d09c282e32bc67e0c054f91512ae22dc"
+        },
+        "date": 1795455170492,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 693198238,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 626899410,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104432,
             "unit": "data"
           }
         ]
