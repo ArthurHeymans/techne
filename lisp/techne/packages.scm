@@ -8,9 +8,16 @@
   (name recipe-name) (source recipe-source))
 (define catalog (make-hash-table equal?))
 
+(define (ascii-alnum? c)
+  (let ((n (char->integer c)))
+    (or (and (>= n 97) (<= n 122))
+        (and (>= n 65) (<= n 90))
+        (and (>= n 48) (<= n 57)))))
+
 (define (component? s)
-  (and (string? s) (positive? (string-length s)) (not (member s '("." "..")))
-       (every (lambda (c) (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_ #\.)))) (string->list s))))
+  (and (string? s) (positive? (string-length s))
+       (ascii-alnum? (string-ref s 0))
+       (every (lambda (c) (or (ascii-alnum? c) (memv c '(#\- #\_ #\.)))) (string->list s))))
 (define (oid? s)
   (and (string? s) (memv (string-length s) '(40 64))
        (every (lambda (c) (string-index "0123456789abcdef" c)) (string->list s))))
@@ -56,8 +63,18 @@ DATUM has the form `(recipe (owner pkg) source)`."
 
 ;; --- Content-addressed store, world.lock & installed roots ---
 
-(define (store) (packages-data-dir))
-(define (store-dir dir) (path-join dir "store"))
+;; Resolve metadata directory (holding installed.scm, world.lock, .publishing)
+;; and content-addressed store directory. When DIRECTORY is omitted, honors
+;; $TECHNE_PACKAGE_STORE via (package-store-dir); when an explicit DIRECTORY is
+;; passed without STORE, uses <DIRECTORY>/store for isolated environments/tests.
+(define (resolve-install-dirs directory store)
+  (let* ((dir (or directory (packages-data-dir)))
+         (sdir (or store
+                   (if directory
+                       (path-join directory "store")
+                       (package-store-dir)))))
+    (values dir sdir)))
+
 (define (world-lock-path dir) (path-join dir "world.lock"))
 (define (installed-roots-path dir) (path-join dir "installed.scm"))
 
@@ -136,13 +153,17 @@ DATUM has the form `(recipe (owner pkg) source)`."
             (make-lockfile (lockfile-techne lf) (hash-table-values keep))))))
 
 (define (find-installed-root roots datum wanted)
-  (if wanted
-      (find (lambda (r)
-              (and (equal? (car r) wanted)
-                   (equal? (strip-package-clause (cdr r)) (strip-package-clause datum))))
-            roots)
-      (let ((hits (filter (lambda (r) (equal? (cdr r) datum)) roots)))
-        (and (= 1 (length hits)) (car hits)))))
+  (let ((base (strip-package-clause datum)))
+    (if wanted
+        (find (lambda (r)
+                (and (equal? (car r) wanted)
+                     (equal? (strip-package-clause (cdr r)) base)))
+              roots)
+        (let ((exact (filter (lambda (r) (equal? (cdr r) datum)) roots)))
+          (if (= 1 (length exact))
+              (car exact)
+              (let ((norm (filter (lambda (r) (equal? (strip-package-clause (cdr r)) base)) roots)))
+                (and (= 1 (length norm)) (car norm))))))))
 
 (define (upsert-root roots name datum)
   (cons (cons name datum)
@@ -221,7 +242,9 @@ DATUM has the form `(recipe (owner pkg) source)`."
     (cond ((and old (string=? old hash)) root-name)
           ((and old upgrade?)
            ;; Upgraded checkout is stored and locked for subsequent sessions;
-           ;; keep the running VM's existing library bindings intact.
+           ;; keep the running VM's existing library bindings intact while
+           ;; updating indexed so repeat installs/restores see the new hash.
+           (hash-table-set! indexed root-name hash)
            root-name)
           (old (error "Package name already installed" root-name))
           (else
@@ -235,7 +258,7 @@ DATUM has the form `(recipe (owner pkg) source)`."
 
 ;; Validate that staged manifests for a candidate install are compatible with
 ;; already installed roots and current editor declarations.
-(define (validate-candidate! dir root-name staged-manifests existing-lock existing-roots wanted upgrade?)
+(define (validate-candidate! sdir root-name staged-manifests existing-lock existing-roots wanted upgrade?)
   (let* ((root-pair (or (assoc root-name staged-manifests)
                         (error "Resolved package missing from staged manifests" root-name)))
          (root-manifest (cdr root-pair))
@@ -244,148 +267,157 @@ DATUM has the form `(recipe (owner pkg) source)`."
       (error "Package name already installed" root-name))
     (unless (and old-in-vm upgrade?)
       (check-declarations! root-manifest wanted))
-    (let* ((sdir (store-dir dir))
-           (other-manifests
-            (if existing-lock
-                (filter-map (lambda (r)
-                              (and (not (and upgrade? (equal? (car r) root-name)))
-                                   (let ((p (find (lambda (e) (equal? (locked-package-name e) (car r)))
-                                                  (lockfile-packages existing-lock))))
-                                     (and p (read-package-manifest (path-join sdir (locked-package-tree-sha256 p)))))))
-                            existing-roots)
-                '())))
+    (let ((other-manifests
+           (if existing-lock
+               (filter-map (lambda (r)
+                             (and (not (and upgrade? (equal? (car r) root-name)))
+                                  (let ((p (find (lambda (e) (equal? (locked-package-name e) (car r)))
+                                                 (lockfile-packages existing-lock))))
+                                    (and p (read-package-manifest (path-join sdir (locked-package-tree-sha256 p)))))))
+                           existing-roots)
+               '())))
       (check-disjoint! (cons root-manifest other-manifests)))))
 
-;; Roll back disk state if announcing fails after publishing.
-(define (rollback-install! dir old-lock old-roots newly-published)
-  (publishing dir
-    (lambda ()
-      (if old-lock
-          (write-lockfile (world-lock-path dir) old-lock)
-          (when (file-exists? (world-lock-path dir))
-            (delete-file (world-lock-path dir))))
-      (if (pair? old-roots)
-          (write-installed-roots! dir old-roots)
-          (when (file-exists? (installed-roots-path dir))
-            (delete-file (installed-roots-path dir))))
-      (for-each (lambda (entry)
-                  (when (file-exists? (cdr entry))
-                    (delete-path (cdr entry) #t)))
-                newly-published)
-      (let ((sdir (store-dir dir)))
-        (when (and (not old-lock) (file-exists? sdir) (null? (directory-list sdir)))
-          (delete-path sdir #f))))))
+;; Roll back metadata files if post-publish verification or announcement fails.
+;; Must be called while already holding `.publishing`. Never deletes
+;; content-addressed `store/<tree-sha256>` entries because they are immutable
+;; and may be shared by other installations or worlds.
+(define (rollback-metadata! dir old-lock old-roots)
+  (if old-lock
+      (write-lockfile (world-lock-path dir) old-lock)
+      (when (file-exists? (world-lock-path dir))
+        (delete-file (world-lock-path dir))))
+  (if (pair? old-roots)
+      (write-installed-roots! dir old-roots)
+      (when (file-exists? (installed-roots-path dir))
+        (delete-file (installed-roots-path dir)))))
 
-(define (package-install! spec #:directory [directory (store)] #:upgrade [upgrade #f])
+(define (package-install! spec #:directory [directory #f] #:store [store #f] #:upgrade [upgrade #f])
   "Install SPEC (a source datum or catalog `(owner pkg)`) and advertise it.
-DIRECTORY is the packages data directory holding `store/<tree-sha256>/`,
-`world.lock`, and `installed.scm`. First install pins commits and content
-hashes; repeats are offline unless UPGRADE is `#t`. Packages without an
-`(editor ...)` clause (pure library or `(cloud ...)` packages) are stored,
-verified, and registered cleanly without requiring editor commands or
-options."
+DIRECTORY holds `world.lock` and `installed.scm` (defaulting to
+`(packages-data-dir)`). STORE overrides the content-addressed store
+directory (defaulting to `(package-store-dir)`, which honors
+`$TECHNE_PACKAGE_STORE`, or `<DIRECTORY>/store` when DIRECTORY is given).
+First install pins commits and content hashes; repeats are offline unless
+UPGRADE is `#t`. Packages without an `(editor ...)` clause are stored,
+verified, and registered cleanly."
   (let* ((recipe (and (package-name? spec) (or (hash-table-ref/default catalog spec #f) (error "Unknown recipe" spec))))
          (datum (if recipe (recipe-source recipe) spec))
          (source (parse-package-source datum))
-         (dir directory)
-         (sdir (store-dir dir))
          (wanted (or (package-source-package source) (and recipe (recipe-name recipe)))))
-    (make-directory dir)
-    (let* ((initial-roots (read-installed-roots dir))
-           (hit (and (not upgrade) (find-installed-root initial-roots datum wanted))))
-      (if hit
-          ;; Offline repeat: verify world.lock + store tree-sha256 without touching Git.
+    (call-with-values (lambda () (resolve-install-dirs directory store))
+      (lambda (dir sdir)
+        (make-directory dir)
+        (define (offline-repeat hit)
           (let* ((lf (or (read-world-lock dir) (error "Missing world.lock for installed package" (car hit))))
-                 (manifests (verify-world-lockfile lf #:store sdir)))
-            (announce-root! lf manifests (car hit) wanted #f))
-          ;; Fetch, stage, resolve transitive dependencies + diamond conflicts, then publish atomically.
-          (let* ((pre-lock (read-world-lock dir))
-                 (pre-roots initial-roots)
-                 (drop-target (and upgrade
-                                   (or wanted
-                                       (let ((existing (find-installed-root pre-roots datum #f)))
-                                         (and existing (car existing)))
-                                       (let ((same-repo
-                                              (filter (lambda (r)
-                                                        (and (eq? (car (cdr r)) (car datum))
-                                                             (equal? (cadr (cdr r)) (cadr datum))))
-                                                      pre-roots)))
-                                         (and (= 1 (length same-repo)) (caar same-repo))))))
-                 (base-lock (if (and upgrade drop-target)
-                                (lockfile-without-root pre-lock pre-roots drop-target)
-                                pre-lock))
-                 (saved-old-lock #f)
-                 (saved-old-roots '())
-                 (recorded-datum #f))
-            (call-with-values
-              (lambda ()
-                (resolve-package-source
-                  datum
-                  #:wanted wanted
-                  #:store sdir
-                  #:existing-lock base-lock
-                  #:stage-root dir
-                  #:wrap-publish
-                  (lambda (root-name staged-manifests merged-lock publish!)
-                    (publishing dir
-                      (lambda ()
-                        (let ((cur-lock (read-world-lock dir))
-                              (cur-roots (read-installed-roots dir)))
-                          (set! saved-old-lock cur-lock)
-                          (set! saved-old-roots cur-roots)
-                          (validate-candidate! dir root-name staged-manifests cur-lock cur-roots wanted upgrade)
-                          (let* ((published (publish!))
-                                 (sub (locked-package-subdir-of merged-lock root-name))
-                                 (root-datum (if sub (with-package-clause datum root-name) datum))
-                                 (new-roots (upsert-root cur-roots root-name root-datum)))
-                            (set! recorded-datum root-datum)
-                            (write-lockfile (world-lock-path dir) merged-lock)
-                            (write-installed-roots! dir new-roots)
-                            published)))))))
-              (lambda (root-name merged-lock newly-published)
-                (guard (e (#t
-                           (rollback-install! dir saved-old-lock saved-old-roots newly-published)
-                           (raise e)))
-                  (let ((manifests (verify-world-lockfile merged-lock #:store sdir)))
-                    (announce-root! merged-lock manifests root-name wanted upgrade))))))))))
+                 (manifests (verify-world-closure lf (list (car hit)) #:store sdir #:root-recipes (list hit))))
+            (announce-root! lf manifests (car hit) wanted #f)))
+        ;; Lock-free fast path for offline repeats when not upgrading.
+        (let* ((initial-roots (read-installed-roots dir))
+               (initial-hit (and (not upgrade) (find-installed-root initial-roots datum wanted))))
+          (if initial-hit
+              (offline-repeat initial-hit)
+              ;; Acquire `.publishing` BEFORE reading `installed.scm` and `world.lock`
+              ;; so concurrent installs cannot lose updates or clobber `world.lock`.
+              (publishing dir
+                (lambda ()
+                  (let* ((cur-roots (read-installed-roots dir))
+                         (cur-hit (and (not upgrade) (find-installed-root cur-roots datum wanted))))
+                    (if cur-hit
+                        (offline-repeat cur-hit)
+                        (let ((cur-lock (read-world-lock dir)))
+                          (when (and (pair? cur-roots) (not cur-lock))
+                            (error "Missing world.lock for installed packages" dir))
+                          (let* ((drop-target
+                                  (and upgrade
+                                       (or wanted
+                                           (let ((existing (find-installed-root cur-roots datum #f)))
+                                             (and existing (car existing)))
+                                           (let ((same-repo
+                                                  (filter (lambda (r)
+                                                            (and (eq? (car (cdr r)) (car datum))
+                                                                 (equal? (cadr (cdr r)) (cadr datum))))
+                                                          cur-roots)))
+                                             (and (= 1 (length same-repo)) (caar same-repo))))))
+                                 (base-lock (if (and upgrade drop-target)
+                                                (lockfile-without-root cur-lock cur-roots drop-target)
+                                                cur-lock))
+                                 (recorded-entry #f))
+                            (call-with-values
+                              (lambda ()
+                                (resolve-package-source
+                                  datum
+                                  #:wanted wanted
+                                  #:store sdir
+                                  #:existing-lock base-lock
+                                  #:stage-root dir
+                                  #:wrap-publish
+                                  (lambda (root-name staged-manifests merged-lock publish!)
+                                    (validate-candidate! sdir root-name staged-manifests cur-lock cur-roots wanted upgrade)
+                                    (let* ((published (publish!))
+                                           (sub (locked-package-subdir-of merged-lock root-name))
+                                           (root-datum (if sub (with-package-clause datum root-name) datum))
+                                           (new-roots (upsert-root cur-roots root-name root-datum)))
+                                      (set! recorded-entry (cons root-name root-datum))
+                                      (write-lockfile (world-lock-path dir) merged-lock)
+                                      (write-installed-roots! dir new-roots)
+                                      published))))
+                              (lambda (root-name merged-lock _newly-published)
+                                (guard (e (#t
+                                           (rollback-metadata! dir cur-lock cur-roots)
+                                           (raise e)))
+                                  (let ((manifests (verify-world-closure merged-lock (list root-name)
+                                                                         #:store sdir
+                                                                         #:root-recipes (list recorded-entry))))
+                                    (announce-root! merged-lock manifests root-name wanted upgrade)))))))))))))))))
 
-(define (package-restore! #:directory [directory (store)])
-  "Verify and restore all packages installed in DIRECTORY strictly offline.
-Reads `world.lock` and `installed.scm`, checks every materialized package's
-`tree-sha256` against `<DIRECTORY>/store/<tree-sha256>/`, registers library
-providers and import boundaries, and advertises editor declarations when
-present."
-  (let ((dir directory))
-    (if (not (and (file-exists? dir) (file-exists? (world-lock-path dir))))
-        '()
-        (let* ((sdir (store-dir dir))
-               (lf (read-world-lock dir))
-               (roots (read-installed-roots dir))
-               (root-names (map car roots))
-               (manifest-alist (verify-world-lockfile lf #:store sdir))
-               (root-manifests (map (lambda (name)
-                                      (let ((p (assoc name manifest-alist)))
-                                        (unless p (error "Installed root missing from world.lock" name))
-                                        (cdr p)))
-                                    root-names)))
-          ;; Validate all declarations and disjointness before mutating editor state.
-          (check-disjoint! root-manifests)
-          (for-each (lambda (name m)
-                      (let ((hash (locked-package-hash lf name))
-                            (old (hash-table-ref/default indexed name #f)))
-                        (if old
-                            (unless (string=? old hash)
-                              (error "Package name already installed" name))
-                            (check-declarations! m #f))))
-                    root-names root-manifests)
-          ;; Register all verified package libraries atomically, then advertise editor packages.
-          (register-package-world! (map cdr manifest-alist))
-          (map (lambda (name m)
-                 (let ((hash (locked-package-hash lf name))
-                       (old (hash-table-ref/default indexed name #f)))
-                   (unless old
-                     (when (manifest-editor m)
-                       (advertise-package! name (car (manifest-editor m)) (commands m) (options m)))
-                     (hash-table-set! indexed name hash))
-                   name))
-               root-names root-manifests)))))
+(define (package-restore! #:directory [directory #f] #:store [store #f])
+  "Verify and restore all packages installed in DIRECTORY offline.
+Reads `world.lock` and `installed.scm` from DIRECTORY, checks the exact
+transitive closure of installed roots against STORE (defaulting to
+`(package-store-dir)`, or `<DIRECTORY>/store` when DIRECTORY is given),
+verifies every `tree-sha256`, registers library providers and import
+boundaries, and advertises editor declarations when present."
+  (call-with-values (lambda () (resolve-install-dirs directory store))
+    (lambda (dir sdir)
+      (if (not (file-exists? dir))
+          '()
+          (let* ((roots (read-installed-roots dir))
+                 (lock-exists? (file-exists? (world-lock-path dir))))
+            (cond
+              ((and (null? roots) (not lock-exists?)) '())
+              ((and (pair? roots) (not lock-exists?))
+               (error "Missing world.lock for installed packages" dir))
+              (else
+               (let* ((lf (read-world-lock dir))
+                      (root-names (map car roots))
+                      (manifest-alist (verify-world-closure lf root-names
+                                                            #:store sdir
+                                                            #:exact #t
+                                                            #:root-recipes roots))
+                      (root-manifests (map (lambda (name)
+                                             (let ((p (assoc name manifest-alist)))
+                                               (unless p (error "Installed root missing from world.lock" name))
+                                               (cdr p)))
+                                           root-names)))
+                 ;; Validate all declarations and disjointness before mutating editor state.
+                 (check-disjoint! root-manifests)
+                 (for-each (lambda (name m)
+                             (let ((hash (locked-package-hash lf name))
+                                   (old (hash-table-ref/default indexed name #f)))
+                               (if old
+                                   (unless (string=? old hash)
+                                     (error "Package name already installed" name))
+                                   (check-declarations! m #f))))
+                           root-names root-manifests)
+                 ;; Register all verified package libraries atomically, then advertise editor packages.
+                 (register-package-world! (map cdr manifest-alist))
+                 (map (lambda (name m)
+                        (let ((hash (locked-package-hash lf name))
+                              (old (hash-table-ref/default indexed name #f)))
+                          (unless old
+                            (when (manifest-editor m)
+                              (advertise-package! name (car (manifest-editor m)) (commands m) (options m)))
+                            (hash-table-set! indexed name hash))
+                          name))
+                      root-names root-manifests)))))))))
