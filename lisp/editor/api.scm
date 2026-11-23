@@ -98,6 +98,13 @@
          make-listing-buffer! listing-redisplay! listing-row listing-mark listing-marked listing-targets
          listing-key-at listing-goto! listing-get listing-set! listing?
          save-document! reload-document! directory-entries path-exists?
+         document-codec document-codec-envelope document-private? document-logical-path
+         codec? codec-name codec-doc codec-private? codec-priority
+         codec-result? make-codec-result codec-result-text codec-result-envelope
+         register-codec! define-codec find-codec codec-names
+         codec-for-path codecs-for-path path-private-by-codec? codec-logical-path codec-init-envelope
+         codec-decode codec-encode
+         default-codec-max-bytes default-codec-timeout default-gzip-program
          remote-path? location-route location-path location-prefix location-at define-method method-names
          hop? hop-method hop-user hop-host hop-port
          location-endpoint remote-endpoints call-with-process-at

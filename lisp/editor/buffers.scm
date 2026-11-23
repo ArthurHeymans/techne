@@ -36,10 +36,15 @@ A file's is named by the file, with its directory's name after it when
 that name is taken. A file's new buffer runs `file-buffer-added`."
   (let* ((new (not (document-buffer d)))
          (b (or (document-buffer d)
-                (let ((path (document-path d)))
-                  (when path (file-document path #:document d))
-                  (make-buffer d (if path (file-buffer-name path #f) "*scratch*")
-                               (if path (mode-for-file path) 'scheme-mode))))))
+                (let ((path (document-path d))
+                      (logical (document-logical-path d)))
+                  (when path
+                    (file-document path #:document d #:codec (document-codec d) #:private (document-unretained? d)))
+                  (let ((buf (make-buffer d (if path (file-buffer-name path #f) "*scratch*")
+                                          (if path (mode-for-file (or logical path)) 'scheme-mode))))
+                    (when (and (document-private? d) (find-option 'lsp-auto))
+                      (set-option! 'lsp-auto #f #:buffer buf))
+                    buf)))))
     (remember-buffer! b)
     (when (and new (document-path d) (current-session))
       (run-hook! (current-session) 'file-buffer-added b))
@@ -85,6 +90,22 @@ kept a journal where it was, a list of texts."
          (to-true (entry-truename to))
          (moved (documents-under true))
          (new (lambda (d) (string-append to-true (substring (document-path d) (string-length true) (string-length (document-path d))))))
+         ;; Refuse crossing a codec or privacy boundary while a document is open.
+         (_ (for-each (lambda (d)
+                        (let* ((dest (new d))
+                               (old-codec (document-codec d))
+                               (dest-codec (codec-for-path dest))
+                               (old-priv? (document-unretained? d))
+                               (dest-priv? (private-path? dest)))
+                          (when (not (eq? old-codec dest-codec))
+                            (error "Cannot move open document across a codec boundary"
+                                   (abbreviate-path (document-path d))
+                                   (abbreviate-path dest)))
+                          (when (and dest-priv? (not old-priv?))
+                            (error "Cannot move non-private open document to a private path"
+                                   (abbreviate-path (document-path d))
+                                   (abbreviate-path dest)))))
+                      moved))
          ;; Each journal is locked before the move, so none can fail after.
          (plans (let loop ((ds moved) (acc '()))
                   (if (null? ds)
@@ -116,7 +137,7 @@ left with no file to be recovered against."
     (delete-path path #t)
     (for-each (lambda (d)
                 ;; Its text is the file's now: none.
-                (document-reload! d)
+                (reload-document! d)
                 (let ((b (document-buffer d)))
                   (when (and b (> (length (buffer-list)) 1)) (drop-buffer! s b))))
               deleted)))
@@ -310,7 +331,15 @@ directory's path, with its slash."
                    #:require-match #f
                    #:select-input existing-directory?
                    #:history 'file-name
-                   #:remember (lambda (entry c) (and (not (goes-into? c)) entry))
+                   #:remember (lambda (entry c)
+                                (let* ((t (candidate-target c))
+                                       (full (absolute-path (if t (target-value t) entry))))
+                                  (and (not (goes-into? c))
+                                       (not (guard (e (#t #t))
+                                              (or (private-path? full)
+                                                  (let ((d (open-document-at full)))
+                                                    (and d (document-private? d))))))
+                                       entry)))
                    #:accept (lambda (s c)
                               (let ((t (candidate-target c)))
                                 (if (goes-into? c)
@@ -504,4 +533,5 @@ its target the line's location."
 (define-action location (goto-location-other-pane s l) "Go to the location in a new pane below." (goto-location! s l show-in-other-pane!))
 (define-action location (copy-location-line s l)
   "Save the location's line as a kill."
-  (kill-save! s (line-candidate-text (location-document l) (location-position l)) #f #f))
+  (let ((d (location-document l)))
+    (kill-save! s (line-candidate-text d (location-position l)) #f #f #:private (private-document? d))))

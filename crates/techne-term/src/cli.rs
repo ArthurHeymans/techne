@@ -30,7 +30,7 @@ use techne_editor::{
     attach::{Link, Target},
     host::{Event, File, Host},
     present::{Input, Output},
-    runtime::{Runtime, journal_for},
+    runtime::Runtime,
     server,
 };
 
@@ -152,13 +152,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
             }
         }
     } else {
-        let file = path.map(|path| {
-            let journal = journal_for(&path).unwrap_or_else(|e| {
-                eprintln!("techne: journal: {e}");
-                std::process::exit(1)
-            });
-            File { path, journal }
-        });
+        let file = path.map(|path| File { path, journal: PathBuf::new() });
         let keep_histories = |rt: &mut Runtime| {
             if let Err(e) = rt.keep_histories(None) {
                 eprintln!("techne: history: {e}");

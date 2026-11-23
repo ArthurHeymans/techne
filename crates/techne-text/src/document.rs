@@ -203,24 +203,50 @@ pub enum Place {
     Remote(String),
 }
 
+/// How a stored document's unsaved edits are retained on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retention {
+    /// Append every transaction to a private journal file on disk.
+    Journal,
+    /// Keep edits in memory only: never create or write journal or lock files.
+    None,
+}
+
+#[derive(Debug)]
+struct JournalState {
+    path: PathBuf,
+    journal: Journal,
+}
+
 /// Where the document is stored and recorded.
 #[derive(Debug)]
 struct Storage {
     place: Place,
-    journal_path: PathBuf,
-    journal: Journal,
+    journal: Option<JournalState>,
+    fence: journal::Fence,
     disk_hash: Option<journal::Hash>,
+    disk_len: Option<u64>,
+    /// True when the document's text was decoded from stored bytes via a
+    /// codec; raw save/reload/revert entry points refuse such documents.
+    decoded: bool,
+    /// Monotonic counter incremented whenever the document relocates to a new path.
+    location_gen: u64,
 }
 
 /// A remote document's save under way (`Document::begin_save`).
 #[derive(Debug)]
 pub struct PendingSave {
-    /// What to write.
+    /// What to write (stored bytes, plain or encoded).
     pub bytes: Vec<u8>,
-    /// The hash the file must still have (`None`: there must be no file),
-    /// unless the save overwrites.
+    /// The stored-bytes hash the file must still have (`None`: there must be
+    /// no file), unless the save overwrites.
     pub base: Option<journal::Hash>,
-    hash: journal::Hash,
+    /// Hash of the stored bytes being written.
+    disk_hash: journal::Hash,
+    /// Length in bytes of the stored bytes being written.
+    disk_len: u64,
+    /// Hash of the plaintext at `revision`, for journal recovery.
+    text_hash: journal::Hash,
     revision: Revision,
     text: Rope,
 }
@@ -295,23 +321,258 @@ pub fn file_path(path: &Path) -> io::Result<PathBuf> {
 /// The bytes of the file at `path`, or none if there is none. Only a
 /// regular file is read: it is opened without waiting, so that a FIFO with
 /// no writer is refused rather than blocking the reader.
+pub fn read_disk_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    disk_bytes_limited(path, None)
+}
+
+/// As `read_disk_bytes`, refusing files larger than `max_bytes`.
+pub fn read_disk_bytes_bounded(path: &Path, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+    disk_bytes_limited(path, Some(max_bytes))
+}
+
+/// Read the bytes of a pinned canonical `path` by walking every directory
+/// component from `/` and the leaf with `O_NOFOLLOW`. Refuses any symlink
+/// anywhere along `path`, returning `Ok(None)` only when every parent is a
+/// real directory and the leaf does not exist.
+pub fn read_disk_bytes_pinned(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    read_pinned_bytes(path, None, "reading")
+}
+
+/// As `read_disk_bytes_pinned`, refusing files larger than `max_bytes`.
+pub fn read_disk_bytes_pinned_bounded(path: &Path, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+    read_pinned_bytes(path, Some(max_bytes), "reading")
+}
+
+/// Verify that a previously canonicalized `path` has canonical formatting,
+/// traverses zero symlinks from `/` to the leaf, and (if present) is a regular
+/// file. Fails closed before any journal directory or lock file is created.
+pub fn verify_pinned_path(path: &Path, action: &str) -> io::Result<()> {
+    if let Some(file) = open_pinned_nofollow(path, action)? {
+        let kind = file.metadata()?.file_type();
+        if kind.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+        }
+        if !kind.is_file() {
+            return Err(io::Error::other("not a regular file"));
+        }
+    }
+    Ok(())
+}
+
 fn disk_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    use std::{io::Read, os::unix::fs::OpenOptionsExt};
-    let file = match fs::OpenOptions::new().read(true).custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32).open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let kind = file.metadata()?.file_type();
+    disk_bytes_limited(path, None)
+}
+
+/// Walk every parent component of a canonical absolute `path` from `/` using
+/// `O_NOFOLLOW | O_DIRECTORY`, returning an open handle to the parent directory
+/// and the leaf entry name. Refuses relative paths, unnormalized paths, and any
+/// symlink or non-directory component.
+pub fn open_pinned_parent_dir(path: &Path, action: &str) -> io::Result<(rustix::fd::OwnedFd, std::ffi::OsString)> {
+    use rustix::fs::{Mode, OFlags, openat};
+    use std::path::Component;
+
+    let normalized: PathBuf = path.components().collect();
+    if normalized != path {
+        return Err(io::Error::other(format!("file target changed on disk while {action}")));
+    }
+    let mut comps = path.components();
+    if !matches!(comps.next(), Some(Component::RootDir)) {
+        return Err(io::Error::other(format!("file target changed on disk while {action}")));
+    }
+    let mut names: Vec<&std::ffi::OsStr> = Vec::new();
+    for c in comps {
+        match c {
+            Component::Normal(n) => names.push(n),
+            _ => return Err(io::Error::other(format!("file target changed on disk while {action}"))),
+        }
+    }
+    if names.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+    }
+
+    let mut dir_fd =
+        openat(rustix::fs::CWD, "/", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(io::Error::from)?;
+    for dir_name in &names[..names.len() - 1] {
+        dir_fd = match openat(&dir_fd, *dir_name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                return Err(io::Error::other(format!("file target changed on disk while {action}")));
+            }
+            Err(e) => return Err(io::Error::from(e)),
+        };
+    }
+
+    let leaf = names[names.len() - 1].to_os_string();
+    Ok((dir_fd, leaf))
+}
+
+/// Open `leaf` inside `dir_fd` with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`.
+/// Returns `Ok(None)` when absent and fails closed if `leaf` is a symlink.
+pub fn open_leaf_in_dir(dir_fd: &rustix::fd::OwnedFd, leaf: &std::ffi::OsStr, action: &str) -> io::Result<Option<fs::File>> {
+    use rustix::fs::{Mode, OFlags, openat};
+    match openat(dir_fd, leaf, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty()) {
+        Ok(fd) => Ok(Some(fs::File::from(fd))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(rustix::io::Errno::LOOP) => Err(io::Error::other(format!("file target changed on disk while {action}"))),
+        Err(e) => Err(io::Error::from(e)),
+    }
+}
+
+fn open_pinned_nofollow(path: &Path, action: &str) -> io::Result<Option<fs::File>> {
+    let (dir_fd, leaf) = open_pinned_parent_dir(path, action)?;
+    open_leaf_in_dir(&dir_fd, &leaf, action)
+}
+
+fn read_regular_file_bytes(file: fs::File, max_bytes: Option<usize>) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let meta = file.metadata()?;
+    let kind = meta.file_type();
     if kind.is_dir() {
         return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
     }
     if !kind.is_file() {
         return Err(io::Error::other("not a regular file"));
     }
+    if let Some(limit) = max_bytes
+        && meta.len() > limit as u64
+    {
+        return Err(io::Error::other(format!("file exceeds maximum size of {limit} bytes")));
+    }
     let mut bytes = Vec::new();
-    (&file).read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
+    match max_bytes {
+        Some(limit) => {
+            (&file).take((limit as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+            if bytes.len() > limit {
+                return Err(io::Error::other(format!("file exceeds maximum size of {limit} bytes")));
+            }
+        }
+        None => {
+            (&file).read_to_end(&mut bytes)?;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Verify that an already-opened file handle is a regular file whose exact byte
+/// length and BLAKE3 digest match `(expected_len, expected_hash)`, streaming
+/// through a fixed-size buffer with early length and growth checks so a file
+/// that grew substantially on disk cannot exhaust memory.
+pub fn regular_file_matches_digest(mut file: fs::File, expected_len: u64, expected_hash: journal::Hash) -> io::Result<bool> {
+    use std::io::Read;
+    let meta = file.metadata()?;
+    let kind = meta.file_type();
+    if kind.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+    }
+    if !kind.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    if meta.len() != expected_len {
+        return Ok(false);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > expected_len {
+            return Ok(false);
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(total == expected_len && *hasher.finalize().as_bytes() == expected_hash)
+}
+
+/// Stream-hash an already-opened regular file in a fixed-size buffer,
+/// returning `Ok(None)` if the file exceeds `max_bytes` (so oversized files
+/// cannot exhaust memory during conflict checks).
+pub fn stream_regular_file_hash(mut file: fs::File, max_bytes: Option<usize>) -> io::Result<Option<journal::Hash>> {
+    use std::io::Read;
+    let meta = file.metadata()?;
+    let kind = meta.file_type();
+    if kind.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+    }
+    if !kind.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    if let Some(limit) = max_bytes
+        && meta.len() > limit as u64
+    {
+        return Ok(None);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if let Some(limit) = max_bytes
+            && total > limit as u64
+        {
+            return Ok(None);
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(Some(*hasher.finalize().as_bytes()))
+}
+
+/// Read the regular file at a pinned canonical `path` via no-follow traversal,
+/// returning `Ok(None)` when absent and refusing symlinks, directories,
+/// non-regular files, or files exceeding `max_bytes`.
+pub fn read_pinned_bytes(path: &Path, max_bytes: Option<usize>, action: &str) -> io::Result<Option<Vec<u8>>> {
+    match open_pinned_nofollow(path, action)? {
+        Some(file) => Ok(Some(read_regular_file_bytes(file, max_bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Verify via directory-handle-relative no-follow open that pinned canonical
+/// `path` still holds exact bytes `expected` (or is still absent if `None`),
+/// reading at most `expected.len() + 1` bytes so growth cannot exhaust memory.
+fn verify_pinned_bytes(path: &Path, expected: Option<&[u8]>, action: &str) -> io::Result<()> {
+    use std::io::Read;
+    let file_opt = open_pinned_nofollow(path, action)?;
+    match (file_opt, expected) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => Err(io::Error::other(format!("file changed on disk while {action}"))),
+        (Some(file), Some(orig)) => {
+            let meta = file.metadata()?;
+            let kind = meta.file_type();
+            if kind.is_dir() {
+                return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+            }
+            if !kind.is_file() {
+                return Err(io::Error::other("not a regular file"));
+            }
+            if meta.len() != orig.len() as u64 {
+                return Err(io::Error::other(format!("file changed on disk while {action}")));
+            }
+            let mut buf = Vec::with_capacity(orig.len().min(64 * 1024));
+            (&file).take((orig.len() as u64).saturating_add(1)).read_to_end(&mut buf)?;
+            if buf.as_slice() != orig {
+                return Err(io::Error::other(format!("file changed on disk while {action}")));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn disk_bytes_limited(path: &Path, max_bytes: Option<usize>) -> io::Result<Option<Vec<u8>>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match fs::OpenOptions::new().read(true).custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(Some(read_regular_file_bytes(file, max_bytes)?))
 }
 
 /// A move of a document's file, prepared (`Document::prepare_relocation`).
@@ -320,8 +581,8 @@ pub struct Relocation {
     /// The document it was prepared for.
     document: u64,
     path: PathBuf,
-    journal: PathBuf,
-    /// The lock of the journal it moves to, unless it stays.
+    journal: Option<PathBuf>,
+    /// The lock of the journal it moves to, unless it stays or there is none.
     lock: Option<journal::Lock>,
 }
 
@@ -459,7 +720,67 @@ impl Document {
         let lock = journal::Lock::acquire(&journal_path)?;
         let path = file_path(path)?;
         let bytes = disk_bytes(&path)?;
-        Document::open_bytes(Place::File(path), bytes, journal_path, lock)
+        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
+        let disk_len = bytes.as_ref().map(|b| b.len() as u64);
+        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
+        Document::open_with_journal(Place::File(path), disk_hash, disk_len, text, journal_path, lock, false)
+    }
+
+    /// Open a pinned canonical `path` (empty if it does not exist), recording
+    /// edits in `journal_path`. Walks every component from `/` with
+    /// `O_NOFOLLOW` before and after acquiring the journal lock and never
+    /// re-canonicalizes or adopts a different target path.
+    pub fn open_pinned(path: &Path, journal_path: &Path) -> Result<(Document, Recovery), OpenError> {
+        verify_pinned_path(path, "opening")?;
+        let journal_path = file_path(journal_path)?;
+        let lock = journal::Lock::acquire(&journal_path)?;
+        let bytes = read_pinned_bytes(path, None, "opening")?;
+        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
+        let disk_len = bytes.as_ref().map(|b| b.len() as u64);
+        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
+        Document::open_with_journal(Place::File(path.to_path_buf()), disk_hash, disk_len, text, journal_path, lock, false)
+    }
+
+    /// Open `path` (empty if it does not exist) with `Retention::None`:
+    /// edits stay in memory and no journal or lock file is ever created.
+    pub fn open_without_journal(path: &Path) -> Result<Document, OpenError> {
+        let path = file_path(path)?;
+        let bytes = disk_bytes(&path)?;
+        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
+        let disk_len = bytes.as_ref().map(|b| b.len() as u64);
+        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
+        let mut doc = Document::new(&text);
+        doc.storage = Some(Storage {
+            place: Place::File(path),
+            journal: None,
+            fence: journal::Fence::current(),
+            disk_hash,
+            disk_len,
+            decoded: false,
+            location_gen: 0,
+        });
+        Ok(doc)
+    }
+
+    /// Open a pinned canonical `path` with `Retention::None` via
+    /// directory-handle-relative no-follow open, never adopting a different
+    /// target path.
+    pub fn open_without_journal_pinned(path: &Path) -> Result<Document, OpenError> {
+        let bytes = read_pinned_bytes(path, None, "opening")?;
+        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
+        let disk_len = bytes.as_ref().map(|b| b.len() as u64);
+        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
+        let mut doc = Document::new(&text);
+        doc.storage = Some(Storage {
+            place: Place::File(path.to_path_buf()),
+            journal: None,
+            fence: journal::Fence::current(),
+            disk_hash,
+            disk_len,
+            decoded: false,
+            location_gen: 0,
+        });
+        Ok(doc)
     }
 
     /// Open the file elsewhere called `name`, whose bytes (`None` if there
@@ -468,17 +789,90 @@ impl Document {
     pub fn open_remote(name: &str, bytes: Option<Vec<u8>>, journal_path: &Path) -> Result<(Document, Recovery), OpenError> {
         let journal_path = file_path(journal_path)?;
         let lock = journal::Lock::acquire(&journal_path)?;
-        Document::open_bytes(Place::Remote(name.to_string()), bytes, journal_path, lock)
+        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
+        let disk_len = bytes.as_ref().map(|b| b.len() as u64);
+        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
+        Document::open_with_journal(Place::Remote(name.to_string()), disk_hash, disk_len, text, journal_path, lock, false)
     }
 
-    fn open_bytes(
+    /// Open the file elsewhere called `name` with `Retention::None`: edits
+    /// stay in memory and no journal or lock file is ever created.
+    pub fn open_remote_without_journal(name: &str, bytes: Option<Vec<u8>>) -> Result<Document, OpenError> {
+        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
+        let disk_len = bytes.as_ref().map(|b| b.len() as u64);
+        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
+        let mut doc = Document::new(&text);
+        doc.storage = Some(Storage {
+            place: Place::Remote(name.to_string()),
+            journal: None,
+            fence: journal::Fence::current(),
+            disk_hash,
+            disk_len,
+            decoded: false,
+            location_gen: 0,
+        });
+        Ok(doc)
+    }
+
+    /// Open a document whose stored bytes `raw_bytes` (`None` if the file
+    /// does not exist yet) have already been decoded into `text`.
+    /// `disk_hash` is computed from `raw_bytes` (the stored representation),
+    /// while any journal tracks `text` (the plaintext). When `journal_path`
+    /// is `None`, the document uses `Retention::None` and never creates or
+    /// reads any journal or lock file.
+    ///
+    /// For local files, `place` must already be a pinned canonical path: it is
+    /// never re-resolved or replaced, and its components and exact stored bytes
+    /// are revalidated via directory-handle-relative no-follow opens bounded by
+    /// `raw_bytes.len()` both before and after acquiring journal ownership.
+    pub fn open_decoded(
         place: Place,
-        bytes: Option<Vec<u8>>,
+        raw_bytes: Option<&[u8]>,
+        text: String,
+        journal_path: Option<&Path>,
+    ) -> Result<(Document, Recovery), OpenError> {
+        let disk_hash = raw_bytes.map(journal::hash);
+        let disk_len = raw_bytes.map(|b| b.len() as u64);
+        match journal_path {
+            None => {
+                if let Place::File(p) = &place {
+                    verify_pinned_bytes(p, raw_bytes, "decoding")?;
+                }
+                let mut doc = Document::new(&text);
+                doc.storage = Some(Storage {
+                    place,
+                    journal: None,
+                    fence: journal::Fence::current(),
+                    disk_hash,
+                    disk_len,
+                    decoded: true,
+                    location_gen: 0,
+                });
+                Ok((doc, Recovery::Clean))
+            }
+            Some(jp) => {
+                if let Place::File(p) = &place {
+                    verify_pinned_bytes(p, raw_bytes, "decoding")?;
+                }
+                let jp = file_path(jp)?;
+                let lock = journal::Lock::acquire(&jp)?;
+                if let Place::File(p) = &place {
+                    verify_pinned_bytes(p, raw_bytes, "decoding")?;
+                }
+                Document::open_with_journal(place, disk_hash, disk_len, text, jp, lock, true)
+            }
+        }
+    }
+
+    fn open_with_journal(
+        place: Place,
+        disk_hash: Option<journal::Hash>,
+        disk_len: Option<u64>,
+        text: String,
         journal_path: PathBuf,
         lock: journal::Lock,
+        decoded: bool,
     ) -> Result<(Document, Recovery), OpenError> {
-        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
-        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
         let hash = journal::hash(text.as_bytes());
         let mut doc = Document::new(&text);
         let mut unsaved = Vec::new();
@@ -512,7 +906,15 @@ impl Document {
         // Start a fresh journal from the file. Recovered edits stay unsaved:
         // they are recorded again after the journal's base.
         let journal = Journal::create_with(&journal_path, doc.first, &hash, &unsaved, lock)?;
-        doc.storage = Some(Storage { place, journal_path, journal, disk_hash });
+        doc.storage = Some(Storage {
+            place,
+            journal: Some(JournalState { path: journal_path, journal }),
+            fence: journal::Fence::current(),
+            disk_hash,
+            disk_len,
+            decoded,
+            location_gen: 0,
+        });
         Ok((doc, recovery))
     }
 
@@ -550,6 +952,22 @@ impl Document {
         self.storage.as_ref().map(|s| &s.place)
     }
 
+    /// How a stored document's unsaved edits are retained, or `None` for
+    /// an in-memory document with no storage.
+    pub fn retention(&self) -> Option<Retention> {
+        self.storage.as_ref().map(|s| if s.journal.is_some() { Retention::Journal } else { Retention::None })
+    }
+
+    /// Whether the document records transactions in a disk journal.
+    pub fn has_journal(&self) -> bool {
+        self.storage.as_ref().is_some_and(|s| s.journal.is_some())
+    }
+
+    /// Whether the document's text was decoded from stored bytes via a codec.
+    pub fn is_decoded(&self) -> bool {
+        self.storage.as_ref().is_some_and(|s| s.decoded)
+    }
+
     /// Whether the text differs from what was opened or saved: edits
     /// undone back to it, it is not, as in Emacs.
     pub fn is_dirty(&self) -> bool {
@@ -574,7 +992,7 @@ impl Document {
     /// units that began there. Refused for a document with a journal,
     /// whose replay could not group its undo as forgetting did.
     pub fn limit_history(&mut self, revisions: Option<usize>) -> Result<(), &'static str> {
-        if self.storage.is_some() {
+        if self.has_journal() {
             return Err("a document with a journal keeps its history");
         }
         self.limit = revisions;
@@ -646,8 +1064,8 @@ impl Document {
 
     pub fn apply(&mut self, tx: Transaction) -> Result<Revision, ApplyError> {
         self.check(&tx)?;
-        if let Some(s) = &mut self.storage {
-            s.journal.append(&Record::Tx { tx: tx.clone(), kind: Kind::Edit }).map_err(ApplyError::Journal)?;
+        if let Some(j) = self.storage.as_mut().and_then(|s| s.journal.as_mut()) {
+            j.journal.append(&Record::Tx { tx: tx.clone(), kind: Kind::Edit }).map_err(ApplyError::Journal)?;
         }
         self.commit(tx, Kind::Edit);
         Ok(self.revision())
@@ -703,9 +1121,9 @@ impl Document {
         let actor = self.operation_actor(op)?;
         let actor = &actor;
         let steps = self.operation_undo(actor, op, operation)?;
-        if let Some(s) = &mut self.storage {
+        if let Some(j) = self.storage.as_mut().and_then(|s| s.journal.as_mut()) {
             let records: Vec<_> = steps.iter().map(|tx| Record::Tx { tx: tx.clone(), kind: Kind::Undo }).collect();
-            s.journal.append_all(&records).map_err(|e| UndoError::Apply(ApplyError::Journal(e)))?;
+            j.journal.append_all(&records).map_err(|e| UndoError::Apply(ApplyError::Journal(e)))?;
         }
         for tx in steps {
             self.stacks.get_mut(actor).expect("actor has stacks").undo.pop();
@@ -857,24 +1275,118 @@ impl Document {
     /// Write the text to its file, following the target resolved at open.
     /// `Overwrite` explicitly permits replacing externally changed text.
     pub fn save_with(&mut self, mode: SaveMode) -> Result<(), SaveError> {
+        if self.is_decoded() {
+            return Err(io::Error::other("a decoded document must be saved through its codec").into());
+        }
+        let rev = self.revision();
+        let bytes = self.text.to_string().into_bytes();
+        self.save_encoded_at(mode, rev, &bytes)
+    }
+
+    /// Write `encoded_bytes` (the stored representation of the document's text
+    /// at `revision`) to its local file, checking the stored bytes on disk
+    /// against `disk_hash` when `mode == SaveMode::IfUnchanged`.
+    ///
+    /// For journaled documents, the disk check, `Saving` record (with the
+    /// plaintext hash of `revision`), atomic file write, and journal
+    /// checkpoint execute under one revocation fence, preserving any edits
+    /// made after `revision` while encoding asynchronously. For
+    /// `Retention::None` documents, no journal or lock file is touched and
+    /// written files use mode `0o600` (both new files and replacements).
+    pub fn save_encoded_at(&mut self, mode: SaveMode, revision: Revision, encoded_bytes: &[u8]) -> Result<(), SaveError> {
+        let head = self.revision();
+        if revision > head {
+            return Err(io::Error::other("the saved revision is ahead of the document").into());
+        }
+        if revision < self.saved {
+            return Err(io::Error::other("a newer revision was already saved").into());
+        }
+        let saved_text = if revision == head {
+            self.text.clone()
+        } else {
+            self.text_at(revision).ok_or_else(|| io::Error::other("the saved revision is no longer in history"))?
+        };
+        let text_hash = journal::hash(saved_text.to_string().as_bytes());
+        let encoded_hash = journal::hash(encoded_bytes);
         let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
         let Place::File(path) = &s.place else {
             return Err(io::Error::other("a remote document is saved through its endpoint").into());
         };
-        let disk_hash = disk_bytes(path)?.as_ref().map(|b| journal::hash(b));
-        if mode == SaveMode::IfUnchanged && disk_hash != s.disk_hash {
-            return Err(SaveError::ChangedOnDisk);
-        }
-        let bytes = self.text.to_string().into_bytes();
-        let hash = journal::hash(&bytes);
-        let disk_hash = &mut s.disk_hash;
-        s.journal.save(&s.journal_path, self.first + self.history.len() as u64, &hash, || {
-            journal::write_atomically(path, &bytes)?;
-            *disk_hash = Some(hash);
+        let (dir_fd, leaf) = open_pinned_parent_dir(path, "saving")?;
+        let expected_disk_hash = s.disk_hash;
+        let expected_disk_len = s.disk_len;
+        let check = || -> Result<(), SaveError> {
+            match open_leaf_in_dir(&dir_fd, &leaf, "saving")? {
+                Some(file) => {
+                    if mode == SaveMode::IfUnchanged {
+                        let (Some(expected_hash), Some(expected_len)) = (expected_disk_hash, expected_disk_len) else {
+                            let kind = file.metadata()?.file_type();
+                            if kind.is_dir() {
+                                return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory").into());
+                            }
+                            if !kind.is_file() {
+                                return Err(io::Error::other("not a regular file").into());
+                            }
+                            return Err(SaveError::ChangedOnDisk);
+                        };
+                        if !regular_file_matches_digest(file, expected_len, expected_hash)? {
+                            return Err(SaveError::ChangedOnDisk);
+                        }
+                    } else {
+                        let kind = file.metadata()?.file_type();
+                        if kind.is_dir() {
+                            return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory").into());
+                        }
+                        if !kind.is_file() {
+                            return Err(io::Error::other("not a regular file").into());
+                        }
+                    }
+                }
+                None => {
+                    if mode == SaveMode::IfUnchanged && expected_disk_hash.is_some() {
+                        return Err(SaveError::ChangedOnDisk);
+                    }
+                }
+            }
             Ok(())
-        })?;
-        self.saved = self.revision();
-        self.saved_text = self.text.clone();
+        };
+        let write_target = |private: bool| -> Result<(), SaveError> {
+            let no_clobber = mode == SaveMode::IfUnchanged && expected_disk_hash.is_none();
+            let res = journal::write_atomically_in_dir(&dir_fd, &leaf, encoded_bytes, private, private && !no_clobber, no_clobber);
+            match res {
+                Ok(()) => Ok(()),
+                Err(e) if no_clobber && e.kind() == io::ErrorKind::AlreadyExists => Err(SaveError::ChangedOnDisk),
+                Err(e) => Err(e.into()),
+            }
+        };
+        match &mut s.journal {
+            Some(j) => {
+                j.journal.save_checked(&j.path, revision, &text_hash, revision != head, check, || write_target(false))?;
+            }
+            None => {
+                let _held = s.fence.hold()?;
+                check()?;
+                write_target(true)?;
+            }
+        }
+        s.disk_hash = Some(encoded_hash);
+        s.disk_len = Some(encoded_bytes.len() as u64);
+        self.saved = revision;
+        self.saved_text = saved_text;
+        self.dirty.set(None);
+        Ok(())
+    }
+
+    /// The document's current location generation, incremented on each `relocate`.
+    pub fn location_generation(&self) -> u64 {
+        self.storage.as_ref().map_or(0, |s| s.location_gen)
+    }
+
+    /// Check that this document's revocation fence has not been revoked.
+    pub fn check_fence(&self) -> io::Result<()> {
+        if let Some(s) = &self.storage {
+            let _held = s.fence.hold()?;
+        }
         Ok(())
     }
 
@@ -882,11 +1394,15 @@ impl Document {
     /// (`file_path`'s), its edits to be journaled in `journal_path`: that
     /// journal is locked from now on, so nothing changes between this and
     /// the move. Refused when another writer holds it, or it has edits not
-    /// saved, which it is never replaced with.
+    /// saved, which it is never replaced with. For a `Retention::None`
+    /// document, no journal or lock is touched.
     pub fn prepare_relocation(&self, path: &Path, journal_path: &Path) -> io::Result<Relocation> {
         let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
+        let Some(j) = &s.journal else {
+            return Ok(Relocation { document: self.id, path: path.to_path_buf(), journal: None, lock: None });
+        };
         let journal = file_path(journal_path)?;
-        let lock = if journal == s.journal_path {
+        let lock = if journal == j.path {
             None
         } else {
             let lock = journal::Lock::acquire(&journal)?;
@@ -895,7 +1411,7 @@ impl Document {
             }
             Some(lock)
         };
-        Ok(Relocation { document: self.id, path: path.to_path_buf(), journal, lock })
+        Ok(Relocation { document: self.id, path: path.to_path_buf(), journal: Some(journal), lock })
     }
 
     /// Follow the file, moved as `r` prepared: saving writes there from now
@@ -910,13 +1426,14 @@ impl Document {
             return Err(io::Error::other("a remote document's file is moved through its endpoint"));
         }
         s.place = Place::File(r.path);
-        match r.lock {
-            None => Ok(()),
-            Some(lock) => {
-                s.journal.move_to(&s.journal_path, &r.journal, lock)?;
-                s.journal_path = r.journal;
+        s.location_gen += 1;
+        match (s.journal.as_mut(), r.journal, r.lock) {
+            (Some(j), Some(new_path), Some(lock)) => {
+                j.journal.move_to(&j.path, &new_path, lock)?;
+                j.path = new_path;
                 Ok(())
             }
+            _ => Ok(()),
         }
     }
 
@@ -927,14 +1444,47 @@ impl Document {
     /// may come in between. A save that failed, or whose outcome is
     /// unknown, leaves the document modified.
     pub fn begin_save(&mut self) -> Result<PendingSave, SaveError> {
+        if self.is_decoded() {
+            return Err(io::Error::other("a decoded document must be saved through its codec").into());
+        }
+        let rev = self.revision();
+        let bytes = self.text.to_string().into_bytes();
+        self.begin_save_encoded(rev, bytes)
+    }
+
+    /// Start saving a remote document whose text at `revision` was encoded
+    /// into `encoded_bytes`. Records `Saving` with the plaintext hash in any
+    /// journal while sending `encoded_bytes` and expecting `disk_hash` on the
+    /// remote host.
+    pub fn begin_save_encoded(&mut self, revision: Revision, encoded_bytes: Vec<u8>) -> Result<PendingSave, SaveError> {
+        let head = self.revision();
+        if revision > head {
+            return Err(io::Error::other("the saved revision is ahead of the document").into());
+        }
+        if revision < self.saved {
+            return Err(io::Error::other("a newer revision was already saved").into());
+        }
+        let saved_text = if revision == head {
+            self.text.clone()
+        } else {
+            self.text_at(revision).ok_or_else(|| io::Error::other("the saved revision is no longer in history"))?
+        };
+        let text_hash = journal::hash(saved_text.to_string().as_bytes());
+        let disk_hash = journal::hash(&encoded_bytes);
+        let disk_len = encoded_bytes.len() as u64;
         let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
         if !matches!(s.place, Place::Remote(_)) {
             return Err(io::Error::other("a local document saves itself").into());
         }
-        let bytes = self.text.to_string().into_bytes();
-        let hash = journal::hash(&bytes);
-        s.journal.append(&Record::Saving { hash })?;
-        Ok(PendingSave { bytes, base: s.disk_hash, hash, revision: self.revision(), text: self.text.clone() })
+        match &mut s.journal {
+            Some(j) => {
+                j.journal.record_saving_at(&j.path, revision, &text_hash, revision != head)?;
+            }
+            None => {
+                let _held = s.fence.hold()?;
+            }
+        }
+        Ok(PendingSave { bytes: encoded_bytes, base: s.disk_hash, disk_hash, disk_len, text_hash, revision, text: saved_text })
     }
 
     /// The file now has the text `save` sent: that text is the saved one,
@@ -942,18 +1492,38 @@ impl Document {
     /// error says the journal could not start again; the save is done
     /// all the same, and recovery finds the file matching it.
     pub fn end_save(&mut self, save: PendingSave) -> io::Result<()> {
+        let disk_hash = save.disk_hash;
+        self.end_save_with_hash(save, disk_hash)
+    }
+
+    /// As `end_save`, recording `written_disk_hash` (the stored-bytes hash
+    /// acknowledged by the remote endpoint) as the document's `disk_hash`.
+    pub fn end_save_with_hash(&mut self, save: PendingSave, written_disk_hash: journal::Hash) -> io::Result<()> {
+        if save.revision < self.saved {
+            return Err(io::Error::other("a newer revision was already saved"));
+        }
         self.saved = save.revision;
         self.saved_text = save.text;
         self.dirty.set(None);
         let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
-        s.disk_hash = Some(save.hash);
-        s.journal.checkpoint(&s.journal_path, save.revision, &save.hash)
+        s.disk_hash = Some(written_disk_hash);
+        s.disk_len = Some(save.disk_len);
+        match &mut s.journal {
+            Some(j) => j.journal.checkpoint(&j.path, save.revision, &save.text_hash),
+            None => Ok(()),
+        }
     }
 
     /// The hash of the file's bytes as last read or saved, `None` when it
     /// had none, or the document has no file.
     pub fn disk_hash(&self) -> Option<journal::Hash> {
         self.storage.as_ref().and_then(|s| s.disk_hash)
+    }
+
+    /// Whether `raw_bytes` (or `None` when absent on disk) matches the
+    /// stored `disk_hash` last read or saved for this document.
+    pub fn stored_matches(&self, raw_bytes: Option<&[u8]>) -> bool {
+        self.storage.as_ref().is_some_and(|s| raw_bytes.map(journal::hash) == s.disk_hash)
     }
 
     /// Read the file again if it changed on disk since it was opened or
@@ -965,11 +1535,14 @@ impl Document {
 
     /// As `reload`, in `operation`.
     pub fn reload_in(&mut self, actor: &Actor, operation: Option<OperationId>) -> Result<bool, ReloadError> {
+        if self.is_decoded() {
+            return Err(io::Error::other("a decoded document must be reloaded through its codec").into());
+        }
         let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
         let Place::File(path) = &s.place else {
             return Err(io::Error::other("a remote document is read through its endpoint").into());
         };
-        let bytes = if self.is_dirty() { None } else { disk_bytes(path)? };
+        let bytes = if self.is_dirty() { None } else { read_pinned_bytes(path, None, "reloading")? };
         self.reload_bytes_in(actor, bytes, operation)
     }
 
@@ -981,10 +1554,33 @@ impl Document {
 
     /// As `reload_bytes`, in `operation`.
     pub fn reload_bytes_in(&mut self, actor: &Actor, bytes: Option<Vec<u8>>, operation: Option<OperationId>) -> Result<bool, ReloadError> {
+        if self.is_decoded() {
+            return Err(io::Error::other("a decoded document must be reloaded through its codec").into());
+        }
         if self.is_dirty() {
             return Err(ReloadError::Unsaved);
         }
         self.take_file_text(actor, bytes, operation)
+    }
+
+    /// As `reload_bytes_in`, when the stored bytes `raw_bytes` have already
+    /// been decoded into `text` by a codec.
+    pub fn reload_decoded_in(
+        &mut self,
+        actor: &Actor,
+        raw_bytes: Option<&[u8]>,
+        text: String,
+        operation: Option<OperationId>,
+    ) -> Result<bool, ReloadError> {
+        if self.is_dirty() {
+            return Err(ReloadError::Unsaved);
+        }
+        if let Some(s) = &self.storage
+            && let Place::File(p) = &s.place
+        {
+            verify_pinned_bytes(p, raw_bytes, "reloading")?;
+        }
+        self.take_decoded_text(actor, raw_bytes, text, operation)
     }
 
     /// Read the file again, its unsaved edits replaced by its text, as
@@ -992,17 +1588,40 @@ impl Document {
     /// journal starts again from the file, as at a reload. Returns
     /// whether the text changed.
     pub fn revert_in(&mut self, actor: &Actor, operation: Option<OperationId>) -> Result<bool, ReloadError> {
+        if self.is_decoded() {
+            return Err(io::Error::other("a decoded document must be reverted through its codec").into());
+        }
         let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
         let Place::File(path) = &s.place else {
             return Err(io::Error::other("a remote document is read through its endpoint").into());
         };
-        let bytes = disk_bytes(path)?;
+        let bytes = read_pinned_bytes(path, None, "reverting")?;
         self.revert_bytes_in(actor, bytes, operation)
     }
 
     /// As `revert_in`, with the file's bytes read by whoever reaches it.
     pub fn revert_bytes_in(&mut self, actor: &Actor, bytes: Option<Vec<u8>>, operation: Option<OperationId>) -> Result<bool, ReloadError> {
+        if self.is_decoded() {
+            return Err(io::Error::other("a decoded document must be reverted through its codec").into());
+        }
         self.take_file_text(actor, bytes, operation)
+    }
+
+    /// As `revert_bytes_in`, when the stored bytes `raw_bytes` have already
+    /// been decoded into `text` by a codec.
+    pub fn revert_decoded_in(
+        &mut self,
+        actor: &Actor,
+        raw_bytes: Option<&[u8]>,
+        text: String,
+        operation: Option<OperationId>,
+    ) -> Result<bool, ReloadError> {
+        if let Some(s) = &self.storage
+            && let Place::File(p) = &s.place
+        {
+            verify_pinned_bytes(p, raw_bytes, "reverting")?;
+        }
+        self.take_decoded_text(actor, raw_bytes, text, operation)
     }
 
     fn take_file_text(&mut self, actor: &Actor, bytes: Option<Vec<u8>>, operation: Option<OperationId>) -> Result<bool, ReloadError> {
@@ -1011,15 +1630,33 @@ impl Document {
         if disk_hash == s.disk_hash && !self.is_dirty() {
             return Ok(false);
         }
-        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| ReloadError::NotUtf8)?;
+        let text = String::from_utf8(bytes.clone().unwrap_or_default()).map_err(|_| ReloadError::NotUtf8)?;
+        self.take_decoded_text(actor, bytes.as_deref(), text, operation)
+    }
+
+    fn take_decoded_text(
+        &mut self,
+        actor: &Actor,
+        raw_bytes: Option<&[u8]>,
+        text: String,
+        operation: Option<OperationId>,
+    ) -> Result<bool, ReloadError> {
+        let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
+        let disk_hash = raw_bytes.map(journal::hash);
+        if disk_hash == s.disk_hash && !self.is_dirty() {
+            return Ok(false);
+        }
         let hash = journal::hash(text.as_bytes());
         let tx = Transaction { operation, ..self.edit(actor, [(0..self.len(), text)]).expect("the whole text is a range of it") };
         // The journal starts again from the file, as at open; first, so
         // that a failure changes nothing.
         let next = self.revision() + 1;
         let s = self.storage.as_mut().expect("checked above");
-        s.journal.reset(&s.journal_path, next, &hash)?;
+        if let Some(j) = &mut s.journal {
+            j.journal.reset(&j.path, next, &hash)?;
+        }
         s.disk_hash = disk_hash;
+        s.disk_len = raw_bytes.map(|b| b.len() as u64);
         self.commit(tx, Kind::Edit);
         self.saved = self.revision();
         self.saved_text = self.text.clone();
@@ -1083,8 +1720,8 @@ impl Document {
         let changes = moved_past(inverse, &self.history[unit.end..], &self.text, actor, Assoc::Before)
             .map_err(|actors| UndoError::Conflict { actors })?;
         let tx = Transaction { base: self.revision(), actor: actor.clone(), changes, group: Group::New, operation };
-        if let Some(s) = &mut self.storage {
-            s.journal.append(&Record::Tx { tx: tx.clone(), kind }).map_err(|e| UndoError::Apply(ApplyError::Journal(e)))?;
+        if let Some(j) = self.storage.as_mut().and_then(|s| s.journal.as_mut()) {
+            j.journal.append(&Record::Tx { tx: tx.clone(), kind }).map_err(|e| UndoError::Apply(ApplyError::Journal(e)))?;
         }
         let stacks = self.stacks.get_mut(actor).expect("actor has stacks");
         match kind {
@@ -1300,7 +1937,7 @@ mod tests {
         edit(&mut doc, &me, 1..1, "b");
         // What save does before starting a new journal.
         let hash = journal::hash(b"ab");
-        doc.storage.as_mut().unwrap().journal.append(&Record::Saving { hash }).unwrap();
+        doc.storage.as_mut().unwrap().journal.as_mut().unwrap().journal.append(&Record::Saving { hash }).unwrap();
         journal::write_atomically(&path, b"ab").unwrap();
         drop(doc);
         let (doc, recovery) = Document::open(&path, &journal).unwrap();
@@ -1314,7 +1951,7 @@ mod tests {
         let (mut doc, _) = Document::open(&path, &journal).unwrap();
         edit(&mut doc, &me, 1..1, "b");
         let hash = journal::hash(b"ab");
-        doc.storage.as_mut().unwrap().journal.append(&Record::Saving { hash }).unwrap();
+        doc.storage.as_mut().unwrap().journal.as_mut().unwrap().journal.append(&Record::Saving { hash }).unwrap();
         edit(&mut doc, &me, 2..2, "c");
         drop(doc);
         let (doc, recovery) = Document::open(&path, &journal).unwrap();
@@ -1699,5 +2336,402 @@ mod tests {
         drop(doc);
         let (doc, recovery) = Document::open_remote("/m:h:/f", Some(b"a".to_vec()), &journal).unwrap();
         assert_eq!((doc.text().to_string(), recovery, doc.is_dirty()), ("a".into(), Recovery::Clean, false));
+    }
+
+    #[test]
+    fn retention_none_never_creates_journal_and_checks_disk_hash() {
+        let me = actor("me");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        let mut doc = Document::open_without_journal(&path).unwrap();
+        assert_eq!(doc.retention(), Some(Retention::None));
+        assert!(!doc.has_journal());
+        assert_eq!(doc.disk_hash(), None);
+        edit(&mut doc, &me, 0..0, "top-secret");
+        assert!(doc.is_dirty());
+        doc.undo(&me).unwrap();
+        assert!(!doc.is_dirty());
+        doc.redo(&me).unwrap();
+        assert!(doc.is_dirty());
+        doc.save().unwrap();
+        assert!(!doc.is_dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "top-secret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // Only the target file exists in the directory: zero journal or lock files.
+        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsStr::new("secret.txt")]);
+
+        // External modification is refused by checked save.
+        fs::write(&path, "external").unwrap();
+        edit(&mut doc, &me, 10..10, "!");
+        assert!(matches!(doc.save(), Err(SaveError::ChangedOnDisk)));
+        // Revert replaces with external bytes and updates disk_hash.
+        assert!(doc.revert_in(&me, None).unwrap());
+        assert_eq!(doc.text().to_string(), "external");
+        assert!(!doc.is_dirty());
+
+        // Relocating an unjournaled document touches no journal or lock path.
+        let moved = dir.path().join("moved.txt");
+        let unused_journal = dir.path().join("never-created.journal");
+        let reloc = doc.prepare_relocation(&moved, &unused_journal).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        doc.relocate(reloc).unwrap();
+        assert_eq!(doc.path(), Some(moved.as_path()));
+        assert!(!unused_journal.exists());
+        assert!(!dir.path().join("never-created.journal.lock").exists());
+    }
+
+    #[test]
+    fn decoded_document_separates_disk_hash_from_journal_text_hash_and_preserves_concurrent_edits() {
+        let me = actor("me");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt.coded");
+        let journal = dir.path().join("notes.journal");
+        let encode = |s: &str| {
+            let mut v = b"CODED:".to_vec();
+            v.extend(s.bytes().rev());
+            v
+        };
+        let initial_stored = encode("hello");
+        fs::write(&path, &initial_stored).unwrap();
+
+        let (mut doc, rec) =
+            Document::open_decoded(Place::File(path.clone()), Some(&initial_stored), "hello".into(), Some(&journal)).unwrap();
+        assert_eq!(rec, Recovery::Clean);
+        assert_eq!(doc.retention(), Some(Retention::Journal));
+        assert_eq!(doc.disk_hash(), Some(journal::hash(&initial_stored)));
+
+        // Edit to rev 1, capture rev 1 for async encode, then make concurrent edit rev 2!
+        let rev1 = edit(&mut doc, &me, 5..5, " world");
+        let encoded_rev1 = encode("hello world");
+        let _rev2 = edit(&mut doc, &me, 11..11, "!!!");
+
+        // Saving rev 1 writes rev 1's encoded bytes and keeps rev 2 dirty & in the journal!
+        doc.save_encoded_at(SaveMode::IfUnchanged, rev1, &encoded_rev1).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), encoded_rev1);
+        assert_eq!(doc.disk_hash(), Some(journal::hash(&encoded_rev1)));
+        assert!(doc.is_dirty(), "concurrent edit after rev1 must remain unsaved");
+
+        // Reopening recovers the concurrent edit `!!!` on top of decoded `hello world`!
+        drop(doc);
+        let disk_now = fs::read(&path).unwrap();
+        let (mut reopened, rec) =
+            Document::open_decoded(Place::File(path.clone()), Some(&disk_now), "hello world".into(), Some(&journal)).unwrap();
+        assert_eq!(rec, Recovery::Replayed { transactions: 1, torn: false });
+        assert_eq!(reopened.text().to_string(), "hello world!!!");
+        assert!(reopened.is_dirty());
+
+        // External change to stored bytes causes ChangedOnDisk on save_encoded_at.
+        let external_stored = encode("outside");
+        fs::write(&path, &external_stored).unwrap();
+        let rev_now = reopened.revision();
+        let attempt = encode(&reopened.text().to_string());
+        assert!(matches!(reopened.save_encoded_at(SaveMode::IfUnchanged, rev_now, &attempt), Err(SaveError::ChangedOnDisk)));
+
+        // Decoded revert updates text and disk_hash.
+        assert!(reopened.revert_decoded_in(&me, Some(&external_stored), "outside".into(), None).unwrap());
+        assert_eq!(reopened.text().to_string(), "outside");
+        assert_eq!(reopened.disk_hash(), Some(journal::hash(&external_stored)));
+        assert!(!reopened.is_dirty());
+    }
+
+    #[test]
+    fn remote_encoded_save_records_written_hash_and_keeps_concurrent_edits() {
+        let me = actor("me");
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("r.journal");
+        let stored0 = b"ENC:a".to_vec();
+        let (mut doc, _) = Document::open_decoded(Place::Remote("/m:h:/f.enc".into()), Some(&stored0), "a".into(), Some(&journal)).unwrap();
+        let rev1 = edit(&mut doc, &me, 1..1, "b");
+        let _rev2 = edit(&mut doc, &me, 2..2, "c");
+        let stored1 = b"ENC:ab".to_vec();
+        let pending = doc.begin_save_encoded(rev1, stored1.clone()).unwrap();
+        assert_eq!(pending.base, Some(journal::hash(&stored0)));
+        assert_eq!(pending.bytes, stored1);
+        let endpoint_hash = journal::hash(b"ENDPOINT-WRITTEN");
+        doc.end_save_with_hash(pending, endpoint_hash).unwrap();
+        assert_eq!(doc.disk_hash(), Some(endpoint_hash));
+        assert!(doc.is_dirty());
+        drop(doc);
+        let (reopened, rec) =
+            Document::open_decoded(Place::Remote("/m:h:/f.enc".into()), Some(&stored1), "ab".into(), Some(&journal)).unwrap();
+        assert_eq!(rec, Recovery::Replayed { transactions: 1, torn: false });
+        assert_eq!(reopened.text().to_string(), "abc");
+    }
+
+    #[test]
+    fn decoded_document_refuses_raw_save_reload_revert_and_remote_monotonicity() {
+        let me = actor("me");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.enc");
+        let journal = dir.path().join("doc.journal");
+        fs::write(&path, b"ENC:hello").unwrap();
+
+        let (mut doc, _) = Document::open_decoded(Place::File(path.clone()), Some(b"ENC:hello"), "hello".into(), Some(&journal)).unwrap();
+        assert!(doc.is_decoded());
+        edit(&mut doc, &me, 5..5, "!");
+        assert!(matches!(doc.save(), Err(SaveError::Io(e)) if e.to_string().contains("codec")));
+        assert!(matches!(doc.save_with(SaveMode::Overwrite), Err(SaveError::Io(e)) if e.to_string().contains("codec")));
+        assert!(matches!(doc.begin_save(), Err(SaveError::Io(e)) if e.to_string().contains("codec")));
+        assert!(matches!(doc.reload(&me), Err(ReloadError::Io(e)) if e.to_string().contains("codec")));
+        assert!(matches!(doc.reload_bytes(&me, Some(b"raw".to_vec())), Err(ReloadError::Io(e)) if e.to_string().contains("codec")));
+        assert!(matches!(doc.revert_in(&me, None), Err(ReloadError::Io(e)) if e.to_string().contains("codec")));
+        assert!(
+            matches!(doc.revert_bytes_in(&me, Some(b"raw".to_vec()), None), Err(ReloadError::Io(e)) if e.to_string().contains("codec"))
+        );
+        // Disk file untouched by refused raw saves.
+        assert_eq!(fs::read(&path).unwrap(), b"ENC:hello");
+
+        // Non-codec remote private document is not decoded and supports raw begin_save / end_save
+        // while rejecting out-of-order stale revisions.
+        let mut rdoc = Document::open_remote_without_journal("/m:h:/secret.txt", Some(b"v0".to_vec())).unwrap();
+        assert!(!rdoc.is_decoded());
+        assert!(!rdoc.has_journal());
+        let _r1 = edit(&mut rdoc, &me, 2..2, "1");
+        let stale = rdoc.begin_save().unwrap();
+        let _r2 = edit(&mut rdoc, &me, 3..3, "2");
+        let newer = rdoc.begin_save().unwrap();
+        rdoc.end_save(newer).unwrap();
+        assert!(matches!(rdoc.end_save(stale), Err(e) if e.to_string().contains("newer")));
+    }
+
+    #[test]
+    fn revoked_fence_refuses_retention_none_encoded_save() {
+        let me = actor("me");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("priv.sbox");
+        fs::write(&path, b"ENC:init").unwrap();
+
+        let prev = journal::Fence::current();
+        let fence = journal::Fence::default();
+        fence.enter();
+        let mut doc = Document::open_decoded(Place::File(path.clone()), Some(b"ENC:init"), "init".into(), None).unwrap().0;
+        prev.enter();
+        edit(&mut doc, &me, 4..4, "2");
+        fence.revoke();
+        let err = doc.save_encoded_at(SaveMode::Overwrite, doc.revision(), b"ENC:init2").unwrap_err();
+        assert!(matches!(err, SaveError::Io(e) if e.to_string().contains("taken over")));
+        assert_eq!(fs::read(&path).unwrap(), b"ENC:init");
+    }
+
+    #[test]
+    fn crash_between_journal_rewrites_with_pending_edits_recovers_cleanly() {
+        let me = actor("me");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.coded");
+        let journal = dir.path().join("notes.journal");
+        let encode = |s: &str| format!("ENC:{s}").into_bytes();
+        let stored0 = encode("hello");
+        fs::write(&path, &stored0).unwrap();
+
+        // Case 1: Crash AFTER first rewrite (Saving inserted between tx1 and tx2), BEFORE file write.
+        {
+            let (mut doc, _) = Document::open_decoded(Place::File(path.clone()), Some(&stored0), "hello".into(), Some(&journal)).unwrap();
+            let rev1 = edit(&mut doc, &me, 5..5, " world");
+            let _rev2 = edit(&mut doc, &me, 11..11, "!!!");
+            // record_saving_at with has_tail = true performs the exact first rewrite of save_checked.
+            let text1_hash = journal::hash(b"hello world");
+            doc.storage.as_mut().unwrap().journal.as_mut().unwrap().journal.record_saving_at(&journal, rev1, &text1_hash, true).unwrap();
+            // Simulate crash before writing encoded rev1 to disk.
+            drop(doc);
+
+            let disk_now = fs::read(&path).unwrap();
+            let (reopened, rec) =
+                Document::open_decoded(Place::File(path.clone()), Some(&disk_now), "hello".into(), Some(&journal)).unwrap();
+            assert_eq!(rec, Recovery::Replayed { transactions: 2, torn: false });
+            assert_eq!(reopened.text().to_string(), "hello world!!!");
+            assert!(reopened.is_dirty());
+        }
+
+        // Case 2: Crash AFTER first rewrite AND AFTER file write (rev1 on disk), BEFORE second rewrite.
+        {
+            let stored1 = encode("hello world");
+            let path2 = dir.path().join("notes2.coded");
+            let journal2 = dir.path().join("notes2.journal");
+            fs::write(&path2, &stored0).unwrap();
+            let (mut doc, _) = Document::open_decoded(Place::File(path2.clone()), Some(&stored0), "hello".into(), Some(&journal2)).unwrap();
+            let rev1 = edit(&mut doc, &me, 5..5, " world");
+            let _rev2 = edit(&mut doc, &me, 11..11, "!!!");
+            let text1_hash = journal::hash(b"hello world");
+            doc.storage.as_mut().unwrap().journal.as_mut().unwrap().journal.record_saving_at(&journal2, rev1, &text1_hash, true).unwrap();
+            // Write encoded rev1 to disk, then crash before the second rewrite resets base to rev1.
+            journal::write_atomically(&path2, &stored1).unwrap();
+            drop(doc);
+
+            let disk_now = fs::read(&path2).unwrap();
+            assert_eq!(disk_now, stored1);
+            let (reopened, rec) =
+                Document::open_decoded(Place::File(path2.clone()), Some(&disk_now), "hello world".into(), Some(&journal2)).unwrap();
+            assert_eq!(rec, Recovery::Replayed { transactions: 1, torn: false });
+            assert_eq!(reopened.text().to_string(), "hello world!!!");
+            assert!(reopened.is_dirty());
+        }
+    }
+
+    #[test]
+    fn open_pinned_and_decoded_refuse_parent_and_leaf_symlinks_and_bound_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let real_pub = root.join("pub");
+        let real_priv = root.join("priv");
+        fs::create_dir(&real_pub).unwrap();
+        fs::create_dir(&real_priv).unwrap();
+        let priv_file = real_priv.join("item.txt");
+        fs::write(&priv_file, b"IDENTICAL").unwrap();
+
+        // Swap parent directory to a symlink pointing at `real_priv` (identical bytes!).
+        let swapped_dir = root.join("swapped");
+        std::os::unix::fs::symlink(&real_priv, &swapped_dir).unwrap();
+        let through_symlink_parent = swapped_dir.join("item.txt");
+        let j_decoded = root.join("decoded.journal");
+        let err =
+            Document::open_decoded(Place::File(through_symlink_parent.clone()), Some(b"IDENTICAL"), "IDENTICAL".into(), Some(&j_decoded))
+                .unwrap_err();
+        assert!(matches!(err, OpenError::Io(e) if e.to_string().contains("file target changed on disk")));
+        assert!(!j_decoded.exists(), "must not create journal when parent dir is a symlink");
+        assert!(!root.join("decoded.journal.lock").exists(), "must not create lock when parent dir is a symlink");
+
+        // `open_pinned` refuses both parent-dir symlink and leaf symlink without creating journal/lock.
+        let j_raw_parent = root.join("raw-parent.journal");
+        let err = Document::open_pinned(&through_symlink_parent, &j_raw_parent).unwrap_err();
+        assert!(matches!(err, OpenError::Io(e) if e.to_string().contains("file target changed on disk")));
+        assert!(!j_raw_parent.exists());
+        assert!(!root.join("raw-parent.journal.lock").exists());
+
+        let leaf_link = real_pub.join("leaf-link.txt");
+        std::os::unix::fs::symlink(&priv_file, &leaf_link).unwrap();
+        let j_raw_leaf = root.join("raw-leaf.journal");
+        let err = Document::open_pinned(&leaf_link, &j_raw_leaf).unwrap_err();
+        assert!(matches!(err, OpenError::Io(e) if e.to_string().contains("file target changed on disk")));
+        assert!(!j_raw_leaf.exists());
+        assert!(!root.join("raw-leaf.journal.lock").exists());
+
+        // `open_without_journal_pinned` also refuses symlinked parent and leaf.
+        assert!(Document::open_without_journal_pinned(&through_symlink_parent).is_err());
+        assert!(Document::open_without_journal_pinned(&leaf_link).is_err());
+
+        // Bounded verification rejects a file that grew or appeared during decode.
+        let grown = real_pub.join("grown.bin");
+        fs::write(&grown, vec![b'X'; 4096]).unwrap();
+        let j_grown = root.join("grown.journal");
+        let err = Document::open_decoded(Place::File(grown.clone()), Some(b"XXXX"), "XXXX".into(), Some(&j_grown)).unwrap_err();
+        assert!(matches!(err, OpenError::Io(e) if e.to_string().contains("file changed on disk while decoding")));
+        assert!(!j_grown.exists());
+        assert!(!root.join("grown.journal.lock").exists());
+
+        let err = Document::open_decoded(Place::File(grown), None, String::new(), Some(&j_grown)).unwrap_err();
+        assert!(matches!(err, OpenError::Io(e) if e.to_string().contains("file changed on disk while decoding")));
+        assert!(!j_grown.exists());
+    }
+
+    #[test]
+    fn reload_revert_and_save_refuse_parent_and_leaf_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let pub_dir = root.join("pub");
+        let priv_dir = root.join("priv");
+        fs::create_dir(&pub_dir).unwrap();
+        fs::create_dir(&priv_dir).unwrap();
+
+        let pub_file = pub_dir.join("note.txt");
+        let priv_file = priv_dir.join("secret.txt");
+        fs::write(&pub_file, "public").unwrap();
+        fs::write(&priv_file, "SECRET").unwrap();
+
+        // 1. Leaf replaced with symlink to private file: reload, revert, and save must fail closed.
+        let j1 = root.join("j1.journal");
+        let (mut doc, _) = Document::open_pinned(&pub_file, &j1).unwrap();
+        fs::remove_file(&pub_file).unwrap();
+        std::os::unix::fs::symlink(&priv_file, &pub_file).unwrap();
+
+        let err = doc.reload(&actor("disk")).unwrap_err();
+        assert!(matches!(err, ReloadError::Io(e) if e.to_string().contains("file target changed on disk while reloading")));
+        assert_eq!(doc.text().to_string(), "public");
+
+        let err = doc.revert_in(&actor("me"), None).unwrap_err();
+        assert!(matches!(err, ReloadError::Io(e) if e.to_string().contains("file target changed on disk while reverting")));
+        assert_eq!(doc.text().to_string(), "public");
+
+        edit(&mut doc, &actor("me"), 6..6, "!");
+        let err = doc.save_with(SaveMode::Overwrite).unwrap_err();
+        assert!(matches!(err, SaveError::Io(e) if e.to_string().contains("file target changed on disk while saving")));
+        assert_eq!(fs::read_to_string(&priv_file).unwrap(), "SECRET");
+
+        // 2. Parent directory swapped with symlink to private dir:
+        //    both matching-bytes existing file and absent new file must refuse save, reload, revert
+        //    and leave zero files or temp files in `priv_dir`.
+        let pub2 = root.join("pub2");
+        let pub2_bak = root.join("pub2.bak");
+        let priv2 = root.join("priv2");
+        fs::create_dir(&pub2).unwrap();
+        fs::create_dir(&priv2).unwrap();
+        let existing_pub = pub2.join("same.txt");
+        let existing_priv = priv2.join("same.txt");
+        let new_pub = pub2.join("new.txt");
+        fs::write(&existing_pub, "SAME").unwrap();
+        fs::write(&existing_priv, "SAME").unwrap();
+
+        let j2 = root.join("j2.journal");
+        let j3 = root.join("j3.journal");
+        let (mut d_existing, _) = Document::open_pinned(&existing_pub, &j2).unwrap();
+        let (mut d_new, _) = Document::open_pinned(&new_pub, &j3).unwrap();
+
+        fs::rename(&pub2, &pub2_bak).unwrap();
+        std::os::unix::fs::symlink(&priv2, &pub2).unwrap();
+
+        assert!(d_existing.reload(&actor("disk")).is_err());
+        assert!(d_existing.revert_in(&actor("me"), None).is_err());
+
+        edit(&mut d_existing, &actor("me"), 4..4, "-edited");
+        let err = d_existing.save().unwrap_err();
+        assert!(matches!(err, SaveError::Io(e) if e.to_string().contains("file target changed on disk while saving")));
+        assert_eq!(fs::read_to_string(&existing_priv).unwrap(), "SAME");
+
+        edit(&mut d_new, &actor("me"), 0..0, "created");
+        let err = d_new.save().unwrap_err();
+        assert!(matches!(err, SaveError::Io(e) if e.to_string().contains("file target changed on disk while saving")));
+        assert!(!priv2.join("new.txt").exists());
+
+        // Verify no stray temp files were created in `priv2`.
+        let entries: Vec<_> = fs::read_dir(&priv2).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("same.txt")]);
+    }
+
+    #[test]
+    fn save_conflict_streams_without_reading_oversized_growth_and_preserves_0600_cleanly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let target = root.join("secret.txt");
+        let journal = root.join("secret.journal");
+        fs::write(&target, "hello").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (mut doc, _) = Document::open_pinned(&target, &journal).unwrap();
+        edit(&mut doc, &actor("me"), 5..5, " world");
+        doc.save().unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "hello world");
+        assert_eq!(target.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+        // No leftover staging directories after save.
+        let mut names: Vec<_> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert!(!names.iter().any(|n| n.to_string_lossy().starts_with(".techne-stage-")));
+
+        // Same-length external modification is rejected as ChangedOnDisk.
+        fs::write(&target, "HELLO WORLD").unwrap();
+        edit(&mut doc, &actor("me"), 11..11, "!");
+        assert!(matches!(doc.save(), Err(SaveError::ChangedOnDisk)));
+
+        // Huge sparse growth (4 GiB) is rejected immediately without reading into memory.
+        let f = fs::OpenOptions::new().write(true).open(&target).unwrap();
+        f.set_len(4u64 << 30).unwrap();
+        drop(f);
+        assert!(matches!(doc.save(), Err(SaveError::ChangedOnDisk)));
     }
 }

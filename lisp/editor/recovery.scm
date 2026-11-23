@@ -194,9 +194,18 @@ the buffer's."
   #:arguments '((document document #:doc "The document to compare with its file."))
   #:effects '(read)
   (let* ((path (document-path document))
+         (priv? (document-private? document))
          (text (unified-diff (file-text document) (document-string document)
                              #:from (string-append path " (file)") #:to (string-append path " (buffer)")))
-         (b (or (buffer-named "*diff*") (make-generated-buffer! "*diff*" (make-document "") 'diff-mode)))
+         (existing (buffer-named "*diff*"))
+         (b (cond (priv?
+                   (let ((doc (make-document "")))
+                     (mark-document-private! doc)
+                     (make-generated-buffer! "*diff*" doc 'diff-mode)))
+                  ((and existing (not (document-private? (buffer-document existing))))
+                   existing)
+                  (else
+                   (make-generated-buffer! "*diff*" (make-document "") 'diff-mode))))
          (d (buffer-document b)))
     ;; The editor's own text, as *Messages*: changed in no operation.
     (without-operation

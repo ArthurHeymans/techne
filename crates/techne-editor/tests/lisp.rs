@@ -27,6 +27,7 @@ fn editor_suites() {
     for suite in suites {
         let mut vm = Vm::new();
         techne_editor::install(&mut vm);
+        techne_node::install(&mut vm).unwrap();
         let failures = vm.eval_file(&suite).unwrap_or_else(|e| panic!("{}: {e}", suite.display()));
         vm.flush();
         assert!(failures.as_int() == Some(0), "{}: {} failed checks", suite.display(), vm.repr(&failures));

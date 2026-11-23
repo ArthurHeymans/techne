@@ -174,7 +174,10 @@ before are shown."
   (operation mb-operation set-mb-operation!)
   (hold mb-hold set-mb-hold!)
   ;; Owned by the scope it was opened in: shutting it aborts the reading.
-  (owned mb-owned set-mb-owned!))
+  (owned mb-owned set-mb-owned!)
+  ;; Latched privacy state when the minibuffer opened (suppresses history
+  ;; even if focus moves to a non-private buffer before accepting).
+  (private? mb-private? set-mb-private?!))
 
 ;; Candidates shown at once.
 ;; Candidates shown at once, as Arthur's vertico-count.
@@ -271,6 +274,7 @@ minibuffer is open, and aborting cancels it."
     (set-mb-session! mb s)
     (set-mb-keymap! mb keymap)
     (set-mb-select-input! mb (owned select-input))
+    (set-mb-private?! mb (session-document-private? s))
     (let ((op (current-operation)) (owned (list 'minibuffer)))
       (set-mb-operation! mb op)
       (set-mb-hold! mb (and op (operation-hold! op #:cancel (lambda () (when (eq? (minibuffer s) mb) (abort-minibuffer! s))))))
@@ -517,12 +521,17 @@ It goes after the part the pattern leaves out."
     (let ((end (document-length (view-document v))))
       (view-set-ranges! v (list (list end end)) 0))))
 
+(define (session-document-private? s)
+  (and s
+       (let ((v (guard (e (#t #f)) (pane-view s))))
+         (and v (document-private? (view-document v))))))
+
 ;; Close the minibuffer and hand CHOSEN to its accept procedure, after
 ;; remembering it in its history. ENTRY is what a choice is remembered
 ;; as: the input completed with it.
 (define (accept! s chosen entry)
   (let* ((mb (minibuffer s)) (remember (mb-remember mb)))
-    (when (mb-history mb)
+    (when (and (mb-history mb) (not (mb-private? mb)) (not (session-document-private? s)))
       (let ((entry (cond ((eq? remember 'input) (minibuffer-input* mb))
                          ((procedure? remember) (remember entry chosen))
                          (else entry))))
@@ -568,8 +577,9 @@ Where a match is required, the input must be a candidate's text."
 
 (define (add-history! name entry)
   "Remember ENTRY, a string, as the newest of the history NAME.
-An empty one is not remembered."
-  (unless (string=? entry "")
+An empty one is not remembered, nor anything entered while a private
+document is focused."
+  (unless (or (string=? entry "") (session-document-private? (current-session)))
     (hash-table-set! %histories name (merge-history (list entry) (minibuffer-history name)))
     (hash-table-set! %added name (merge-history (list entry) (added name)))))
 

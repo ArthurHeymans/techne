@@ -178,21 +178,38 @@ pub enum Request {
         path: Vec<u8>,
     },
     /// The bytes of the regular file at `path` (`Reply::File(None)`: there
-    /// is none) and their hash (`Reply::File`).
+    /// is none) and their hash (`Reply::File`). When `pinned` is true, `path`
+    /// must already be an absolute canonical path and every component is
+    /// traversed with `O_NOFOLLOW`.
     ReadFile {
         #[serde(with = "serde_bytes")]
         path: Vec<u8>,
+        #[serde(default)]
+        pinned: bool,
     },
     /// If the file at `path` is as `expect` says, replace it with `data`
     /// through an atomic rename; else `Reply::Conflict`. The check does
-    /// not lock out writers other than this node. A symbolic link is
-    /// followed.
+    /// not lock out writers other than this node. When `pinned` is false, a
+    /// symbolic link is followed; when `pinned` is true, `path` must already
+    /// be an absolute canonical path and every parent and leaf component is
+    /// verified with `O_NOFOLLOW` without re-canonicalization. When `private`
+    /// is true, the written file gets mode 0o600 (both new files and replacements).
     WriteFile {
         #[serde(with = "serde_bytes")]
         path: Vec<u8>,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         expect: Expect,
+        #[serde(default)]
+        private: bool,
+        #[serde(default)]
+        pinned: bool,
+    },
+    /// The canonical path of `path` on this node (`Reply::Path`), following
+    /// symlinks (including a non-existent file's canonical parent).
+    CanonicalPath {
+        #[serde(with = "serde_bytes")]
+        path: Vec<u8>,
     },
     /// The entries of a directory (`Reply::Entries`).
     ListDirectory {
@@ -288,7 +305,7 @@ pub struct Message<T> {
 }
 
 /// The version of the framed node protocol (not nREPL).
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// The first frame in each direction, before any request or response.
 #[derive(Serialize, Deserialize, Debug)]

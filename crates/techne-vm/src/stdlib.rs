@@ -1579,5 +1579,15 @@ fn files(vm: &mut Vm) {
         "(pinned-dir-try-lock! dir)" => |dir: Foreign<RefCell<files::PinnedDir>>| {
             dir.borrow().try_lock().map_err(|e| e.to_string())
         };
+        /// Read a regular UTF-8 file at PATH bounded by MAX-BYTES without blocking on FIFOs.
+        "(read-regular-file path max-bytes)" => |path: String, max_bytes: usize| files::read_regular_file(Path::new(&path), max_bytes).map_err(|e| format!("{path}: {e}"));
+        /// Read RELATIVE confined beneath canonical ROOT as a regular UTF-8 file bounded by MAX-BYTES.
+        /// Opens ROOT via no-follow traversal; returns #f only when the direct entry does not exist.
+        /// Symlinked roots, escapes, dangling symlinks, non-regular files, and oversized files raise an error.
+        "(read-confined-file root relative max-bytes)" => |root: String, relative: String, max_bytes: usize| files::read_confined_file(Path::new(&root), Path::new(&relative), max_bytes).map_err(|e| format!("{relative}: {e}"));
+        /// Read RELATIVE beneath canonical ROOT as a regular UTF-8 file bounded by MAX-BYTES, refusing all symlinks.
+        /// Opens ROOT and every component of RELATIVE with O_NOFOLLOW and validates the opened descriptor.
+        /// Returns #f when ROOT or RELATIVE is absent; symlinks, non-regular files, and oversized files raise an error.
+        "(read-confined-file-nofollow root relative max-bytes)" => |root: String, relative: String, max_bytes: usize| files::read_confined_file_nofollow(Path::new(&root), Path::new(&relative), max_bytes).map_err(|e| format!("{relative}: {e}"));
     }
 }

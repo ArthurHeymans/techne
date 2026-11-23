@@ -53,7 +53,6 @@ use techne_editor::{
     attach::{Link, Target},
     host::{Event, File, Host},
     present::{Color, CursorShape, Input, Output, Slant, Style, StyleId, Underline, Weight},
-    runtime::journal_for,
     server,
 };
 use winit::{
@@ -1129,10 +1128,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         let journal = if args.bench.is_some() {
             std::env::temp_dir().join(format!("techne-bench-{}.journal", std::process::id()))
         } else {
-            journal_for(&path).unwrap_or_else(|e| {
-                eprintln!("techne: journal: {e}");
-                std::process::exit(1)
-            })
+            PathBuf::new()
         };
         File { path, journal }
     });

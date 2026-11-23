@@ -10,6 +10,7 @@
 (require "indent.scm")
 (require "minibuffer.scm")
 (require "operations.scm")
+(require "files.scm")
 
 (provide emacs-profile emacs-map isearch-map prefix-count)
 
@@ -86,6 +87,7 @@ keys end the search.")
 
 (define (isearch-start s forward)
   (sset! s 'isearch (list forward "" (ranges s) (view-primary (session-view s))))
+  (sset! s 'isearch-private? (document-private? (doc s)))
   (sset! s 'isearch-match #f)
   (sset! s 'isearch-ring-index 0)
   (sset! s 'overriding-map (cons 'isearch isearch-map)))
@@ -93,8 +95,10 @@ keys end the search.")
 ;; End the search where it is, remembering its string.
 (define (isearch-done! s)
   (let ((needle (isearch-needle s)))
-    (unless (string=? needle "") (add-history! 'isearch needle)))
+    (unless (or (string=? needle "") (sget s 'isearch-private?) (document-private? (doc s)))
+      (add-history! 'isearch needle)))
   (sset! s 'isearch #f)
+  (sset! s 'isearch-private? #f)
   (sset! s 'overriding-map #f)
   (sset! s 'pending '()))
 
@@ -162,7 +166,7 @@ keys end the search.")
   (isearch-append! s (string (key-char (sget s 'key)))))
 
 (define-command (isearch-delete-char s n)
-  "Remove the last character of the string being searched for."
+  "Remove the last character from the string being searched for."
   (let ((needle (isearch-needle s)))
     (isearch-restart! s (if (string=? needle "") needle (substring needle 0 (- (string-length needle) 1))))))
 
@@ -174,6 +178,7 @@ keys end the search.")
   "End the search and go back to where it started."
   (let ((state (isearch-state s)))
     (sset! s 'isearch #f)
+    (sset! s 'isearch-private? #f)
     (sset! s 'overriding-map #f)
     (view-set-ranges! (session-view s) (caddr state) (cadddr state))
     (message! s "Quit")))

@@ -14,7 +14,26 @@
          attach-session! detach-session! attached-sessions shown-views add-unseen-session!
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=? view-point
          session-tree set-session-tree! tree-leaves split-pane! delete-pane! pane-places
-         pane-view set-pane-view! document=?)
+         pane-view set-pane-view! document=?
+         private-document? set-document-private-hook!)
+
+(define %document-private-hook
+  (lambda (d)
+    (and d (eq? (guard (e (#t #f)) (document-retention d)) 'none))))
+
+(define (set-document-private-hook! proc)
+  "Register PROC used by `private-document?` to check document privacy.
+Root authority only."
+  (unless (root-authority?)
+    (error "set-document-private-hook!: may only be called with root authority"
+           (scope-name (authority-scope))))
+  (unless (procedure? proc)
+    (error "set-document-private-hook!: expected procedure" proc))
+  (set! %document-private-hook proc))
+
+(define (private-document? d)
+  "Return #t if D is a document using the private profile."
+  (and (%document-private-hook d) #t))
 
 (define (sget s k)
   "Return the value of the key K in the session S, or #f."

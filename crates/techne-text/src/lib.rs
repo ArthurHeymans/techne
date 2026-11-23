@@ -14,6 +14,6 @@ pub mod selection;
 pub use change::{Assoc, ChangeSet, Conflict, EditError, Op};
 pub use document::{
     Actor, ApplyError, Document, Group, Kind, OpenError, OperationId, PendingSave, Place, RebaseError, Recovery, ReloadError, Relocation,
-    Revision, SaveError, SaveMode, Transaction, UndoError,
+    Retention, Revision, SaveError, SaveMode, Transaction, UndoError,
 };
 pub use selection::{Range, Selection};

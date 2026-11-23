@@ -410,9 +410,16 @@ fn a_remote_save_refused_offers_to_compare_and_revert_there() {
         )
     };
     choose(&mut rt, "Compare");
+    until(&mut rt, "remote diff", |s| s.panes.iter().any(|p| p.text.to_string().contains("-elsewhere\n+xone\n")));
     let diff = eval(&mut rt, "(document-string (buffer-document (buffer-named \"*diff*\")))");
     assert!(diff.contains("-elsewhere\\n+xone\\n"), "{diff}");
     choose(&mut rt, "Revert");
+    let start = Instant::now();
+    while eval(&mut rt, "(document-dirty? d)") != "#f" {
+        assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for remote revert");
+        rt.run_tasks(Duration::from_millis(10)).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(eval(&mut rt, "(list (document-string d) (document-dirty? d))"), "(\"elsewhere\\n\" #f)");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "elsewhere\n");
 }
@@ -628,7 +635,8 @@ fn find_file_browses_a_remote_directory() {
     keys(&mut rt, "^");
     assert_eq!(eval(&mut rt, "(default-directory (current-session))"), format!("{location:?}"));
     keys(&mut rt, "RET RET");
-    assert_eq!(rt.snapshot().pane().text.to_string(), "from the node\n");
+    let opened = until(&mut rt, "remote note.txt", |s| s.pane().text == "from the node\n");
+    assert_eq!(opened.pane().text.to_string(), "from the node\n");
     assert_eq!(eval(&mut rt, "(document-path (doc (current-session)))"), format!("\"{location}nested/note.txt\""));
     keys(&mut rt, "C-x C-f");
     type_text(&mut rt, "/pipe::/");
@@ -765,4 +773,87 @@ fn commands_on_another_machine() {
         s.pane().text.to_string()
     );
     eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "rm" '("-rf" {name:?}) process-wait)"#));
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_symlink_to_private_codec_and_new_private_file_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("vault.rsec");
+    let alias = dir.path().join("alias.txt");
+    let new_priv = dir.path().join("brand-new.rsec");
+    std::fs::write(&target, "ENC:remote-secret\n").unwrap();
+    symlink(&target, &alias).unwrap();
+
+    let mut rt = runtime();
+    let alias_loc = format!("/pipe::{}", alias.display());
+    let target_loc = format!("/pipe::{}", target.display());
+    let new_loc = format!("/pipe::{}", new_priv.display());
+    let res = eval(
+        &mut rt,
+        &format!(
+            "(begin\n\
+               (define-codec rsec \"Remote private test codec.\"\n\
+                 #:match (lambda (p) (string-suffix? \".rsec\" p))\n\
+                 #:decode (lambda (_p r)\n\
+                            (if (not r) (make-codec-result \"\")\n\
+                                (let ((s (utf8->string r)))\n\
+                                  (make-codec-result (if (string-prefix? \"ENC:\" s) (substring s 4) s)))))\n\
+                 #:encode (lambda (_p t _e) (string->utf8 (string-append \"ENC:\" t)))\n\
+                 #:private #t)\n\
+               (let* ((d1 (file-document {alias_loc:?}))\n\
+                      (d2 (file-document {target_loc:?}))\n\
+                      (d3 (file-document {new_loc:?}))\n\
+                      (v3 (make-view d3 \"user\")))\n\
+                 (view-edit! v3 (list (list 0 0 \"created-privately\\n\")) \"new\")\n\
+                 (save-document! d3)\n\
+                 (list (eq? d1 d2)\n\
+                       (codec-name (document-codec d1))\n\
+                       (document-private? d1)\n\
+                       (document-retention d1)\n\
+                       (document-string d1)\n\
+                       (document-private? d3)\n\
+                       (document-retention d3))))"
+        ),
+    );
+    assert_eq!(res, "(#t rsec #t none \"remote-secret\\n\" #t none)");
+
+    let mode = std::fs::metadata(&new_priv).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "newly created remote private file should be mode 0o600, got {:o}", mode);
+    assert_eq!(std::fs::read_to_string(&new_priv).unwrap(), "ENC:created-privately\n");
+
+    // Swapping an already-open remote public file to a symlink pointing at a
+    // private file must fail closed on reload, revert, file-text, and save.
+    let pub_file = dir.path().join("public.txt");
+    std::fs::write(&pub_file, "public-remote\n").unwrap();
+    let pub_loc = format!("/pipe::{}", pub_file.display());
+    eval(
+        &mut rt,
+        &format!(
+            "(begin\n\
+               (define %test-pub-doc (file-document {pub_loc:?}))\n\
+               (define %test-pub-session (start-session (make-view %test-pub-doc \"user\") \"emacs\")))"
+        ),
+    );
+    std::fs::remove_file(&pub_file).unwrap();
+    symlink(&target, &pub_file).unwrap();
+    let swapped = eval(
+        &mut rt,
+        "(let* ((reload-err (guard (e (#t (error-object-message e))) (reload-document! %test-pub-doc) #f))\n\
+                (revert-err (guard (e (#t (error-object-message e))) (revert-document! %test-pub-doc) #f))\n\
+                (read-err (guard (e (#t (error-object-message e))) (file-text %test-pub-doc) #f))\n\
+                (_ (insert-text! %test-pub-session \"!\" \"new\"))\n\
+                (save-err (guard (e (#t (error-object-message e))) (save-document! %test-pub-doc) #f))\n\
+                (ow-err (guard (e (#t (error-object-message e))) (save-document! %test-pub-doc #:overwrite #t) #f)))\n\
+           (list (and (string? reload-err) (string-contains reload-err \"file target changed on disk while reading\") #t)\n\
+                 (and (string? revert-err) (string-contains revert-err \"file target changed on disk while reading\") #t)\n\
+                 (and (string? read-err) (string-contains read-err \"file target changed on disk while reading\") #t)\n\
+                 (and (string? save-err) (string-contains save-err \"file target changed on disk while saving\") #t)\n\
+                 (and (string? ow-err) (string-contains ow-err \"file target changed on disk while saving\") #t)\n\
+                 (document-string %test-pub-doc)))",
+    );
+    assert_eq!(swapped, "(#t #t #t #t #t \"!public-remote\\n\")");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "ENC:remote-secret\n");
 }
