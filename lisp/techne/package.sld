@@ -63,17 +63,30 @@
     (define (bad what . irritants)
       (apply error (string-append package-manifest-file ": " what) irritants))
 
-    ;; A name that is one path component and nothing a shell or a path
-    ;; could take otherwise.
+    (define (ascii-lower-or-digit? c)
+      (let ((n (char->integer c)))
+        (or (and (>= n 97) (<= n 122))
+            (and (>= n 48) (<= n 57)))))
+
+    (define (ascii-alnum? c)
+      (let ((n (char->integer c)))
+        (or (and (>= n 97) (<= n 122))
+            (and (>= n 65) (<= n 90))
+            (and (>= n 48) (<= n 57)))))
+
+    ;; A name that is one ASCII path component starting with an ASCII letter or
+    ;; digit, never `.` or `-`, and nothing a shell or a path could take otherwise.
     (define (component? s)
-      (and (string? s) (positive? (string-length s)) (not (member s '("." "..")))
-           (every (lambda (c) (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_ #\.)))) (string->list s))))
+      (and (string? s) (positive? (string-length s))
+           (ascii-alnum? (string-ref s 0))
+           (every (lambda (c) (or (ascii-alnum? c) (memv c '(#\- #\_ #\.)))) (string->list s))))
 
     (define (package-part? sym)
       (and (symbol? sym)
            (let ((s (symbol->string sym)))
-             (and (component? s)
-                  (not (any char-upper-case? (string->list s)))))))
+             (and (positive? (string-length s))
+                  (ascii-lower-or-digit? (string-ref s 0))
+                  (every (lambda (c) (or (ascii-lower-or-digit? c) (memv c '(#\- #\_ #\.)))) (string->list s))))))
 
     (define (package-name? x)
       "Return whether X is a canonical `(owner pkg)` package identity."

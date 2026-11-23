@@ -45,8 +45,8 @@ fn package_prefix(vm: &Vm, v: Value, who: &str) -> Result<(String, String), Erro
         return Err(Error::new(format!("{who}: expected a 2-part (owner pkg) name")));
     }
     let (owner, pkg) = (part(items[0])?, part(items[1])?);
-    if owner.is_empty() || pkg.is_empty() {
-        return Err(Error::new(format!("{who}: expected non-empty (owner pkg) components")));
+    if !crate::library::is_valid_package_component(&owner) || !crate::library::is_valid_package_component(&pkg) {
+        return Err(Error::new(format!("{who}: invalid package name ({owner} {pkg})")));
     }
     Ok((owner, pkg))
 }
@@ -1302,9 +1302,31 @@ pub fn install(vm: &mut Vm) {
         // Name the current module as a library, e.g. `(techne editor)`, for
         // a host to give its own interface a library name.
         "(%name-library name)" => |vm: &mut Vm, a, _| {
-            let name = crate::builtins::repr(arg(vm, a, 0));
+            let items = list_values(arg(vm, a, 0)).filter(|l| !l.is_empty()).ok_or_else(|| Error::new("%name-library: bad library name"))?;
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                if item.is_symbol() {
+                    parts.push(reader::symbol_name(reader::strip(item.as_symbol())).to_string());
+                } else if item.is_int() && item.as_int() >= 0 {
+                    parts.push(item.as_int().to_string());
+                } else {
+                    return Err(Error::new("%name-library: bad library name"));
+                }
+            }
             let m = vm.current_module();
+            let source_path = vm.modules[m as usize].path.clone();
+            let under_lisp = source_path.as_deref().is_some_and(crate::library::is_under_lisp_dir);
+            if parts.first().is_some_and(|s| matches!(s.as_str(), "scheme" | "srfi")) && !under_lisp {
+                return Err(Error::new(format!("%name-library: namespace ({} ...) is reserved", parts[0])));
+            }
+            vm.check_library_ownership(&parts, source_path.as_deref(), "%name-library")?;
+            let name = crate::library::module_name(&parts);
+            if vm.loaded_module_by_parts(&parts).is_some_and(|existing| existing != m) {
+                return Err(Error::new(format!("%name-library: {name} is already defined")));
+            }
             vm.modules[m as usize].name = name.into();
+            vm.modules[m as usize].library_parts = Some(parts.into_iter().map(Into::into).collect());
+            vm.recharge_module(m);
             Ok(Value::VOID) };
         "(%environment import-sets)" => |vm: &mut Vm, a, _| {
             let sets = list_values(arg(vm, a, 0)).ok_or_else(|| Error::new("environment: expected import sets"))?;

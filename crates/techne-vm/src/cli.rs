@@ -143,6 +143,7 @@ pub fn use_locked_package_of(
     if !root.join("techne-package.scm").is_file() {
         return Err(crate::vm::Error::new(format!("techne run --locked: no techne-package.scm in {}", root.display())));
     }
+    vm.set_locked_libraries(true);
     vm.find_module(&crate::library::lisp_dir().join("techne/lock.sld").to_string_lossy())?;
     let call = match store_dir {
         Some(store) => {

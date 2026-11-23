@@ -214,10 +214,108 @@ pub fn lisp_dir() -> &'static Path {
     &DIR
 }
 
+/// Whether `s` is a valid ASCII package owner or package name component:
+/// starts with ASCII `[a-z0-9]` and contains only `[a-z0-9._-]`.
+pub(crate) fn is_valid_package_component(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    !bytes.is_empty()
+        && matches!(bytes[0], b'a'..=b'z' | b'0'..=b'9')
+        && bytes.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
+}
+
+/// Whether `part` is safe as a single path segment in library lookup.
+fn valid_library_part(part: &str) -> bool {
+    !part.is_empty() && !part.starts_with('.') && !part.bytes().any(|b| matches!(b, b'/' | b'\\' | b'\0'))
+}
+
+/// Whether `path` resolves inside Techne's own `lisp_dir()`.
+pub(crate) fn is_under_lisp_dir(path: &Path) -> bool {
+    let Ok(root) = lisp_dir().canonicalize() else { return false };
+    path.canonicalize().is_ok_and(|p| p.starts_with(&root))
+}
+
+/// Resolve `parts` to `<root>/<p0>/.../<pn>.sld`, validating every segment and
+/// verifying canonical containment inside `root`.
+fn contained_library_file(root: &Path, parts: &[String]) -> Option<PathBuf> {
+    if parts.is_empty() || !parts.iter().all(|p| valid_library_part(p)) {
+        return None;
+    }
+    let root = if root.as_os_str().is_empty() { Path::new(".") } else { root };
+    let root = root.canonicalize().ok()?;
+    let mut candidate = root.clone();
+    for part in &parts[..parts.len() - 1] {
+        candidate.push(part);
+    }
+    candidate.push(format!("{}.sld", parts.last()?));
+    if !candidate.is_file() {
+        return None;
+    }
+    let canonical = candidate.canonicalize().ok()?;
+    canonical.starts_with(&root).then_some(canonical)
+}
+
+/// Whether library `parts` belongs to Techne's own standard or built-in libraries.
+pub(crate) fn is_stdlib_library(parts: &[String]) -> bool {
+    if builtin(parts).is_some() {
+        return true;
+    }
+    if contained_library_file(lisp_dir(), parts).is_some() {
+        return true;
+    }
+    if let [owner, pkg, ..] = parts
+        && owner == "techne"
+    {
+        if pkg == "editor" {
+            return true;
+        }
+        if valid_library_part(pkg) {
+            let stdlib = lisp_dir().join("techne");
+            if stdlib.join(format!("{pkg}.sld")).is_file() || stdlib.join(pkg).is_dir() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve an `(include name)` path inside `root`, rejecting absolute paths,
+/// dot-prefixed hidden components, and paths escaping `root`.
+fn resolve_contained_include(dir: &Path, name: &str, root: &Path) -> R<PathBuf> {
+    let rel = Path::new(name);
+    if rel.is_absolute() {
+        return err(format!("include: absolute path not allowed: {name}"));
+    }
+    for c in rel.components() {
+        if let std::path::Component::Normal(part) = c
+            && part.to_string_lossy().starts_with('.')
+        {
+            return err(format!("include: hidden path not allowed: {name}"));
+        }
+    }
+    let candidate = dir.join(rel);
+    let canonical = candidate.canonicalize().map_err(|e| Error::new(format!("include: {}: {e}", candidate.display())))?;
+    if !canonical.starts_with(root) {
+        return err(format!("include: path escapes package directory: {name}"));
+    }
+    if let Ok(inside) = canonical.strip_prefix(root) {
+        for c in inside.components() {
+            if let std::path::Component::Normal(part) = c
+                && part.to_string_lossy().starts_with('.')
+            {
+                return err(format!("include: hidden path not allowed: {name}"));
+            }
+        }
+    }
+    Ok(canonical)
+}
+
 /// A library name's parts: identifiers and exact integers.
 fn name_parts(name: &Sexp) -> Option<Vec<String>> {
-    name.list()?
-        .iter()
+    let list = name.list()?;
+    if list.is_empty() {
+        return None;
+    }
+    list.iter()
         .map(|p| match p {
             Sexp::Sym(s) => Some(symbol_name(strip(*s)).to_string()),
             Sexp::Int(i) if *i >= 0 => Some(i.to_string()),
@@ -242,7 +340,7 @@ fn builtin(parts: &[String]) -> Option<Builtin> {
     }
 }
 
-fn module_name(parts: &[String]) -> String {
+pub(crate) fn module_name(parts: &[String]) -> String {
     format!("({})", parts.join(" "))
 }
 
@@ -341,17 +439,47 @@ impl Vm {
         self.bindings.iter().filter(|((m, _), _)| *m == ROOT_MODULE).map(|(&(_, s), b)| (s, b.clone())).collect()
     }
 
+    /// Verify that code from `source_path` may define or claim library `parts`.
+    pub(crate) fn check_library_ownership(&self, parts: &[String], source_path: Option<&Path>, who: &str) -> R<()> {
+        if parts.is_empty() {
+            return err(format!("{who}: bad library name"));
+        }
+        let name = module_name(parts);
+        if is_stdlib_library(parts) {
+            if source_path.is_some_and(is_under_lisp_dir) {
+                return Ok(());
+            }
+            return err(format!("{who}: {name} belongs to Techne's own libraries"));
+        }
+        if let Some(provider) = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1])) {
+            let owned = source_path.is_some_and(|p| p.starts_with(provider));
+            if !owned {
+                return err(format!("{who}: {name} is owned by package ({} {})", parts[0], parts[1]));
+            }
+            return Ok(());
+        }
+        if self.locked_libraries {
+            return err(format!("{who}: {name} is not provided in locked mode"));
+        }
+        Ok(())
+    }
+
     /// The module of library `parts`, loading its `.sld` file if needed.
     fn library(&mut self, parts: &[String], dir: &Path) -> R<u32> {
         let name = module_name(parts);
         self.check_declared(parts, dir)?;
-        if let Some(m) = self.loaded_library(&name)? {
+        if let Some(m) = self.loaded_library_parts(parts)? {
+            self.check_library_ownership(parts, self.modules[m as usize].path.as_deref(), "import")?;
             return Ok(m);
         }
         let file = self.library_file(parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
         self.check_loading().map_err(|e| Error::new(format!("import {name}: {}", e.msg)))?;
         let result = self.load_module(&file).and_then(|_| {
-            self.loaded_library(&name)?.ok_or_else(|| Error::new(format!("import: {} does not define {name}", file.display())))
+            let m = self
+                .loaded_library_parts(parts)?
+                .ok_or_else(|| Error::new(format!("import: {} does not define {name}", file.display())))?;
+            self.check_library_ownership(parts, self.modules[m as usize].path.as_deref(), "import")?;
+            Ok(m)
         });
         if result.is_err() {
             self.abort_library_file(&file);
@@ -361,13 +489,16 @@ impl Vm {
 
     /// Make a pending registration before processing declarations, so cycles
     /// are rejected on every import path. No importer may use it yet.
-    fn new_library(&mut self, form: &[Sexp], owner: u32, dir: &Path) -> R<u32> {
+    fn new_library(&mut self, form: &[Sexp], owner: u32, file: u32) -> R<u32> {
         let parts = form.get(1).and_then(name_parts).ok_or_else(|| Error::new("define-library: bad library name"))?;
+        let source_path = self.source_file_path(file);
+        self.check_library_ownership(&parts, source_path.as_deref(), "define-library")?;
         let name = module_name(&parts);
-        if self.loaded_library(&name)?.is_some() {
+        if self.loaded_library_parts(&parts)?.is_some() {
             return err(format!("define-library: {name} is already defined"));
         }
-        let m = self.new_module(&name, Some(dir.join(format!("{}.sld", parts.join("/")))));
+        let m = self.new_module(&name, source_path);
+        self.modules[m as usize].library_parts = Some(parts.into_iter().map(Into::into).collect());
         self.modules[m as usize].exports = Some(Vec::new());
         self.recharge_module(m);
         self.modules[m as usize].isolated = true;
@@ -377,7 +508,7 @@ impl Vm {
 
     /// `(define-library name declaration ...)`, from a file in `dir`.
     pub fn define_library(&mut self, form: &[Sexp], owner: u32, file: u32, dir: &Path) -> R<()> {
-        let m = self.new_library(form, owner, dir)?;
+        let m = self.new_library(form, owner, file)?;
         // A compiler/host fallback: it must return with the library loaded
         // before the enclosing form can compile. The Scheme forms loop uses
         // library_forms instead, so its bodies can wait without Rust nesting.
@@ -408,7 +539,7 @@ impl Vm {
     /// Register a library and queue its imports before its body. Nothing
     /// here runs Scheme; the caller evaluates the forms on its VM stack.
     pub(crate) fn library_forms(&mut self, form: &[Sexp], owner: u32, file: u32, dir: &Path) -> R<Forms> {
-        let m = self.new_library(form, owner, dir)?;
+        let m = self.new_library(form, owner, file)?;
         let mut imports = Vec::new();
         let mut body = Vec::new();
         if let Err(e) = self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body) {
@@ -439,7 +570,8 @@ impl Vm {
             let name = module_name(&parts);
             // Before it loads: one refused is not run either.
             self.check_declared(&parts, dir)?;
-            if let Some(m) = self.loaded_library(&name)? {
+            if let Some(m) = self.loaded_library_parts(&parts)? {
+                self.check_library_ownership(&parts, self.modules[m as usize].path.as_deref(), "import")?;
                 self.exported(m, &name)?;
                 continue;
             }
@@ -512,15 +644,49 @@ impl Vm {
         Ok(())
     }
 
+    /// The package/locked containment root for `include` from `dir`, if any.
+    fn include_containment_root(&self, dir: &Path) -> Option<PathBuf> {
+        let effective = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let canon_dir = effective.canonicalize().ok();
+        if let Some(canon_dir) = &canon_dir {
+            if let Some(p) = self.package_imports.iter().filter(|p| canon_dir.starts_with(&p.root)).max_by_key(|p| p.root.as_os_str().len())
+            {
+                return Some(p.root.clone());
+            }
+            if let Some((_, provider)) =
+                self.library_providers.iter().filter(|(_, p)| canon_dir.starts_with(p)).max_by_key(|(_, p)| p.as_os_str().len())
+            {
+                return Some(provider.clone());
+            }
+        }
+        if self.locked_libraries {
+            if let Some(canon_dir) = canon_dir {
+                if let Ok(lisp) = lisp_dir().canonicalize()
+                    && canon_dir.starts_with(&lisp)
+                {
+                    return Some(lisp);
+                }
+                return Some(canon_dir);
+            }
+            return Path::new(".").canonicalize().ok();
+        }
+        None
+    }
+
     /// The forms of each file named by `(include "file" ...)`, relative to
     /// `dir`, with the source file each was read as.
     pub fn include(&mut self, names: &[Sexp], dir: &Path, fold_case: bool) -> R<Vec<(Vec<Sexp>, u32)>> {
         self.check_loading().map_err(|e| Error::new(format!("include: {}", e.msg)))?;
+        let containment_root = self.include_containment_root(dir);
+        let effective_dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
         names
             .iter()
             .map(|n| {
                 let Sexp::Str(name) = n else { return err("include: expected file names") };
-                let path = dir.join(&**name);
+                let path = match &containment_root {
+                    Some(root) => resolve_contained_include(effective_dir, name, root)?,
+                    None => dir.join(&**name),
+                };
                 // The text, and the copy kept as the file's source.
                 let text = self.read_file_admitted(&path.to_string_lossy(), 2).map_err(|e| Error::new(format!("include: {}", e.msg)))?;
                 let meter = crate::vm::meter::Meter::new(self);
@@ -566,11 +732,19 @@ impl Vm {
             "not" if items.len() == 2 => Ok(!self.requirement(&items[1], dir)?),
             "library" if items.len() == 2 => {
                 let parts = name_parts(&items[1]).ok_or_else(|| Error::new("cond-expand: bad library name"))?;
-                let name = module_name(&parts);
                 // File discovery still establishes availability; a dead
                 // inline registration does not, even before any import.
                 self.abandon_dead_libraries();
-                Ok(builtin(&parts).is_some() || self.loaded_module(&name).is_some() || self.library_file(&parts, dir).is_some())
+                if builtin(&parts).is_some() {
+                    return Ok(true);
+                }
+                if self.check_declared(&parts, dir).is_err() {
+                    return Ok(false);
+                }
+                let loaded = self
+                    .loaded_module_by_parts(&parts)
+                    .is_some_and(|m| self.check_library_ownership(&parts, self.modules[m as usize].path.as_deref(), "cond-expand").is_ok());
+                Ok(loaded || self.library_file(&parts, dir).is_some())
             }
             _ => err(format!("cond-expand: bad requirement {}", display_sexp(req))),
         }
@@ -587,6 +761,9 @@ impl Vm {
     /// Techne's own libraries, or if one is already loaded from elsewhere.
     pub fn provide_libraries(&mut self, owner: &str, pkg: &str, dir: &Path) -> R<()> {
         self.check_loading()?;
+        if !is_valid_package_component(owner) || !is_valid_package_component(pkg) {
+            return err(format!("invalid package name ({owner} {pkg})"));
+        }
         let missing = || Error::new(format!("{}: no such directory", dir.display()));
         let resolved = match dir.canonicalize() {
             Ok(dir) => Some(dir).filter(|d| d.is_dir()),
@@ -611,6 +788,9 @@ impl Vm {
     /// What makes several packages known at once asks before it changes
     /// anything.
     pub fn library_conflict(&self, owner: &str, pkg: &str, dir: &Path) -> Option<String> {
+        if !is_valid_package_component(owner) || !is_valid_package_component(pkg) {
+            return Some(format!("invalid package name ({owner} {pkg})"));
+        }
         if matches!(owner, "scheme" | "srfi") {
             return Some(format!("namespace ({owner} ...) is reserved"));
         }
@@ -625,7 +805,7 @@ impl Vm {
         }
         if owner == "techne" {
             let stdlib = lisp_dir().join("techne");
-            if stdlib.join(format!("{pkg}.sld")).is_file() || stdlib.join(pkg).is_dir() {
+            if pkg == "editor" || stdlib.join(format!("{pkg}.sld")).is_file() || stdlib.join(pkg).is_dir() {
                 return Some(format!("libraries ({owner} {pkg} ...) are part of Techne's own libraries"));
             }
         }
@@ -640,6 +820,14 @@ impl Vm {
     /// Declared again for a directory, this replaces what was declared.
     pub fn declare_imports(&mut self, root: &Path, package: (&str, &str), names: &[(String, String)]) -> R<()> {
         self.check_loading()?;
+        if !is_valid_package_component(package.0) || !is_valid_package_component(package.1) {
+            return err(format!("invalid package name ({} {})", package.0, package.1));
+        }
+        for (o, n) in names {
+            if !is_valid_package_component(o) || !is_valid_package_component(n) {
+                return err(format!("invalid package name ({o} {n})"));
+            }
+        }
         let missing = || Error::new(format!("{}: no such directory", root.display()));
         let root = root.canonicalize().ok().filter(|d| d.is_dir() && self.may_read(d)).ok_or_else(missing)?;
         let declared = PackageImports {
@@ -657,16 +845,23 @@ impl Vm {
     /// Refuse the import of library `parts` from a file in `dir` if that
     /// file is a package's and the library another's it does not depend on
     /// (`declare_imports`): what a package needs is what its manifest says.
-    /// The innermost package holding `dir` is the file's; an empty `dir`
-    /// is that of no file (`Vm::import_dir`), and no package's.
+    /// In locked mode, any non-stdlib library without a registered provider
+    /// is also refused.
     fn check_declared(&self, parts: &[String], dir: &Path) -> R<()> {
+        if is_stdlib_library(parts) {
+            return Ok(());
+        }
+        let provider = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1]));
+        if self.locked_libraries && provider.is_none() {
+            return err(format!("import: {}: library is not provided in locked mode", module_name(parts)));
+        }
         if dir.as_os_str().is_empty() {
             return Ok(());
         }
         let Some([owner, pkg]) = parts.get(..2) else {
             return Ok(());
         };
-        if self.package_imports.is_empty() || self.library_provider(owner, pkg).is_none() {
+        if self.package_imports.is_empty() || provider.is_none() {
             return Ok(());
         }
         let Ok(dir) = dir.canonicalize() else { return Ok(()) };
@@ -685,15 +880,23 @@ impl Vm {
         self.library_providers.iter().find(|(p, _)| p.matches(owner, pkg)).map(|(_, dir)| &**dir)
     }
 
-    /// Where library `parts` is defined: under its provider's directory if
-    /// its 2-part prefix has one, else where [`library_file`] finds it.
+    /// Where library `parts` is defined: Techne's own `lisp_dir()` for stdlib
+    /// libraries, under its provider's directory if its 2-part prefix has one,
+    /// else (only when not locked) where [`library_file`] finds it.
     pub(crate) fn library_file(&self, parts: &[String], dir: &Path) -> Option<PathBuf> {
-        match parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1])) {
-            Some(provider) => {
-                Some(provider.join(format!("{}.sld", parts.join("/")))).filter(|p| p.is_file()).and_then(|p| p.canonicalize().ok())
-            }
-            None => library_file(parts, dir),
+        if parts.is_empty() || !parts.iter().all(|p| valid_library_part(p)) {
+            return None;
         }
+        if is_stdlib_library(parts) {
+            return contained_library_file(lisp_dir(), parts);
+        }
+        if let Some(provider) = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1])) {
+            return contained_library_file(provider, parts);
+        }
+        if self.locked_libraries {
+            return None;
+        }
+        library_file(parts, dir)
     }
 }
 
@@ -703,15 +906,22 @@ pub fn is_builtin(parts: &[String]) -> bool {
     builtin(parts).is_some()
 }
 
-/// Where library `parts` is defined: `a/b.sld` in `dir`, on the library
-/// path or in Techne's own Lisp ([`lisp_dir`]).
+/// Where library `parts` is defined: Techne's own Lisp ([`lisp_dir`]) first so
+/// stdlib cannot be shadowed, then `a/b.sld` in `dir`, then on `TECHNE_LIBRARY_PATH`.
 pub fn library_file(parts: &[String], dir: &Path) -> Option<PathBuf> {
-    let rel = format!("{}.sld", parts.join("/"));
+    if parts.is_empty() || !parts.iter().all(|p| valid_library_part(p)) {
+        return None;
+    }
+    if let Some(own) = contained_library_file(lisp_dir(), parts) {
+        return Some(own);
+    }
+    if is_stdlib_library(parts) {
+        return None;
+    }
+    let search_dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    if let Some(local) = contained_library_file(search_dir, parts) {
+        return Some(local);
+    }
     let path_dirs = std::env::var("TECHNE_LIBRARY_PATH").unwrap_or_default();
-    std::iter::once(dir.to_path_buf())
-        .chain(std::env::split_paths(&path_dirs))
-        .chain(std::iter::once(lisp_dir().to_path_buf()))
-        .map(|d| d.join(&rel))
-        .find(|p| p.is_file())
-        .and_then(|p| p.canonicalize().ok())
+    std::env::split_paths(&path_dirs).find_map(|d| contained_library_file(&d, parts))
 }

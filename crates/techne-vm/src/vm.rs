@@ -552,6 +552,9 @@ pub(crate) enum GlobalBinding {
 #[derive(Clone)]
 pub(crate) struct Module {
     pub name: Rc<str>,
+    /// Structured R7RS library identity (its name components), when this module
+    /// is a library. Used for collision-free lookup and ownership checks.
+    pub(crate) library_parts: Option<Vec<Box<str>>>,
     pub path: Option<PathBuf>,
     pub(crate) imports: FxHashMap<u32, GlobalBinding>,
     /// What `provide` or a library's `export` makes visible: each binding's
@@ -587,6 +590,10 @@ impl Module {
             + self.defined.capacity() * size_of::<u32>()
             + self.exports.as_ref().map_or(0, |e| e.capacity() * size_of::<(u32, u32)>())
             + self.name.len()
+            + self
+                .library_parts
+                .as_ref()
+                .map_or(0, |parts| parts.capacity() * size_of::<Box<str>>() + parts.iter().map(|p| p.len()).sum::<usize>())
             + self.path.as_ref().map_or(0, |p| p.as_os_str().len())
     }
 }
@@ -892,6 +899,10 @@ pub struct Vm {
     pub(crate) library_providers: Vec<(crate::library::PackagePrefix, PathBuf)>,
     /// What the files of each package may import (`declare_imports`).
     pub(crate) package_imports: Vec<crate::library::PackageImports>,
+    /// When set, library lookup is restricted to Techne's own stdlib/built-ins
+    /// and registered package providers (ignoring `TECHNE_LIBRARY_PATH` and
+    /// importing-directory/CWD fallbacks).
+    pub(crate) locked_libraries: bool,
     /// A package generation being loaded: its files load into fresh
     /// modules, kept apart until published.
     staging: Option<Staging>,
@@ -1529,6 +1540,7 @@ impl Vm {
             module_paths: FxHashMap::default(),
             library_providers: Vec::new(),
             package_imports: Vec::new(),
+            locked_libraries: false,
             staging: None,
             staged: None,
             staged_by: None,
@@ -1658,6 +1670,7 @@ impl Vm {
             self.staging_here().filter(|s| path.as_deref().is_none_or(|p| self.staging_owns(s, p))).map_or(0, |s| s.generation);
         let module = Module {
             name: name.into(),
+            library_parts: None,
             path,
             imports: FxHashMap::default(),
             exports: None,
@@ -1994,16 +2007,56 @@ impl Vm {
         file.or_else(|| self.named_module(name))
     }
 
-    /// The name of a library loaded whose name begins with `(owner pkg)`, as
-    /// `(owner pkg)` or `(owner pkg ...)`, from a file not under `dir`.
+    /// Restrict library resolution to Techne's own stdlib/built-ins and
+    /// registered package providers, ignoring `TECHNE_LIBRARY_PATH` and
+    /// importing-directory/CWD fallbacks.
+    pub fn set_locked_libraries(&mut self, locked: bool) {
+        self.locked_libraries = locked;
+    }
+
+    /// Whether library resolution is locked to stdlib and registered providers.
+    pub fn locked_libraries(&self) -> bool {
+        self.locked_libraries
+    }
+
+    /// The name of a library loaded whose structured name begins with
+    /// `(owner pkg)`, as `(owner pkg)` or `(owner pkg ...)`, from a file not
+    /// under `dir`.
     pub(crate) fn library_loaded_outside(&self, owner: &str, pkg: &str, dir: &Path) -> Option<&str> {
-        let (whole, prefix) = (format!("({owner} {pkg})"), format!("({owner} {pkg} "));
         self.modules
             .iter()
             .find(|m| {
-                !m.retired && (*m.name == *whole || m.name.starts_with(&prefix)) && !m.path.as_deref().is_some_and(|p| p.starts_with(dir))
+                !m.retired
+                    && m.library_parts.as_deref().is_some_and(|p| p.len() >= 2 && &*p[0] == owner && &*p[1] == pkg)
+                    && !m.path.as_deref().is_some_and(|p| p.starts_with(dir))
             })
             .map(|m| &*m.name)
+    }
+
+    /// The newest visible module registered with structured library name `parts`.
+    pub(crate) fn loaded_module_by_parts(&self, parts: &[String]) -> Option<u32> {
+        let staging = self.staging_here();
+        let unpublished = |generation: u32| {
+            generation != 0
+                && (self.staging.as_ref().is_some_and(|s| s.generation == generation)
+                    || self.staged.as_ref().is_some_and(|(staged, _)| *staged == generation))
+        };
+        self.modules
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                !m.retired
+                    && m.library_parts
+                        .as_deref()
+                        .is_some_and(|p| p.len() == parts.len() && p.iter().zip(parts).all(|(a, b)| &**a == b.as_str()))
+            })
+            .filter(|(_, m)| match staging {
+                Some(s) if m.generation == s.generation => true,
+                Some(s) => !m.path.as_deref().is_some_and(|p| self.staging_owns(s, p)),
+                None => !unpublished(m.generation),
+            })
+            .max_by_key(|(i, m)| (m.generation, *i))
+            .map(|(i, _)| i as u32)
     }
 
     /// The module called `name` a lookup here finds: the one of the newest
@@ -2287,6 +2340,15 @@ impl Vm {
         }
     }
 
+    /// Canonical path of source `file`, if it corresponds to an actual file on disk.
+    pub(crate) fn source_file_path(&self, file: u32) -> Option<PathBuf> {
+        let name = &*self.files[file as usize].name;
+        if name.is_empty() || (name.starts_with('<') && name.ends_with('>')) {
+            return None;
+        }
+        Path::new(name).canonicalize().ok().filter(|p| p.is_file())
+    }
+
     /// Drop ownership state a killed library loader could not clean up.
     /// Snapshotting and availability queries must not copy or observe it.
     pub(crate) fn abandon_dead_libraries(&mut self) {
@@ -2304,11 +2366,12 @@ impl Vm {
 
     /// The central lookup for every import path, including compiler and
     /// environment fallbacks. A dead loader never publishes a partial library.
-    pub(crate) fn loaded_library(&mut self, name: &str) -> Result<Option<u32>, Error> {
-        let Some(m) = self.loaded_module(name) else { return Ok(None) };
+    pub(crate) fn loaded_library_parts(&mut self, parts: &[String]) -> Result<Option<u32>, Error> {
+        let Some(m) = self.loaded_module_by_parts(parts) else { return Ok(None) };
         let module = &self.modules[m as usize];
         if module.loading {
             if module.loader.is_none_or(|e| self.stops.is_live(e)) {
+                let name = crate::library::module_name(parts);
                 return Err(Error::new(format!("import: library {name} is still loading")));
             }
             self.abort_library(m);
@@ -2645,7 +2708,7 @@ impl Vm {
             self.bindings.retain(|&(module, _), _| module != m);
             let module = &mut self.modules[m as usize];
             (module.imports, module.exports, module.defined) = (FxHashMap::default(), None, Vec::new());
-            (module.name, module.path) = ("".into(), None);
+            (module.name, module.library_parts, module.path) = ("".into(), None, None);
             self.recharge_module(m);
             self.free_modules.push(m);
         }
