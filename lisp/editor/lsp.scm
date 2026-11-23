@@ -195,11 +195,13 @@ The other arguments are keywords, as `register-lsp-server!' takes them."
               (else (up (directory-of (substring dir 0 (- (string-length dir) 1))) found)))))))
 
 ;; Whether PROGRAM is one to run: a path to a file, or a name on PATH.
-(define (installed? program)
-  (if (string-contains program "/")
-      (file-exists? program)
-      (any (lambda (dir) (and (not (string=? dir "")) (file-exists? (string-append dir "/" program))))
-           (string-split (or (getenv "PATH") "") ":"))))
+(define (installed? program #:site [site #f])
+  (if site
+      (and (execution-site-find-program site program) #t)
+      (if (string-contains program "/")
+          (file-exists? program)
+          (any (lambda (dir) (and (not (string=? dir "")) (file-exists? (string-append dir "/" program))))
+               (string-split (or (getenv "PATH") "") ":")))))
 
 ;;; Sessions: a server's process for a project, and the documents it has.
 
@@ -381,44 +383,59 @@ ON-ERROR, if given, are as `rpc-request!` takes them."
 ;;; Starting and ending
 
 (define (start-session! server root)
-  (set! %generation (+ %generation 1))
-  (let* ((ls (%make-session server root #f 'starting (make-channel) (make-channel) (dict) (make-hash-table) (make-hash-table) %generation #f))
-         (name (symbol->string (lsp-server-name server)))
-         (log (session-log ls))
-         (stderr (lsp-log-stderr-count log)))
-    (lsp-log-mark! log (string-append "started: " (string-join (lsp-server-command server) " ")))
-    (set-session-conn! ls (rpc-connect (car (lsp-server-command server)) (cdr (lsp-server-command server))
-                                       #:directory root
-                                       #:on-note (lambda (m p) (on-note ls m p))
-                                       #:on-ask (lambda (m p) (on-ask ls m p))
-                                       #:on-dead (lambda () (session-ended! ls stderr))
-                                       #:on-event (lambda (direction text) (lsp-log-event! log direction text))))
-    (hash-table-set! %sessions (session-key root server) ls)
-    (spawn (lambda ()
-             (guard (e (#t (say (string-append name ": " (error-text e)))
-                           (let ((buffers (session-buffers ls)))
-                             (end-session! ls)
-                             (session-lost! ls buffers))))
-               (let ((answer (lsp-request ls "initialize"
-                                          (dict "processId" 'null
-                                                "clientInfo" (dict "name" "techne")
-                                                "rootUri" (file-uri root) "rootPath" root
-                                                "workspaceFolders" (list (dict "uri" (file-uri root) "name" root))
-                                                "initializationOptions" (lsp-server-initialization server)
-                                                "capabilities" (client-capabilities))
-                                          #:timeout 60000)))
-                 (set-session-capabilities! ls (dict-ref answer "capabilities" (dict)))
-                 (lsp-notify ls "initialized" (dict))
-                 (when (pair? (dict-keys (lsp-server-settings server)))
-                   (lsp-notify ls "workspace/didChangeConfiguration" (dict "settings" (lsp-server-settings server))))
-                 ;; The documents waiting are opened, then it is ready:
-                 ;; what waits for it finds them there.
-                 (set-session-state! ls 'ready)
-                 (set-session-ready-at! ls (current-milliseconds))
-                 (for-each (lambda (t) (open-tracked! ls t)) (hash-table-values (session-documents ls)))
-                 (channel-close (session-ready ls))
-                 (say (string-append name " ready in " (abbreviate-path root)))))))
-    ls))
+  (let* ((site (execution-site-for root #:policy 'project))
+         (env (execution-site-resolved-environment site))
+         (key (session-key root server))
+         (existing (hash-table-ref/default %sessions key #f)))
+    (if (and existing (memq (session-state existing) '(starting ready)))
+        existing
+        (begin
+          (set! %generation (+ %generation 1))
+          (let* ((ls (%make-session server root #f 'starting (make-channel) (make-channel) (dict) (make-hash-table) (make-hash-table) %generation #f))
+                 (name (symbol->string (lsp-server-name server)))
+                 (log (session-log ls))
+                 (stderr (lsp-log-stderr-count log)))
+            (hash-table-set! %sessions key ls)
+            (guard (e (#t
+                       (when (eq? (hash-table-ref/default %sessions key #f) ls)
+                         (hash-table-delete! %sessions key))
+                       (set-session-state! ls 'dead)
+                       (channel-close (session-ready ls))
+                       (channel-close (session-gone ls))
+                       (raise e)))
+              (lsp-log-mark! log (string-append "started: " (string-join (lsp-server-command server) " ")))
+              (set-session-conn! ls (rpc-connect (car (lsp-server-command server)) (cdr (lsp-server-command server))
+                                                 #:directory root
+                                                 #:environment env
+                                                 #:on-note (lambda (m p) (on-note ls m p))
+                                                 #:on-ask (lambda (m p) (on-ask ls m p))
+                                                 #:on-dead (lambda () (session-ended! ls stderr))
+                                                 #:on-event (lambda (direction text) (lsp-log-event! log direction text)))))
+            (spawn (lambda ()
+                     (guard (e (#t (say (string-append name ": " (error-text e)))
+                                   (let ((buffers (session-buffers ls)))
+                                     (end-session! ls)
+                                     (session-lost! ls buffers))))
+                       (let ((answer (lsp-request ls "initialize"
+                                                  (dict "processId" 'null
+                                                        "clientInfo" (dict "name" "techne")
+                                                        "rootUri" (file-uri root) "rootPath" root
+                                                        "workspaceFolders" (list (dict "uri" (file-uri root) "name" root))
+                                                        "initializationOptions" (lsp-server-initialization server)
+                                                        "capabilities" (client-capabilities))
+                                                  #:timeout 60000)))
+                         (set-session-capabilities! ls (dict-ref answer "capabilities" (dict)))
+                         (lsp-notify ls "initialized" (dict))
+                         (when (pair? (dict-keys (lsp-server-settings server)))
+                           (lsp-notify ls "workspace/didChangeConfiguration" (dict "settings" (lsp-server-settings server))))
+                         ;; The documents waiting are opened, then it is ready:
+                         ;; what waits for it finds them there.
+                         (set-session-state! ls 'ready)
+                         (set-session-ready-at! ls (current-milliseconds))
+                         (for-each (lambda (t) (open-tracked! ls t)) (hash-table-values (session-documents ls)))
+                         (channel-close (session-ready ls))
+                         (say (string-append name " ready in " (abbreviate-path root)))))))
+            ls)))))
 
 ;; The process ended: by itself, said; asked to, by `end-session!'.
 ;; STDERR is where its run's stderr starts in its log.
@@ -699,23 +716,34 @@ servers whose project files (#:roots) are not there."
           ((remote-path? path) (if quiet '() (error "lsp: not for files on other machines yet")))
           (else
            (let* ((servers (servers-for b))
-                  (runnable (filter (lambda (s) (and (installed? (car (lsp-server-command s)))
-                                                     (or (not quiet) (cdr (server-root s path)))))
-                                    servers)))
+                  (candidates (map (lambda (s)
+                                     (let ((sr (server-root s path)))
+                                       (list s (car sr) (cdr sr))))
+                                   servers))
+                  (runnable (filter (lambda (entry)
+                                      (let ((s (car entry)) (root (cadr entry)) (found? (caddr entry)))
+                                        (and (or (not quiet) found?)
+                                             (installed? (car (lsp-server-command s))
+                                                         #:site (execution-site-for root #:policy 'project)))))
+                                    candidates)))
              (when (and (not quiet) (null? runnable))
                (error (if (null? servers)
                           "No language server serves this buffer"
                           (string-append "Not installed: "
                                          (string-join (map (lambda (s) (car (lsp-server-command s))) servers) ", ")))))
-             (begin
-               (unless (null? runnable) (set-option! 'lsp-mode #t #:buffer b))
-               (map (lambda (server)
-                      (let* ((root (car (server-root server path)))
-                             (found (hash-table-ref/default %sessions (session-key root server) #f))
-                             (ls (if (and found (memq (session-state found) '(starting ready))) found (start-session! server root))))
-                        (track! ls b)
-                        ls))
-                    runnable)))))))
+             (if (not (memq b (buffer-list)))
+                 '()
+                 (begin
+                   (unless (null? runnable) (set-option! 'lsp-mode #t #:buffer b))
+                   (filter-map (lambda (entry)
+                                 (and (memq b (buffer-list))
+                                      (let* ((server (car entry))
+                                             (root (cadr entry))
+                                             (ls (start-session! server root)))
+                                        (when (memq b (buffer-list))
+                                          (track! ls b))
+                                        ls)))
+                               runnable))))))))
 
 (define (lsp-buffer-sessions b)
   "Return the live sessions buffer B's document is open in."
@@ -1640,8 +1668,35 @@ the region, or of the thing at point."
 
 ;;; Following buffers
 
+(define (unique-strings xs)
+  (let loop ((xs xs) (acc '()))
+    (cond ((null? xs) (reverse acc))
+          ((member (car xs) acc) (loop (cdr xs) acc))
+          (else (loop (cdr xs) (cons (car xs) acc))))))
+
 (add-hook! 'file-buffer-added 'lsp
-           (lambda (s b) (when (option b 'lsp-auto) (lsp-attach! b #:quiet #t))))
+           (lambda (s b)
+             (when (option b 'lsp-auto)
+               (let* ((path (document-path (buffer-document b)))
+                      (local? (and path (not (remote-path? path))))
+                      (dir (and local? (directory-of path)))
+                      (roots (if local?
+                                 (unique-strings
+                                  (cons dir (map (lambda (srv) (car (server-root srv path)))
+                                                 (servers-for b))))
+                                 '()))
+                      (need-warm (filter execution-site-needs-eval? roots)))
+                 (if (pair? need-warm)
+                     (spawn (lambda ()
+                              (guard (e ((task-cancelled-condition? e) (raise e))
+                                        (#t #f))
+                                (for-each (lambda (r)
+                                            (execution-site-env-snapshot (execution-site-for r #:policy 'project)))
+                                          need-warm)
+                                (when (and (memq b (buffer-list))
+                                           (option b 'lsp-auto))
+                                  (lsp-attach! b #:quiet #t)))))
+                     (lsp-attach! b #:quiet #t))))))
 
 (add-hook! 'buffer-killed 'lsp
            (lambda (s b)

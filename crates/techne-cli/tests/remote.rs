@@ -540,6 +540,34 @@ fn lost_endpoints_are_connected_again() {
     assert!(eval_err(&mut rt, &format!(r#"(path-exists? "/named:there:{d}/")"#)).contains("no such host"));
 }
 
+/// Endpoint caching keys by structured hop tuples, so routes sharing a
+/// rendered display string (user+host vs host containing `@`) never collide
+/// while equivalent routes still reuse the same connection.
+#[test]
+fn distinct_hops_with_same_display_string_do_not_collide() {
+    let mut rt = runtime();
+    eval(
+        &mut rt,
+        "(import (only (techne location) make-hop route->string) (only (techne endpoint) default-remote-node-command route-endpoint))",
+    );
+    assert_eq!(
+        eval(
+            &mut rt,
+            r#"(parameterize ((default-remote-node-command (option #f 'remote-node-command)))
+                 (let* ((r1 (list (make-hop 'pipe "lab" "build" #f)))
+                        (r2 (list (make-hop 'pipe #f "lab@build" #f)))
+                        (r1-copy (list (make-hop 'pipe "lab" "build" #f)))
+                        (n1 (route-endpoint r1))
+                        (n2 (route-endpoint r2))
+                        (n1-again (route-endpoint r1-copy)))
+                   (list (string=? (route->string r1) (route->string r2))
+                         (eq? n1 n1-again)
+                         (not (eq? n1 n2)))))"#
+        ),
+        "(#t #t #t)"
+    );
+}
+
 /// A name no other run of these tests uses, made with `prefix`.
 fn unique(prefix: &str) -> String {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();

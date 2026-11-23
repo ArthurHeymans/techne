@@ -39,6 +39,7 @@
 (require "staging.scm")
 (require "shell.scm")
 (require "remote.scm")
+(require "direnv.scm")
 (require "syntax.scm")
 (require "rpc.scm")
 (require "lsp.scm")
@@ -100,6 +101,14 @@
          remote-path? location-route location-path location-prefix location-at define-method method-names
          hop? hop-method hop-user hop-host hop-port
          location-endpoint remote-endpoints call-with-process-at
+         execution-site? execution-site-for
+         execution-site-route execution-site-directory
+         env-snapshot-status
+         execution-site-env-snapshot execution-site-cached-snapshot
+         execution-site-resolved-environment execution-site-find-program
+         execution-site-needs-eval? execution-site-watched-path?
+         execution-site-invalidate!
+         spawn-at-site call-with-process-at-site
          rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting rpc-unsupported rpc-timeout
          define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc lsp-attach! lsp-buffer-sessions
          rich-present! rich-splice! rich-units make-rich-buffer! rich-code-language markdown->rich markdown-render! markdown-escape buffer-projections)

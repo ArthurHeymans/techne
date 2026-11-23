@@ -89,7 +89,11 @@
       "is_macro": false
     },
     "call-with-process-at": {
-      "description": "(call-with-process-at dir program args f #:pty (pty #f))  procedure, @lisp@/editor/remote.scm:251\n\nCall F with a new process running PROGRAM with ARGS in DIR.\nDIR is a directory here, or a location: the process then runs on its\nmachine. PTY is as `process-spawn` takes it.",
+      "description": "(call-with-process-at dir program args f #:pty (pty #f) #:policy (policy #f) #:environment (environment (quote ())))  procedure, @lisp@/editor/remote.scm:243\n\nCall F with a new process running PROGRAM with ARGS in DIR.\nDIR is a directory here, a remote location, or an `execution-site`.\nPOLICY defaults to `project` for a string DIR (or DIR's policy for an\n`execution-site`): `project` applies active project environment such as\ndirenv, `endpoint-base` uses the unmodified endpoint base environment,\nand `user-trusted` runs in the local trusted working directory.\nENVIRONMENT overrides site variables. PTY is as `process-spawn` takes it.",
+      "is_macro": false
+    },
+    "call-with-process-at-site": {
+      "description": "(call-with-process-at-site site program args f #:pty (pty #f) #:persist (persist #f) #:environment (environment (quote ())) #:stdin (stdin #f) #:stdout (stdout #f) #:stderr (stderr #f))  procedure, @lisp@/editor/remote.scm:233\n\nCall F with a process running PROGRAM with ARGS at execution site SITE.\nENVIRONMENT overrides site variables; PTY, PERSIST, STDIN, STDOUT, and\nSTDERR forward to `call-with-process`.",
       "is_macro": false
     },
     "call-with-socket": {
@@ -293,7 +297,7 @@
       "is_macro": true
     },
     "define-method": {
-      "description": "(define-method name doc #:command command #:jump (jump #f))  procedure, @lisp@/editor/remote.scm:115\n\nDefine the method NAME of a route's hops, documented by DOC.\n(COMMAND hop jumps program) returns the command, a list of strings,\nrunning the list of strings PROGRAM one hop further, as the hop HOP\nsays: its user (`hop-user`), host and port. The first hop's command\nruns here, a later one's on the endpoint before it. With JUMP, leading\nhops of this method are one command: JUMPS are the hops before HOP it\ngoes through (ssh's -J), else '().",
+      "description": "(define-method name doc #:command command #:jump (jump #f))  procedure, @lisp@/editor/remote.scm:101\n\nDefine route hop method NAME with DOC, COMMAND, and optional JUMP.",
       "is_macro": false
     },
     "define-minor-mode": {
@@ -476,6 +480,10 @@
       "description": "emacs-map = #<keymap #<hash-table> #f #<registry bindings #<hash-table> #<procedure> #f> #f>\n\nThe keys of the Emacs profile, after the modes'.",
       "is_macro": false
     },
+    "env-snapshot-status": {
+      "description": "(env-snapshot-status snap)  procedure, @lisp@/editor/remote.scm:190\n\nReturn the status symbol of SNAP.",
+      "is_macro": false
+    },
     "error-text": {
       "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:610\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
       "is_macro": false
@@ -502,6 +510,50 @@
     },
     "excerpt": {
       "description": "(excerpt d from to #:face (face #f))  procedure, @lisp@/editor/views.scm:40\n\nReturn a run showing FROM to TO of document D, edited through to it.\nFACE is how it is drawn, or #f.",
+      "is_macro": false
+    },
+    "execution-site-cached-snapshot": {
+      "description": "(execution-site-cached-snapshot dir)  procedure, @lisp@/editor/remote.scm:198\n\nReturn the cached `env-snapshot` for DIR without I/O, or #f.",
+      "is_macro": false
+    },
+    "execution-site-directory": {
+      "description": "(execution-site-directory site)  procedure, @lisp@/editor/remote.scm:186\n\nReturn the working directory path of SITE.",
+      "is_macro": false
+    },
+    "execution-site-env-snapshot": {
+      "description": "(execution-site-env-snapshot site #:refresh? (refresh? #f))  procedure, @lisp@/editor/remote.scm:194\n\nReturn the `env-snapshot` for SITE, re-evaluating when REFRESH? is true.",
+      "is_macro": false
+    },
+    "execution-site-find-program": {
+      "description": "(execution-site-find-program site program #:refresh? (refresh? #f))  procedure, @lisp@/editor/remote.scm:207\n\nResolve PROGRAM against SITE's environment, honoring REFRESH?.",
+      "is_macro": false
+    },
+    "execution-site-for": {
+      "description": "(execution-site-for location #:policy (policy #f) #:environment (environment (quote ())))  procedure, @lisp@/editor/remote.scm:176\n\nReturn an `execution-site` for LOCATION under POLICY and ENVIRONMENT.\nIf LOCATION is already an `execution-site`, keep its policy unless\nPOLICY is explicitly provided; otherwise default POLICY to `project`.",
+      "is_macro": false
+    },
+    "execution-site-invalidate!": {
+      "description": "(execution-site-invalidate! (dir #f))  procedure, @lisp@/editor/remote.scm:219\n\nClear cached environment snapshots for DIR, or all if omitted.",
+      "is_macro": false
+    },
+    "execution-site-needs-eval?": {
+      "description": "(execution-site-needs-eval? dir)  procedure, @lisp@/editor/remote.scm:211\n\nReturn #t if DIR's environment cache is missing or stale.",
+      "is_macro": false
+    },
+    "execution-site-resolved-environment": {
+      "description": "(execution-site-resolved-environment site #:refresh? (refresh? #f) #:environment (environment (quote ())))  procedure, @lisp@/editor/remote.scm:202\n\nReturn the launch environment alist for SITE.\nHonors REFRESH? and overlays explicit ENVIRONMENT overrides last.",
+      "is_macro": false
+    },
+    "execution-site-route": {
+      "description": "(execution-site-route site)  procedure, @lisp@/editor/remote.scm:182\n\nReturn the hop route of SITE.",
+      "is_macro": false
+    },
+    "execution-site-watched-path?": {
+      "description": "(execution-site-watched-path? path)  procedure, @lisp@/editor/remote.scm:215\n\nReturn #t if PATH is watched by a cached environment snapshot.",
+      "is_macro": false
+    },
+    "execution-site?": {
+      "description": "(execution-site? x)  procedure, @lisp@/editor/remote.scm:172\n\nReturn #t if X is an `execution-site`.",
       "is_macro": false
     },
     "explain-face": {
@@ -609,23 +661,23 @@
       "is_macro": false
     },
     "hop-host": {
-      "description": "(hop-host record)  procedure, @lisp@/editor/remote.scm:32\n\nReturn the `host` field of RECORD, a `hop` record.",
+      "description": "(hop-host h)  procedure, @lisp@/editor/remote.scm:93\n\nReturn the host string of hop H, or #f.",
       "is_macro": false
     },
     "hop-method": {
-      "description": "(hop-method record)  procedure, @lisp@/editor/remote.scm:30\n\nReturn the `method` field of RECORD, a `hop` record.",
+      "description": "(hop-method h)  procedure, @lisp@/editor/remote.scm:85\n\nReturn the method symbol of hop H.",
       "is_macro": false
     },
     "hop-port": {
-      "description": "(hop-port record)  procedure, @lisp@/editor/remote.scm:33\n\nReturn the `port` field of RECORD, a `hop` record.",
+      "description": "(hop-port h)  procedure, @lisp@/editor/remote.scm:97\n\nReturn the port string of hop H, or #f.",
       "is_macro": false
     },
     "hop-user": {
-      "description": "(hop-user record)  procedure, @lisp@/editor/remote.scm:31\n\nReturn the `user` field of RECORD, a `hop` record.",
+      "description": "(hop-user h)  procedure, @lisp@/editor/remote.scm:89\n\nReturn the user string of hop H, or #f.",
       "is_macro": false
     },
     "hop?": {
-      "description": "(hop? obj)  procedure, @lisp@/editor/remote.scm:28\n\nReturn #t if OBJ is a `hop` record.",
+      "description": "(hop? x)  procedure, @lisp@/editor/remote.scm:81\n\nReturn #t if X is a route hop.",
       "is_macro": false
     },
     "image-height": {
@@ -809,7 +861,7 @@
       "is_macro": false
     },
     "location-at": {
-      "description": "(location-at s path)  procedure, @lisp@/editor/remote.scm:104\n\nReturn the location of PATH on the machine the location S is on.",
+      "description": "(location-at s path)  procedure, @lisp@/editor/remote.scm:77\n\nReturn the location of PATH on the machine location S is on.",
       "is_macro": false
     },
     "location-document": {
@@ -817,11 +869,11 @@
       "is_macro": false
     },
     "location-endpoint": {
-      "description": "(location-endpoint s)  procedure, @lisp@/editor/remote.scm:233\n\nReturn the node the location S is on, or #f for a local path.\nA connection found lost is made again, as `route-endpoint` does.",
+      "description": "(location-endpoint loc)  procedure, @lisp@/editor/remote.scm:130\n\nReturn the remote node endpoint for LOC, or #f when local.",
       "is_macro": false
     },
     "location-path": {
-      "description": "(location-path s)  procedure, @lisp@/editor/remote.scm:92\n\nReturn the path of the location S on the machine it is on.\nFor a local path, that is S.",
+      "description": "(location-path s)  procedure, @lisp@/editor/remote.scm:69\n\nReturn the path of location S on the machine it is on.",
       "is_macro": false
     },
     "location-position": {
@@ -829,11 +881,11 @@
       "is_macro": false
     },
     "location-prefix": {
-      "description": "(location-prefix s)  procedure, @lisp@/editor/remote.scm:100\n\nReturn the route part of the location S, as /ssh:host:, or \"\".",
+      "description": "(location-prefix s)  procedure, @lisp@/editor/remote.scm:73\n\nReturn the route part of location S, as /ssh:host:, or \"\".",
       "is_macro": false
     },
     "location-route": {
-      "description": "(location-route s)  procedure, @lisp@/editor/remote.scm:88\n\nReturn the route of the location S, a list of hops, or '() if local.",
+      "description": "(location-route s)  procedure, @lisp@/editor/remote.scm:65\n\nReturn the route of location S, a list of hops, or '() if local.",
       "is_macro": false
     },
     "location?": {
@@ -849,11 +901,11 @@
       "is_macro": false
     },
     "lsp-attach!": {
-      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:691\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
+      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:708\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
       "is_macro": false
     },
     "lsp-buffer-sessions": {
-      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:720\n\nReturn the live sessions buffer B's document is open in.",
+      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:748\n\nReturn the live sessions buffer B's document is open in.",
       "is_macro": false
     },
     "lsp-server-doc": {
@@ -969,7 +1021,7 @@
       "is_macro": false
     },
     "method-names": {
-      "description": "(method-names)  procedure, @lisp@/editor/remote.scm:126\n\nReturn the names of the methods defined.",
+      "description": "(method-names)  procedure, @lisp@/editor/remote.scm:105\n\nReturn the names of the route methods defined.",
       "is_macro": false
     },
     "minibuffer-history": {
@@ -1601,11 +1653,11 @@
       "is_macro": false
     },
     "remote-endpoints": {
-      "description": "(remote-endpoints)  procedure, @lisp@/editor/remote.scm:190\n\nReturn the routes connected, each (route . node).",
+      "description": "(remote-endpoints)  procedure, @lisp@/editor/remote.scm:134\n\nReturn the currently connected remote node endpoints.",
       "is_macro": false
     },
     "remote-path?": {
-      "description": "(remote-path? s)  procedure, @lisp@/editor/remote.scm:82\n\nReturn #t if S names a location on another machine.\nIt is written as TRAMP writes it: /METHOD:USER@HOST#PORT|...:PATH, with\nmethods `define-method` defined.",
+      "description": "(remote-path? s)  procedure, @lisp@/editor/remote.scm:61\n\nReturn #t if S names a location on another machine.",
       "is_macro": false
     },
     "remote-value-written": {
@@ -1681,7 +1733,7 @@
       "is_macro": false
     },
     "rpc-connect": {
-      "description": "(rpc-connect program args #:directory (directory #f) #:on-note (on-note (lambda (m p) #f)) #:on-ask (on-ask (lambda (m p) rpc-unsupported)) #:on-dead (on-dead (lambda () #f)) #:on-event (on-event #f))  procedure, @lisp@/editor/rpc.scm:177\n\nStart PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.\nReturn the connection. A task reads it, in the scope calling:\nnotifications go to ON-NOTE (method params), requests of the peer's to\nON-ASK (method params), which answers with a JSON value or\n`rpc-unsupported`, and answers wake `rpc-request!`'s. The process's\nstderr is read as it comes, and given to ON-EVENT or thrown away: a\npeer whose log nobody reads blocks on a full pipe and then on nothing\nelse, ever. When the process ends — or speaks out of frame, which ends\nit from here — the waiters fail and ON-DEAD runs. The scope owns the\nprocess, as every process is: shutting it kills the peer. ON-EVENT, if\ngiven, is told (direction text) of each message as it is written\n(`out`) and read (`in`), the JSON as it went, and of what the peer\nwrites to stderr (`err`): a log's. It must not wait, and its failure is\nits own.",
+      "description": "(rpc-connect program args #:directory (directory #f) #:environment (environment (quote ())) #:node (node #f) #:on-note (on-note (lambda (m p) #f)) #:on-ask (on-ask (lambda (m p) rpc-unsupported)) #:on-dead (on-dead (lambda () #f)) #:on-event (on-event #f))  procedure, @lisp@/editor/rpc.scm:177\n\nStart PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.\nReturn the connection. ENVIRONMENT is an optional list of\n`(NAME . VALUE-OR-#f)` entries and NODE an optional remote endpoint, as\n`process-spawn` takes them. A task reads it, in the scope calling:\nnotifications go to ON-NOTE (method params), requests of the peer's to\nON-ASK (method params), which answers with a JSON value or\n`rpc-unsupported`, and answers wake `rpc-request!`'s. The process's\nstderr is read as it comes, and given to ON-EVENT or thrown away: a\npeer whose log nobody reads blocks on a full pipe and then on nothing\nelse, ever. When the process ends — or speaks out of frame, which ends\nit from here — the waiters fail and ON-DEAD runs. The scope owns the\nprocess, as every process is: shutting it kills the peer. ON-EVENT, if\ngiven, is told (direction text) of each message as it is written\n(`out`) and read (`in`), the JSON as it went, and of what the peer\nwrites to stderr (`err`): a log's. It must not wait, and its failure is\nits own.",
       "is_macro": false
     },
     "rpc-framer-clear!": {
@@ -1894,6 +1946,10 @@
     },
     "show-view!": {
       "description": "(show-view! s name make-rows #:mode (mode (quote rows-mode)) #:data (data #f))  procedure, @lisp@/editor/views.scm:123\n\nShow in S the view NAME, whose rows (MAKE-ROWS session) gives.\nIts mode is MODE, `rows-mode` or one extending it, keeping DATA.",
+      "is_macro": false
+    },
+    "spawn-at-site": {
+      "description": "(spawn-at-site site program args #:pty (pty #f) #:persist (persist #f) #:environment (environment (quote ())) #:stdin (stdin #f) #:stdout (stdout #f) #:stderr (stderr #f))  procedure, @lisp@/editor/remote.scm:223\n\nStart PROGRAM with ARGS at execution site SITE; return the process.\nENVIRONMENT overrides site variables; PTY, PERSIST, STDIN, STDOUT, and\nSTDERR forward to `process-spawn`.",
       "is_macro": false
     },
     "sqlite-close": {

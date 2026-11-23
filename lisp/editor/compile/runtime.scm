@@ -45,7 +45,11 @@ line names none, or a file that does not exist."
                 (named (let ((t (substring text lead (string-length text))))
                          (if (string-suffix? ":" t) (substring t 0 (- (string-length t) 1)) t)))
                 (parts (string-split named ":"))
-                (path (if (string-prefix? "/" (car parts)) (car parts) (string-append (state b 'dir) (car parts)))))
+                (dir (state b 'dir))
+                (raw (car parts))
+                (path (if (string-prefix? "/" raw)
+                          (if (remote-path? dir) (location-at dir raw) raw)
+                          (string-append dir raw))))
            (and (exists? b path)
                 (list (+ start lead) (+ start lead (bytevector-length (string->utf8 named)))
                       (file-location path (string->number (cadr parts))
@@ -56,7 +60,11 @@ line names none, or a file that does not exist."
 (define (exists? b path)
   (let* ((known (state b 'exists)) (e (hash-table-ref/default known path 'unknown)))
     (if (eq? e 'unknown)
-        (let ((e (file-exists? path))) (hash-table-set! known path e) e)
+        (let ((e (if (remote-path? path)
+                     (guard (ex (#t #f)) (path-exists? path))
+                     (file-exists? path))))
+          (hash-table-set! known path e)
+          e)
         e)))
 
 ;; The first line of B's output naming a place from FROM on, or with
@@ -122,10 +130,7 @@ command again, \\[kill-compilation] stops it."
 (define %commands (make-hash-table))
 
 (define (default-command root)
-  (if (file-exists? (string-append root "Cargo.toml")) "cargo build" "make -k "))
-
-(define (shell-quote s)
-  (string-append "'" (string-join (string-split s "'") "'\\''") "'"))
+  (if (guard (e (#t #f)) (path-exists? (string-append root "Cargo.toml"))) "cargo build" "make -k "))
 
 (define (status-text status)
   (cond ((eqv? status 0) "finished")
@@ -167,8 +172,7 @@ command again, \\[kill-compilation] stops it."
     (display-buffer! s (buffer-document b))
     (request! (state b 'slot)
               (lambda ()
-                (note-effect! 'external)
-                (call-with-process "sh" (list "-c" (string-append "cd " (shell-quote dir) " && { " command "\n} 2>&1"))
+                (call-with-process-at dir "sh" (list "-c" (string-append "{ " command "\n} 2>&1"))
                   (lambda (p)
                     (process-close-input p)
                     (let loop ()

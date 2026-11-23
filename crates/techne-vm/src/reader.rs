@@ -721,16 +721,29 @@ pub fn is_delimiter(c: char) -> bool {
 }
 
 /// The length of the text before the first delimiter.
+const fn build_ascii_class() -> [u8; 256] {
+    // bit 0: ASCII whitespace (including 0x0b vertical tab)
+    // bit 1: delimiter (whitespace or R7RS/Techne delimiter)
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let ws = matches!(i as u8, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        let delim = ws || matches!(i as u8, b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"' | b';' | b'|' | b'\'' | b'`' | b',');
+        table[i] = (ws as u8) | ((delim as u8) << 1);
+        i += 1;
+    }
+    table
+}
+
+static ASCII_CLASS: [u8; 256] = build_ascii_class();
+
 fn undelimited(s: &str) -> usize {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b < 0x80 {
-            if b.is_ascii_whitespace()
-                || b == 0x0b
-                || matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"' | b';' | b'|' | b'\'' | b'`' | b',')
-            {
+            if ASCII_CLASS[b as usize] & 2 != 0 {
                 return i;
             }
             i += 1;
@@ -842,9 +855,13 @@ impl<'a, D: Build> Reader<'a, D> {
                 None => return Ok(()),
                 // A run of layout at once. The vertical tab is Unicode
                 // whitespace but not ASCII whitespace.
-                Some(b) if b.is_ascii_whitespace() || *b == 0x0b => {
+                Some(&b) if ASCII_CLASS[b as usize] & 1 != 0 => {
                     let bytes = rest.as_bytes();
-                    self.pos += bytes.iter().position(|b| !b.is_ascii_whitespace() && *b != 0x0b).unwrap_or(bytes.len());
+                    let mut k = 1;
+                    while k < bytes.len() && ASCII_CLASS[bytes[k] as usize] & 1 != 0 {
+                        k += 1;
+                    }
+                    self.pos += k;
                 }
                 Some(b';') => self.pos += rest.find('\n').unwrap_or(rest.len()),
                 Some(b'#') if rest.starts_with("#|") => self.block_comment()?,
