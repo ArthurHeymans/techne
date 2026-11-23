@@ -262,6 +262,12 @@ enum Job {
         action: Inspect,
         reply: Reply,
     },
+    PatchLibrary {
+        library: Vec<String>,
+        code: String,
+        check_retained: bool,
+        reply: Reply,
+    },
     CloseSession(String),
     Debug {
         id: u64,
@@ -273,7 +279,11 @@ impl Job {
     /// Where it is answered, if it is.
     fn reply(&self) -> Option<&Reply> {
         match self {
-            Job::Eval { reply, .. } | Job::Complete { reply, .. } | Job::Info { reply, .. } | Job::Inspect { reply, .. } => Some(reply),
+            Job::Eval { reply, .. }
+            | Job::Complete { reply, .. }
+            | Job::Info { reply, .. }
+            | Job::Inspect { reply, .. }
+            | Job::PatchLibrary { reply, .. } => Some(reply),
             Job::Wake | Job::CloseSession(_) | Job::Debug { .. } => None,
         }
     }
@@ -890,6 +900,38 @@ fn inspect(vm: &mut Vm, state: &Rc<State>, action: Inspect, reply: &Reply) {
     state.inspectors.borrow_mut().insert(key, stack);
 }
 
+fn patch_library(vm: &mut Vm, library: &[String], code: &str, check_retained: bool, reply: &Reply) {
+    match vm.patch_library(library, code, check_retained) {
+        Ok(report) => {
+            let stale = report
+                .stale_holders
+                .iter()
+                .map(|h| dict([("binding", B::str(&h.binding)), ("chain", B::List(h.chain.iter().map(B::str).collect()))]))
+                .collect();
+            reply.send(vec![
+                ("status", B::List(vec![B::str("done")])),
+                ("library", B::List(report.library.iter().map(B::str).collect())),
+                ("patched", B::List(report.patched.iter().map(B::str).collect())),
+                ("unchanged", B::Int(report.unchanged as i64)),
+                ("stale-holders", B::List(stale)),
+                ("source-sha256", B::str(&report.source_sha256)),
+            ]);
+        }
+        Err(e) => {
+            let mut fields = vec![
+                ("status", B::List(vec![B::str("error"), B::str("patch-refused"), B::str("done")])),
+                ("reason", B::str(e.reason.code())),
+                ("message", B::str(&e.message)),
+                ("err", B::str(format!("{e}\n"))),
+            ];
+            if let Some(binding) = &e.binding {
+                fields.push(("binding", B::str(binding)));
+            }
+            reply.send(fields);
+        }
+    }
+}
+
 fn handle(vm: &mut Vm, state: &Rc<State>, job: Job) {
     match job {
         Job::Eval { name, source, ns, debug, reply } => start_eval(vm, state, name, source, ns, debug, reply),
@@ -903,6 +945,7 @@ fn handle(vm: &mut Vm, state: &Rc<State>, job: Job) {
             info(vm, module, &sym, kind, &reply)
         }
         Job::Inspect { action, reply } => inspect(vm, state, action, &reply),
+        Job::PatchLibrary { library, code, check_retained, reply } => patch_library(vm, &library, &code, check_retained, &reply),
         Job::CloseSession(s) => {
             let s = Some(s);
             state.inspectors.borrow_mut().remove(&s);
@@ -1268,6 +1311,7 @@ const OPS: &[&str] = &[
     "techne-inspect-pop",
     "techne-debug-inspect",
     "techne-debug-subscribe",
+    "techne-patch-library",
 ];
 
 /// The sessions a principal may have at once.
@@ -1432,6 +1476,49 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             }
             _ => reply.error("techne-debug-inspect needs a debug-id", &[]),
         },
+        "techne-patch-library" => {
+            let library = match msg.get("library") {
+                Some(B::List(items)) if !items.is_empty() => {
+                    let mut parts = Vec::with_capacity(items.len());
+                    for item in items {
+                        if let Some(s) = item.as_str() {
+                            parts.push(s.to_string());
+                        } else if let Some(i) = item.as_int().filter(|&i| i >= 0) {
+                            parts.push(i.to_string());
+                        } else {
+                            return reply.send(vec![
+                                ("status", B::List(vec![B::str("error"), B::str("patch-refused"), B::str("done")])),
+                                ("reason", B::str("syntax-error")),
+                                ("message", B::str("library name parts must be strings or non-negative integers")),
+                                ("err", B::str("syntax-error: library name parts must be strings or non-negative integers\n")),
+                            ]);
+                        }
+                    }
+                    parts
+                }
+                Some(B::Bytes(_)) => match msg.get("library").and_then(B::as_str).map(techne_vm::patch::parse_library_name) {
+                    Some(Ok(parts)) => parts,
+                    Some(Err(e)) => {
+                        return reply.send(vec![
+                            ("status", B::List(vec![B::str("error"), B::str("patch-refused"), B::str("done")])),
+                            ("reason", B::str("syntax-error")),
+                            ("message", B::str(&e)),
+                            ("err", B::str(format!("syntax-error: {e}\n"))),
+                        ]);
+                    }
+                    None => return reply.error("techne-patch-library: invalid library name", &["patch-refused"]),
+                },
+                _ => return reply.error("techne-patch-library needs library", &["no-library"]),
+            };
+            let Some(code) = text("code") else {
+                return reply.error("techne-patch-library needs code", &["no-code"]);
+            };
+            let check_retained = !matches!(
+                msg.get("check-retained"),
+                Some(v) if v.as_int() == Some(0) || v.as_str() == Some("false")
+            );
+            shared.post(Job::PatchLibrary { library, code, check_retained, reply });
+        }
         _ => reply.status(&["error", "unknown-op", "done"]),
     }
 }
