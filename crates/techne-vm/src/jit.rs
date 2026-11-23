@@ -447,12 +447,12 @@ impl Inlinee {
 }
 
 /// Instructions a function inlined at a call site may have at most.
-pub const INLINE_MAX: usize = 28;
+pub const INLINE_MAX: usize = 20;
 /// Functions inlined in each other at most, a call of the function
 /// compiled inlining the first.
 pub const INLINE_DEPTH: usize = 3;
 /// Instructions a call inlined may bring at most, nested ones included.
-pub const INLINE_TOTAL: usize = 56;
+pub const INLINE_TOTAL: usize = 40;
 
 /// Whether calls of a function of `ops` (taking `nparams` arguments, and
 /// rest arguments if `rest`) with `n` arguments may run inline: a small
@@ -478,6 +478,7 @@ pub fn inlinable(
     use Op::*;
     let mut calls = 0;
     let mut self_tail = false;
+    let mut has_loop = false;
     let mut mutates_global = false;
     let ok = ops.iter().enumerate().all(|(pc, op)| match *op {
         CallG { .. } | TailCallG { .. } if nested.contains_key(&(pc as u32)) => true,
@@ -491,6 +492,10 @@ pub fn inlinable(
                 calls += inline.is_none() as usize;
             })
             .is_some(),
+        Loop { .. } => {
+            has_loop = true;
+            true
+        }
         SetG { .. } => {
             mutates_global = true;
             true
@@ -498,7 +503,7 @@ pub fn inlinable(
         Closure { .. } | PushHandler { .. } | PopHandler | PushEscape { .. } | Call { .. } | TailCall { .. } | EnterJit => false,
         _ => true,
     });
-    ok && calls <= 1 && !rest && nparams == n && ops.len() <= INLINE_MAX && (!self_tail || (calls == 0 && !mutates_global))
+    ok && calls <= 1 && !rest && nparams == n && ops.len() <= INLINE_MAX && (!(self_tail || has_loop) || (calls == 0 && !mutates_global))
 }
 
 /// `op` of a function inlined with its registers `off` above the caller's

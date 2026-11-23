@@ -119,7 +119,9 @@ instead, without saving it, and kill its buffer."
     (map (lambda (b)
            (cons b (car (sort (hash-table-ref/default by-command b '())
                               (lambda (x y) (if (eq? (not (named? x)) (not (named? y)))
-                                                (< (string-length x) (string-length y))
+                                                (if (= (string-length x) (string-length y))
+                                                    (string>? x y)
+                                                    (< (string-length x) (string-length y)))
                                                 (not (named? x))))))))
          (hash-table-keys by-command))))
 
