@@ -444,6 +444,11 @@ impl Inlinee {
     pub fn size(&self) -> usize {
         self.ops.len() + self.inlined.values().map(Inlinee::size).sum::<usize>()
     }
+
+    /// Whether this inlinee or any nested inlinee writes a global.
+    fn mutates_global(&self) -> bool {
+        self.ops.iter().any(|op| matches!(op, Op::SetG { .. })) || self.inlined.values().any(Inlinee::mutates_global)
+    }
 }
 
 /// Instructions a function inlined at a call site may have at most.
@@ -481,7 +486,10 @@ pub fn inlinable(
     let mut has_loop = false;
     let mut mutates_global = false;
     let ok = ops.iter().enumerate().all(|(pc, op)| match *op {
-        CallG { .. } | TailCallG { .. } if nested.contains_key(&(pc as u32)) => true,
+        CallG { .. } | TailCallG { .. } if nested.contains_key(&(pc as u32)) => {
+            mutates_global |= nested[&(pc as u32)].mutates_global();
+            true
+        }
         TailCallG { g, n: argc, .. } if self_global == Some(g) && argc == nparams => {
             self_tail = true;
             true
