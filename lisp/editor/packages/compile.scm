@@ -2,6 +2,13 @@
 (import (techne editor))
 (require "../files.scm")
 
+(define-option compile-command #f
+  "Default shell command offered by `compile` for a project or buffer.
+When `#f`, `compile` chooses `cargo build` if `Cargo.toml` exists, else
+`make -k `. Project `.techne.scm` values require explicit user trust."
+  #:type '(or (one-of #f) (string #:min 1))
+  #:directory-safe #f)
+
 (register-command-package! (quote compile-runtime)
   (string-append (directory-of (current-module)) "../compile/runtime.scm")
   (quote ((compile "Run a command in the project root; show its output as it comes.")

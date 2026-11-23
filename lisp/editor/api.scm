@@ -42,6 +42,8 @@
 (require "direnv.scm")
 (require "syntax.scm")
 (require "rpc.scm")
+(require "project-settings-bridge.scm")
+(require "project-settings.scm")
 (require "lsp.scm")
 (require "rich.scm")
 (require "markdown.scm")
@@ -54,7 +56,9 @@
          command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
          mode-name mode-doc mode-parent mode-chain derived-mode? mode-for-file register-mode-line-segment!
-          define-option register-option! find-option option-user-only? set-option! unset-option! option explain-option
+         define-option register-option! find-option option-user-only? option-directory-safe option-merge
+         set-option! unset-option! option option-json-overlay explain-option
+         add-option-changed-hook! remove-option-changed-hook!
          define-face register-face! find-face face-names face-doc set-face! unset-face! explain-face face-attributes
          set-palette! palette-color load-theme unload-theme
          define-language register-language! find-language language-names language-generation buffer-language path-language
@@ -122,6 +126,13 @@
          spawn-at-site call-with-process-at-site
          rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting rpc-unsupported rpc-timeout
          define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc lsp-attach! lsp-buffer-sessions
+         lsp-session-env-id lsp-effective-settings lsp-refresh-configuration!
+         make-settings-context settings-context? json-unset json-unset? json-object-overlay json-object-compose-overlays
+         project-settings-load! project-settings-cached-snapshot project-settings-invalidate! project-settings-invalidate-ancestors!
+         default-trust-store-path project-trust-verdict project-trust-entries project-trust-clear-memory!
+         project-settings-approve! project-settings-deny! project-settings-revoke!
+         add-project-settings-changed-hook! remove-project-settings-changed-hook!
+         buffer-project-settings-pending buffer-project-settings-diagnostics
          rich-present! rich-splice! rich-units make-rich-buffer! rich-code-language markdown->rich markdown-render! markdown-escape buffer-projections)
 
 (%name-library '(techne editor))

@@ -111,6 +111,8 @@ const KNOWN_SLOW: &[(&str, &str, u64, &str)] = &[
     // `buffers`, nightly of 2026-11-03).
     ("*", "describe-function", 60_000_000, "listing every name"),
     ("*", "describe-symbol", 60_000_000, "listing every name"),
+    ("*", "describe-variable", 60_000_000, "listing every name"),
+    ("*", "describe-command", 60_000_000, "listing every name"),
     // In any corpus (`*`): the first definition motion of a session
     // compiles its language's definitions query (some 23 M), kept after;
     // in `unicode`, up to 177 M (nightly of 2026-11-20).
