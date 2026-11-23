@@ -114,16 +114,22 @@ provides its handler:
   Today (`crates/techne-host`, `lisp/cloud/manifest.scm`): `env` is a
   dict by the names the manifest gives its bindings (`manifest.scm`
   beside the entry module, data, never evaluated): `(dict-ref env
-  'cache)`. A secret (its value from `.secrets.scm`, which is no part of
-  the bundle) or a text is its string; a KV namespace is a handle for
-  `kv-get`, `kv-put!` (with `#:ttl`), `kv-delete!` and `kv-list`, whose
-  values are data. The handle names the binding, not the namespace: the
-  supervisor looks the namespace up among the bindings of the deployment
-  the request was sent for, so a handle of a world's own making reaches
-  nothing. Loading sees no `env`, and hidden files are no part of a
-  bundle: a snapshot holds no secret, and a worker only those bound. A
-  request keeps the bindings of the deployment it was sent for, as it
-  keeps its code, whatever is published after ("Deploying").
+  'cache)`. For packaged deployments (`techne-package.scm` with a
+  `(cloud ENTRY [(bindings (NAME KIND) ...)])` clause), `manifest.scm`
+  is validated against the **root package's** declared binding names and
+  exact kinds (`kv`, `secret`, `text`) before loading or uploading
+  (dependencies' `(cloud ...)` clauses are ignored; omitting
+  `(bindings ...)` requires no bindings). A secret (its value from
+  `.secrets.scm`, which is no part of the bundle) or a text is its
+  string; a KV namespace is a handle for `kv-get`, `kv-put!` (with
+  `#:ttl`), `kv-delete!` and `kv-list`, whose values are data. The
+  handle names the binding, not the namespace: the supervisor looks the
+  namespace up among the bindings of the deployment the request was sent
+  for, so a handle of a world's own making reaches nothing. Loading sees
+  no `env`, and hidden files are no part of a bundle: a snapshot holds
+  no secret, and a worker only those bound. A request keeps the bindings
+  of the deployment it was sent for, as it keeps its code, whatever is
+  published after ("Deploying").
 - `ctx`: the request's id, its deadline, and `wait-until` (below).
 - Concurrency inside an instance is techne's tasks. A request runs as a
   task; waits on fetch, KV and timers suspend only it. Every task a request
@@ -132,15 +138,22 @@ provides its handler:
   ends when its response is sent and its `wait-until` work is done, or at
   its deadline.
 - **Initialization has no external effects.** The entry module and what it
-  requires are read by the host from the bundle and run once, to make the
-  snapshot, with no bindings and no clocks or randomness beyond a fixed
-  seed: its world is not granted the clock or entropy, which the host
-  grants to instances (`Vm::set_grant`). It may define, compile and compute constants. If it leaves
-  anything a snapshot cannot hold (a task, a channel, a foreign object) the
-  deployment is rejected with an ordinary error (runtime work 1).
-  `crates/techne-host` loads it reading only the deployment's directory
-  and Techne's own Lisp (the libraries it ships, `(techne http)` among them),
-  within bounds of CPU, wall time and memory.
+  requires are loaded by the worker directly from an immutable,
+  in-memory read-only `BundleVfs` (`crates/techne-vm/src/bundle.rs`,
+  `Vm::install_bundle`, `Vm::eval_bundle_entry`) with zero temporary
+  filesystem unpacking, and run once to make the snapshot, with no
+  bindings and no clocks or randomness beyond a fixed seed: its world is
+  not granted the clock or entropy, which the host grants to instances
+  (`Vm::set_grant`). It may define, compile and compute constants. If it
+  leaves anything a snapshot cannot hold (a task, a channel, a foreign
+  object) the deployment is rejected with an ordinary error (runtime
+  work 1). `crates/techne-host` enforces locked library resolution
+  inside `BundleVfs` — disabling `TECHNE_LIBRARY_PATH`, CWD fallback,
+  and ambient OS filesystem reads — so code may load only built-ins,
+  Techne's shipped stdlib (including `(techne http)`), and packages in
+  the bundle within declared direct-dependency boundaries, bounded by
+  CPU, wall time and memory. Production snapshots strip host OS
+  `PathBuf`s (`crates/techne-vm/src/vm/template.rs`).
 - Globals an instance sets survive to later requests on that instance and
   no further. Which requests share an instance is not promised (below).
 - Scheduled handlers (cron) and queues come later, with their delivery and
@@ -243,29 +256,35 @@ A deployment goes through these states, each recorded:
    (up to the wall limit) and are dropped.
 
 Of these, the supervisor has the mechanism today
-(`crates/techne-host/src/supervisor.rs`): a deployment's id is a hash of
-its name, entry, files and bindings, so the same one deployed twice is
-one; `Supervisor::prepare` has the worker load it, beside those it
-serves, which changes nothing served and fails alone (Built and Ready,
-with one worker); `Supervisor::publish` routes the name to it, at once,
-and only if the name is still routed where the publisher saw it; a
-request is pinned to the deployment its name was routed to when it was
-sent, code and bindings both; a deployment no longer routed to is
-retired from the worker once its requests are done (Draining), and its
-files with it. For development the worker's REPL moves to a
+(`crates/techne-host/src/supervisor.rs`, `crates/techne-host/src/package.rs`):
+a deployment's id is a hash of its name, entry, files (or packaged
+`BundleVfs` trees and dependency graph) and bindings, so the same one
+deployed twice is one; `Supervisor::prepare`, `Supervisor::prepare_directory`,
+and `Supervisor::prepare_packaged_from_trees` send the bundle over IPC to
+the worker, which builds an immutable in-memory `BundleVfs` and loads it
+beside those it serves with zero temporary filesystem files, changing
+nothing served and failing alone (Built and Ready, with one worker);
+`Supervisor::publish` routes the name to it, at once, and only if the name
+is still routed where the publisher saw it; a request is pinned to the
+deployment its name was routed to when it was sent, code and bindings both;
+a deployment no longer routed to is retired from the worker once its
+requests are done (Draining). For development the worker's REPL moves to a
 deployment's world when it is published, not when it is prepared.
 
 What is done with that mechanism is Lisp, in the supervisor's front
-world (`lisp/cloud/control.scm`): to deploy is to prepare, keep the
-bundle (files and bindings, by id, the latest ten), publish if nothing
-overtook it, and record it; to roll back is to prepare an earlier one
-again from its bundle and publish it the same way. The record and the
-bundles are files, which outlive the supervisor. `techne cloud dev
---ops PORT` serves the operations `deployments`, `deploy` and
-`rollback` as JSON over HTTP (`POST /v1/ops`, a bearer token allowing
+world (`lisp/cloud/control.scm`, `lisp/cloud/serve.scm`): to deploy is to
+prepare, keep the bundle (files or packages and bindings, by id, the latest
+ten), publish if nothing overtook it, and record it; to roll back is to
+prepare an earlier one again from its bundle and publish it the same way.
+The record and the bundles are files, which outlive the supervisor.
+`techne cloud dev --ops PORT` serves the operations `deployments`, `deploy`
+and `rollback` as JSON over HTTP (`POST /v1/ops`, a bearer token allowing
 `inspect` or `deploy` on the project), and `techne cloud deployments`,
-`deploy` and `rollback` ask them. Not yet: uploading a bundle (the
-supervisor reads the project's directory), `dry-run`, idempotency keys,
+`deploy` and `rollback` ask them. Against `techne cloud serve`, packaged
+deploys query `has-trees` first and omit `"files"` for dependency trees
+already cached by canonical `tree-sha256` under `<state>/trees/<sha>/`;
+uploaded trees are verified against their declared `tree-sha256` and
+cached atomically before staging. Not yet: `dry-run`, idempotency keys,
 the other operations and the audit log.
 
 Rollback publishes an earlier deployment that is still Ready or can be
@@ -803,18 +822,19 @@ is the storage layout and that the supervisor can start any worker locally.
 - **`techne cloud dev`** runs the same supervisor and worker locally,
   sandboxed where the kernel allows it, so the REPL, error records and
   limits are developed and tested without the service. So far
-  (`crates/techne-cli/src/cloud.rs`) it serves one deployment, its entry
-  module given, through the Lisp front on a local port and a worker, and
-  deploys it again when a Lisp file under its directory is saved, keeping
-  the last one that loaded. With `--nrepl PORT` the worker serves it from
-  a dev world with an nREPL server in it, which Emacs connects to through
-  the supervisor, which relays the connection: a definition sent from the
-  file changes the next request, and the connection follows the
-  deployment to its next dev world when it is deployed again; it ends
-  with its worker. With `--debug` too, the deployment is served by
-  instances as in production and the nREPL server is in its debug
-  instance, reached by requests carrying the credential printed
-  ("Debugging in production").
+  (`crates/techne-cli/src/cloud.rs`) it serves one deployment — given a
+  package directory (with `techne-package.scm` and `techne.lock`) or a
+  legacy entry module — through the Lisp front on a local port and a
+  worker, and deploys it again when a Lisp file or `techne.lock` under
+  its directory is saved, keeping the last one that loaded. With
+  `--nrepl PORT` the worker serves it from a dev world with an nREPL
+  server in it, which Emacs connects to through the supervisor, which
+  relays the connection: a definition sent from the file changes the next
+  request, and the connection follows the deployment to its next dev
+  world when it is deployed again; it ends with its worker. With
+  `--debug` too, the deployment is served by instances as in production
+  and the nREPL server is in its debug instance, reached by requests
+  carrying the credential printed ("Debugging in production").
 - **Emacs** (`editors/emacs/techne.el`): connect with a token over TLS;
   choose a dev world or attach a debug instance, shown in the mode line;
   route one's own requests to it, set break on error, trace; deploy the
@@ -947,16 +967,19 @@ dicts in `match` and `let`.
 
 What techne-vm and techne-node need that they do not have:
 
-1. **Deployment snapshots** (started). `Vm::snapshot` makes a world at
+1. **Deployment snapshots** (mostly done). `Vm::snapshot` makes a world at
    rest a template that `Snapshot::world` starts worlds from, refusing
    with an error what it cannot carry (unfinished tasks, timers,
    channels, foreign objects, values rooted from Rust); snapshots are
-   bound to their thread, as worlds are. With the Org library loaded a
-   world starts in 0.43 ms (`examples/snapshot.rs`). Still needed: a
-   loader confined to a bundle's contents, given by the host; an
-   initialization phase without clocks or randomness; measurements of a
-   larger project and of the cost of the first requests before the JIT
-   has compiled anything.
+   bound to their thread, as worlds are. Loading runs against an
+   immutable, read-only in-memory `BundleVfs` (`crates/techne-vm/src/bundle.rs`,
+   `Vm::install_bundle`, `Vm::eval_bundle_entry`) with locked library
+   resolution, without clocks or randomness, and production snapshots
+   strip host OS `PathBuf`s (`crates/techne-vm/src/vm/template.rs`).
+   With the Org library loaded a world starts in 0.43 ms
+   (`examples/snapshot.rs`). Still needed: measurements of a larger
+   project and of the cost of the first requests before the JIT has
+   compiled anything.
 2. **Request lifetimes** (done). The host spawns a request's task in a
    lifetime (`Vm::new_lifetime`, `spawn_in`), which every task it spawns
    inherits, whatever scope they are in: CPU summed across them in thread

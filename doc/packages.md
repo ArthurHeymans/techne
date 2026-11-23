@@ -120,7 +120,10 @@ this file:
   read and means the same.
 - `(cloud "app.scm" [(bindings (name kind) ...)])` — optional cloud worker
   entry contained in the package directory. `bindings` declares binding names
-  and kinds (`kv`, `secret`, `text`) as distinct symbols, never secret values.
+  and kinds (`kv`, `secret`, `text`) as distinct symbols, never secret values
+  (omitting `(bindings ...)` declares an empty binding contract `'()`). Only
+  the **root package's** `(cloud ...)` clause governs a deployment; `(cloud ...)`
+  clauses on transitive dependencies are ignored.
 
 ## Canonical `tree-sha256`
 
@@ -193,7 +196,7 @@ and read by `(techne lock)` without evaluation:
     `techne-package.scm` to pick one version explicitly.
 - Dependency cycles are rejected with the full cycle chain.
 
-## CLI & LSP
+## CLI, Cloud & LSP
 
 - **`techne lock [DIR] [--check | --frozen | --update] [--store DIR]`**
   - Resolves `techne-package.scm` in `DIR` (default `.`), fetches and
@@ -226,6 +229,25 @@ and read by `(techne lock)` without evaluation:
     invoking Git or touching the network; directs you to `techne lock --frozen`
     if store entries are missing), wires every `(owner pkg)` library provider
     and direct import boundary into the VM, and runs `FILE`.
+- **`techne cloud dev TARGET`, `techne cloud deploy TARGET --to ...`, `techne cloud serve`**
+  - `TARGET` may be a package directory containing `techne-package.scm` (with a
+    `(cloud ...)` entry), a file inside a package directory, or a legacy plain
+    entry `.scm` file.
+  - Packaged deployments resolve and verify the locked dependency closure from
+    `techne.lock` and `$TECHNE_PACKAGE_STORE`, enforce the root package's
+    `(cloud ... (bindings ...))` contract strictly against `manifest.scm`
+    before loading or uploading (matching binding names and exact kinds `kv`,
+    `secret`, `text`), and never hash or upload dot-prefixed files such as
+    `.secrets.scm`.
+  - Workers load deployments directly from an immutable, in-memory read-only
+    `BundleVfs` (`crates/techne-vm/src/bundle.rs`) with locked library
+    resolution (disabling `TECHNE_LIBRARY_PATH`, CWD fallback, and ambient OS
+    filesystem lookups) and zero temporary filesystem unpacking; production
+    snapshots strip host OS `PathBuf`s.
+  - Against `techne cloud serve`, `techne cloud deploy` queries `has-trees` and
+    omits `"files"` for package trees already cached by canonical `tree-sha256`
+    under `<state>/trees/<sha>/`; uploaded trees are verified against their
+    declared `tree-sha256` and written atomically before staging.
 - **`techne lsp`**
   - Resolves a package's own `(owner pkg ...)` libraries from `lib/` and its
     direct `(depends ...)` via the consuming workspace/project root's
