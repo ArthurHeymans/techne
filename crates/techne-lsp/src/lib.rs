@@ -21,35 +21,49 @@ use analysis::{Analysis, Def, DefKind, Span, analyze, checkdoc, head, ident, lib
 use techne_vm::reader::Syntax;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result, lsp_types::*};
 
+/// A 2-part `(owner pkg)` package identity in a manifest datum.
+fn package_id(form: &Syntax) -> Option<(String, String)> {
+    let items = list(form)?;
+    if items.len() != 2 {
+        return None;
+    }
+    Some((ident(&items[0])?.0, ident(&items[1])?.0))
+}
+
 /// Where a file in `dir` finds library `parts` if a package provides it,
 /// as the runtime does once the file's package is used (`(techne
 /// package)`): the package the file is in, by the nearest manifest above,
-/// `techne-package.scm`, for the libraries of its own name, under its
-/// `lib`; or a package that manifest depends on, `(depends (NAME (path
-/// "directory")) ...)`, for those of that name, under its `lib`. Some:
-/// the library is such a package's, found there or, None inside, missing:
-/// it is looked for nowhere else, whatever the library path holds. None:
-/// no package the file may import from provides it. The manifest is read
-/// as data; a file of another name under a `lib` is no library of that
-/// package's, and the packages a dependency depends on are not a file's
-/// to import.
+/// `techne-package.scm`, for the libraries of its own `(owner pkg)`, under
+/// its `lib`; or a package that manifest depends on, `(depends ((owner pkg)
+/// (path "directory")) ...)`, for those of that `(owner pkg)`, under its
+/// `lib`. Some: the library is such a package's, found there or, None
+/// inside, missing: it is looked for nowhere else, whatever the library
+/// path holds. None: no package the file may import from provides it. The
+/// manifest is read as data; a file of another name under a `lib` is no
+/// library of that package's, and the packages a dependency depends on are
+/// not a file's to import.
 fn package_library(parts: &[String], dir: &Path) -> Option<Option<PathBuf>> {
+    let [owner, pkg, ..] = parts else { return None };
     let root = dir.ancestors().find(|d| d.join("techne-package.scm").is_file())?;
     let text = std::fs::read_to_string(root.join("techne-package.scm")).ok()?;
     let forms = techne_vm::reader::read_syntax(&text).ok()?;
     let manifest = list(forms.first()?)?;
-    let (first, file) = (parts.first()?, format!("{}.sld", parts.join("/")));
+    if head(manifest).as_deref() != Some("package") {
+        return None;
+    }
+    let file = format!("{}.sld", parts.join("/"));
     let under = |package: PathBuf| Some(package.join("lib").join(&file)).filter(|p| p.is_file());
-    if ident(manifest.get(1)?)?.0 == *first {
+    if package_id(manifest.get(1)?).is_some_and(|(o, p)| o == *owner && p == *pkg) {
         return Some(under(root.to_path_buf()));
     }
-    let depends = manifest.iter().filter_map(list).filter(|clause| head(clause).as_deref() == Some("depends"));
+    let depends = manifest.iter().skip(2).filter_map(list).filter(|clause| head(clause).as_deref() == Some("depends"));
     depends
         .flat_map(|clause| clause.iter().skip(1))
         .filter_map(|dependency| {
             let dependency = list(dependency)?;
             let place = list(dependency.get(1)?)?;
-            let named = ident(dependency.first()?)?.0 == *first && head(place).as_deref() == Some("path");
+            let named =
+                package_id(dependency.first()?).is_some_and(|(o, p)| o == *owner && p == *pkg) && head(place).as_deref() == Some("path");
             named.then(|| string_lit(place.get(1)?)).flatten()
         })
         .next()

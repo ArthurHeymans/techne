@@ -2,11 +2,11 @@
   (kind git-ref-kind) (value git-ref-value))
 (define-record-type package-source (%source kind url ref package) package-source?
   (kind package-source-kind) (url package-source-url) (ref package-source-ref)
-  ;; The package wanted of a repository holding several, a symbol, or #f.
+  ;; The package wanted of a repository holding several, (owner pkg), or #f.
   (package package-source-package))
 (define-record-type recipe (%recipe name source) recipe?
   (name recipe-name) (source recipe-source))
-(define catalog (make-hash-table eq?))
+(define catalog (make-hash-table equal?))
 
 (define (component? s)
   (and (string? s) (positive? (string-length s)) (not (member s '("." "..")))
@@ -24,7 +24,7 @@
 (define (parse-package-source datum)
   "Validate DATUM and return a package source, without accessing a repository."
   (unless (and (list? datum) (memv (length datum) '(2 3 4)) (string? (cadr datum)))
-    (error "Expected (github owner/repo [ref] [(package name)]), (git https-url ...) or (local absolute-repo ...)" datum))
+    (error "Expected (github owner/repo [ref] [(package (owner pkg))]), (git https-url ...) or (local absolute-repo ...)" datum))
   (let* ((kind (car datum)) (s (cadr datum))
          (url (case kind
                 ((github) (unless (let ((parts (string-split s "/"))) (and (= 2 (length parts)) (every component? parts)))
@@ -38,18 +38,18 @@
            (packages (filter package? (cddr datum)))
            (refs (remove package? (cddr datum))))
       (when (or (pair? (if (pair? packages) (cdr packages) '())) (pair? (if (pair? refs) (cdr refs) '())))
-        (error "Expected at most one revision and one (package name)" datum))
+        (error "Expected at most one revision and one (package (owner pkg))" datum))
       (for-each (lambda (p)
-                  (unless (and (list? p) (= 2 (length p)) (symbol? (cadr p)) (component? (symbol->string (cadr p))))
-                    (error "Expected (package name)" p)))
+                  (unless (and (list? p) (= 2 (length p)) (package-name? (cadr p)))
+                    (error "Expected (package (owner pkg))" p)))
                 packages)
       (%source kind url (and (pair? refs) (parse-ref (car refs))) (and (pair? packages) (cadr (car packages)))))))
 (define (register-package-recipe! datum)
-  "Register a catalog entry DATUM, (recipe name source), without fetching it."
-  (unless (and (list? datum) (= 3 (length datum)) (eq? 'recipe (car datum)) (symbol? (cadr datum)))
+  "Register a catalog entry DATUM, (recipe (owner pkg) source), without fetching it."
+  (unless (and (list? datum) (= 3 (length datum)) (eq? 'recipe (car datum)) (package-name? (cadr datum)))
     (error "Invalid recipe" datum))
   (let ((wanted (package-source-package (parse-package-source (caddr datum)))))
-    (when (and wanted (not (eq? wanted (cadr datum)))) (error "Recipe names another package than its source" (cadr datum) wanted)))
+    (when (and wanted (not (equal? wanted (cadr datum)))) (error "Recipe names another package than its source" (cadr datum) wanted)))
   (hash-table-set! catalog (cadr datum) (%recipe (cadr datum) (caddr datum))))
 
 (define (store)
@@ -102,11 +102,11 @@
            (let* ((named (filter-map (lambda (dir)
                                        (guard (e (#t #f)) (cons (manifest-name (read-package-manifest (path-join tree dir))) dir)))
                                      found))
-                  (hit (and wanted (assq wanted named))))
+                  (hit (and wanted (assoc wanted named))))
              (cond (hit (cdr hit))
                    (wanted (error "Repository holds no package of this name" wanted (map car named)))
                    ((and (pair? named) (null? (cdr named))) (cdar named))
-                   (else (error "Repository holds several packages: say which with (package NAME)" (map car named)))))))))
+                   (else (error "Repository holds several packages: say which with (package (owner pkg))" (map car named)))))))))
 ;; The package in DIRECTORY and what it depends on stay in the checkout
 ;; TREE, links resolved, and can be made known here: checked before a
 ;; checkout is published, and changing nothing.
@@ -201,18 +201,18 @@
     (unique! (map manifest-name manifests))
     (unique! (append-map (lambda (d) (map car (commands d))) manifests))
     (unique! (append-map (lambda (d) (map car (options d))) manifests))))
-(define indexed (make-hash-table eq?))
+(define indexed (make-hash-table equal?))
 ;; Run the same checks before rename and before restoring any declarations.
 (define (check-declarations! d expected)
   (let ((name (manifest-name d)))
-    (when (and expected (not (eq? expected name))) (error "Recipe and manifest disagree" expected name))
+    (when (and expected (not (equal? expected name))) (error "Recipe and manifest disagree" expected name))
     (when (or (find-package name) (package-declared? name)) (error "Package name already installed" name))
     (for-each (lambda (c) (when (memq (car c) (command-names)) (error "Command already registered" (car c)))) (commands d))
     (for-each (lambda (o) (when (find-option (car o)) (error "Option already declared" (car o)))) (options d))))
 ;; Advertise the installation I; EXPECTED is the name it must have, or #f.
 (define (announce! i expected)
   (let* ((tree (installation-tree i)) (d (manifest tree)) (name (manifest-name d)) (old (hash-table-ref/default indexed name #f)))
-    (when (and expected (not (eq? expected name))) (error "Package name mismatch" name expected))
+    (when (and expected (not (equal? expected name))) (error "Package name mismatch" name expected))
     (cond (old (unless (equal? old i) (error "Package name already installed" name)))
           (else
            (check-declarations! d expected)
@@ -224,13 +224,13 @@
            (advertise-package! name (car (manifest-editor d)) (commands d) (options d))
            (hash-table-set! indexed name i))) name))
 (define (package-install! spec #:directory [directory (store)])
-  "Install SPEC (a source datum or catalog name) and advertise its commands.
+  "Install SPEC (a source datum or catalog `(owner pkg)`) and advertise it.
 DIRECTORY is the package store. First install pins a commit; repeats are offline.
 Of a repository holding several packages, the one installed is the one
-the source names with (package NAME), else the one of the catalog name.
-The packages installed from one source share its checkout, and so the
-packages beside them that they depend on."
-  (let* ((recipe (and (symbol? spec) (or (hash-table-ref/default catalog spec #f) (error "Unknown recipe" spec))))
+the source names with (package (owner pkg)), else the one of the catalog
+name. The packages installed from one source share its checkout, and so
+the packages beside them that they depend on."
+  (let* ((recipe (and (package-name? spec) (or (hash-table-ref/default catalog spec #f) (error "Unknown recipe" spec))))
          (datum (if recipe (recipe-source recipe) spec)) (source (parse-package-source datum)) (dir directory)
          (wanted (or (package-source-package source) (and recipe (recipe-name recipe))))
          ;; The package wanted is no part of what is fetched, nor of its key.

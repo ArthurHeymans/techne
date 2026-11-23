@@ -4,24 +4,33 @@
 ;;; run from a package's directory (`techne run`) and the editor's
 ;;; packages resolve their libraries the same way.
 ;;;
-;;;   (package mail
-;;;     (depends (authinfo (path "../authinfo")))
+;;;   (package (techne mail)
+;;;     (version "0.1.0")
+;;;     (techne "0.4")
+;;;     (description "Native Scheme mail client.")
+;;;     (depends ((alice authinfo) (path "../authinfo")))
 ;;;     (editor "editor.scm"
 ;;;       (commands (mail "Open the mail dashboard."))
-;;;       (options (mail-prefer-html #t boolean "Whether to show HTML."))))
+;;;       (options (mail-prefer-html #t boolean "Whether to show HTML.")))
+;;;     (cloud "app.scm"
+;;;       (bindings (cache kv) (api-key secret))))
 ;;;
-;;; The package NAME owns the libraries whose names begin with it: `(mail
-;;; imap)` is `lib/mail/imap.sld` in its directory and nowhere else. They
-;;; are the world's, one instance whoever imports them. `depends` names the
-;;; packages whose libraries this one imports, each by the directory it is
-;;; in, relative to this one. `editor` is what the editor loads on first
-;;; use (doc/packages.md): the entry file, the commands advertised before
-;;; that and the options declared early, as (name default schema
-;;; documentation).
+;;; The package `(owner pkg)` owns the libraries whose names begin with
+;;; `(owner pkg)`: `(techne mail)` is `lib/techne/mail.sld` and `(techne
+;;; mail imap)` is `lib/techne/mail/imap.sld` in its directory and nowhere
+;;; else. They are the world's, one instance whoever imports them.
+;;; `depends` names the packages whose libraries this one imports, each by
+;;; the directory it is in, relative to this one. `editor` is what the
+;;; editor loads on first use (doc/packages.md): the entry file, the
+;;; commands advertised before that and the options declared early, as
+;;; (name default schema documentation). `cloud` declares a cloud worker
+;;; entry file and its binding interface (name and kind: kv, secret, text).
 
 (define-library (techne package)
-  (export package-manifest-file read-package-manifest package-manifest? manifest-name manifest-directory
-          manifest-dependencies manifest-editor use-package-directory! package-closure package-directories)
+  (export package-manifest-file package-name? read-package-manifest package-manifest?
+          manifest-name manifest-directory manifest-version manifest-techne manifest-description
+          manifest-dependencies manifest-editor manifest-cloud
+          use-package-directory! package-closure package-directories)
   (import (techne) (techne path) (techne schema))
   (begin
 
@@ -29,12 +38,16 @@
       "The name of the file in a package's directory holding its manifest.")
 
     (define-record-type manifest
-      (%manifest name directory dependencies editor)
+      (%manifest name directory version techne description dependencies editor cloud)
       package-manifest?
       (name manifest-name)
       (directory manifest-directory)
+      (version manifest-version)
+      (techne manifest-techne)
+      (description manifest-description)
       (dependencies manifest-dependencies)
-      (editor manifest-editor))
+      (editor manifest-editor)
+      (cloud manifest-cloud))
 
     (define (bad what . irritants)
       (apply error (string-append package-manifest-file ": " what) irritants))
@@ -44,6 +57,25 @@
     (define (component? s)
       (and (string? s) (positive? (string-length s)) (not (member s '("." "..")))
            (every (lambda (c) (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_ #\.)))) (string->list s))))
+
+    (define (package-part? sym)
+      (and (symbol? sym)
+           (let ((s (symbol->string sym)))
+             (and (component? s)
+                  (not (any char-upper-case? (string->list s)))))))
+
+    (define (package-name? x)
+      "Return whether X is a canonical `(owner pkg)` package identity."
+      (and (list? x) (= 2 (length x)) (package-part? (car x)) (package-part? (cadr x))))
+
+    (define (reserved-namespace? name)
+      (memq (car name) '(scheme srfi)))
+
+    (define (version-string? s)
+      (and (string? s) (positive? (string-length s))
+           (char-numeric? (string-ref s 0))
+           (every (lambda (c) (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\. #\- #\+))))
+                  (string->list s))))
 
     (define (relative? path)
       (and (string? path) (every component? (string-split path "/"))))
@@ -69,13 +101,25 @@
     (define (distinct! what names)
       (unless (= (length names) (length (delete-duplicates names))) (bad what names)))
 
+    (define (version-clause what clause)
+      (unless (and (list? clause) (= 1 (length clause)) (version-string? (car clause)))
+        (bad (string-append "expected (" what " \"version\")") clause))
+      (car clause))
+
+    (define (description-clause clause)
+      (unless (and (list? clause) (= 1 (length clause)) (string? (car clause)) (positive? (string-length (car clause))))
+        (bad "expected (description \"...\")" clause))
+      (car clause))
+
     (define (dependencies root name clause)
       (map (lambda (d)
-             (unless (and (list? d) (= 2 (length d)) (symbol? (car d)) (component? (symbol->string (car d)))
+             (unless (and (list? d) (= 2 (length d)) (package-name? (car d))
+                          (not (reserved-namespace? (car d)))
                           (list? (cadr d)) (= 2 (length (cadr d))) (eq? 'path (car (cadr d)))
-                          (string? (cadr (cadr d))) (not (path-absolute? (cadr (cadr d)))))
-               (bad "expected a dependency (NAME (path \"relative/directory\"))" d))
-             (when (eq? (car d) name) (bad "a package cannot depend on itself" name))
+                          (string? (cadr (cadr d))) (positive? (string-length (cadr (cadr d))))
+                          (not (path-absolute? (cadr (cadr d)))))
+               (bad "expected a dependency ((owner pkg) (path \"relative/directory\"))" d))
+             (when (equal? (car d) name) (bad "a package cannot depend on itself" name))
              (cons (car d) (path-join root (cadr (cadr d)))))
            clause))
 
@@ -88,7 +132,7 @@
                        (and (pair? found) (cdar found)))))
              (commands (part 'commands))
              (options (or (part 'options) '())))
-        (unless (every (lambda (p) (and (pair? p) (memq (car p) '(commands options)))) parts)
+        (unless (every (lambda (p) (and (pair? p) (list? p) (memq (car p) '(commands options)))) parts)
           (bad "expected (commands ...) and (options ...) after the editor's entry"))
         (unless (and (list? commands) (pair? commands)
                      (every (lambda (c) (and (list? c) (= 2 (length c)) (symbol? (car c)) (string? (cadr c)))) commands))
@@ -102,37 +146,61 @@
         (distinct! "option declared twice" (map car options))
         (list (contained root (car clause)) commands options)))
 
+    (define (cloud root clause)
+      (unless (and (pair? clause) (string? (car clause)))
+        (bad "expected (cloud \"entry.scm\" [(bindings (name kind) ...)])"))
+      (let* ((parts (cdr clause))
+             (found (filter (lambda (p) (and (pair? p) (eq? (car p) 'bindings))) parts)))
+        (unless (every (lambda (p) (and (pair? p) (list? p) (eq? (car p) 'bindings))) parts)
+          (bad "expected (bindings ...) after the cloud entry"))
+        (when (and (pair? found) (pair? (cdr found))) (bad "given twice" 'bindings))
+        (let ((bindings (if (pair? found) (cdar found) '())))
+          (unless (every (lambda (b)
+                           (and (list? b) (= 2 (length b)) (symbol? (car b))
+                                (symbol? (cadr b)) (memq (cadr b) '(kv secret text))))
+                         bindings)
+            (bad "expected bindings, each (NAME kv|secret|text)"))
+          (distinct! "binding declared twice" (map car bindings))
+          (list (contained root (car clause)) bindings))))
+
     (define (read-package-manifest directory)
       "Return the manifest of the package in DIRECTORY, read as data.
-Nothing in it is evaluated and no other file is read: its entry must
-exist inside the package, its dependencies need not be there yet. It
-is an error if the manifest is missing or is not one."
+Nothing in it is evaluated and no other file is read: its entries must
+exist inside the package, its dependencies need not be there yet. It is
+an error if the manifest is missing or is not one."
       (let* ((found (or (%package-manifest directory) (bad "none to read in" directory)))
              (root (car found))
              (d (one-datum (cadr found))))
-        (unless (and (list? d) (pair? d) (pair? (cdr d)) (eq? (car d) 'package) (symbol? (cadr d))
-                     (component? (symbol->string (cadr d))))
-          (bad "expected (package NAME clause ...)"))
+        (unless (and (list? d) (pair? d) (pair? (cdr d)) (eq? (car d) 'package) (package-name? (cadr d)))
+          (bad "expected (package (owner pkg) clause ...)"))
         (let* ((name (cadr d))
-               ;; As first written: (package NAME ENTRY COMMANDS OPTIONS).
+               (_ (when (reserved-namespace? name)
+                    (bad "a package cannot take a reserved library namespace" name)))
+               ;; Shorthand form: (package (owner pkg) ENTRY COMMANDS OPTIONS).
                (clauses (if (and (pair? (cddr d)) (string? (caddr d)))
                             (if (and (= 5 (length d)) (list? (cadddr d)) (list? (list-ref d 4)))
                                 `((editor ,(caddr d) (commands ,@(cadddr d)) (options ,@(list-ref d 4))))
-                                (bad "expected (package NAME \"entry.scm\" (COMMAND ...) (OPTION ...))"))
+                                (bad "expected (package (owner pkg) \"entry.scm\" (COMMAND ...) (OPTION ...))"))
                             (cddr d)))
                (clause (lambda (head)
                          (let ((found (assq head clauses))) (and found (cdr found))))))
-          (unless (every (lambda (c) (and (pair? c) (list? c) (memq (car c) '(depends editor)))) clauses)
-            (bad "expected (depends ...) and (editor ...) clauses" (map (lambda (c) (if (pair? c) (car c) c)) clauses)))
+          (unless (every (lambda (c) (and (pair? c) (list? c) (memq (car c) '(version techne description depends editor cloud)))) clauses)
+            (bad "unknown manifest clause" (map (lambda (c) (if (pair? c) (car c) c)) clauses)))
           (distinct! "clause given twice" (map car clauses))
           (let ((depends (dependencies root name (or (clause 'depends) '()))))
             (distinct! "dependency declared twice" (map car depends))
-            (%manifest name root depends (and (clause 'editor) (editor root (clause 'editor))))))))
+            (%manifest name root
+                       (and (clause 'version) (version-clause "version" (clause 'version)))
+                       (and (clause 'techne) (version-clause "techne" (clause 'techne)))
+                       (and (clause 'description) (description-clause (clause 'description)))
+                       depends
+                       (and (clause 'editor) (editor root (clause 'editor)))
+                       (and (clause 'cloud) (cloud root (clause 'cloud))))))))
 
     ;; The manifest of each directory used.
     (define used (make-hash-table equal?))
     ;; The directory each package name was used from.
-    (define names (make-hash-table eq?))
+    (define names (make-hash-table equal?))
 
     ;; The manifests of the package in ROOT and of those it depends on
     ;; that are not used yet, each after the ones it depends on. Everything
@@ -155,15 +223,15 @@ is an error if the manifest is missing or is not one."
         (define (check-name! m above)
           (let* ((name (manifest-name m))
                  (dir (manifest-directory m))
-                 (same (filter (lambda (entry) (eq? name (manifest-name (cdr entry)))) found))
-                 (visiting (filter (lambda (entry) (eq? name (cdr entry))) above))
+                 (same (filter (lambda (entry) (equal? name (manifest-name (cdr entry)))) found))
+                 (visiting (filter (lambda (entry) (equal? name (cdr entry))) above))
                  (other (or (hash-table-ref/default names name #f) (and (pair? same) (caar same))
                             (and (pair? visiting) (caar visiting))))
                  ;; Asked now: refused when the libraries are provided, a
                  ;; set of packages would be left half made known.
-                 (conflict (%library-conflict (symbol->string name) (library-directory m))))
-            (when (memq name '(scheme srfi techne))
-              (error "A package cannot take the name of Techne's own libraries" name))
+                 (conflict (%library-conflict name (library-directory m))))
+            (when (reserved-namespace? name)
+              (error "A package cannot take a reserved library namespace" name))
             (when (and other (not (equal? other dir)))
               (error "Another directory holds a package of this name" name other dir))
             (when conflict
@@ -189,7 +257,7 @@ is an error if the manifest is missing or is not one."
                               (error "No package where a dependency says" (car dependency) (cdr dependency)))
                             (let ((name (manifest-name (visit (%loadable-path (cdr dependency))
                                                               (cons (cons root (manifest-name m)) above)))))
-                              (unless (eq? name (car dependency))
+                              (unless (equal? name (car dependency))
                                 (error "A dependency names another package than its directory holds" (car dependency) name))))
                           (manifest-dependencies m))
                 (set! found (cons (cons root m) found))
@@ -219,24 +287,24 @@ checked, WITHIN as it takes it, and nothing is changed."
     (define (use-package-directory! directory #:within [within #f])
       "Make the package in DIRECTORY known here; return its manifest.
 Its libraries, those under its `lib` directory, whose names begin with
-its own, are found there from now on and nowhere else, and so are those
-of the packages it depends on, and of theirs. Its files import, of the
-libraries packages provide, only its own and those of the packages it
-depends on itself: what it needs is what its manifest says. No code is
-loaded. It is an error, and nothing changes, if another directory holds
-a package of the same name, if a dependency is missing or is another
-package than the one named, if packages depend on each other in a
-circle, or, with WITHIN, a directory, if one of them is outside it (a
-repository's packages depend on each other, not on what is beside it)."
+its own `(owner pkg)`, are found there from now on and nowhere else,
+and so are those of the packages it depends on, and of theirs. Its files
+import, of the libraries packages provide, only its own and those of the
+packages it depends on itself: what it needs is what its manifest says.
+No code is loaded. It is an error, and nothing changes, if another
+directory holds a package of the same name, if a dependency is missing
+or is another package than the one named, if packages depend on each
+other in a circle, or, with WITHIN, a directory, if one of them is
+outside it (a repository's packages depend on each other, not on what is
+beside it)."
       (let ((root (resolved directory)))
         ;; Nothing to make known of a package known already, which is
         ;; held to WITHIN all the same.
         (for-each (lambda (m)
                     (let ((dir (manifest-directory m))
                           (name (manifest-name m)))
-                      (%provide-libraries! (symbol->string name) (library-directory m))
-                      (%package-imports! dir (symbol->string name)
-                                         (map symbol->string (cons name (map car (manifest-dependencies m)))))
+                      (%provide-libraries! name (library-directory m))
+                      (%package-imports! dir name (cons name (map car (manifest-dependencies m))))
                       (hash-table-set! names name dir)
                       (hash-table-set! used dir m)))
                   (package-closure root #:within within))

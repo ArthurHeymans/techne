@@ -84,43 +84,46 @@ fn a_file_in_a_package_finds_the_packages_libraries() {
     let packages = std::env::temp_dir().join(format!("techne-lsp-packages-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&packages);
     let dir = packages.join("pkg");
-    std::fs::create_dir_all(dir.join("lib/pkg")).unwrap();
-    // A library of the package's name beside the importing file, where a
+    std::fs::create_dir_all(dir.join("lib/techne/pkg")).unwrap();
+    // A library of the package's (owner pkg) beside the importing file, where a
     // file in no package would find it: not the package's, which is in lib/.
-    std::fs::create_dir_all(dir.join("tests/pkg")).unwrap();
-    std::fs::write(dir.join("tests/pkg/tools.sld"), "(define-library (pkg tools) (export) (import (scheme base)) (begin))").unwrap();
-    std::fs::write(dir.join("tests/pkg/absent.sld"), "(define-library (pkg absent) (export) (import (scheme base)) (begin))").unwrap();
+    std::fs::create_dir_all(dir.join("tests/techne/pkg")).unwrap();
+    std::fs::write(dir.join("tests/techne/pkg/tools.sld"), "(define-library (techne pkg tools) (export) (import (scheme base)) (begin))")
+        .unwrap();
+    std::fs::write(dir.join("tests/techne/pkg/absent.sld"), "(define-library (techne pkg absent) (export) (import (scheme base)) (begin))")
+        .unwrap();
     std::fs::create_dir_all(dir.join("tests")).unwrap();
     // The package depends on one beside it, not on the other there.
-    std::fs::write(dir.join("techne-package.scm"), "(package pkg (depends (dep (path \"../dep\"))))").unwrap();
+    std::fs::write(dir.join("techne-package.scm"), "(package (techne pkg) (depends ((acme dep) (path \"../dep\"))))").unwrap();
     for name in ["dep", "undeclared"] {
-        std::fs::create_dir_all(packages.join(format!("{name}/lib/{name}"))).unwrap();
-        std::fs::write(packages.join(format!("{name}/techne-package.scm")), format!("(package {name})")).unwrap();
+        std::fs::create_dir_all(packages.join(format!("{name}/lib/acme/{name}"))).unwrap();
+        std::fs::write(packages.join(format!("{name}/techne-package.scm")), format!("(package (acme {name}))")).unwrap();
         std::fs::write(
-            packages.join(format!("{name}/lib/{name}/more.sld")),
+            packages.join(format!("{name}/lib/acme/{name}/more.sld")),
             format!(
-                "(define-library ({name} more) (export thrice-{name}) (import (scheme base)) (begin (define (thrice-{name} x) (* 3 x))))"
+                "(define-library (acme {name} more) (export thrice-{name}) (import (scheme base)) (begin (define (thrice-{name} x) (* 3 x))))"
             ),
         )
         .unwrap();
     }
-    // A file of another name under lib/ is there, and no library of pkg's.
-    std::fs::create_dir_all(dir.join("lib/other")).unwrap();
-    std::fs::write(dir.join("lib/other/tools.sld"), "(define-library (other tools) (export) (import (scheme base)) (begin))").unwrap();
+    // A file of another (owner pkg) under lib/ is there, and no library of (techne pkg)'s.
+    std::fs::create_dir_all(dir.join("lib/other/pkg")).unwrap();
+    std::fs::write(dir.join("lib/other/pkg/tools.sld"), "(define-library (other pkg tools) (export) (import (scheme base)) (begin))")
+        .unwrap();
     std::fs::write(
-        dir.join("lib/pkg/tools.sld"),
-        "(define-library (pkg tools) (export twice) (import (scheme base)) (begin (define (twice x) (* 2 x))))",
+        dir.join("lib/techne/pkg/tools.sld"),
+        "(define-library (techne pkg tools) (export twice) (import (scheme base)) (begin (define (twice x) (* 2 x))))",
     )
     .unwrap();
     let reply = diagnostics(
         &dir.join("tests/main.scm"),
-        "(import (scheme base) (pkg tools) (dep more) (undeclared more) (other tools) (pkg absent))\n(twice (thrice-dep 2))",
+        "(import (scheme base) (techne path) (techne pkg tools) (acme dep more) (acme undeclared more) (other pkg tools) (techne pkg absent))\n(list (path-join \"a\" \"b\") (twice (thrice-dep 2)))",
     );
     let messages: Vec<&str> = reply.split("\"message\":\"").skip(1).map(|m| m.split('"').next().unwrap()).collect();
     let _ = std::fs::remove_dir_all(&packages);
     assert_eq!(
         messages,
-        ["cannot find library (undeclared more)", "cannot find library (other tools)", "cannot find library (pkg absent)"],
+        ["cannot find library (acme undeclared more)", "cannot find library (other pkg tools)", "cannot find library (techne pkg absent)",],
         "{reply}"
     );
 }

@@ -146,16 +146,16 @@ fn bundled_libraries() {
 fn a_package_is_used_by_techne_s_own_library() {
     let root = std::env::temp_dir().join(format!("techne-package-run-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    for d in ["pkg/lib/pkg", "elsewhere/techne"] {
+    for d in ["pkg/lib/acme/pkg", "elsewhere/techne"] {
         fs::create_dir_all(root.join(d)).unwrap();
     }
-    fs::write(root.join("pkg/techne-package.scm"), "(package pkg)").unwrap();
+    fs::write(root.join("pkg/techne-package.scm"), "(package (acme pkg))").unwrap();
     fs::write(
-        root.join("pkg/lib/pkg/say.sld"),
-        "(define-library (pkg say) (export said) (import (scheme base)) (begin (define said \"ran\")))",
+        root.join("pkg/lib/acme/pkg/say.sld"),
+        "(define-library (acme pkg say) (export said) (import (scheme base)) (begin (define said \"ran\")))",
     )
     .unwrap();
-    fs::write(root.join("pkg/main.scm"), "(import (scheme base) (scheme write) (pkg say)) (display said)").unwrap();
+    fs::write(root.join("pkg/main.scm"), "(import (scheme base) (scheme write) (acme pkg say)) (display said)").unwrap();
     fs::write(
         root.join("elsewhere/techne/package.sld"),
         "(define-library (techne package) (export use-package-directory!) (import (scheme base) (scheme write))

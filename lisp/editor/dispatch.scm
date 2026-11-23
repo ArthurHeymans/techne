@@ -143,7 +143,7 @@ read from the user (keys, \\[execute-extended-command]), or given as
 data (`invoke`)."
   ;; Last: (procedure . its code-id), the code BODY gave last, numbered.
   (let* ((o (registry-ref %offers name))
-         (reg (if (and o (eq? (scope-name (current-scope)) (offer-package o))) (offer-impl o) %commands)))
+         (reg (if (and o (equal? (scope-name (current-scope)) (offer-package o))) (offer-impl o) %commands)))
     (when (and o (eq? reg (offer-impl o)) (%offered-generation)
                (eq? (current-scope) (car (%offered-generation))))
       (hash-table-set! (cdr (%offered-generation)) name #t))
@@ -169,7 +169,9 @@ Records of its runs keep the number of theirs (`record-code`)."
   "Advertise COMMANDS of PACKAGE without loading PATH.
 COMMANDS is a list of (name documentation) pairs. The current scope owns
 the declarations. A failed load can be retried."
-  (unless (and (symbol? package) (string? path) (list? commands) (pair? commands)
+  (unless (and (or (symbol? package)
+                   (and (list? package) (= (length package) 2) (symbol? (car package)) (symbol? (cadr package))))
+               (string? path) (list? commands) (pair? commands)
                (every (lambda (c) (and (list? c) (= (length c) 2) (symbol? (car c)) (string? (cadr c)))) commands))
     (error "Invalid command package" package))
   (let ((names (map car commands)) (predecessor (%scope-predecessor (current-scope))))
@@ -178,7 +180,7 @@ the declarations. A failed load can be retried."
                 (let ((old (registry-ref %offers name)))
                   (when (and (registry-ref %commands name)
                              (not (and old predecessor (eq? predecessor (registry-owner %offers name))
-                                       (eq? (offer-package old) package))))
+                                       (equal? (offer-package old) package))))
                     (error "Command already registered" name)))) names))
   (let ((loading? #f))
     (define (activate)
