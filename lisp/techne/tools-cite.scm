@@ -1,7 +1,7 @@
 ;;; Bounds/revision validation only: a valid location need not support a claim.
 (define (%tool-cite p path from to revision)
-  (%count from 2147483647 "tool-cite FROM")
-  (%count to 2147483647 "tool-cite TO")
+  (%count from 2147483647 "tool-cite" "#:from")
+  (%count to 2147483647 "tool-cite" "#:to")
   (when (> from to) (error "tool-cite: FROM must not exceed TO"))
   (unless (or (not revision) (string? revision))
     (error "tool-cite: REVISION must be a string or #f"))

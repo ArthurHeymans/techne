@@ -33,6 +33,10 @@
               (make (- tries 1)))))))
 
 (define (fixture-write root path contents)
+  ;; A fixture in a directory makes the directory.
+  (let ((parts (string-split path "/")))
+    (when (pair? (cdr parts))
+      (make-directory (string-append root "/" (string-join (reverse (cdr (reverse parts))) "/")))))
   (call-with-port
     ((if (bytevector? contents) open-binary-output-file open-output-file) (string-append root "/" path))
     (lambda (port)

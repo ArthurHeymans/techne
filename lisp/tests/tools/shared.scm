@@ -80,7 +80,7 @@
     (define definition (tool-read-symbol p "inline.rs" "one"))
     (expect '(#t #f #f) (map (lambda (key) (tool-ref definition key)) '(region-complete file-eof next-line)))
     (define range-error (guard (e (#t (condition/report-string e))) (tool-files p #:limit 0)))
-    (expect #t (and (string-contains range-error "expected 1 to 50") #t))
+    (expect "tool-files: #:limit must be an integer from 1 to 50, not 0" range-error)
     ;; A page past its ceiling is the ceiling.
     (expect 6 (length (tool-ref (tool-files p #:limit 100) 'items)))
     ;; A window wider than its bound is the bound, with its continuation.
@@ -107,3 +107,30 @@
     (expect "<stdout of sh>:1: a" (tool-show output-line #:numbered #t))
     (expect '(2 2 #f)
       (map (lambda (key) (tool-ref (tool-read p "<stdout of sh>" #:lines 1) key)) '(file-lines next-line file-eof)))))
+
+(with-tool-project "find in a read's region says what is outside it"
+  '(("f" "alpha\nbeta needle\ngamma\nneedle\n"))
+  (lambda (root p)
+    (define first (tool-read p "f" #:lines 1))
+    ;; The read reply stands for its handle.
+    (define region (tool-find p first "needle"))
+    (expect '(0 2) (map (lambda (k) (tool-ref region k)) '(total outside)))
+    (expect #t (and (string-contains (tool-show region) "2 more matching lines outside this handle's region; #:whole #t") #t))
+    (define whole (tool-find p first "needle" #:whole #t))
+    (expect '(2 0) (map (lambda (k) (tool-ref whole k)) '(total outside)))
+    (expect '(2 4) (map (lambda (i) (tool-ref i 'line)) (tool-ref whole 'items)))
+    (expect #f (and (string-contains (tool-show whole) "outside") #t))
+    ;; A hit's region is its line.
+    (define hit (car (tool-ref whole 'items)))
+    (expect '(1 1) (map (lambda (k) (tool-ref (tool-find p hit "needle") k)) '(total outside)))
+    ;; The snapshot, not the disk.
+    (fixture-write root "f" "changed\n")
+    (expect 2 (tool-ref (tool-find p first "needle" #:whole #t) 'total))))
+
+(with-tool-project "a marker outside a block is refused, not skipped"
+  '(("f" "one\ntwo\n"))
+  (lambda (root p)
+    (define (message thunk) (guard (e (#t (condition/report-string e))) (thunk) "no error"))
+    (define patch "f\n<<<<<<< SEARCH\none\n=======\nONE\n>>>>>>> REPLACE\ntwo\n=======\nTWO\n>>>>>>> REPLACE\n")
+    (expect #t (and (string-contains (message (lambda () (tool-apply! p patch))) "SEARCH line is missing") #t))
+    (expect "one\ntwo\n" (tool-ref (tool-read p "f") 'text))))

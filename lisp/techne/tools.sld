@@ -43,6 +43,9 @@ Hidden files are listed (`.github/`), version control metadata (`.git`,
 `.jj`, `.hg`, `.svn`) never; ignore rules apply, so put secrets and
 generated directories not otherwise ignored (`.env`, `.direnv/`) in
 `.ignore`. At most 10000 files are walked, before PREFIX selects.
+A PREFIX naming an ignored directory or file (`target/`), which no
+listed name starts with, is walked without the rules, at most 10000
+files there, and the reply says ignored #t: naming it asks for it.
 Return LIMIT names at most, from OFFSET, and total, complete and next.
 LIMIT is 1 to 50 (more gives 50). The revision hashes the cached
 file-name list, not file contents. Skipped and problems describe
@@ -85,7 +88,9 @@ or foreign handle is an error; query again."
                          #:before [before 0] #:after [after 0] #:chars [chars 8000] #:group-by [group-by #f]
                          #:enclosing [enclosing 'auto])
       "Find literal QUERY in PROJECT, with context or grouped line counts.
-Search files whose names start with PREFIX. LIMIT is 1 to 50 (more
+Search files whose names start with PREFIX: `tool-files`' names, or, for
+a PREFIX naming an ignored directory (`target/`), the files there
+(ignored #t). LIMIT is 1 to 50 (more
 gives 50), OFFSET is an item offset. Normally items carry paths,
 revisions, lines and handles. Previews center on the match and contain
 at most 240 characters; inspect
@@ -193,9 +198,12 @@ conditional atomic rename, not a lock against other programs."
       (%tool-refresh! project)
       #t)
 
-    (define (%count n max who)
+    ;; WHAT names the argument, its keyword most often: an error that
+    ;; says only "count" leaves a caller guessing which of several.
+    (define (%count n max who what)
       (unless (and (integer? n) (exact? n) (<= 1 n max))
-        (error who (string-append "count out of range; expected 1 to " (number->string max)) n)))
+        (error (string-append who ": " what " must be an integer from 1 to " (number->string max)
+                              ", not " (%written n)))))
     ;; A window or page wider than its bound is the bound, not an error:
     ;; the reply says where the rest is (next, truncated), and one wide
     ;; request in a batch does not lose the batch's other answers.
@@ -219,8 +227,12 @@ conditional atomic rename, not a lock against other programs."
 
     (define (tool-discover query #:module [module "user"] #:limit [limit 6] #:offset [offset 0])
       "Find live bindings matching the words of QUERY, within LIMIT.
-Those with every word come first; when none has them all, those with the
-most, and the reply's partial says how many of how many words matched.
+A word matches from the start of a word (run in runs, not in truncated),
+or anywhere in a name. Bindings rank by where their words match, a name
+over its signature or first doc line over the rest of its doc, and by
+how many match: a binding with one word in its name ranks over one with
+every word somewhere in a long doc. When none has every word, the
+reply's partial says how many of how many words the best matched.
 Inspect MODULE's visible bindings and loaded definitions, not a separate
 registry: a library's bindings once it is imported. Short of every word,
 libraries lists exports of the libraries shipped in lisp/ whose names
@@ -232,7 +244,7 @@ not a stable snapshot. Lexical variables inside a CLI form are not
 module bindings. Use `tool-describe` for full docs or signatures; a
 clipped signature has an explicit signature-truncated flag."
       (set! limit (%at-most limit 50))
-      (%count limit 50 "tool-discover") (%offset offset)
+      (%count limit 50 "tool-discover" "#:limit") (%offset offset)
       (let* ((words (delete-duplicates
                      (remove (lambda (s) (string=? s "")) (string-split (string-downcase query) " "))))
              (scored
@@ -242,24 +254,25 @@ clipped signature has an explicit signature-truncated flag."
                         (description (binding-description name home))
                         (signature (or (%binding description 'signature) ""))
                         (doc (or (%binding description 'doc) ""))
-                        (label (symbol->string name))
-                        (hay (string-downcase (string-append label " " signature " " doc)))
-                        (hits (count (lambda (w) (string-contains hay w)) words)))
+                        (label (string-downcase (symbol->string name)))
+                        (weights (map (lambda (w) (%word-weight w label (string-downcase signature)
+                                                                (string-downcase (%first-line doc))
+                                                                (string-downcase doc)))
+                                      words))
+                        (hits (count positive? weights)))
                    (and (or (positive? hits) (null? words))
                         (list hits
-                              (+ (if (string=? (string-downcase label) (string-downcase query)) 100 0)
-                                 (* 4 (count (lambda (w) (string-contains (string-downcase label) w)) words)))
+                              (+ (if (string=? label (string-downcase query)) 100 0)
+                                 (apply + weights) (* 2 hits))
                               `((name ,name) (module ,home) (kind ,(caddr binding))
                                 (signature ,(%clip signature 240))
                                 (signature-truncated ,(> (string-length signature) 240))
                                 (doc ,(%clip (%first-line doc) 160))
                                 (location ,(%binding description 'location)))))))
                (defined-names module)))
-             ;; Every word where some binding has them all, else the most
-             ;; any has.
+             ;; The most words any binding has.
              (best (fold (lambda (m most) (max (car m) most)) 0 scored))
-             (matches (filter (lambda (m) (= (car m) best)) scored))
-             (sorted (sort matches (lambda (a b)
+             (sorted (sort scored (lambda (a b)
                                     (if (= (cadr a) (cadr b))
                                         (string<? (symbol->string (tool-ref (caddr a) 'name))
                                                   (symbol->string (tool-ref (caddr b) 'name)))
@@ -292,6 +305,22 @@ clipped signature has an explicit signature-truncated flag."
                                    (take found (min 8 (length found)))))
                             (libraries-total ,(length found))))))
             page)))
+
+    ;; Whether W begins a word of HAY: run in runs, not in truncated.
+    (define (%word-start? hay w)
+      (let loop ((from 0))
+        (let ((i (%index hay w from)))
+          (and i (or (= i 0)
+                     (let ((c (string-ref hay (- i 1)))) (not (or (char-alphabetic? c) (char-numeric? c))))
+                     (loop (+ i 1)))))))
+    ;; How much W matching a binding counts, by where it matches: its
+    ;; NAME, SIGNATURE, FIRST doc line or the REST of its doc.
+    (define (%word-weight w name signature first rest)
+      (cond ((%word-start? name w) 6)
+            ((string-contains name w) 2)
+            ((or (%word-start? signature w) (%word-start? first w)) 3)
+            ((%word-start? rest w) 1)
+            (else 0)))
 
     ;; The bindings the libraries shipped in lisp/ export, (NAME LIBRARY)
     ;; each, read from their declarations once a session.
@@ -333,7 +362,7 @@ Return CHARS characters at most, 1 to 16000, from OFFSET of PART, `doc`
 or `signature`. Text is the selected part; doc remains the docstring
 window by default. Signature metadata is a preview with its own explicit
 signature-truncated flag. Next and truncated describe the selected part."
-      (%count chars 16000 "tool-describe") (%offset offset)
+      (%count chars 16000 "tool-describe" "#:chars") (%offset offset)
       (unless (memq part (quote (doc signature))) (error "tool-describe: expected doc or signature part" part))
       (let ((description (binding-description name module)))
         (unless description (error "tool-describe: unknown binding" name))
@@ -392,14 +421,18 @@ must take no arguments; successful values should themselves be bounded."
     ;; project's 16 MiB snapshot cache: storing one never evicts the other.
     (define %keep-limit (* 1024 1024))
 
-    ;; STATE is #(tail seen chunks kept): the newest RETAIN characters, all
-    ;; characters seen, and, with KEEP, the first KEEP in reverse chunks.
+    ;; STATE is #(tail seen chunks kept head): the newest RETAIN characters,
+    ;; all characters seen, with KEEP the first KEEP in reverse chunks,
+    ;; and the first RETAIN characters, for a report of the start.
     (define (%drain p stream state retain keep)
       (let loop ()
         (let ((chunk (process-read p stream)))
           (unless (eof-object? chunk)
             (let* ((joined (string-append (vector-ref state 0) chunk)) (n (string-length joined)))
               (vector-set! state 0 (substring joined (max 0 (- n retain)) n))
+              (let ((head (vector-ref state 4)))
+                (when (< (string-length head) retain)
+                  (vector-set! state 4 (string-append head (%clip chunk (- retain (string-length head)))))))
               (vector-set! state 1 (+ (vector-ref state 1) (string-length chunk))))
             (when keep
               (let* ((kept (vector-ref state 3)) (room (- keep kept)))
@@ -411,8 +444,9 @@ must take no arguments; successful values should themselves be bounded."
 
     (define (tool-run project program args #:retain [retain 4000] #:environment [environment '()] #:keep [keep #f]
                       #:timeout [timeout #f])
-      "Start PROGRAM with ARGS in PROJECT and keep bounded output tails.
-RETAIN is 1 to 16000 characters per stream. Both streams drain
+      "Start a command, PROGRAM with ARGS, in PROJECT; keep bounded output.
+RETAIN is 1 to 16000 characters per stream, kept from its end and from
+its start (`tool-process-result` #:head #t reports that). Both streams drain
 concurrently, even after their retained text is full. The current scope
 owns the process. Wait with `tool-process-result`, or cancel explicitly;
 this does not run a shell unless PROGRAM is a shell. ENVIRONMENT is a
@@ -423,8 +457,8 @@ for `tool-find`, `tool-expand` and `tool-show`, in PROJECT's snapshot
 cache (16 MiB, which both fit in; older handles are evicted first).
 TIMEOUT, seconds up to a day, kills its process group if it has not
 exited by then; its result says timed-out."
-      (%count retain 16000 "tool-run")
-      (when keep (%count keep %keep-limit "tool-run"))
+      (%count retain 16000 "tool-run" "#:retain")
+      (when keep (%count keep %keep-limit "tool-run" "#:keep"))
       (when timeout (%seconds timeout "tool-run"))
       (unless (and (list? environment)
                    (every (lambda (entry)
@@ -436,7 +470,7 @@ exited by then; its result says timed-out."
                           environment))
         (error "tool-run: environment must be a list of (name . value) strings; names must be nonempty without =, and strings without NUL"))
       (let* ((p (process-spawn program args #:directory (tool-root project) #:environment environment))
-             (out (vector "" 0 '() 0)) (err (vector "" 0 '() 0))
+             (out (vector "" 0 '() 0 "")) (err (vector "" 0 '() 0 ""))
              (stdout (spawn (lambda () (%drain p 'stdout out retain keep))))
              (stderr (spawn (lambda () (%drain p 'stderr err retain keep))))
              (wait (spawn (lambda () (process-wait p))))
@@ -454,12 +488,17 @@ exited by then; its result says timed-out."
       "Return whether JOB has exited and both output streams have drained."
       (and (task-done? (%job-wait job)) (task-done? (%job-stdout job)) (task-done? (%job-stderr job))))
 
-    (define (tool-process-result job #:chars [chars 2000] #:wait [wait #f])
+    (define (tool-process-result job #:chars [chars 2000] #:wait [wait #f] #:head [head #f])
       "Wait for JOB and return its status and bounded stdout and stderr.
 CHARS is 1 to 8000 characters per stream. Characters counts all text
 seen; retained counts the saved tail. Dropped reports retention loss,
 clipped a smaller report window, and truncated either kind of omission.
 This is a tail, not parsed diagnostics. Repeated reads are safe.
+HEAD #t reports each stream's start instead, the first of the text
+`tool-run` retained (its #:retain): the newest entries a log prints
+first, the top of a report; the stream says head #t.
+A stream kept with `tool-run` #:keep has a handle besides, for
+`tool-expand` (from #:offset 0, the start) and `tool-find`.
 WAIT, seconds, waits at most that long: if JOB still runs, the result
 has running #t, status #f and the output so far, and JOB goes on; ask
 again, or cancel it. Timed-out says its own timeout killed it."
@@ -470,12 +509,13 @@ again, or cancel it. Timed-out says its own timeout killed it."
           (%keep! (%job-project job) s)
           (list (%handle (%job-project job) s 0 (string-length text)) (string-length text))))
       (define (stream state kept)
-        (let* ((s (vector-ref state 0)) (n (string-length s)) (seen (vector-ref state 1)))
-          `((text ,(substring s (max 0 (- n chars)) n))
+        (let* ((s (vector-ref state (if head 4 0))) (n (string-length s)) (seen (vector-ref state 1)))
+          `((text ,(if head (substring s 0 (min n chars)) (substring s (max 0 (- n chars)) n)))
             (characters ,seen) (retained ,n) (dropped ,(> seen n))
             (clipped ,(> n chars)) (truncated ,(> seen (min n chars)))
+            ,@(if head '((head #t)) '())
             ,@(if kept `((handle ,(car kept)) (kept ,(cadr kept))) '()))))
-      (%count chars 8000 "tool-process-result")
+      (%count chars 8000 "tool-process-result" "#:chars")
       (if (and wait (not (%wait-until (lambda () (tool-process-done? job))
                                       (+ (current-milliseconds) (%seconds wait "tool-process-result")))))
           `((program ,(%job-program job)) (status #f) (running #t) (timed-out #f)
@@ -493,14 +533,19 @@ again, or cancel it. Timed-out says its own timeout killed it."
       (process-kill (%job-process job))
       (tool-process-result job))
 
-    (define (tool-find project handle query #:limit [limit 8] #:offset [offset 0])
+    (define (tool-find project handle query #:limit [limit 8] #:offset [offset 0] #:whole [whole #f])
       "Find lines containing literal QUERY in PROJECT's snapshot HANDLE.
-HANDLE is any reply's: a file read, a search hit, or a process stream
-kept with `tool-run` #:keep. Return at most LIMIT items, 1 to 50 (more
-gives 50), from OFFSET, with line numbers in the snapshot's file and a
-handle per line.
+HANDLE is any reply's handle, or the reply itself: a file read, a search
+hit, or a process stream kept with `tool-run` #:keep, such as
+(tool-ref (tool-process-result JOB) 'stdout); a whole process result
+stands for its one stream with output, and when both have output, name
+one. Return at most LIMIT items, 1 to 50 (more gives
+50), from OFFSET, with line numbers in the snapshot's file and a handle
+per line. A handle names a region: a read's covers the lines read, a
+hit's its line. Outside counts matching lines of the snapshot outside
+it; WHOLE #t searches the whole snapshot, all of the file it was read from.
 Unlike `tool-search`, this reads the snapshot, not the disk."
-      (%response (%tool-find project handle query (%at-most limit 50) offset)))
+      (%response (%tool-find project handle query (%at-most limit 50) offset whole)))
 
     (define (tool-lines project handle #:from [from 1] #:lines [lines 40] #:chars [chars 8000])
       "Read LINES lines, 1 to 200, from line FROM of PROJECT's snapshot HANDLE.
@@ -526,11 +571,15 @@ From the CLI, pass PATCH on stdin with
 `techne tool --stdin ROOT (tool-apply! project input)`; nothing needs escaping."
       (%response (%tool-apply! project patch)))
 
-    (define %check-patterns '("error:" "error[" "panicked at" "FAILED" "test result:" "warning: unused"))
+    ;; FAIL is cargo's FAILED and Techne's own test.scm's FAIL NAME.
+    (define %check-patterns '("error:" "error[" "panicked at" "FAIL" "test result:" "warning: unused"))
+    ;; A test run's passing summaries, one per test binary: forty of them
+    ;; fill a page before the one failure at the end.
+    (define %check-passing '("test result: ok"))
 
     (define (tool-check project program args #:find [patterns %check-patterns] #:context [context 0] #:limit [limit 30]
-                        #:timeout [timeout #f] #:environment [environment '()])
-      "Run PROGRAM with ARGS in PROJECT; return the output's lines that matter.
+                        #:timeout [timeout #f] #:environment [environment '()] #:passing [passing %check-passing])
+      "Run a command, PROGRAM with ARGS, in PROJECT; return lines that matter.
 It waits for the end. Those are the lines of either stream containing
 any literal of PATTERNS, by default a compiler's errors and a test
 run's failures and results, each once, stdout's first, in order, at
@@ -541,13 +590,18 @@ Total counts the matching lines; truncated says some are in no item. The first
 complete #f say there was more. The result names both streams' handles
 for `tool-find` and `tool-lines`, and their tails, which `tool-show`
 shows when nothing matched and it failed. TIMEOUT and ENVIRONMENT are
-`tool-run`'s."
+`tool-run`'s. A matching line containing any of PASSING, by default a
+test binary's `test result: ok` summary, is listed only when no other
+line matched: else it is counted in passing, not total, so that
+failures are not crowded out. PASSING '() lists them all."
       (set! limit (%at-most limit 50))
-      (%count limit 50 "tool-check")
+      (%count limit 50 "tool-check" "#:limit")
       (unless (and (integer? context) (exact? context) (<= 0 context 40))
         (error "tool-check: context is 0 to 40 lines" context))
       (unless (and (pair? patterns) (list? patterns) (every (lambda (p) (and (string? p) (not (string=? p "")))) patterns))
         (error "tool-check: patterns are non-empty strings"))
+      (unless (and (list? passing) (every (lambda (p) (and (string? p) (not (string=? p "")))) passing))
+        (error "tool-check: #:passing is a list of non-empty strings"))
       (let* ((r (tool-process-result
                   (tool-run project program args #:keep %keep-limit #:retain 1000 #:timeout timeout #:environment environment)
                   #:chars 1000))
@@ -555,12 +609,18 @@ shows when nothing matched and it failed. TIMEOUT and ENVIRONMENT are
              (lost (any (lambda (s) (> (tool-ref (tool-ref r s) 'characters) (tool-ref (tool-ref r s) 'kept))) '(stdout stderr)))
              ;; Every matching line of each stream, once, in order, one
              ;; pass each: (stream line . item).
-             (matching
+             (all-matching
                (append-map
                  (lambda (stream)
                    (map (lambda (i) (cons stream (cons (tool-ref i 'line) i)))
                         (%matching-lines project (tool-ref (tool-ref r stream) 'handle) patterns)))
                  '(stdout stderr)))
+             ;; Passing summaries step aside for any other matching line.
+             (passed? (lambda (m) (let ((text (tool-ref (cddr m) 'text)))
+                                    (any (lambda (p) (string-contains text p)) passing))))
+             (others (remove passed? all-matching))
+             (matching (if (null? others) all-matching others))
+             (set-aside (- (length all-matching) (length matching)))
              ;; Up to LIMIT items, each a hit with the lines after it, as
              ;; (item stream first last), LAST the last line it returned
              ;; whole; a hit among those is shown there, not again.
@@ -597,7 +657,7 @@ shows when nothing matched and it failed. TIMEOUT and ENVIRONMENT are
         (%response
           `((program ,program) (status ,(tool-ref r 'status)) (timed-out ,(tool-ref r 'timed-out))
             (hits ((items ,items) (total ,(length matching)) (complete ,(not lost))
-                   (truncated ,(or more-hits lost)) (next #f)))
+                   (truncated ,(or more-hits lost)) (next #f) (passing ,set-aside)))
             (lost ,lost)
             (stdout ((handle ,(tool-ref (tool-ref r 'stdout) 'handle)) (characters ,(tool-ref (tool-ref r 'stdout) 'characters))
                      (tail ,(tool-ref (tool-ref r 'stdout) 'text))))
