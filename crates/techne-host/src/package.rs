@@ -238,11 +238,20 @@ pub fn read_clean_package_tree(dir: &Path, total_bytes: &mut usize, max_bytes: u
                 stack.push((entry.path(), rel));
             } else if ft.is_file() {
                 validate_bundle_relpath(&rel).map_err(|e| e.msg.clone())?;
-                let bytes = std::fs::read(entry.path()).map_err(|e| format!("{}: {e}", entry.path().display()))?;
-                *total_bytes = total_bytes.saturating_add(bytes.len());
-                if *total_bytes > max_bytes {
+                let remaining = max_bytes.saturating_sub(*total_bytes);
+                let meta = entry.metadata().map_err(|e| format!("{}: {e}", entry.path().display()))?;
+                if meta.len() > remaining as u64 {
                     return Err(format!("{}: deployment exceeds {max_bytes} bytes", dir.display()));
                 }
+                let file = std::fs::File::open(entry.path()).map_err(|e| format!("{}: {e}", entry.path().display()))?;
+                let cap = remaining.saturating_add(1) as u64;
+                let mut bytes = Vec::new();
+                use std::io::Read as _;
+                file.take(cap).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", entry.path().display()))?;
+                if bytes.len() > remaining {
+                    return Err(format!("{}: deployment exceeds {max_bytes} bytes", dir.display()));
+                }
+                *total_bytes = total_bytes.saturating_add(bytes.len());
                 files.push((rel, bytes));
             } else {
                 return Err(format!("unsupported file type in package tree: {rel}"));

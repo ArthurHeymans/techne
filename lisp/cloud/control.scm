@@ -197,14 +197,16 @@ runs at a time."
         ;; Read before anything is published: it must be there to add
         ;; to. One published already and recorded as the last is left
         ;; so; one published and not recorded (the record could not be
-        ;; written then) is recorded now.
+        ;; written then) is recorded now. Always invoke `%cloud-publish`
+        ;; even when `id` equals `seen` so Mode 1 redeploy resets a dirty
+        ;; dev/debug world back to its clean immutable snapshot.
         (let* ((events (history c))
-               (last (and (pair? events) (caar events))))
+               (last (and (pair? events) (caar events)))
+               (same (and (equal? id seen) (equal? id last))))
+          (unless same (keep-bundle! c id))
+          (%cloud-publish name id seen)
           (dict "id" id "previous" seen "output" (cadr prepared)
-                "recorded" (or (and (equal? id seen) (equal? id last))
-                               (begin (keep-bundle! c id)
-                                      (unless (equal? id seen) (%cloud-publish name id seen))
-                                      (recorded? c id)))))))))
+                "recorded" (or same (recorded? c id))))))))
 
 (define (control-rollback! c [id #f])
   "Publish again an earlier deployment of the project of C.
@@ -288,7 +290,7 @@ with why it was not deployed."
   (let ((given (request-header request "authorization")))
     (and given (string-prefix? "Bearer " given) (substring given 7 (string-length given)))))
 
-(define (control-ops-handler c key #:revoked? [revoked? (lambda (id) #f)])
+(define (control-ops-handler c key #:revoked? [revoked? (lambda (id) #f)] #:debug? [debug? #f])
   "Return an HTTP handler answering the operations on the project of C.
 `POST /v1/ops` with a JSON object of its `op`: `deployments`; `deploy`;
 `rollback`, with the `id` to go back to if not the one before; or
@@ -296,7 +298,9 @@ with why it was not deployed."
 Answered with a JSON array of one reply, its `status` done, or error and
 what kind, with a `message`. The request's bearer token must hold under
 KEY (and REVOKED?, as `verify-token` has them) and allow the operation on
-the project: `inspect` to list, `deploy` for the others."
+the project: `inspect` to list, `deploy` to deploy or roll back, `prod`
+for `patch-library` when DEBUG? is true, and `eval` or `deploy` for
+`patch-library` in a dev-only world."
   (define (reply status statuses . fields)
     (json-response (vector (apply dict "status" (list->vector statuses) fields)) #:status status))
   (lambda (request)
@@ -307,13 +311,15 @@ the project: `inspect` to list, `deploy` for the others."
                            (equal? (dict-ref request 'path) "/v1/ops")
                            (guard (e (#t #f)) (request-json request))))
              (op (and (dict? message) (dict-ref message "op" #f)))
-             (scope (cond ((equal? op "deployments") "inspect")
-                          ((member op '("deploy" "rollback" "patch-library")) "deploy")
-                          (else #f))))
+             (scopes (cond ((equal? op "deployments") '("inspect"))
+                           ((member op '("deploy" "rollback")) '("deploy"))
+                           ((equal? op "patch-library") (if debug? '("prod") '("eval" "deploy")))
+                           (else #f))))
         (cond ((not claims) (reply 401 '("error" "unauthenticated" "done")))
               ((not message) (reply 400 '("error" "not-an-operation" "done")))
-              ((not scope) (reply 400 '("error" "unknown-op" "done")))
-              ((not (token-allows? claims (control-name c) scope)) (reply 403 '("error" "refused" "done")))
+              ((not scopes) (reply 400 '("error" "unknown-op" "done")))
+              ((not (any (lambda (scope) (token-allows? claims (control-name c) scope)) scopes))
+               (reply 403 '("error" "refused" "done")))
               ((equal? op "deployments") (apply reply 200 '("done") (dict->fields (control-deployments c))))
               ((equal? op "deploy") (apply reply 200 '("done") (dict->fields (control-deploy! c))))
               ((equal? op "patch-library")

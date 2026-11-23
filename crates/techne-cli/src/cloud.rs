@@ -735,6 +735,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
             tokens(&mut front, &dir)?;
         }
         if let Some(port) = options.ops {
+            let debug_flag = if options.debug { "#t" } else { "#f" };
             front.eval_source(&format!(
                 r#"(require {})
                    (let ((listener (tcp-listen {port})))
@@ -742,7 +743,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
                      (display (string-append "Operations on http://127.0.0.1:"
                                              (number->string (cadr (tcp-local-address listener))) "\n"))
                      (flush-output-port)
-                     (spawn (lambda () (http-serve listener (control-ops-handler control token-key)))))"#,
+                     (spawn (lambda () (http-serve listener (control-ops-handler control token-key #:debug? {debug_flag})))))"#,
                 techne_vm::reader::string_repr(&techne_vm::library::lisp_dir().join("http/server.scm").display().to_string()),
                 techne_vm::reader::string_repr(&dir.join(".techne/ops-port").display().to_string()),
             ))?;
@@ -1160,6 +1161,7 @@ impl techne_host::worker::Dev for DevWorker {
     fn publish(&mut self, host: &Host, name: &str, entry: &Path, deployment: Deployment) -> Result<(), Error> {
         self.deployed += 1;
         self.names.insert(name.into(), self.deployed);
+        self.entries.insert(name.into(), entry.display().to_string());
         let waker: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(host.waker());
         let world = DevRepl { repl: self.repl.clone(), generation: self.deployed, entry: entry.display().to_string(), waker };
         // The server stays where it is: a deployment loaded is not yet
@@ -1175,10 +1177,35 @@ impl techne_host::worker::Dev for DevWorker {
     }
 
     fn activate(&mut self, host: &Host, name: &str) {
-        if let Some(generation) = self.names.get(name) {
-            self.repl.borrow_mut().active = *generation;
-            // Its world is driven, and the server moves.
-            (host.waker())();
+        if self.names.contains_key(name) {
+            // Mode 1 redeploy or rollback to a cached dev/debug generation must
+            // reset a dirty Mode 2 patched world cleanly back to the snapshot.
+            if host.is_dirty(name)
+                && let Some(entry) = self.entries.get(name).cloned()
+            {
+                self.deployed += 1;
+                let generation = self.deployed;
+                let waker: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(host.waker());
+                let world = DevRepl { repl: self.repl.clone(), generation, entry, waker };
+                let attach = move |_: &mut Vm| -> Result<Box<dyn Attached>, Error> { Ok(Box::new(world)) };
+                let reset = if self.debug { host.attach_debug(name, attach).map(drop) } else { host.reset_dev_world(name, attach) };
+                match reset {
+                    Ok(()) => {
+                        self.names.insert(name.into(), generation);
+                    }
+                    Err(e) => eprintln!("techne cloud: could not reset dirty world for {name}: {}", e.msg),
+                }
+            }
+            if let Some(generation) = self.names.get(name) {
+                self.repl.borrow_mut().active = *generation;
+                // Its world is driven, and the server moves.
+                (host.waker())();
+            }
+        } else if self.debugged.contains_key(name) && host.is_dirty(name) {
+            // Same-ID redeploy on `serve` while a dirty remote debug instance
+            // is attached: detach it so Mode 1 redeploy always starts clean.
+            host.detach_debug(name, None);
+            self.orphan(name);
         }
     }
 

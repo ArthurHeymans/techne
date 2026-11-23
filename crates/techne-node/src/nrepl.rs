@@ -914,7 +914,9 @@ fn patch_library(vm: &mut Vm, library: &[String], code: &str, check_retained: bo
                 ("patched", B::List(report.patched.iter().map(B::str).collect())),
                 ("unchanged", B::Int(report.unchanged as i64)),
                 ("stale-holders", B::List(stale)),
+                ("stale-holders-truncated", B::Int(i64::from(report.stale_holders_truncated))),
                 ("source-sha256", B::str(&report.source_sha256)),
+                ("dirty", B::Int(i64::from(vm.is_patch_dirty()))),
             ]);
         }
         Err(e) => {
@@ -1477,8 +1479,24 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             _ => reply.error("techne-debug-inspect needs a debug-id", &[]),
         },
         "techne-patch-library" => {
+            let patch_syntax_err = |msg: &str| {
+                reply.send(vec![
+                    ("status", B::List(vec![B::str("error"), B::str("patch-refused"), B::str("done")])),
+                    ("reason", B::str("syntax-error")),
+                    ("message", B::str(msg)),
+                    ("err", B::str(format!("syntax-error: {msg}\n"))),
+                ]);
+            };
             let library = match msg.get("library") {
                 Some(B::List(items)) if !items.is_empty() => {
+                    if items.len() > techne_vm::patch::MAX_LIBRARY_PARTS {
+                        patch_syntax_err(&format!(
+                            "library name has {} parts (maximum {})",
+                            items.len(),
+                            techne_vm::patch::MAX_LIBRARY_PARTS
+                        ));
+                        return;
+                    }
                     let mut parts = Vec::with_capacity(items.len());
                     for item in items {
                         if let Some(s) = item.as_str() {
@@ -1486,25 +1504,21 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
                         } else if let Some(i) = item.as_int().filter(|&i| i >= 0) {
                             parts.push(i.to_string());
                         } else {
-                            return reply.send(vec![
-                                ("status", B::List(vec![B::str("error"), B::str("patch-refused"), B::str("done")])),
-                                ("reason", B::str("syntax-error")),
-                                ("message", B::str("library name parts must be strings or non-negative integers")),
-                                ("err", B::str("syntax-error: library name parts must be strings or non-negative integers\n")),
-                            ]);
+                            patch_syntax_err("library name parts must be strings or non-negative integers");
+                            return;
                         }
+                    }
+                    if let Err(e) = techne_vm::patch::validate_library_parts(&parts) {
+                        patch_syntax_err(&e);
+                        return;
                     }
                     parts
                 }
                 Some(B::Bytes(_)) => match msg.get("library").and_then(B::as_str).map(techne_vm::patch::parse_library_name) {
                     Some(Ok(parts)) => parts,
                     Some(Err(e)) => {
-                        return reply.send(vec![
-                            ("status", B::List(vec![B::str("error"), B::str("patch-refused"), B::str("done")])),
-                            ("reason", B::str("syntax-error")),
-                            ("message", B::str(&e)),
-                            ("err", B::str(format!("syntax-error: {e}\n"))),
-                        ]);
+                        patch_syntax_err(&e);
+                        return;
                     }
                     None => return reply.error("techne-patch-library: invalid library name", &["patch-refused"]),
                 },
@@ -1513,6 +1527,10 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             let Some(code) = text("code") else {
                 return reply.error("techne-patch-library needs code", &["no-code"]);
             };
+            if code.len() > techne_vm::patch::MAX_PATCH_BYTES {
+                patch_syntax_err("patch source exceeds maximum size (4 MiB)");
+                return;
+            }
             let check_retained = !matches!(
                 msg.get("check-retained"),
                 Some(v) if v.as_int() == Some(0) || v.as_str() == Some("false")

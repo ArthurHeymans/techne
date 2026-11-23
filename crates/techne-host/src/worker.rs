@@ -265,6 +265,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                 if let Some(dev) = &mut *dev.borrow_mut() {
                     dev.activate(&host, &name);
                 }
+                close_gone();
             }
             ToWorker::Deactivate { name } => {
                 host.detach_debug(&name, None);
@@ -412,7 +413,8 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
             }
             ToWorker::PatchLibrary { id, name, library, code, check_retained } => {
                 let result = host.patch_library(&name, &library, &code, check_retained);
-                let _ = tx.send(FromWorker::PatchedLibrary { id, result });
+                let dirty = host.is_dirty(&name);
+                let _ = tx.send(FromWorker::PatchedLibrary { id, result, dirty });
             }
         }
     }

@@ -567,6 +567,14 @@ struct Running {
     cgroup: Option<cgroup::Worker>,
 }
 
+/// Result of a Mode 2 live library patch executed in a worker, including
+/// whether the target mutable world currently carries any active patch deltas.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchOutcome {
+    pub report: PatchReport,
+    pub dirty: bool,
+}
+
 struct State {
     /// No worker until one is next needed (`Supervisor::sleep`), and one
     /// being started for that.
@@ -587,7 +595,11 @@ struct State {
     next_deploy: u64,
     deploys: HashMap<u64, (Bundle, oneshot::Sender<Result<String, String>>)>,
     next_patch: u64,
-    patches: HashMap<u64, oneshot::Sender<Result<PatchReport, HostPatchError>>>,
+    /// Value of `next_patch` when the current worker was started, so late
+    /// replies from timed-out patches sent to this worker are recognized and
+    /// ignored without tolerating stale IDs from an older worker.
+    worker_patch_floor: u64,
+    patches: HashMap<u64, oneshot::Sender<Result<PatchOutcome, HostPatchError>>>,
     /// The deployments the worker has loaded, by the names it serves
     /// them under.
     ready: HashMap<String, Ready>,
@@ -936,7 +948,10 @@ fn parse_library_arg(data: &Data) -> Result<Vec<String>, String> {
             if items.is_empty() {
                 return Err("library name must not be empty".into());
             }
-            items
+            if items.len() > techne_vm::patch::MAX_LIBRARY_PARTS {
+                return Err(format!("library name has {} parts (maximum {})", items.len(), techne_vm::patch::MAX_LIBRARY_PARTS));
+            }
+            let parts = items
                 .iter()
                 .map(|item| match item {
                     Data::String(s) if !s.is_empty() => Ok(s.clone()),
@@ -944,15 +959,17 @@ fn parse_library_arg(data: &Data) -> Result<Vec<String>, String> {
                     Data::Int(n) if *n >= 0 => Ok(n.to_string()),
                     _ => Err("library name parts must be non-empty strings, symbols, or non-negative integers".into()),
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()?;
+            techne_vm::patch::validate_library_parts(&parts)?;
+            Ok(parts)
         }
         _ => Err("library must be a list/vector of name parts or a Scheme library name string".into()),
     }
 }
 
-fn patch_result_to_data(result: Result<PatchReport, HostPatchError>) -> Data {
+fn patch_result_to_data(result: Result<PatchOutcome, HostPatchError>) -> Data {
     match result {
-        Ok(report) => Data::Dict(vec![
+        Ok(PatchOutcome { report, dirty }) => Data::Dict(vec![
             (Data::String("ok".into()), Data::Bool(true)),
             (Data::String("library".into()), Data::Vector(report.library.into_iter().map(Data::String).collect())),
             (Data::String("patched".into()), Data::Vector(report.patched.into_iter().map(Data::String).collect())),
@@ -972,8 +989,9 @@ fn patch_result_to_data(result: Result<PatchReport, HostPatchError>) -> Data {
                         .collect(),
                 ),
             ),
+            (Data::String("stale-holders-truncated".into()), Data::Bool(report.stale_holders_truncated)),
             (Data::String("source-sha256".into()), Data::String(report.source_sha256)),
-            (Data::String("dirty".into()), Data::Bool(true)),
+            (Data::String("dirty".into()), Data::Bool(dirty)),
         ]),
         Err(err) => {
             let mut entries = vec![
@@ -1099,6 +1117,7 @@ impl Supervisor {
                 next_deploy: 0,
                 deploys: HashMap::new(),
                 next_patch: 0,
+                worker_patch_floor: 0,
                 patches: HashMap::new(),
                 ready: HashMap::new(),
                 joining: HashMap::new(),
@@ -1146,7 +1165,8 @@ impl Supervisor {
     /// and not published is forgotten. Whether it sleeps now.
     pub fn sleep(&self) -> bool {
         let mut s = self.state.borrow_mut();
-        let idle = s.pending.is_empty() && s.deploys.is_empty() && s.repls.is_empty() && s.fetching == 0 && !s.waking;
+        let idle =
+            s.pending.is_empty() && s.deploys.is_empty() && s.patches.is_empty() && s.repls.is_empty() && s.fetching == 0 && !s.waking;
         let Some(w) = s.worker.take_if(|_| idle) else { return s.asleep };
         kill(&w);
         s.asleep = true;
@@ -1380,7 +1400,9 @@ impl Supervisor {
             };
             me.end_worker(generation, &why);
         });
-        self.state.borrow_mut().worker = Some(Running { generation, send, pidfd, cgroup });
+        let mut s = self.state.borrow_mut();
+        s.worker_patch_floor = s.next_patch;
+        s.worker = Some(Running { generation, send, pidfd, cgroup });
         Ok(())
     }
 
@@ -1565,11 +1587,13 @@ impl Supervisor {
                 s.repls.remove(&cid);
                 None
             }
-            FromWorker::PatchedLibrary { id, result } => match s.patches.remove(&id) {
+            FromWorker::PatchedLibrary { id, result, dirty } => match s.patches.remove(&id) {
                 Some(reply) => {
-                    let _ = reply.send(result);
+                    let _ = reply.send(result.map(|report| PatchOutcome { report, dirty }));
                     None
                 }
+                // Late reply for a patch that was sent to this worker and already timed out.
+                None if id > s.worker_patch_floor && id <= s.next_patch => None,
                 None => Some(format!("a library patch it was not given ({id})")),
             },
             FromWorker::Ready => Some("ready again".into()),
@@ -1608,7 +1632,8 @@ impl Supervisor {
             let _ = reply.send(Err(why.into()));
         }
         for (_, reply) in patches {
-            let _ = reply.send(Err(HostPatchError::no_mutable_world(why)));
+            let _ =
+                reply.send(Err(HostPatchError::outcome_unknown(format!("the worker ended while the library patch was in flight: {why}"))));
         }
         let me = self.clone();
         tokio::task::spawn_local(async move {
@@ -2119,7 +2144,24 @@ impl Supervisor {
         library: Vec<String>,
         code: String,
         check_retained: bool,
-    ) -> Result<PatchReport, HostPatchError> {
+    ) -> Result<PatchOutcome, HostPatchError> {
+        self.patch_library_with_timeout(name, library, code, check_retained, PATCHING).await
+    }
+
+    async fn patch_library_with_timeout(
+        &self,
+        name: &str,
+        library: Vec<String>,
+        code: String,
+        check_retained: bool,
+        timeout: Duration,
+    ) -> Result<PatchOutcome, HostPatchError> {
+        if let Err(e) = techne_vm::patch::validate_library_parts(&library) {
+            return Err(HostPatchError::syntax_error(e));
+        }
+        if code.len() > MAX_PATCH_BYTES {
+            return Err(HostPatchError::syntax_error("patch source exceeds maximum size"));
+        }
         let (tx, rx) = oneshot::channel();
         let pid = {
             let mut s = self.state.borrow_mut();
@@ -2136,15 +2178,18 @@ impl Supervisor {
             s.next_patch += 1;
             let pid = s.next_patch;
             s.patches.insert(pid, tx);
-            let _ = send.send(ToWorker::PatchLibrary { id: pid, name: served, library, code, check_retained });
+            if send.send(ToWorker::PatchLibrary { id: pid, name: served, library, code, check_retained }).is_err() {
+                s.patches.remove(&pid);
+                return Err(HostPatchError::outcome_unknown("could not send library patch to worker"));
+            }
             pid
         };
-        match tokio::time::timeout(PATCHING, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(HostPatchError::no_mutable_world("the worker is gone")),
+            Ok(Err(_)) => Err(HostPatchError::outcome_unknown("the worker ended while the library patch was in flight")),
             Err(_) => {
                 self.state.borrow_mut().patches.remove(&pid);
-                Err(HostPatchError::no_mutable_world("the worker did not answer the library patch in time"))
+                Err(HostPatchError::outcome_unknown("the worker did not answer the library patch in time"))
             }
         }
     }

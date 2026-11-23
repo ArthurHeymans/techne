@@ -28,13 +28,16 @@ pub const REPL_CHUNK: usize = 64 << 10;
 pub const BUNDLE_BYTES: usize = 24 << 20;
 
 /// The most bytes of a single Mode 2 library source patch.
-pub const MAX_PATCH_BYTES: usize = 4 << 20;
+pub const MAX_PATCH_BYTES: usize = techne_vm::patch::MAX_PATCH_BYTES;
 
 /// The most parts in a library name over IPC.
-const MAX_LIBRARY_PARTS: usize = 32;
+const MAX_LIBRARY_PARTS: usize = techne_vm::patch::MAX_LIBRARY_PARTS;
 
 /// The most stale-holder diagnostics returned in a single patch report.
-const MAX_STALE_HOLDERS: usize = 256;
+const MAX_STALE_HOLDERS: usize = techne_vm::patch::MAX_STALE_HOLDERS;
+
+/// The most steps in a single stale-holder retention chain over IPC.
+const MAX_STALE_CHAIN: usize = techne_vm::patch::MAX_STALE_CHAIN;
 
 /// Chunks of a body sent before any is credited.
 pub const WINDOW: usize = 4;
@@ -213,10 +216,12 @@ pub enum FromWorker {
     ReplClose {
         cid: u64,
     },
-    /// Result of Mode 2 `PatchLibrary` `id`.
+    /// Result of Mode 2 `PatchLibrary` `id`, plus whether the target mutable
+    /// world currently carries any active patch deltas.
     PatchedLibrary {
         id: u64,
         result: Result<crate::PatchReport, crate::HostPatchError>,
+        dirty: bool,
     },
 }
 
@@ -424,6 +429,7 @@ impl ToWorker {
                 let id = p.uint()?;
                 let name = p.string()?;
                 let library = decode_string_list(p.list()?, MAX_LIBRARY_PARTS, true)?;
+                techne_vm::patch::validate_library_parts(&library).map_err(|e| bad(&e))?;
                 let code = p.string()?;
                 if code.len() > MAX_PATCH_BYTES {
                     return Err(bad("patch source too large"));
@@ -472,28 +478,39 @@ impl FromWorker {
             }
             FromWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
             FromWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
-            FromWorker::PatchedLibrary { id, result } => match result {
-                Ok(report) => Data::List(vec![
-                    sym("patched-library"),
-                    int(*id),
-                    Data::Bool(true),
-                    Data::List(report.library.iter().cloned().map(Data::String).collect()),
-                    Data::List(report.patched.iter().cloned().map(Data::String).collect()),
-                    int(report.unchanged as u64),
-                    Data::List(
-                        report
-                            .stale_holders
-                            .iter()
-                            .map(|h| {
-                                Data::List(vec![
-                                    Data::String(h.binding.clone()),
-                                    Data::List(h.chain.iter().cloned().map(Data::String).collect()),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                    Data::String(report.source_sha256.clone()),
-                ]),
+            FromWorker::PatchedLibrary { id, result, dirty } => match result {
+                Ok(report) => {
+                    let mut truncated = report.stale_holders_truncated;
+                    if report.stale_holders.len() > MAX_STALE_HOLDERS {
+                        truncated = true;
+                    }
+                    let holders: Vec<Data> = report
+                        .stale_holders
+                        .iter()
+                        .take(MAX_STALE_HOLDERS)
+                        .map(|h| {
+                            if h.chain.len() > MAX_STALE_CHAIN {
+                                truncated = true;
+                            }
+                            Data::List(vec![
+                                Data::String(h.binding.clone()),
+                                Data::List(h.chain.iter().take(MAX_STALE_CHAIN).cloned().map(Data::String).collect()),
+                            ])
+                        })
+                        .collect();
+                    Data::List(vec![
+                        sym("patched-library"),
+                        int(*id),
+                        Data::Bool(true),
+                        Data::List(report.library.iter().cloned().map(Data::String).collect()),
+                        Data::List(report.patched.iter().cloned().map(Data::String).collect()),
+                        int(report.unchanged as u64),
+                        Data::List(holders),
+                        Data::Bool(truncated),
+                        Data::String(report.source_sha256.clone()),
+                        Data::Bool(*dirty),
+                    ])
+                }
                 Err(err) => Data::List(vec![
                     sym("patched-library"),
                     int(*id),
@@ -527,9 +544,10 @@ impl FromWorker {
             "repl-close" => FromWorker::ReplClose { cid: p.uint()? },
             "patched-library" => {
                 let id = p.uint()?;
-                let result = match p.flag()? {
+                let (result, dirty) = match p.flag()? {
                     true => {
                         let library = decode_string_list(p.list()?, MAX_LIBRARY_PARTS, true)?;
+                        techne_vm::patch::validate_library_parts(&library).map_err(|e| bad(&e))?;
                         let patched = decode_string_list(p.list()?, MAX_PARTS, false)?;
                         let unchanged = usize::try_from(p.uint()?).map_err(|_| bad("unchanged count"))?;
                         let raw_holders = p.list()?;
@@ -541,24 +559,29 @@ impl FromWorker {
                             .map(|h| {
                                 let mut hp = Parts::of(h)?;
                                 let binding = hp.string()?;
-                                let chain = decode_string_list(hp.list()?, MAX_DEPTH, false)?;
+                                let chain = decode_string_list(hp.list()?, MAX_STALE_CHAIN, false)?;
                                 if hp.has_more() {
                                     return Err(bad("trailing parts in stale holder"));
                                 }
                                 Ok(crate::StaleHolder { binding, chain })
                             })
                             .collect::<io::Result<Vec<_>>>()?;
+                        let stale_holders_truncated = p.flag()?;
                         let source_sha256 = p.string()?;
-                        Ok(crate::PatchReport { library, patched, unchanged, stale_holders, stale_holders_truncated: false, source_sha256 })
+                        let dirty = p.flag()?;
+                        (
+                            Ok(crate::PatchReport { library, patched, unchanged, stale_holders, stale_holders_truncated, source_sha256 }),
+                            dirty,
+                        )
                     }
                     false => {
                         let reason = p.string()?;
                         let message = p.string()?;
                         let binding = p.failure()?;
-                        Err(crate::HostPatchError { reason, message, binding })
+                        (Err(crate::HostPatchError { reason, message, binding }), false)
                     }
                 };
-                FromWorker::PatchedLibrary { id, result }
+                FromWorker::PatchedLibrary { id, result, dirty }
             }
             other => return Err(bad(&format!("no message {other}"))),
         };
@@ -1026,17 +1049,20 @@ mod tests {
                 stale_holders_truncated: false,
                 source_sha256: "a".repeat(64),
             }),
+            dirty: true,
         };
         let encoded_ok = encode(&ok_reply.to_data());
         match FromWorker::from_data(decode(&encoded_ok).unwrap()).unwrap() {
-            FromWorker::PatchedLibrary { id, result: Ok(report) } => {
+            FromWorker::PatchedLibrary { id, result: Ok(report), dirty } => {
                 assert_eq!(id, 7);
+                assert!(dirty);
                 assert_eq!(report.library, vec!["bob", "util"]);
                 assert_eq!(report.patched, vec!["f"]);
                 assert_eq!(report.unchanged, 3);
                 assert_eq!(report.stale_holders.len(), 1);
                 assert_eq!(report.stale_holders[0].binding, "f");
                 assert_eq!(report.stale_holders[0].chain, vec!["global saved", "pair car"]);
+                assert!(!report.stale_holders_truncated);
                 assert_eq!(report.source_sha256, "a".repeat(64));
             }
             other => panic!("unexpected {other:?}"),
@@ -1050,11 +1076,13 @@ mod tests {
                 message: "record `item` changed".into(),
                 binding: Some("item".into()),
             }),
+            dirty: false,
         };
         let encoded_err = encode(&err_reply.to_data());
         match FromWorker::from_data(decode(&encoded_err).unwrap()).unwrap() {
-            FromWorker::PatchedLibrary { id, result: Err(err) } => {
+            FromWorker::PatchedLibrary { id, result: Err(err), dirty } => {
                 assert_eq!(id, 8);
+                assert!(!dirty);
                 assert_eq!(err.reason, "record-layout-changed");
                 assert_eq!(err.message, "record `item` changed");
                 assert_eq!(err.binding.as_deref(), Some("item"));
@@ -1071,7 +1099,9 @@ mod tests {
             Data::List(vec![]),
             int(0),
             Data::List(vec![Data::List(vec![Data::String("f".into()), Data::List(vec![]), Data::Int(99)])]),
+            Data::Bool(false),
             Data::String("a".repeat(64)),
+            Data::Bool(false),
         ]);
         assert!(FromWorker::from_data(bad_holder).is_err());
     }

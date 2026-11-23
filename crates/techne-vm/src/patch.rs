@@ -29,6 +29,14 @@ pub const MAX_RETENTION_NODES: usize = 200_000;
 pub const MAX_STALE_HOLDERS: usize = 256;
 /// Maximum steps reported per stale-holder retention chain.
 pub const MAX_STALE_CHAIN: usize = 64;
+/// Maximum number of components in a Scheme library name accepted over RPC/IPC.
+pub const MAX_LIBRARY_PARTS: usize = 32;
+/// Maximum UTF-8 byte length of a single library name component.
+pub const MAX_LIBRARY_PART_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of a Scheme library name string.
+pub const MAX_LIBRARY_NAME_BYTES: usize = 4096;
+/// Maximum UTF-8 byte length of a single Mode 2 library source patch (4 MiB).
+pub const MAX_PATCH_BYTES: usize = 4 << 20;
 
 /// Load-time `cond-expand` clause decision captured in a [`LibrarySnapshot`]
 /// so live patching can verify that `cond-expand` branches have not diverged.
@@ -230,13 +238,99 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Parse a Scheme library name string such as `"(alice math)"` into canonical parts.
-pub fn parse_library_name(text: &str) -> Result<Vec<String>, String> {
-    let forms = reader::read(text).map_err(|e| format!("bad library name: {e}"))?;
-    if forms.len() != 1 {
-        return Err("bad library name: expected a single library name list".into());
+fn is_library_delimiter(c: char) -> bool {
+    c.is_control() || c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '"' | ';' | '#' | '\'' | '`' | ',' | '|')
+}
+
+/// Validate canonical library name parts without interning any symbols.
+/// Enforces `1..=MAX_LIBRARY_PARTS` components, each `1..=MAX_LIBRARY_PART_BYTES`
+/// UTF-8 bytes, with no control characters, whitespace, or Scheme delimiters.
+pub fn validate_library_parts(parts: &[String]) -> Result<(), String> {
+    if parts.is_empty() {
+        return Err("library name must not be empty".into());
     }
-    name_parts(&forms[0]).ok_or_else(|| format!("bad library name: {}", display_sexp(&forms[0])))
+    if parts.len() > MAX_LIBRARY_PARTS {
+        return Err(format!("library name has {} parts (maximum {MAX_LIBRARY_PARTS})", parts.len()));
+    }
+    for part in parts {
+        if part.is_empty() {
+            return Err("library name part must not be empty".into());
+        }
+        if part.len() > MAX_LIBRARY_PART_BYTES {
+            return Err(format!("library name part exceeds {MAX_LIBRARY_PART_BYTES} bytes"));
+        }
+        if part == "." {
+            return Err("library name part must not be `.`".into());
+        }
+        if part.chars().any(is_library_delimiter) {
+            return Err(format!("invalid character in library name part `{part}`"));
+        }
+        // Reject signed numbers, decimals, ratios, or tokens starting with digits
+        // unless they are canonical non-negative exact integers.
+        let bytes = part.as_bytes();
+        if bytes[0].is_ascii_digit() {
+            if !bytes.iter().all(u8::is_ascii_digit) {
+                return Err(format!("invalid numeric library name part `{part}`"));
+            }
+            if part.parse::<i64>().is_err() {
+                return Err(format!("library name integer out of range: `{part}`"));
+            }
+        } else if ((bytes[0] == b'+' || bytes[0] == b'-') && bytes.len() > 1 && (bytes[1].is_ascii_digit() || bytes[1] == b'.'))
+            || (bytes[0] == b'.' && bytes.len() > 1 && bytes[1].is_ascii_digit())
+        {
+            return Err(format!("invalid numeric library name part `{part}`"));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a Scheme library name string such as `"(alice math)"` into canonical parts
+/// without invoking the Scheme reader or interning any symbols.
+pub fn parse_library_name(text: &str) -> Result<Vec<String>, String> {
+    if text.len() > MAX_LIBRARY_NAME_BYTES {
+        return Err(format!("bad library name: exceeds {MAX_LIBRARY_NAME_BYTES} bytes"));
+    }
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix('(') else {
+        return Err("bad library name: expected a parenthesized library name list".into());
+    };
+    let Some(inner) = rest.strip_suffix(')') else {
+        return Err("bad library name: missing closing `)`".into());
+    };
+    let mut parts = Vec::new();
+    let mut chars = inner.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if is_library_delimiter(c) {
+            return Err(format!("bad library name: unexpected `{c}`"));
+        }
+        let mut end = inner.len();
+        while let Some(&(i, ch)) = chars.peek() {
+            if ch.is_whitespace() {
+                end = i;
+                break;
+            }
+            if is_library_delimiter(ch) {
+                return Err(format!("bad library name: unexpected `{ch}`"));
+            }
+            chars.next();
+        }
+        let tok = &inner[start..end];
+        if tok.bytes().all(|b| b.is_ascii_digit()) {
+            let n = tok.parse::<i64>().map_err(|_| format!("bad library name: integer out of range `{tok}`"))?;
+            parts.push(n.to_string());
+        } else {
+            parts.push(tok.to_string());
+        }
+        if parts.len() > MAX_LIBRARY_PARTS {
+            return Err(format!("bad library name: exceeds {MAX_LIBRARY_PARTS} parts"));
+        }
+    }
+    validate_library_parts(&parts).map_err(|e| format!("bad library name: {e}"))?;
+    Ok(parts)
 }
 
 /// Flatten nested unshadowed `(begin ...)` forms in top-level library bodies

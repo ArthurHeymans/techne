@@ -41,8 +41,10 @@
 (define max-files 1000)
 (define max-bytes (* 16 1024 1024))
 (define max-depth 8)
-;; Per-tenant cached dependency trees on disk, at most.
-(define max-tenant-trees 100)
+;; Packages per deployment and per-tenant cached dependency trees on disk, at most.
+;; Keep max-tenant-trees >= max-packages so one valid deployment never exceeds the cache bound.
+(define max-packages 128)
+(define max-tenant-trees 128)
 (define max-tenant-tree-bytes (* 64 1024 1024))
 ;; Operations at once, of all tenants: each may hold an upload.
 (define max-operations 8)
@@ -550,8 +552,8 @@ the others go on. The targets published, `tenant/project`."
         (raw-pkgs (dict-ref pkg-obj "packages" #f))
         (total-files 0)
         (total-bytes 0))
-    (unless (and (vector? raw-pkgs) (<= 1 (vector-length raw-pkgs) 128))
-      (error "A packaged deployment has 1 to 128 packages"))
+    (unless (and (vector? raw-pkgs) (<= 1 (vector-length raw-pkgs) max-packages))
+      (error (string-append "A packaged deployment has 1 to " (number->string max-packages) " packages")))
     (let ((parsed
            (map (lambda (p)
                   (unless (dict? p) (error "Each package entry is an object"))
@@ -563,7 +565,7 @@ the others go on. The targets published, `tenant/project`."
                     (unless (and (package-name-str? owner) (package-name-str? pkg))
                       (error "A package has owner and pkg strings"))
                     (unless (sha256-hex? sha) (error "Not a package tree_sha256:" sha))
-                    (unless (and (vector? raw-deps) (<= (vector-length raw-deps) 128))
+                    (unless (and (vector? raw-deps) (<= (vector-length raw-deps) max-packages))
                       (error "A package's depends is an array"))
                     (let ((deps (map parse-package-pair (vector->list raw-deps)))
                           (decoded (and raw-files (decode-files raw-files))))
@@ -600,8 +602,8 @@ the others go on. The targets published, `tenant/project`."
 (define (check-operation cloud tenant op message)
   (cond ((equal? op "has-trees")
          (let ((trees (dict-ref message "trees" #f)))
-           (unless (and (vector? trees) (<= (vector-length trees) 128))
-             (error "trees is an array of up to 128 sha256 digests"))
+           (unless (and (vector? trees) (<= (vector-length trees) max-packages))
+             (error (string-append "trees is an array of up to " (number->string max-packages) " sha256 digests")))
            (let ((list-trees (vector->list trees)))
              (for-each (lambda (sha) (unless (sha256-hex? sha) (error "Not a sha256 digest:" sha))) list-trees)
              list-trees)))
@@ -651,7 +653,8 @@ and the operation's own fields, as this file says them. Answered with a
 JSON array of one reply, its `status` done, or error and what kind, with
 a `message`. The request's bearer token must hold (REVOKED? as
 `verify-token` has it) and allow the operation on `tenant/project`:
-`inspect` to list deployments, `deploy` for the others. A tenant not
+`inspect` to list deployments, `prod` for `patch-library` (against an
+attached debug instance), and `deploy` for the others. A tenant not
 invited has no projects, whatever token is shown.
 
 Serve it with bodies that stream: a request's body is read only once
@@ -669,7 +672,8 @@ without is answered 503, its body unread."
              (tenant (and message (dict-ref message "tenant" #f)))
              (project (and message (dict-ref message "project" #f)))
              (scope (cond ((equal? op "deployments") "inspect")
-                          ((member op '("deploy" "rollback" "secret-put" "has-trees" "patch-library")) "deploy")
+                          ((equal? op "patch-library") "prod")
+                          ((member op '("deploy" "rollback" "secret-put" "has-trees")) "deploy")
                           (else #f))))
         (cond ((not message) (reply 400 '("error" "not-an-operation" "done")))
               ((not scope) (reply 400 '("error" "unknown-op" "done")))
@@ -776,7 +780,9 @@ without is answered 503, its body unread."
              (refuse request 400 "error" "not-an-operation" "done"))
             ((not (and named (equal? named target) (not (string-suffix? "/trees" target))))
              (refuse request 400 "error" "not-a-project" "done"))
-            ((not (or (token-allows? claims target "inspect") (token-allows? claims target "deploy")))
+            ((not (or (token-allows? claims target "inspect")
+                      (token-allows? claims target "deploy")
+                      (token-allows? claims target "prod")))
              (refuse request 403 "error" "refused" "done"))
             ((not (admit! cloud target)) (refuse request 503 "error" "busy" "done"))
             (else

@@ -278,9 +278,12 @@ ten), publish if nothing overtook it, and record it; to roll back is to
 prepare an earlier one again from its bundle and publish it the same way.
 The record and the bundles are files, which outlive the supervisor.
 `techne cloud dev --ops PORT` serves the operations `deployments`, `deploy`,
-`rollback`, and `patch-library` as JSON over HTTP (`POST /v1/ops`, a bearer
-token allowing `inspect` or `deploy` on the project), and `techne cloud
-deployments`, `deploy`, `rollback`, and `patch-library` ask them. Against
+`rollback`, and `patch-library` as JSON over HTTP (`POST /v1/ops`), with a
+bearer token allowing `inspect` for `deployments`, `deploy` for `deploy` and
+`rollback`, `eval` or `deploy` for `patch-library` on dev-only worlds, and
+`prod` for `patch-library` when `--debug` is active or against `techne cloud
+serve` (matching debug session authority). `techne cloud deployments`, `deploy`,
+`rollback`, and `patch-library` ask them. Against
 `techne cloud serve`, packaged deploys query `has-trees` first and omit
 `"files"` for dependency trees already cached by canonical `tree-sha256` under
 `<state>/trees/<sha>/`; uploaded trees are verified against their declared
