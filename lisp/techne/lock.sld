@@ -15,9 +15,9 @@
           locked-package-tree-sha256 locked-package-depends
           parse-lockfile read-lockfile format-lockfile write-lockfile
           packages-data-dir package-store-dir
-          materialize-package-tree!
+          materialize-package-tree! materialize-lockfile!
           resolve-project resolve-package-source lock-project!
           verify-lockfile check-lockfile use-locked-package!
-          verify-world-lockfile)
+          verify-world-lockfile verify-world-closure)
   (import (techne) (techne crypto) (techne package) (techne path))
   (include "lock.scm"))

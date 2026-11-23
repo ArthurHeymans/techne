@@ -509,15 +509,22 @@ beside it)."
     (define (package-directories root)
       "Return the directories under ROOT holding a package, relative to it.
 ROOT's own is \"\", and then the only one: a package's directory is not
-searched for others. Directories whose names begin with a dot are not
-searched, nor those more than four below ROOT."
+searched for others. Directories whose names begin with a dot and
+symbolic links are not searched, nor those more than four below ROOT."
       (let walk ((relative "") (depth 0))
-        (let ((dir (path-join root relative)))
-          (cond ((file-exists? (path-join dir package-manifest-file)) (list relative))
+        (let* ((dir (path-join root relative))
+               (manifest-attrs (file-attributes (path-join dir package-manifest-file))))
+          (cond ((and manifest-attrs (eq? (car manifest-attrs) 'file)) (list relative))
                 ((= depth 4) '())
                 (else
                  (append-map (lambda (entry)
-                               (if (and (string-suffix? "/" entry) (not (string-prefix? "." entry)))
-                                   (walk (path-join relative (substring entry 0 (- (string-length entry) 1))) (+ depth 1))
-                                   '()))
+                               (let ((name (if (string-suffix? "/" entry)
+                                               (substring entry 0 (- (string-length entry) 1))
+                                               entry)))
+                                 (if (not (string-prefix? "." name))
+                                     (let ((attrs (file-attributes (path-join dir name))))
+                                       (if (and attrs (eq? (car attrs) 'directory))
+                                           (walk (path-join relative name) (+ depth 1))
+                                           '()))
+                                     '())))
                              (directory-list dir)))))))))
