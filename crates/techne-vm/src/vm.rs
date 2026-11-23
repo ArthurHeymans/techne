@@ -2898,9 +2898,10 @@ impl Vm {
             }
             Sexp::Vector(items) => {
                 let vals: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();
+                let fix = if vals.iter().all(|v| v.is_int()) { heap::VECTOR_FIXNUM } else { 0 };
                 let p = self.heap.alloc_old_unremembered(1 + vals.len());
                 unsafe {
-                    *p = header(Kind::Vector, vals.len(), labels.flags);
+                    *p = header(Kind::Vector, vals.len(), labels.flags | fix);
                     for (i, v) in vals.into_iter().enumerate() {
                         set_field(p, i, v);
                     }
@@ -3008,6 +3009,62 @@ impl Vm {
             return self.heap.bump(words);
         }
         self.alloc_slow(words)
+    }
+
+    #[inline(always)]
+    pub(crate) fn alloc_fast(&mut self, words: usize) -> *mut u64 {
+        unsafe {
+            let top = self.heap.top;
+            let next = top.add(words);
+            if next <= self.heap.jit_limit {
+                self.heap.top = next;
+                return top;
+            }
+        }
+        self.alloc(words)
+    }
+
+    /// Fast single-pass nursery append for 2-argument `append` on short proper lists.
+    #[inline(always)]
+    pub(crate) fn append2_fast(&mut self, a: Value, tail: Value) -> Option<Value> {
+        if a == Value::NIL {
+            return Some(tail);
+        }
+        const FAST_MAX: usize = 16;
+        let mut buf = [Value::NIL; FAST_MAX];
+        let mut len = 0;
+        let mut cur = a;
+        while is_kind(cur, Kind::Pair) && len < FAST_MAX {
+            unsafe {
+                let p = cur.as_ptr();
+                buf[len] = field(p, 0);
+                cur = field(p, 1);
+            }
+            len += 1;
+        }
+        if cur != Value::NIL {
+            return None;
+        }
+        let words = 3 * len;
+        unsafe {
+            let top = self.heap.top;
+            let next = top.add(words);
+            if next <= self.heap.jit_limit {
+                self.heap.top = next;
+                let mut acc = tail;
+                let mut dst = top;
+                let h = header(Kind::Pair, 2, 0);
+                for &car in buf[..len].iter().rev() {
+                    *dst = h;
+                    *dst.add(1) = car.bits();
+                    *dst.add(2) = acc.bits();
+                    acc = Value::ptr(dst);
+                    dst = dst.add(3);
+                }
+                return Some(acc);
+            }
+        }
+        None
     }
 
     /// `words` in the nursery (collecting first if needed); for blocks that
@@ -3352,11 +3409,13 @@ impl Vm {
         self.scratch.extend_from_slice(items);
         let words = 1 + items.len();
         let p = if words >= LARGE_WORDS { self.heap.alloc_old(words) } else { self.alloc(words) };
+        let mut all_int = true;
         unsafe {
-            *p = header(Kind::Vector, items.len(), 0);
             for (i, v) in self.scratch.drain(mark..).enumerate() {
+                all_int &= v.is_int();
                 set_field(p, i, v);
             }
+            *p = header(Kind::Vector, items.len(), if all_int { heap::VECTOR_FIXNUM } else { 0 });
         }
         Value::ptr(p)
     }
@@ -3415,6 +3474,11 @@ impl Vm {
     #[inline(always)]
     pub(crate) fn write_barrier(&mut self, obj: *mut u64, v: Value) {
         self.heap.barrier(obj, v);
+    }
+
+    #[inline(always)]
+    pub(crate) fn write_barrier_slot(&mut self, obj: *mut u64, slot: *mut u64, v: Value) {
+        self.heap.barrier_slot(obj, slot, v);
     }
 
     // ----- running code -----
@@ -4847,15 +4911,13 @@ impl Vm {
                             let mut slice = POLL_SLICE;
                             let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut slice };
                             let vm = self as *mut Vm;
-                            let (heap_top, heap_end) = self.heap.bump_pointers();
+                            self.heap.sync_jit_limit();
                             let mut ctx = crate::jit::JitCtx {
                                 globals: self.globals.as_mut_ptr(),
                                 code_table: self.code_ptrs.as_ptr(),
                                 regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
                                 fuel: fuel_ptr,
                                 stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
-                                heap_top,
-                                heap_end,
                                 code,
                                 bp: bp as u64,
                                 tail: 0,
@@ -5108,8 +5170,15 @@ impl Vm {
                             {
                                 fail!(crate::builtins::vector_set_error(vec, k));
                             }
-                            set_field(vec.as_ptr(), k.as_int() as usize, val);
-                            self.write_barrier(vec.as_ptr(), val);
+                            let idx = k.as_int() as usize;
+                            let vp = vec.as_ptr();
+                            if !val.is_int() {
+                                *vp &= !heap::VECTOR_FIXNUM;
+                                set_field(vp, idx, val);
+                                self.write_barrier_slot(vp, vp.add(1 + idx), val);
+                            } else {
+                                set_field(vp, idx, val);
+                            }
                         }
 
                         Op::CallG { base, n, g } | Op::TailCallG { base, n, g } => {
@@ -5357,6 +5426,9 @@ impl Vm {
         // frame, unless a `guard` landing in this function could read its
         // registers.
         let handlers = orig.iter().any(|op| matches!(op, Op::PushHandler { .. } | Op::PushEscape { .. }));
+        let caller_recursive = orig.iter().any(|op| {
+            matches!(*op, Op::CallG { g, .. } if self.globals.get(g as usize).is_some_and(|&v| is_kind(v, Kind::Closure) && self.closure_code(v) == code))
+        });
         let mut inlined = crate::hash::Map::default();
         for (pc, op) in orig.iter().enumerate().filter(|_| jit_inlines()) {
             let inlinee = match *op {
@@ -5365,13 +5437,14 @@ impl Vm {
                         continue;
                     }
                     unsafe { self.jit_inlinee(g, n, 1, &mut vec![code], &known_native) }
+                        .filter(|inl| !(caller_recursive && inl.ops.iter().any(|o| matches!(o, Op::Loop { .. }))))
                 }
                 // Non-tail indirect calls keep their actual closure in
                 // the base register below the callee's registers. Tail
                 // indirect calls use the guarded compiled-call path.
                 Op::Call { n, .. } => closure_calls
                     .get(&(pc as u32))
-                    .and_then(|k| unsafe { self.jit_inline_code(k.code as *const Code, n, 1, &mut vec![code], &known_native) }),
+                    .and_then(|k| unsafe { self.jit_inline_code(k.code as *const Code, n, None, 1, &mut vec![code], &known_native) }),
                 _ => None,
             };
             if let Some(inlinee) = inlinee {
@@ -5426,6 +5499,17 @@ impl Vm {
         }
         let mut inlined_ops = Vec::new();
         inlined.values().for_each(|i| all_ops(i, &mut inlined_ops));
+        let is_fixnum_vec = |v: Value| is_kind(v, Kind::Vector) && unsafe { *v.as_ptr() & heap::VECTOR_FIXNUM != 0 };
+        let mut fixnum_vec_globals: Vec<u32> = orig
+            .iter()
+            .chain(inlined_ops.iter().copied())
+            .filter_map(|op| match *op {
+                Op::GetG { g, .. } if self.globals.get(g as usize).copied().is_some_and(is_fixnum_vec) => Some(g),
+                _ => None,
+            })
+            .collect();
+        fixnum_vec_globals.sort_unstable();
+        fixnum_vec_globals.dedup();
         let native_globals = orig
             .iter()
             .chain(inlined_ops)
@@ -5455,11 +5539,33 @@ impl Vm {
                 let frame = &self.regs[bp..(bp + len).min(self.regs.len())];
                 let of =
                     |p: fn(Value) -> bool| frame.iter().enumerate().filter(|(_, v)| p(**v)).map(|(r, _)| r as crate::code::Reg).collect();
-                crate::jit::Observed { head, fixnums: of(Value::is_int), floats: of(Value::is_float) }
+                let is_int64: fn(Value) -> bool = |v| {
+                    if v.is_int() {
+                        return true;
+                    }
+                    if !v.is_ptr() {
+                        return false;
+                    }
+                    let p = v.as_ptr();
+                    let h = unsafe { *p };
+                    if (h & 0xFF) != Kind::BigInt as u64 || crate::heap::header_len(h) != 1 {
+                        return false;
+                    }
+                    let mag = unsafe { *p.add(1) };
+                    if h & crate::heap::NEGATIVE != 0 { mag <= i64::MIN.unsigned_abs() } else { mag <= i64::MAX as u64 }
+                };
+                crate::jit::Observed {
+                    head,
+                    fixnums: of(Value::is_int),
+                    floats: of(Value::is_float),
+                    int64s: of(is_int64),
+                    fixnum_vecs: of(is_fixnum_vec),
+                }
             }),
             heads,
             captures,
             native_globals,
+            fixnum_vec_globals,
             closure_calls,
             native_calls,
             inlined,
@@ -5507,13 +5613,14 @@ impl Vm {
         if !is_kind(v, Kind::Closure) {
             return None;
         }
-        unsafe { self.jit_inline_code(self.closure_code(v), n, depth, outer, known_native) }
+        unsafe { self.jit_inline_code(self.closure_code(v), n, Some(g), depth, outer, known_native) }
     }
 
     unsafe fn jit_inline_code(
         &self,
         callee: *const Code,
         n: u16,
+        self_global: Option<u32>,
         depth: usize,
         outer: &mut Vec<*const Code>,
         known_native: &dyn Fn(u32) -> Option<crate::jit::KnownNative>,
@@ -5538,7 +5645,7 @@ impl Vm {
             }
             outer.pop();
         }
-        if !crate::jit::inlinable(ops, callee.nparams, callee.rest, n, known_native, &nested) {
+        if !crate::jit::inlinable(ops, callee.nparams, callee.rest, n, self_global, known_native, &nested) {
             return None;
         }
         let inlinee = crate::jit::Inlinee {
@@ -5547,6 +5654,7 @@ impl Vm {
             consts: callee.consts.iter().map(|v| v.bits()).collect(),
             consts_addr: callee.consts.as_ptr() as usize,
             frame_size: callee.frame_size,
+            self_global,
             inlined: nested,
         };
         (inlinee.size() <= crate::jit::INLINE_TOTAL).then_some(inlinee)

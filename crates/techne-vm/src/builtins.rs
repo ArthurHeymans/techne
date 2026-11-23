@@ -764,23 +764,43 @@ const WEAK: i64 = 4;
 /// Hash of `v` consistent with `equiv`: identity for objects the
 /// equivalence compares by identity, else their contents.
 #[inline(always)]
+fn mix64(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^ (h >> 33)
+}
+
+#[inline(always)]
 fn hash_key(vm: &mut Vm, v: Value, equiv: Equiv) -> u64 {
+    if !v.is_ptr() {
+        return mix64(v.bits());
+    }
+    if equiv == Equiv::Equal && is_kind(v, Kind::String) {
+        if let Some(short) = heap::fast_short_string_hash(v) {
+            return mix64(short);
+        }
+        let mut h = FxHasher::default();
+        heap::hash_string_into(v, &mut h);
+        return mix64(h.finish());
+    }
+    let mut h = FxHasher::default();
+    hash_into(vm, v, equiv, &mut h, &mut 32);
+    mix64(h.finish())
+}
+
+/// `hash`: consistent with `equal?`.
+pub(crate) fn equal_hash(vm: &mut Vm, v: Value) -> u64 {
     let mut h = FxHasher::default();
     if !v.is_ptr() {
         v.bits().hash(&mut h);
         return h.finish();
     }
-    if equiv == Equiv::Equal && is_kind(v, Kind::String) {
-        unsafe { str_bytes(v.as_ptr()) }.hash(&mut h);
+    if is_kind(v, Kind::String) {
+        heap::hash_string_into(v, &mut h);
         return h.finish();
     }
-    hash_into(vm, v, equiv, &mut h, &mut 32);
+    hash_into(vm, v, Equiv::Equal, &mut h, &mut 32);
     h.finish()
-}
-
-/// `hash`: consistent with `equal?`.
-pub(crate) fn equal_hash(vm: &mut Vm, v: Value) -> u64 {
-    hash_key(vm, v, Equiv::Equal)
 }
 
 /// Feeds `v` to `h`; `budget` bounds the nodes of a structure hashed, so
@@ -832,17 +852,20 @@ fn hash_into(vm: &mut Vm, v: Value, equiv: Equiv, h: &mut FxHasher, budget: &mut
     }
 }
 
-#[inline]
+#[inline(always)]
 fn same_key(a: Value, b: Value, equiv: Equiv) -> bool {
     // Immediates are the same exactly when their bits are.
-    a == b
-        || a.is_ptr()
-            && b.is_ptr()
-            && match equiv {
-                Equiv::Eq | Equiv::Custom => false,
-                Equiv::Eqv => eqv(a, b),
-                Equiv::Equal => equal(a, b),
-            }
+    if a == b {
+        return true;
+    }
+    if !a.is_ptr() || !b.is_ptr() {
+        return false;
+    }
+    match equiv {
+        Equiv::Eq | Equiv::Custom => false,
+        Equiv::Eqv => eqv(a, b),
+        Equiv::Equal => heap::fast_string_eq(a, b).unwrap_or_else(|| equal(a, b)),
+    }
 }
 
 /// Slot index of `key`, or of the slot where it would be inserted (the first
@@ -1034,17 +1057,49 @@ fn hash_delete(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(Value::VOID)
 }
 
-fn hash_ref(vm: &mut Vm, args: usize, _: usize) -> R {
-    let (slots, i) = find(vm, args, "hash-table-ref/default")?;
-    if !is_free(unsafe { field(slots, 2 * i) }) {
-        return Ok(unsafe { field(slots, 2 * i + 1) });
+/// Fast lookup-only probe for `hash-table-ref/default` and `hash-table-contains?`:
+/// does not track tombstones and returns the matched value directly.
+#[inline(always)]
+unsafe fn probe_lookup(slots: *mut u64, key: Value, hash: u64, equiv: Equiv) -> Option<Value> {
+    unsafe {
+        let mask = (len_of(slots) / 2).saturating_sub(1);
+        let mut i = (hash as usize) & mask;
+        for _ in 0..=mask {
+            let k = field(slots, 2 * i);
+            if k == Value::EMPTY {
+                return None;
+            }
+            if k != Value::UNDEFINED && same_key(k, key, equiv) {
+                return Some(field(slots, 2 * i + 1));
+            }
+            i = (i + 1) & mask;
+        }
+        None
     }
-    Ok(arg(vm, args, 2))
+}
+
+fn hash_ref(vm: &mut Vm, args: usize, _: usize) -> R {
+    let t = table_arg(arg(vm, args, 0), "hash-table-ref/default")?;
+    let (equiv, _) = table_mode(t);
+    if equiv == Equiv::Custom {
+        let operands = [arg(vm, args, 0), arg(vm, args, 1), Value::int_unchecked(0), arg(vm, args, 2)];
+        return Err(scheme_call(vm, "%custom-table-op", &operands));
+    }
+    let key = arg(vm, args, 1);
+    let hash = hash_key(vm, key, equiv);
+    Ok(unsafe { probe_lookup(field(t, 1).as_ptr(), key, hash, equiv) }.unwrap_or_else(|| arg(vm, args, 2)))
 }
 
 fn hash_contains(vm: &mut Vm, args: usize, _: usize) -> R {
-    let (slots, i) = find(vm, args, "hash-table-contains?")?;
-    Ok(Value::bool(!is_free(unsafe { field(slots, 2 * i) })))
+    let t = table_arg(arg(vm, args, 0), "hash-table-contains?")?;
+    let (equiv, _) = table_mode(t);
+    if equiv == Equiv::Custom {
+        let operands = [arg(vm, args, 0), arg(vm, args, 1), Value::int_unchecked(1), Value::FALSE];
+        return Err(scheme_call(vm, "%custom-table-op", &operands));
+    }
+    let key = arg(vm, args, 1);
+    let hash = hash_key(vm, key, equiv);
+    Ok(Value::bool(unsafe { probe_lookup(field(t, 1).as_ptr(), key, hash, equiv) }.is_some()))
 }
 
 fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1086,9 +1141,11 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
             changed!(t);
             vm.write_barrier(t, Value::ptr(new));
         }
-        let (slots, i) = find(vm, args, "hash-table-set!")?;
         let t = arg(vm, args, 0).as_ptr();
         let (key, value) = (arg(vm, args, 1), arg(vm, args, 2));
+        let hash = hash_key(vm, key, equiv);
+        let slots = field(t, 1).as_ptr();
+        let i = probe(slots, key, hash, equiv);
         let k = field(slots, 2 * i);
         if is_free(k) {
             set_field(t, 0, Value::int_unchecked(field(t, 0).as_int() + 1));
@@ -1097,10 +1154,14 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
                 set_field(t, 2, Value::int_unchecked(field(t, 2).as_int() + 1));
             }
             set_field(slots, 2 * i, key);
-            vm.write_barrier(slots, key);
+            if key.is_ptr() {
+                vm.write_barrier_slot(slots, slots.add(1 + 2 * i), key);
+            }
         }
         set_field(slots, 2 * i + 1, value);
-        vm.write_barrier(slots, value);
+        if value.is_ptr() {
+            vm.write_barrier_slot(slots, slots.add(2 + 2 * i), value);
+        }
     }
     Ok(Value::VOID)
 }
@@ -1157,10 +1218,10 @@ fn custom_finish(vm: &mut Vm, args: usize, _: usize) -> R {
                         set_field(t, 2, Value::int_unchecked(field(t, 2).as_int() + 1));
                     }
                     set_field(slots, 2 * i, key);
-                    vm.write_barrier(slots, key);
+                    vm.write_barrier_slot(slots, slots.add(1 + 2 * i), key);
                 }
                 set_field(slots, 2 * i + 1, value);
-                vm.write_barrier(slots, value);
+                vm.write_barrier_slot(slots, slots.add(2 + 2 * i), value);
                 Ok(Value::VOID)
             }
             _ => Err(Error::new("hash-table: unknown operation")),
@@ -1378,9 +1439,10 @@ unsafe fn write_int(i: i64, radix: u64, out: &mut [u8]) {
 }
 
 /// A fixnum `i` in `radix` (2 to 36), as a new string written in place.
+#[inline(always)]
 fn fixnum_string(vm: &mut Vm, i: i64, radix: u64) -> Value {
     let len = int_len(i, radix);
-    let p = vm.alloc(heap::string_words(len, true));
+    let p = vm.alloc_fast(heap::string_words(len, true));
     // SAFETY: `len` is `int_len(i, radix)`.
     unsafe { init_ascii_with(p, len, |out| write_int(i, radix, out)) };
     Value::ptr(p)
@@ -1532,6 +1594,11 @@ fn append(vm: &mut Vm, args: usize, n: usize) -> R {
     if n == 0 {
         return Ok(Value::NIL);
     }
+    if n == 2
+        && let Some(res) = vm.append2_fast(arg(vm, args, 0), arg(vm, args, 1))
+    {
+        return Ok(res);
+    }
     let total = (0..n - 1).map(|i| list_len(arg(vm, args, i), "append")).sum::<Result<usize, _>>()?;
     // Pairs, and the items gathered first.
     vm.admit_items(total, 32, 0)?;
@@ -1616,8 +1683,9 @@ fn make_vector(vm: &mut Vm, args: usize, n: usize) -> R {
     vm.admit_items(len, 8, 8)?;
     let p = Bulk::new(vm, 1 + len)?.take(vm, 1 + len);
     let fill = if n > 1 { arg(vm, args, 1) } else { Value::int_unchecked(0) };
+    let flags = if fill.is_int() { crate::heap::VECTOR_FIXNUM } else { 0 };
     unsafe {
-        *p = header(Kind::Vector, len, 0);
+        *p = header(Kind::Vector, len, flags);
         for i in 0..len {
             set_field(p, i, fill);
         }
@@ -1627,11 +1695,14 @@ fn make_vector(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn vector(vm: &mut Vm, args: usize, n: usize) -> R {
     let p = Bulk::new(vm, 1 + n)?.take(vm, 1 + n);
+    let mut all_int = true;
     unsafe {
-        *p = header(Kind::Vector, n, 0);
         for i in 0..n {
-            set_field(p, i, arg(vm, args, i));
+            let v = arg(vm, args, i);
+            all_int &= v.is_int();
+            set_field(p, i, v);
         }
+        *p = header(Kind::Vector, n, if all_int { crate::heap::VECTOR_FIXNUM } else { 0 });
     }
     Ok(Value::ptr(p))
 }
@@ -1661,19 +1732,26 @@ fn vector_set(vm: &mut Vm, args: usize, _: usize) -> R {
     if i >= unsafe { len_of(p) } {
         return Err(index_error("vector-set!", v, k));
     }
-    unsafe { set_field(p, i, x) };
-    vm.write_barrier(p, x);
+    unsafe {
+        if !x.is_int() {
+            *p &= !crate::heap::VECTOR_FIXNUM;
+        }
+        set_field(p, i, x);
+        vm.write_barrier_slot(p, p.add(1 + i), x);
+    }
     Ok(Value::VOID)
 }
 
 fn list_to_vector(vm: &mut Vm, args: usize, _: usize) -> R {
     let len = list_len(arg(vm, args, 0), "list->vector")?;
     let p = Bulk::new(vm, 1 + len)?.take(vm, 1 + len);
+    let mut all_int = true;
     unsafe {
-        *p = header(Kind::Vector, len, 0);
         for (i, x) in list_items(arg(vm, args, 0)).enumerate() {
+            all_int &= x.is_int();
             set_field(p, i, x);
         }
+        *p = header(Kind::Vector, len, if all_int { crate::heap::VECTOR_FIXNUM } else { 0 });
     }
     Ok(Value::ptr(p))
 }
@@ -2012,6 +2090,9 @@ fn vector_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
         return Err(Error::new("vector-copy!: not enough room in the target"));
     }
     let items: Vec<Value> = (a..b).map(|k| unsafe { field(from, k) }).collect();
+    if items.iter().any(|x| !x.is_int()) {
+        heap::clear_vector_fixnum(to);
+    }
     for (k, &x) in items.iter().enumerate() {
         unsafe { set_field(to, at + k, x) };
         vm.write_barrier(to, x);
@@ -2021,7 +2102,13 @@ fn vector_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn vector_fill_range(vm: &mut Vm, args: usize, n: usize) -> R {
     let (p, x) = (changeable(arg(vm, args, 0), Kind::Vector, "vector-fill!")?, arg(vm, args, 1));
-    let (a, b) = range_args(vm, args, n, 2, unsafe { len_of(p) }, "vector-fill!")?;
+    let len = unsafe { len_of(p) };
+    let (a, b) = range_args(vm, args, n, 2, len, "vector-fill!")?;
+    if !x.is_int() && a < b {
+        heap::clear_vector_fixnum(p);
+    } else if x.is_int() && a == 0 && b == len {
+        heap::set_vector_fixnum(p, true);
+    }
     for k in a..b {
         unsafe { set_field(p, k, x) };
     }

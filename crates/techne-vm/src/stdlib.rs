@@ -752,10 +752,13 @@ fn vector_copy(vm: &mut Vm, args: usize, n: usize) -> R {
     let p = Bulk::new(vm, 1 + end - start)?.take(vm, 1 + end - start);
     let v = arg(vm, args, 0).as_ptr();
     unsafe {
-        *p = header(Kind::Vector, end - start, 0);
+        let mut all_int = (*v & crate::heap::VECTOR_FIXNUM) != 0;
         for i in start..end {
-            set_field(p, i - start, field(v, i));
+            let x = field(v, i);
+            all_int &= x.is_int();
+            set_field(p, i - start, x);
         }
+        *p = header(Kind::Vector, end - start, if all_int { crate::heap::VECTOR_FIXNUM } else { 0 });
     }
     Ok(Value::ptr(p))
 }

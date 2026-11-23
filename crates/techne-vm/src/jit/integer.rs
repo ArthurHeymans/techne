@@ -9,7 +9,8 @@ pub(super) fn enabled() -> bool {
 }
 
 impl Gen {
-    fn integer_operand(&self, b: &mut FunctionBuilder, x: ir::Value, slow: Block) -> ir::Value {
+    /// Unbox a fixnum or 1-word signed `i64` BigInt into a raw `I64`, else jump to `slow`.
+    pub(super) fn unbox_i64(&self, b: &mut FunctionBuilder, x: ir::Value, slow: Block) -> ir::Value {
         let int = Self::is_int(b, x);
         let fix = b.create_block();
         let wide = b.create_block();
@@ -43,17 +44,102 @@ impl Gen {
         b.block_params(done)[0]
     }
 
-    pub(super) fn integer_add(&self, b: &mut FunctionBuilder, a: ir::Value, c: ir::Value, slow: Block) -> ir::Value {
+    /// Box a raw `i64` into a fixnum or 2-word nursery BigInt; if nursery is full,
+    /// runs `fallback` to produce the boxed Value.
+    pub(super) fn box_i64_with(
+        &self,
+        b: &mut FunctionBuilder,
+        n: ir::Value,
+        fallback: impl FnOnce(&Self, &mut FunctionBuilder, ir::Value) -> ir::Value,
+    ) -> ir::Value {
+        let small = Self::fits48(b, n);
+        let fix = b.create_block();
+        let wide = b.create_block();
+        let slow_box = b.create_block();
+        let done = b.create_block();
+        b.set_cold_block(slow_box);
+        b.append_block_param(done, I64);
+        b.ins().brif(small, fix, &[], wide, &[]);
+        b.switch_to_block(fix);
+        let shifted = Self::shifted(b, n);
+        let value = Self::tag_shifted(b, shifted);
+        b.ins().jump(done, &[BlockArg::Value(value)]);
+        b.switch_to_block(wide);
+        let p = self.alloc_words(b, 2, slow_box);
+        let negative = b.ins().icmp_imm_s(IntCC::SignedLessThan, n, 0);
+        let zero = b.ins().iconst(I64, 0);
+        let sign = b.ins().iconst(I64, crate::heap::NEGATIVE as i64);
+        let sign = b.ins().select(negative, sign, zero);
+        let h = b.ins().bor_imm_s(sign, header(Kind::BigInt, 1, 0) as i64);
+        let negated = b.ins().ineg(n);
+        let magnitude = b.ins().select(negative, negated, n);
+        b.ins().store(flags(), h, p, 0);
+        b.ins().store(flags(), magnitude, p, 8);
+        let value = Self::tag_ptr(b, p);
+        b.ins().jump(done, &[BlockArg::Value(value)]);
+        b.switch_to_block(slow_box);
+        let value = fallback(self, b, n);
+        b.ins().jump(done, &[BlockArg::Value(value)]);
+        b.switch_to_block(done);
+        b.block_params(done)[0]
+    }
+
+    pub(super) fn box_i64_call(&self, b: &mut FunctionBuilder, n: ir::Value) -> ir::Value {
+        self.box_i64_with(b, n, |g, b, n| g.call(b, g.sigs.box_i64, jit_box_i64 as *const (), &[g.vm, n]).unwrap())
+    }
+
+    pub(super) fn integer_add(&self, b: &mut FunctionBuilder, pc: usize, base: Reg, a: ir::Value, c: ir::Value, slow: Block) -> ir::Value {
         if std::env::var_os("TECHNE_JIT_LOG").is_some() {
             eprintln!("jit-wide-add: code={:x}", self.code_ptr);
         }
+        let kf = self.floats_known(b, pc, base + 1, base + 2);
+        if kf.0.is_some() || kf.1.is_some() {
+            let xn = self.num(b, pc, base + 1);
+            let yn = self.num(b, pc, base + 2);
+            let fa = Self::as_f64(b, xn, kf.0, slow);
+            let fb = Self::as_f64(b, yn, kf.1, slow);
+            let sum = if self.fix[pc].contains(base + 1) || self.fix[pc].contains(base + 2) {
+                b.ins().fadd(fa, fb)
+            } else {
+                let zero = b.ins().f64const(0.0);
+                let fa = b.ins().fadd(zero, fa);
+                b.ins().fadd(fa, fb)
+            };
+            if self.flo.get(pc + 1).is_some_and(|f| f.contains(base)) {
+                b.def_var(self.fvals[base as usize], sum);
+            }
+            return Self::from_f(b, sum);
+        }
+
+        let want_i64 = self.i64s.get(pc + 1).is_some_and(|s| s.contains(base));
         let raw = (a, c);
-        let floating = b.create_block();
-        let a = self.integer_operand(b, a, floating);
-        let c = self.integer_operand(b, c, floating);
-        let (n, overflow) = b.ins().sadd_overflow(a, c);
-        let ok = b.ins().icmp_imm_s(IntCC::Equal, overflow, 0);
-        Self::guard(b, ok, slow);
+        let floating = if want_i64 {
+            slow
+        } else {
+            let blk = b.create_block();
+            b.set_cold_block(blk);
+            blk
+        };
+        let load_op = |b: &mut FunctionBuilder, r: Reg, x: ir::Value| {
+            if self.i64s[pc].contains(r) {
+                b.use_var(self.ivals[r as usize])
+            } else if self.fix[pc].contains(r) {
+                let s = b.use_var(self.shifts[r as usize]);
+                b.ins().sshr_imm_s(s, 16)
+            } else {
+                self.unbox_i64(b, x, floating)
+            }
+        };
+        let a_i = load_op(b, base + 1, a);
+        let c_i = load_op(b, base + 2, c);
+        let (n, overflow) = b.ins().sadd_overflow(a_i, c_i);
+        let ok = b.create_block();
+        b.ins().brif(overflow, slow, &[], ok, &[]);
+        b.switch_to_block(ok);
+        if want_i64 {
+            b.def_var(self.ivals[base as usize], n);
+            return b.ins().iconst(I64, 0);
+        }
         let small = Self::fits48(b, n);
         let fix = b.create_block();
         let wide = b.create_block();
