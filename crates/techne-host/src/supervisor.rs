@@ -86,7 +86,11 @@ use crate::{
     ask::Asker,
     body::{self, DataValue, Piece, Reader},
     outbound::Service,
-    wire::{BUNDLE_BYTES, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, encode, read_frame, write_encoded},
+    package::{CloudTarget, PackageSpec, TreeCache, load_verified_packaged_trees, prepare_packaged_bundle, resolve_cloud_target},
+    wire::{
+        BUNDLE_BYTES, BundledPackage, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, decode_packages, decode_root_package, encode,
+        encode_packages, encode_root_package, read_frame, write_encoded,
+    },
     worker,
 };
 
@@ -244,25 +248,45 @@ impl Bindings {
     }
 }
 
+struct DecodedBundle {
+    name: String,
+    entry: String,
+    files: Vec<(String, Vec<u8>)>,
+    bindings: Bindings,
+    root_package: Option<(String, String)>,
+    packages: Vec<BundledPackage>,
+}
+
 impl Bundle {
     /// All of it, as bytes to keep: `Bundle::decode` reads them.
     fn encode(&self) -> Vec<u8> {
-        encode(&Data::List(vec![
+        let mut items = vec![
             Data::String(self.name.clone()),
             Data::String(self.entry.clone()),
             Data::List(self.files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
             self.bindings.to_data(),
-        ]))
+        ];
+        if self.root_package.is_some() || !self.packages.is_empty() {
+            items.push(encode_root_package(&self.root_package));
+            items.push(encode_packages(&self.packages));
+        }
+        encode(&Data::List(items))
     }
 
-    /// The name, entry, files and bindings `bytes` keep.
-    #[allow(clippy::type_complexity)]
-    fn decode(bytes: &[u8]) -> Result<(String, String, Vec<(String, Vec<u8>)>, Bindings), String> {
+    /// The name, entry, files, bindings, and optional packages `bytes` keep.
+    fn decode(bytes: &[u8]) -> Result<DecodedBundle, String> {
         let bad = || "not a deployment's bundle".to_string();
         let Ok(Data::List(parts)) = crate::wire::decode(bytes) else { return Err(bad()) };
-        let [Data::String(name), Data::String(entry), Data::List(files), bindings] = &parts[..] else { return Err(bad()) };
-        let files = files
-            .iter()
+        if parts.len() != 4 && parts.len() != 6 {
+            return Err(bad());
+        }
+        let mut iter = parts.into_iter();
+        let Some(Data::String(name)) = iter.next() else { return Err(bad()) };
+        let Some(Data::String(entry)) = iter.next() else { return Err(bad()) };
+        let Some(Data::List(raw_files)) = iter.next() else { return Err(bad()) };
+        let Some(bindings_data) = iter.next() else { return Err(bad()) };
+        let files = raw_files
+            .into_iter()
             .map(|f| match f {
                 Data::List(f) => match &f[..] {
                     [Data::String(path), Data::Bytes(bytes)] => Ok((path.clone(), bytes.clone())),
@@ -271,7 +295,13 @@ impl Bundle {
                 _ => Err(bad()),
             })
             .collect::<Result<_, _>>()?;
-        Ok((name.clone(), entry.clone(), files, Bindings::from_data(bindings)?))
+        let bindings = Bindings::from_data(&bindings_data)?;
+        let (root_package, packages) = match (iter.next(), iter.next()) {
+            (Some(rp), Some(pkgs)) => (decode_root_package(rp).map_err(|_| bad())?, decode_packages(pkgs).map_err(|_| bad())?),
+            (None, None) => (None, Vec::new()),
+            _ => return Err(bad()),
+        };
+        Ok(DecodedBundle { name, entry, files, bindings, root_package, packages })
     }
 }
 
@@ -356,7 +386,8 @@ impl Drop for Repl {
 }
 
 /// What a deployment's worker is given: its name and id, entry, and
-/// files, and its bindings, of which the worker is given the `env`.
+/// files (or structured packages), and its bindings, of which the worker
+/// is given the `env`.
 #[derive(Clone)]
 struct Bundle {
     name: String,
@@ -364,6 +395,8 @@ struct Bundle {
     entry: String,
     files: Vec<(String, Vec<u8>)>,
     bindings: Bindings,
+    root_package: Option<(String, String)>,
+    packages: Vec<BundledPackage>,
 }
 
 impl Bundle {
@@ -379,17 +412,51 @@ fn served(name: &str, id: &str) -> String {
 }
 
 /// The id of a deployment: a hash of all it is.
-fn deployment_id(name: &str, entry: &str, files: &[(String, Vec<u8>)], bindings: &Bindings) -> String {
+fn deployment_id(
+    name: &str,
+    entry: &str,
+    files: &[(String, Vec<u8>)],
+    bindings: &Bindings,
+    root_package: &Option<(String, String)>,
+    packages: &[BundledPackage],
+) -> String {
     use sha2::Digest;
     let mut stores: Vec<_> = bindings.stores.iter().collect();
     stores.sort();
-    let all = Data::List(vec![
-        Data::String(name.into()),
-        Data::String(entry.into()),
-        Data::List(files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
-        bindings.env.clone(),
-        Data::List(stores.into_iter().map(|(b, n)| Data::List(vec![Data::String(b.clone()), Data::String(n.clone())])).collect()),
-    ]);
+    let stores_data =
+        Data::List(stores.into_iter().map(|(b, n)| Data::List(vec![Data::String(b.clone()), Data::String(n.clone())])).collect());
+    let files_data = Data::List(files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect());
+    let all = if root_package.is_none() && packages.is_empty() {
+        Data::List(vec![Data::String(name.into()), Data::String(entry.into()), files_data, bindings.env.clone(), stores_data])
+    } else {
+        let mut sorted_pkgs: Vec<&BundledPackage> = packages.iter().collect();
+        sorted_pkgs.sort_by(|a, b| (&a.owner, &a.pkg).cmp(&(&b.owner, &b.pkg)));
+        let pkgs_data = Data::List(
+            sorted_pkgs
+                .into_iter()
+                .map(|p| {
+                    let mut deps = p.depends.clone();
+                    deps.sort();
+                    Data::List(vec![
+                        Data::String(p.owner.clone()),
+                        Data::String(p.pkg.clone()),
+                        Data::String(p.tree_sha256.clone()),
+                        Data::List(deps.into_iter().map(|(o, k)| Data::List(vec![Data::String(o), Data::String(k)])).collect()),
+                    ])
+                })
+                .collect(),
+        );
+        Data::List(vec![
+            Data::Symbol("packaged".into()),
+            Data::String(name.into()),
+            encode_root_package(root_package),
+            Data::String(entry.into()),
+            pkgs_data,
+            files_data,
+            bindings.env.clone(),
+            stores_data,
+        ])
+    };
     // The whole digest: an id is what tells two deployments apart.
     sha2::Sha256::digest(encode(&all)).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -517,6 +584,8 @@ struct State {
     next_cid: u64,
     /// Fetches being made.
     fetching: usize,
+    /// Immutable verified package trees cached in memory by canonical `tree-sha256`.
+    tree_cache: TreeCache,
     on_failure: Box<dyn FnMut(&Failure)>,
     on_output: Box<dyn FnMut(&Printed)>,
 }
@@ -661,9 +730,7 @@ pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
         })();
         async move {
             let (me, name, entry) = asked?;
-            let entry = Path::new(&entry);
-            let bindings = read_bindings(entry.parent().unwrap_or(Path::new("/"))).map_err(Error::new)?;
-            me.prepare(&name, entry, bindings).await.map(listed).map_err(Error::new)
+            me.prepare_directory(&name, Path::new(&entry)).await.map(listed).map_err(Error::new)
         }
     });
     let of = resolve.clone();
@@ -681,6 +748,30 @@ pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
         }
     });
     let of = resolve.clone();
+    front.register_async("%cloud-prepare-packaged", 6, move |vm, args| {
+        let asked = (|| {
+            let name = args.get::<String>(vm, 0)?;
+            let source_dir = args.get::<String>(vm, 1)?;
+            let trees_dir = args.get::<String>(vm, 2)?;
+            let entry = args.get::<String>(vm, 3)?;
+            let root_val = args.value(vm, 4)?;
+            let specs_val = args.value(vm, 5)?;
+            let root_data = vm.to_data(&root_val, 4096)?;
+            let specs_data = vm.to_data(&specs_val, crate::REQUEST_BYTES)?;
+            let root_package = parse_pair(&root_data).map_err(Error::new)?;
+            let specs = parse_package_specs(&specs_data).map_err(Error::new)?;
+            let (me, name) = of(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, source_dir, trees_dir, entry, root_package, specs))
+        })();
+        async move {
+            let (me, name, source_dir, trees_dir, entry, root_package, specs) = asked?;
+            me.prepare_packaged_from_trees(&name, Path::new(&source_dir), Path::new(&trees_dir), &entry, root_package, &specs)
+                .await
+                .map(listed)
+                .map_err(Error::new)
+        }
+    });
+    let of = resolve.clone();
     front.register_async("%cloud-prepare-bundle", 2, move |vm, args| {
         let asked = (|| {
             let (name, bytes) = (args.get::<String>(vm, 0)?, args.get::<Bytes>(vm, 1)?.0);
@@ -692,11 +783,14 @@ pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
             if bytes.len() > MAX_FRAME {
                 return Err(Error::new("the bundle is larger than a deployment may be"));
             }
-            let (kept, entry, files, bindings) = Bundle::decode(&bytes).map_err(Error::new)?;
-            if kept != name {
-                return Err(Error::new(format!("the bundle is a deployment of {kept}, not {name}")));
+            let decoded = Bundle::decode(&bytes).map_err(Error::new)?;
+            if decoded.name != name {
+                return Err(Error::new(format!("the bundle is a deployment of {}, not {name}", decoded.name)));
             }
-            me.prepare_files(&name, &entry, files, bindings).await.map(listed).map_err(Error::new)
+            me.prepare_bundle(&name, &decoded.entry, decoded.files, decoded.bindings, decoded.root_package, decoded.packages)
+                .await
+                .map(listed)
+                .map_err(Error::new)
         }
     });
     let of = resolve.clone();
@@ -718,6 +812,30 @@ pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
     front.register_fn("%cloud-bundle", move |name: String, id: String| -> DataValue {
         DataValue(resolve(&name).ok().and_then(|(me, name)| me.bundle_of(&name, &id)).map_or(Data::Bool(false), Data::Bytes))
     });
+}
+
+fn parse_pair(data: &Data) -> Result<(String, String), String> {
+    let Data::List(items) = data else { return Err("expected a (owner pkg) pair of strings".into()) };
+    let [Data::String(owner), Data::String(pkg)] = &items[..] else {
+        return Err("expected a (owner pkg) pair of strings".into());
+    };
+    Ok((owner.clone(), pkg.clone()))
+}
+
+fn parse_package_specs(data: &Data) -> Result<Vec<PackageSpec>, String> {
+    let bad = || "expected package specs as ((owner pkg tree-sha256 depends) ...)".to_string();
+    let Data::List(items) = data else { return Err(bad()) };
+    items
+        .iter()
+        .map(|entry| {
+            let Data::List(parts) = entry else { return Err(bad()) };
+            let [Data::String(owner), Data::String(pkg), Data::String(tree_sha256), Data::List(dep_items)] = &parts[..] else {
+                return Err(bad());
+            };
+            let depends = dep_items.iter().map(parse_pair).collect::<Result<Vec<_>, _>>()?;
+            Ok(PackageSpec { owner: owner.clone(), pkg: pkg.clone(), tree_sha256: tree_sha256.clone(), depends })
+        })
+        .collect()
 }
 
 /// Kill worker `w`, all of it.
@@ -815,6 +933,7 @@ impl Supervisor {
                 repls: HashMap::new(),
                 next_cid: 0,
                 fetching: 0,
+                tree_cache: HashMap::new(),
                 on_failure: Box::new(|f| eprintln!("techne cloud: {} #{}: {} {}", f.deployment, f.request, f.status, f.message)),
                 on_output: Box::new(|p| {
                     for line in p.output.text.lines() {
@@ -1081,13 +1200,6 @@ impl Supervisor {
                 Ok(s) => format!("the worker ended ({s})"),
                 Err(e) => format!("the worker is gone: {e}"),
             };
-            // One not sandboxed wrote its deployments' files where they
-            // outlast it, in a directory named by its pid: removed, so
-            // that workers started and stopped leave nothing.
-            if !sandbox {
-                let tmp = me.options.env.iter().find(|(k, _)| k == "TMPDIR").map_or("/tmp".into(), |(_, v)| PathBuf::from(v));
-                let _ = std::fs::remove_dir_all(tmp.join(format!("bundles-{pid}")));
-            }
             me.end_worker(generation, &why);
         });
         self.state.borrow_mut().worker = Some(Running { generation, send, pidfd, cgroup });
@@ -1572,21 +1684,59 @@ impl Supervisor {
         Ok(prepared.output)
     }
 
-    /// Have the worker load the deployment whose entry module is `entry`,
-    /// for `name`, with `bindings`, its files those under the entry's
-    /// directory as [`Supervisor::deploy`] takes them: its id, by which
-    /// to publish it. Nothing served changes; one that does not load is
-    /// an error and no more. The same deployment prepared again is the
-    /// one there is.
-    pub async fn prepare(&self, name: &str, entry: &Path, bindings: Bindings) -> Result<Prepared, String> {
-        let dir = entry.parent().ok_or("an entry in no directory")?;
-        let files = bundle(dir)?;
-        let entry = entry.strip_prefix(dir).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
-        self.prepare_files(name, &entry, files, bindings).await
+    /// Whether `tree_sha256` is cached in this supervisor's in-memory verified
+    /// package-tree cache.
+    pub fn has_cached_tree(&self, tree_sha256: &str) -> bool {
+        self.state.borrow().tree_cache.contains_key(tree_sha256)
     }
 
-    /// [`Supervisor::prepare`], of `files` given, by their paths, `entry`
-    /// among them.
+    /// Have the worker load the deployment at `target` (either a legacy entry
+    /// file or a packaged cloud app directory / entry inside one), reading
+    /// `manifest.scm` + `.secrets.scm` and validating declared `(cloud ...)`
+    /// bindings for packaged deployments.
+    pub async fn prepare_directory(&self, name: &str, target: &Path) -> Result<Prepared, String> {
+        match resolve_cloud_target(target)? {
+            CloudTarget::Legacy { entry } => {
+                let bindings = read_bindings(entry.parent().unwrap_or(Path::new("/")))?;
+                self.prepare(name, &entry, bindings).await
+            }
+            CloudTarget::Package { root_dir, explicit_entry } => {
+                let app = {
+                    let mut s = self.state.borrow_mut();
+                    prepare_packaged_bundle(&root_dir, explicit_entry.as_deref(), Some(&mut s.tree_cache))?
+                };
+                let bindings = read_bindings_with_contract(&app.root_dir, &app.declared_bindings)?;
+                self.prepare_packaged(name, &app.entry, app.root_package, app.packages, bindings).await
+            }
+        }
+    }
+
+    /// Have the worker load the deployment whose entry module or package
+    /// directory is `entry`, for `name`, with `bindings`, its files those
+    /// under the entry's directory (or locked package closure for packaged
+    /// apps): its id, by which to publish it. Nothing served changes; one
+    /// that does not load is an error and no more. The same deployment
+    /// prepared again is the one there is.
+    pub async fn prepare(&self, name: &str, entry: &Path, bindings: Bindings) -> Result<Prepared, String> {
+        match resolve_cloud_target(entry)? {
+            CloudTarget::Legacy { entry } => {
+                let dir = entry.parent().ok_or("an entry in no directory")?;
+                let files = bundle(dir)?;
+                let entry = entry.strip_prefix(dir).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+                self.prepare_files(name, &entry, files, bindings).await
+            }
+            CloudTarget::Package { root_dir, explicit_entry } => {
+                let app = {
+                    let mut s = self.state.borrow_mut();
+                    prepare_packaged_bundle(&root_dir, explicit_entry.as_deref(), Some(&mut s.tree_cache))?
+                };
+                self.prepare_packaged(name, &app.entry, app.root_package, app.packages, bindings).await
+            }
+        }
+    }
+
+    /// [`Supervisor::prepare`], of legacy `files` given, by their paths,
+    /// `entry` among them.
     pub async fn prepare_files(
         &self,
         name: &str,
@@ -1594,10 +1744,55 @@ impl Supervisor {
         files: Vec<(String, Vec<u8>)>,
         bindings: Bindings,
     ) -> Result<Prepared, String> {
+        self.prepare_bundle(name, entry, files, bindings, None, Vec::new()).await
+    }
+
+    /// [`Supervisor::prepare`], of a verified closed package graph rooted at
+    /// `root_package` with relative `entry`.
+    pub async fn prepare_packaged(
+        &self,
+        name: &str,
+        entry: &str,
+        root_package: (String, String),
+        packages: Vec<BundledPackage>,
+        bindings: Bindings,
+    ) -> Result<Prepared, String> {
+        self.prepare_bundle(name, entry, Vec::new(), bindings, Some(root_package), packages).await
+    }
+
+    /// Verify and load packaged trees stored under `trees_dir`, validate
+    /// `source_dir/manifest.scm` + `.secrets.scm` against the root package's
+    /// `(cloud ...)` bindings contract, and prepare the deployment.
+    pub async fn prepare_packaged_from_trees(
+        &self,
+        name: &str,
+        source_dir: &Path,
+        trees_dir: &Path,
+        entry: &str,
+        root_package: (String, String),
+        specs: &[PackageSpec],
+    ) -> Result<Prepared, String> {
+        let (packages, declared) = {
+            let mut s = self.state.borrow_mut();
+            load_verified_packaged_trees(trees_dir, entry, &root_package, specs, Some(&mut s.tree_cache))?
+        };
+        let bindings = read_bindings_with_contract(source_dir, &declared)?;
+        self.prepare_packaged(name, entry, root_package, packages, bindings).await
+    }
+
+    async fn prepare_bundle(
+        &self,
+        name: &str,
+        entry: &str,
+        files: Vec<(String, Vec<u8>)>,
+        bindings: Bindings,
+        root_package: Option<(String, String)>,
+        packages: Vec<BundledPackage>,
+    ) -> Result<Prepared, String> {
         if name.is_empty() || name.contains('@') {
             return Err(format!("{name}: not a deployment's name"));
         }
-        let id = deployment_id(name, entry, &files, &bindings);
+        let id = deployment_id(name, entry, &files, &bindings, &root_package, &packages);
         let key = served(name, &id);
         if self.sleeping() || self.state.borrow().waking {
             self.awake().await?;
@@ -1624,7 +1819,10 @@ impl Supervisor {
                 Ok(loaded) => loaded.map_err(|_| "the worker is gone".to_string())?,
                 Err(_) => Err("the worker did not load it in time".into()),
             },
-            None => self.send_deploy(Bundle { name: name.into(), id: id.clone(), entry: entry.into(), files, bindings }).await,
+            None => {
+                self.send_deploy(Bundle { name: name.into(), id: id.clone(), entry: entry.into(), files, bindings, root_package, packages })
+                    .await
+            }
         };
         output.map(|output| Prepared { id, output })
     }
@@ -1742,6 +1940,8 @@ impl Supervisor {
                 wall_ms: self.options.wall.as_millis() as u64,
                 dev: self.options.dev,
                 env: bundle.bindings.env.clone(),
+                root_package: bundle.root_package.clone(),
+                packages: bundle.packages.clone(),
             };
             s.deploys.insert(id, (bundle, tx));
             let _ = send.send(message);

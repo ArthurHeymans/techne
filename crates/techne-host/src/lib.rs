@@ -80,6 +80,7 @@ pub mod body;
 pub mod egress;
 pub mod fleet;
 pub mod outbound;
+pub mod package;
 pub mod supervisor;
 pub mod wire;
 pub mod worker;
@@ -87,7 +88,7 @@ pub mod worker;
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    path::{Path, PathBuf},
+    path::Path,
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -97,6 +98,7 @@ pub use body::Response;
 use body::{Exchange, Reader};
 use techne_vm::{
     api::Value,
+    bundle::BundleVfs,
     data::Data,
     tasks::{LifetimeId, LifetimeLimits, Progress, TaskId},
     vm::{Capability, Error, Grants, Output, ROOT_MODULE, Snapshot, Vm},
@@ -205,6 +207,34 @@ impl Deployment {
     /// holds the thread, up to `limits.load`.
     pub async fn load_async(entry: &Path, limits: Limits) -> Result<Deployment, Error> {
         let mut loading = Loading::start(entry, limits)?;
+        loop {
+            match loading.step() {
+                Step::Done => return loading.finish(),
+                Step::Wait(d) => tokio::time::sleep(d).await,
+                Step::Again => tokio::task::yield_now().await,
+            }
+        }
+    }
+
+    /// Load the deployment whose entry module is `entry` directly from an
+    /// in-memory read-only [`BundleVfs`] without touching the OS filesystem
+    /// for user or package code. Enforces locked library resolution,
+    /// verifies `fetch`, revokes `Capability::Loading`, and snapshots with
+    /// zero OS `PathBuf`s.
+    pub fn load_bundle(bundle: Arc<BundleVfs>, entry: &str, limits: Limits) -> Result<Deployment, Error> {
+        let mut loading = Loading::start_bundle(bundle, entry, limits)?;
+        loop {
+            match loading.step() {
+                Step::Done => return loading.finish(),
+                Step::Wait(d) => std::thread::sleep(d),
+                Step::Again => {}
+            }
+        }
+    }
+
+    /// [`Deployment::load_bundle`], yielding to the runtime between slices.
+    pub async fn load_bundle_async(bundle: Arc<BundleVfs>, entry: &str, limits: Limits) -> Result<Deployment, Error> {
+        let mut loading = Loading::start_bundle(bundle, entry, limits)?;
         loop {
             match loading.step() {
                 Step::Done => return loading.finish(),
@@ -1012,7 +1042,7 @@ pub(crate) fn failed(status: u16) -> Data {
 /// of CPU and of wall time, a slice at a time ([`Loading::step`]).
 struct Loading {
     vm: Vm,
-    entry: PathBuf,
+    entry: String,
     limits: Limits,
     lifetime: LifetimeId,
     task: TaskId,
@@ -1041,6 +1071,24 @@ impl Loading {
             setup(&mut vm);
         }
         vm.confine_reading(entry.parent().unwrap_or(Path::new("/")))?;
+        let entry_str = entry.display().to_string();
+        Self::start_vm(vm, entry_str.clone(), &entry_str, limits)
+    }
+
+    fn start_bundle(bundle: Arc<BundleVfs>, entry: &str, limits: Limits) -> Result<Loading, Error> {
+        if limits.concurrency == 0 {
+            return Err(Error::new("a deployment serves one request at once at least"));
+        }
+        let entry_vpath = bundle.entry_virtual_path(entry)?.display().to_string();
+        let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        if let Some(setup) = WORLD_SETUP.get() {
+            setup(&mut vm);
+        }
+        vm.install_bundle(bundle);
+        Self::start_vm(vm, entry_vpath, entry, limits)
+    }
+
+    fn start_vm(mut vm: Vm, entry: String, require_target: &str, limits: Limits) -> Result<Loading, Error> {
         // Before the deployment's code: nothing of it changes what serves
         // its requests.
         body::install(&mut vm);
@@ -1054,8 +1102,8 @@ impl Loading {
         // Scheme loads the module from Scheme too, where its task can be
         // preempted and stopped (`eval` would load it as it compiles,
         // where it cannot).
-        let source = format!("(require {:?})", entry.display().to_string());
-        let prefixed = |e: Error| Error::new(format!("{}: {}", entry.display(), e.msg));
+        let source = format!("(require {require_target:?})");
+        let prefixed = |e: Error| Error::new(format!("{entry}: {}", e.msg));
         let load = vm.eval_source(&format!("(lambda () (eval-source {source:?} \"user\" \"<host>\"))")).map_err(prefixed)?;
         let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(limits.load), tasks: None });
         let task = vm.spawn_in(lifetime, &load).map_err(prefixed)?;
@@ -1091,7 +1139,7 @@ impl Loading {
     /// output taken, snapshotted. Nothing the loading made stays rooted
     /// from Rust.
     fn finish(mut self) -> Result<Deployment, Error> {
-        let entry = self.entry.display().to_string();
+        let entry = self.entry.clone();
         let usage = self.vm.end_lifetime(self.lifetime);
         let loaded = match usage {
             Some(u) if u.cpu_exceeded => Err(Error::new("it takes too long to load")),

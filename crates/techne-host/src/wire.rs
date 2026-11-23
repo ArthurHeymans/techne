@@ -12,7 +12,7 @@
 //! and one for each chunk it took on since. What waits for a slow reader
 //! waits in the sender's queue alone, bounded.
 
-use std::io;
+use std::{io, sync::Arc};
 
 use techne_vm::data::Data;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -36,12 +36,23 @@ const MAX_DEPTH: usize = 64;
 /// How many parts a message has, at most.
 const MAX_PARTS: usize = 1 << 20;
 
+/// One package in a structured deployment bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundledPackage {
+    pub owner: String,
+    pub pkg: String,
+    pub tree_sha256: String,
+    pub depends: Vec<(String, String)>,
+    pub files: Arc<Vec<(String, Vec<u8>)>>,
+}
+
 /// What the supervisor says.
 #[derive(Debug)]
 pub enum ToWorker {
     /// Load a deployment from its files, publish it as `name`, its
     /// requests given `env`: for development, its dev world with a REPL,
-    /// if `dev`.
+    /// if `dev`. When packaged (`root_package` is `Some`), `packages` holds
+    /// the complete closed package graph loaded into an in-memory `BundleVfs`.
     Deploy {
         id: u64,
         name: String,
@@ -50,6 +61,8 @@ pub enum ToWorker {
         wall_ms: u64,
         dev: bool,
         env: Data,
+        root_package: Option<(String, String)>,
+        packages: Vec<BundledPackage>,
     },
     /// The deployment published as `name` is the one its requests go to
     /// from now on: for development, its world is the REPL's.
@@ -197,19 +210,108 @@ fn int(n: u64) -> Data {
     Data::Int(n as i64)
 }
 
+pub(crate) fn encode_root_package(root_package: &Option<(String, String)>) -> Data {
+    match root_package {
+        Some((owner, pkg)) => Data::List(vec![Data::String(owner.clone()), Data::String(pkg.clone())]),
+        None => Data::Bool(false),
+    }
+}
+
+pub(crate) fn decode_root_package(d: Data) -> io::Result<Option<(String, String)>> {
+    match d {
+        Data::Bool(false) => Ok(None),
+        Data::List(items) => {
+            let mut p = Parts(items.into_iter());
+            let pair = (p.string()?, p.string()?);
+            if p.has_more() {
+                return Err(bad("a root package has two parts"));
+            }
+            Ok(Some(pair))
+        }
+        _ => Err(bad("a root package")),
+    }
+}
+
+pub(crate) fn encode_packages(packages: &[BundledPackage]) -> Data {
+    Data::List(
+        packages
+            .iter()
+            .map(|pkg| {
+                Data::List(vec![
+                    Data::String(pkg.owner.clone()),
+                    Data::String(pkg.pkg.clone()),
+                    Data::String(pkg.tree_sha256.clone()),
+                    Data::List(
+                        pkg.depends.iter().map(|(o, p)| Data::List(vec![Data::String(o.clone()), Data::String(p.clone())])).collect(),
+                    ),
+                    Data::List(pkg.files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
+                ])
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn decode_packages(d: Data) -> io::Result<Vec<BundledPackage>> {
+    let Data::List(items) = d else { return Err(bad("a package list")) };
+    items
+        .into_iter()
+        .map(|entry| {
+            let mut p = Parts::of(entry)?;
+            let owner = p.string()?;
+            let pkg = p.string()?;
+            let tree_sha256 = p.string()?;
+            let depends = p
+                .list()?
+                .into_iter()
+                .map(|dep| {
+                    let mut d = Parts::of(dep)?;
+                    let pair = (d.string()?, d.string()?);
+                    if d.has_more() {
+                        return Err(bad("a dependency name has two parts"));
+                    }
+                    Ok(pair)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let files = p
+                .list()?
+                .into_iter()
+                .map(|f| {
+                    let mut f = Parts::of(f)?;
+                    let pair = (f.string()?, f.bytes()?);
+                    if f.has_more() {
+                        return Err(bad("a file entry has two parts"));
+                    }
+                    Ok(pair)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            if p.has_more() {
+                return Err(bad("trailing parts in package"));
+            }
+            Ok(BundledPackage { owner, pkg, tree_sha256, depends, files: Arc::new(files) })
+        })
+        .collect()
+}
+
 impl ToWorker {
     pub fn to_data(&self) -> Data {
         match self {
-            ToWorker::Deploy { id, name, entry, files, wall_ms, dev, env } => Data::List(vec![
-                sym("deploy"),
-                int(*id),
-                Data::String(name.clone()),
-                Data::String(entry.clone()),
-                Data::List(files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
-                int(*wall_ms),
-                Data::Bool(*dev),
-                env.clone(),
-            ]),
+            ToWorker::Deploy { id, name, entry, files, wall_ms, dev, env, root_package, packages } => {
+                let mut items = vec![
+                    sym("deploy"),
+                    int(*id),
+                    Data::String(name.clone()),
+                    Data::String(entry.clone()),
+                    Data::List(files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
+                    int(*wall_ms),
+                    Data::Bool(*dev),
+                    env.clone(),
+                ];
+                if root_package.is_some() || !packages.is_empty() {
+                    items.push(encode_root_package(root_package));
+                    items.push(encode_packages(packages));
+                }
+                Data::List(items)
+            }
             ToWorker::Activate { name } => Data::List(vec![sym("activate"), Data::String(name.clone())]),
             ToWorker::Deactivate { name } => Data::List(vec![sym("deactivate"), Data::String(name.clone())]),
             ToWorker::Retire { name } => Data::List(vec![sym("retire"), Data::String(name.clone())]),
@@ -250,7 +352,10 @@ impl ToWorker {
                         Ok((f.string()?, f.bytes()?))
                     })
                     .collect::<io::Result<_>>()?;
-                ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()?, dev: p.flag()?, env: p.any()? }
+                let (wall_ms, dev, env) = (p.uint()?, p.flag()?, p.any()?);
+                let (root_package, packages) =
+                    if p.has_more() { (decode_root_package(p.any()?)?, decode_packages(p.any()?)?) } else { (None, Vec::new()) };
+                ToWorker::Deploy { id, name, entry, files, wall_ms, dev, env, root_package, packages }
             }
             "activate" => ToWorker::Activate { name: p.string()? },
             "deactivate" => ToWorker::Deactivate { name: p.string()? },
@@ -344,6 +449,9 @@ impl Parts {
             Data::List(items) => Ok(Parts(items.into_iter())),
             _ => Err(bad("a message is a list")),
         }
+    }
+    fn has_more(&self) -> bool {
+        self.0.len() > 0
     }
     fn any(&mut self) -> io::Result<Data> {
         self.0.next().ok_or_else(|| bad("a part missing"))
@@ -613,5 +721,58 @@ mod tests {
         assert!(decode(&[BOOL_TRUE, BOOL_TRUE]).is_err());
         assert!(decode(&[99]).is_err());
         assert!(FromWorker::from_data(Data::List(vec![Data::Symbol("response".into()), Data::Int(-1), Data::Int(0)])).is_err());
+    }
+
+    #[test]
+    fn deploy_wire_supports_legacy_and_packaged() {
+        let legacy = ToWorker::Deploy {
+            id: 1,
+            name: "app@1".into(),
+            entry: "app.scm".into(),
+            files: vec![("app.scm".into(), b"(provide fetch)".to_vec())],
+            wall_ms: 5000,
+            dev: false,
+            env: Data::Dict(vec![]),
+            root_package: None,
+            packages: vec![],
+        };
+        let encoded_legacy = encode(&legacy.to_data());
+        match ToWorker::from_data(decode(&encoded_legacy).unwrap()).unwrap() {
+            ToWorker::Deploy { root_package, packages, files, .. } => {
+                assert!(root_package.is_none());
+                assert!(packages.is_empty());
+                assert_eq!(files.len(), 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let packaged = ToWorker::Deploy {
+            id: 2,
+            name: "app@2".into(),
+            entry: "app.scm".into(),
+            files: vec![],
+            wall_ms: 5000,
+            dev: true,
+            env: Data::Dict(vec![]),
+            root_package: Some(("alice".into(), "app".into())),
+            packages: vec![BundledPackage {
+                owner: "alice".into(),
+                pkg: "app".into(),
+                tree_sha256: "a".repeat(64),
+                depends: vec![("bob".into(), "util".into())],
+                files: Arc::new(vec![("app.scm".into(), b"(provide fetch)".to_vec())]),
+            }],
+        };
+        let encoded_pkg = encode(&packaged.to_data());
+        match ToWorker::from_data(decode(&encoded_pkg).unwrap()).unwrap() {
+            ToWorker::Deploy { root_package, packages, dev, .. } => {
+                assert!(dev);
+                assert_eq!(root_package, Some(("alice".into(), "app".into())));
+                assert_eq!(packages.len(), 1);
+                assert_eq!(packages[0].owner, "alice");
+                assert_eq!(packages[0].depends, vec![("bob".into(), "util".into())]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

@@ -4,14 +4,14 @@
 //! tenant's.
 //!
 //! It waits for a byte from its supervisor (who puts it in its cgroup
-//! first), enters its sandbox, reading Techne's Lisp and writing only its
-//! tmpfs, says it is ready, and then serves: a deployment's files, sent
-//! to it, are written to a directory of their own in its tmpfs, each
-//! path checked to stay in it, and loaded from there; requests are
-//! answered as the host answers them; failures and output are reported
-//! to the supervisor. A Rust native that never looks for stops, holding
-//! the worker's thread past a kill, ends the worker (`STUCK`); the end of
-//! its socket, its supervisor gone, ends it too.
+//! first), enters its sandbox, reading Techne's Lisp and writing nothing
+//! of a deployment's sources to disk, says it is ready, and then serves:
+//! a deployment's files and packages, sent to it, are validated and loaded
+//! directly from an in-memory read-only [`techne_vm::bundle::BundleVfs`];
+//! requests are answered as the host answers them; failures and output are
+//! reported to the supervisor. A Rust native that never looks for stops,
+//! holding the worker's thread past a kill, ends the worker (`STUCK`); the
+//! end of its socket, its supervisor gone, ends it too.
 //!
 //! For development ([`Dev`]), a deployment is published to a dev world
 //! with a REPL server, whose clients the supervisor relays: each a
@@ -19,16 +19,20 @@
 //! A connection that falls behind what is sent to it is closed.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Read,
     os::fd::{FromRawFd, RawFd},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::ExitCode,
     rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
-use techne_vm::data::Data;
+use techne_vm::{
+    bundle::{BundlePackage, BundleVfs, PackagePrefix},
+    data::Data,
+};
 use tokio::{
     net::UnixStream,
     sync::{Semaphore, mpsc, oneshot},
@@ -38,7 +42,7 @@ use tokio::{
 use crate::{
     Deployment, Host, Limits,
     body::{self, Piece},
-    wire::{BUNDLE_BYTES, FromWorker, REPL_CHUNK, ToWorker, WINDOW, read_frame, write_frame},
+    wire::{BUNDLE_BYTES, BundledPackage, FromWorker, REPL_CHUNK, ToWorker, WINDOW, read_frame, write_frame},
 };
 
 /// A request being served: the task answering it, the queue its body
@@ -222,44 +226,29 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
     });
     let _ = tx.send(FromWorker::Ready);
     let running = Rc::new(std::cell::RefCell::new(HashMap::<u64, Serving>::new()));
-    // Where each deployment's files are, by the name it is published as.
-    let unpacked = Rc::new(std::cell::RefCell::new(HashMap::<String, PathBuf>::new()));
     let driver = host.clone();
     let host_task = tokio::task::spawn_local(async move { driver.run(None).await });
     while let Some(d) = read_frame(&mut read).await? {
         match ToWorker::from_data(d)? {
-            ToWorker::Deploy { id, name, entry, files, wall_ms, dev: for_dev, env } => {
-                let (host, tx, dev, unpacked) = (host.clone(), tx.clone(), dev.clone(), unpacked.clone());
+            ToWorker::Deploy { id, name, entry, files, wall_ms, dev: for_dev, env, root_package, packages } => {
+                let (host, tx, dev) = (host.clone(), tx.clone(), dev.clone());
                 tokio::task::spawn_local(async move {
                     let limits = Limits { wall: Duration::from_millis(wall_ms), ..Limits::default() };
-                    // A directory of this worker's own, where it is not
-                    // sandboxed too, and of this deployment's.
-                    let root = std::env::temp_dir().join(format!("bundles-{}", std::process::id())).join(id.to_string());
-                    let ours = !root.exists();
-                    let loaded = match unpack(&root, &entry, &files) {
-                        Ok(entry) => Deployment::load_async(&entry, limits).await.map(|d| (entry, d.with_env(env))),
+                    let loaded = match build_bundle_vfs(&entry, files, root_package, packages) {
+                        Ok((bundle, entry_vpath)) => {
+                            Deployment::load_bundle_async(bundle, &entry, limits).await.map(|d| (entry_vpath, d.with_env(env)))
+                        }
                         Err(e) => Err(techne_vm::vm::Error::new(e)),
                     };
-                    // One not loaded leaves no files (those it wrote: not
-                    // what was there before it); one replaced under its
-                    // name, those of the one before.
-                    let before = match &loaded {
-                        Ok(_) => unpacked.borrow_mut().insert(name.clone(), root),
-                        Err(_) if ours => Some(root),
-                        Err(_) => None,
-                    };
-                    if let Some(before) = before {
-                        let _ = std::fs::remove_dir_all(before);
-                    }
-                    let published = loaded.and_then(|(entry, d)| {
+                    let published = loaded.and_then(|(entry_vpath, d)| {
                         let output = d.output().text.clone();
                         match &mut *dev.borrow_mut() {
-                            Some(dev) if for_dev => dev.publish(&host, &name, &entry, d)?,
+                            Some(dev) if for_dev => dev.publish(&host, &name, &entry_vpath, d)?,
                             _ if for_dev => return Err(techne_vm::vm::Error::new("this worker has no development")),
                             dev => {
                                 host.publish(&name, d);
                                 if let Some(dev) = dev {
-                                    dev.loaded(&name, &entry);
+                                    dev.loaded(&name, &entry_vpath);
                                 }
                             }
                         }
@@ -287,9 +276,6 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     dev.retire(&name);
                 }
                 close_gone();
-                if let Some(root) = unpacked.borrow_mut().remove(&name) {
-                    let _ = std::fs::remove_dir_all(root);
-                }
             }
             ToWorker::Request { rid, name, request, streams, debug } => {
                 // Its body written to the host as it arrives, each chunk
@@ -430,40 +416,49 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
     Ok(())
 }
 
-/// Write a deployment's files to `root`, a directory of their own in the
-/// tmpfs, each path relative and staying in it, each written once, a
-/// bounded number and size: the entry's path there.
-fn unpack(root: &Path, entry: &str, files: &[(String, Vec<u8>)]) -> Result<PathBuf, String> {
-    use std::io::Write;
-    if files.len() > BUNDLE_FILES || files.iter().map(|(_, b)| b.len()).sum::<usize>() > BUNDLE_BYTES {
+/// Build an immutable, read-only in-memory [`BundleVfs`] from a deployment's
+/// root files and optional package graph, validating file counts, byte sizes,
+/// uniqueness, package graph integrity, and entry existence without touching
+/// the OS filesystem. Returns the bundle and the entry's deterministic virtual
+/// path.
+fn build_bundle_vfs(
+    entry: &str,
+    files: Vec<(String, Vec<u8>)>,
+    root_package: Option<(String, String)>,
+    packages: Vec<BundledPackage>,
+) -> Result<(Arc<BundleVfs>, PathBuf), String> {
+    let mut total_files = files.len();
+    let mut total_bytes: usize = files.iter().map(|(_, b)| b.len()).sum();
+    for pkg in &packages {
+        total_files = total_files.saturating_add(pkg.files.len());
+        total_bytes = total_bytes.saturating_add(pkg.files.iter().map(|(_, b)| b.len()).sum::<usize>());
+    }
+    if total_files > BUNDLE_FILES || total_bytes > BUNDLE_BYTES {
         return Err("the deployment has too many files, or too large".into());
     }
-    if root.exists() {
-        return Err(format!("{}: a deployment was sent as that before", root.display()));
-    }
-    let io = |e: std::io::Error| e.to_string();
-    std::fs::create_dir_all(root).map_err(io)?;
+    let mut root_files = BTreeMap::new();
     for (path, bytes) in files {
-        let dest = root.join(relative(path)?);
-        if let Some(dir) = dest.parent() {
-            std::fs::create_dir_all(dir).map_err(io)?;
+        if root_files.insert(path.clone(), Arc::<[u8]>::from(bytes)).is_some() {
+            return Err(format!("{path}: duplicate file in deployment"));
         }
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&dest).map_err(|e| format!("{path}: {e}"))?;
-        f.write_all(bytes).map_err(io)?;
     }
-    let entry = root.join(relative(entry)?);
-    if !entry.is_file() {
-        return Err(format!("{}: no such file in the deployment", entry.display()));
+    let mut pkg_map = BTreeMap::new();
+    for pkg in packages {
+        let prefix = PackagePrefix::new(&pkg.owner, &pkg.pkg);
+        let mut pkg_files = BTreeMap::new();
+        for (path, bytes) in pkg.files.iter() {
+            if pkg_files.insert(path.clone(), Arc::<[u8]>::from(bytes.as_slice())).is_some() {
+                return Err(format!("{prefix}/{path}: duplicate file in package"));
+            }
+        }
+        let declared_deps = pkg.depends.into_iter().map(|(o, p)| PackagePrefix::new(&o, &p)).collect();
+        let entry_pkg = BundlePackage { tree_sha256: pkg.tree_sha256, files: pkg_files, declared_deps };
+        if pkg_map.insert(prefix.clone(), entry_pkg).is_some() {
+            return Err(format!("duplicate package {prefix} in deployment"));
+        }
     }
-    Ok(entry)
-}
-
-/// `path` if it is relative and names nothing outside where it is taken
-/// from: no root, no `..`, no `.`.
-fn relative(path: &str) -> Result<&Path, String> {
-    let p = Path::new(path);
-    match !path.is_empty() && p.components().all(|c| matches!(c, Component::Normal(_))) {
-        true => Ok(p),
-        false => Err(format!("{path}: not a path in the deployment")),
-    }
+    let root_prefix = root_package.map(|(o, p)| PackagePrefix::new(&o, &p));
+    let vfs = BundleVfs::new(root_files, root_prefix, pkg_map).map_err(|e| e.msg.clone())?;
+    let entry_vpath = vfs.entry_virtual_path(entry).map_err(|e| e.msg.clone())?;
+    Ok((Arc::new(vfs), entry_vpath))
 }
