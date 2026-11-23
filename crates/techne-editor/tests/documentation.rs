@@ -37,7 +37,7 @@ fn documentation_problems() {
     ] {
         vm.eval_source(&format!("(require {:?})", root.join(file).display().to_string())).unwrap_or_else(|e| panic!("{file}: {e}"));
     }
-    vm.eval_source(&format!("(load-package 'mail {:?})", root.join("packages/mail/editor.scm").display().to_string())).unwrap();
+    vm.eval_source(&format!("(load-package '(techne mail) {:?})", root.join("packages/mail/editor.scm").display().to_string())).unwrap();
     vm.eval_source(&format!("(load-package 'compile-runtime {:?})", root.join("lisp/editor/compile/runtime.scm").display().to_string()))
         .unwrap();
     vm.eval_source(&format!("(load-package 'vc-runtime {:?})", root.join("lisp/editor/packages/vc/runtime.scm").display().to_string()))

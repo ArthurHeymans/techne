@@ -2,7 +2,7 @@
 ;;; mailboxes of a tree of them, as mbsync or offlineimap keep. A message
 ;;; is never written: only renamed, to change its flags or its folder,
 ;;; as mu4e does and mbsync then carries to the server.
-(define-library (mail maildir)
+(define-library (techne mail maildir)
   (export maildir-read maildir-for-each maildir-source-bytes maildir-folders maildir-keys
           maildir-check-root maildir-path-key maildir-path-flags maildir-locate maildir-set-flag! maildir-move!)
   (import (techne) (techne path) (techne task))

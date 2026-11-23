@@ -2,7 +2,7 @@
 ;;; The tables are glibc iconv's; 65533 is a byte the charset does not
 ;;; define. UTF-8 and Latin-1 need no table. Multi-byte charsets (Big5,
 ;;; Shift_JIS, GB2312, ISO-2022-JP) have none: their text is not decoded.
-(define-library (mail charset)
+(define-library (techne mail charset)
   (export mail-charset-name mail-charset-table)
   (import (techne))
   (begin

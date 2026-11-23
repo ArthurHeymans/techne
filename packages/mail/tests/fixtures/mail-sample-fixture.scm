@@ -1,7 +1,7 @@
 ;;; Seven sample messages, a conversation among them, for the editor and
 ;;; terminal mail tests: plain and HTML text, a quotation, an attachment,
 ;;; read, unread and starred. Entirely synthetic.
-(import (scheme base) (srfi 1) (techne editor) (mail store))
+(import (scheme base) (srfi 1) (techne editor) (techne mail store))
 (provide mail-test-seed-samples!)
 
 (define samples

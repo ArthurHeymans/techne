@@ -3,7 +3,7 @@
 (require "../../../test.scm")
 (require "../../main.scm")
 (require "../../dispatch.scm")
-(import (techne editor) (mail store))
+(import (techne editor) (techne mail store))
 (provide run-compose-case compose-cases)
 
 (define s (current-session))

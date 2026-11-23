@@ -1,4 +1,4 @@
-(import (techne) (mail smtp) (mail address) (mail mime))
+(import (techne) (techne mail smtp) (techne mail address) (techne mail mime))
 (import (techne test))
 
 (check "addresses" '("ada@example.org" "ben@example.org") (mail-addresses "Ada <ada@example.org>, ben@example.org"))

@@ -1,7 +1,7 @@
 ;;; Conversation membership from References/In-Reply-To, never subject guessing.
-(define-library (mail thread)
+(define-library (techne mail thread)
   (export mail-thread-members mail-thread-groups mail-thread-tree)
-  (import (techne) (mail store) (mail date))
+  (import (techne) (techne mail store) (techne mail date))
   (begin
     (define (index-from text char start)
       (let loop ((at start))

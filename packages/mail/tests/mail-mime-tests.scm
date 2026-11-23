@@ -1,6 +1,6 @@
 ;;; Fixtures are relative to this suite, independent of the working directory.
 (import (techne test))
-(import (mail mime) (mail html) (techne path))
+(import (techne mail mime) (techne mail html) (techne path))
 
 (define (field msg key) (cdr (assq key msg)))
 (define (raises? thunk) (guard (e (#t #t)) (thunk) #f))

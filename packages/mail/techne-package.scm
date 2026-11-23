@@ -1,10 +1,11 @@
 ;;; Mail: a native mail client for the editor, and the libraries it is
-;;; made of under lib/, (mail imap), (mail smtp), (mail mime) and the
-;;; rest, which a program without the editor imports as well
-;;; (lisp/techne/package.sld). The editor reads this as data at start,
-;;; for the options and the command below; editor.scm loads when `mail`
-;;; is first run.
-(package mail
+;;; made of under lib/, (techne mail imap), (techne mail smtp),
+;;; (techne mail mime) and the rest, which a program without the editor
+;;; imports as well (lisp/techne/package.sld). The editor reads this as
+;;; data at start, for the options and the command below; editor.scm
+;;; loads when `mail` is first run.
+(package (techne mail)
+  (version "0.1.0")
   (editor "editor.scm"
     (commands
       (mail "Open the mail dashboard. Configure accounts with `mail-accounts`."))

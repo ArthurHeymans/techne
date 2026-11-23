@@ -697,8 +697,9 @@ fully hygienic.
   when that package is reloaded or unloaded, with the tasks it started
   and what it registered as it loaded, which the root scope owns. So do
   the libraries a package
-  provides under `lib/` in its directory, which its manifest's name owns
-  (`(techne package)`, doc/packages.md): `(mail imap)` is found there and
+  provides under `lib/` in its directory, which its manifest's 2-part
+  `(owner pkg)` name owns (`(techne package)`, doc/packages.md):
+  `(techne mail imap)` is found under `lib/techne/mail/imap.sld` there and
   nowhere else, by the package itself, by those depending on it and by a
   program `techne run` starts from its directory. Loading again stages the next
   generation, holding back its registry entries; a failure shuts it and

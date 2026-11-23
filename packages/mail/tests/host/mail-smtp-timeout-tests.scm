@@ -1,4 +1,4 @@
-(import (techne) (mail smtp))
+(import (techne) (techne mail smtp))
 (import (techne test))
 
 ;; A local peer accepts TCP and reads ClientHello, but never speaks TLS.

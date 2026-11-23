@@ -1,7 +1,7 @@
 ;;; Mailbox syntax is Scheme policy, shared by envelope and header formatting.
-(define-library (mail address)
+(define-library (techne mail address)
   (export mail-parse-addresses mail-display-addresses)
-  (import (techne) (mail mime))
+  (import (techne) (techne mail mime))
   (begin
     (define (bad) (error "Invalid mailbox list: check quotes, comments and addresses"))
     (define (parts text)

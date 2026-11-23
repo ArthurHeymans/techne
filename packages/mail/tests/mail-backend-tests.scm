@@ -1,6 +1,6 @@
 ;;; Run: techne run packages/mail/tests/mail-backend-tests.scm
 (import (techne test))
-(import (mail imap) (mail maildir) (mail mime) (techne uuid))
+(import (techne mail imap) (techne mail maildir) (techne mail mime) (techne uuid))
 
 (define (field row key) (cdr (assq key row)))
 (define (rejected? thunk)

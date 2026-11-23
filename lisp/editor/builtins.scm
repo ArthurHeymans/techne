@@ -30,12 +30,14 @@
   (let* ((found (or (%package-manifest (string-append (directory-of %here) "../../packages/" (symbol->string name)))
                     (error "No package shipped as" name)))
          (root (car found))
-         (editor (cdr (assq (quote editor) (cddr (read (open-input-string (cadr found)))))))
+         (manifest (read (open-input-string (cadr found))))
+         (pkg (cadr manifest))
+         (editor (cdr (assq (quote editor) (cddr manifest))))
          (options (assq (quote options) (cdr editor))))
-    (%provide-libraries! (symbol->string name) (string-append root "/lib"))
+    (%provide-libraries! pkg (string-append root "/lib"))
     ;; It depends on nothing: its files import its own libraries only.
-    (%package-imports! root (symbol->string name) (list (symbol->string name)))
-    (advertise-package! name (string-append root "/" (car editor))
+    (%package-imports! root pkg (list pkg))
+    (advertise-package! pkg (string-append root "/" (car editor))
                         (cdr (assq (quote commands) (cdr editor))) (if options (cdr options) (quote ())))))
 
 (for-each (lambda (name)

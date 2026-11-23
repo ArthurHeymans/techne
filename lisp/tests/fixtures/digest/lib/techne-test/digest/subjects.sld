@@ -1,9 +1,9 @@
 ;;; What a program without the editor makes of mail's libraries: the
 ;;; subjects of messages, decoded.
 
-(define-library (digest subjects)
+(define-library (techne-test digest subjects)
   (export subjects)
-  (import (scheme base) (mail mime))
+  (import (scheme base) (techne mail mime))
   (begin
 
     (define (subjects messages)

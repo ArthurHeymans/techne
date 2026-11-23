@@ -1,7 +1,8 @@
 ;;; A native Scheme mail application. IMAP and Maildir share one local cache,
 ;;; one rich reader, and one composer. No source mail is deleted or changed.
-(import (techne editor) (mail store) (mail mime) (mail html) (mail address)
-        (mail imap) (mail maildir) (mail smtp) (mail thread) (mail date)
+(import (techne editor) (techne mail store) (techne mail mime) (techne mail html)
+        (techne mail address) (techne mail imap) (techne mail maildir)
+        (techne mail smtp) (techne mail thread) (techne mail date)
         (techne time) (techne uuid) (techne path) (techne task))
 
 

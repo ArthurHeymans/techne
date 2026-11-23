@@ -1,4 +1,4 @@
-(import (techne) (techne task) (mail store) (mail thread) (techne uuid) (techne sqlite) (techne path))
+(import (techne) (techne task) (techne mail store) (techne mail thread) (techne uuid) (techne sqlite) (techne path))
 (import (techne test))
 (define dir (path-join (or (get-environment-variable "TMPDIR") "/tmp") (string-append "techne-mail-" (uuid-v4))))
 (create-directory dir #o700)
