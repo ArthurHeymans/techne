@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795454069893,
+  "lastUpdate": 1795454072230,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -61604,6 +61604,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 627790463,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104418,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b7a47b87f18b80c02f529871fa14169e01e6ebb0",
+          "message": "Merge pull request #405 from ArthurHeymans/fix/bump-url\n\nchore: bump url to 2.5.9 for RUSTSEC-2026-0592",
+          "timestamp": "2026-11-23T17:58:37+01:00",
+          "tree_id": "a38486721a22801a850c4077c6e9e8f2b69b6d09",
+          "url": "https://github.com/ArthurHeymans/techne/commit/b7a47b87f18b80c02f529871fa14169e01e6ebb0"
+        },
+        "date": 1795454072182,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697427862,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 627786031,
             "unit": "instructions"
           },
           {
