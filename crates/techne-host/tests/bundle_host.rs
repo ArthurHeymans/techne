@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use techne_host::{
     Deployment, Host, Limits,
     package::{PackageSpec, canonical_tree_sha256, load_verified_packaged_trees, read_clean_package_tree},
-    supervisor::{Options, ResourceConfinement, Sandboxing, Supervisor},
+    supervisor::{Bindings, Options, ResourceConfinement, Sandboxing, Supervisor},
     wire::BUNDLE_BYTES,
 };
 use techne_vm::{
@@ -417,4 +417,191 @@ fn load_verified_packaged_trees_rejects_forged_deps_and_corrupted_trees() {
     std::fs::write(trees.join(&dep_sha).join("lib/acme/dep.sld"), "tampered").unwrap();
     let err = load_verified_packaged_trees(&trees, "app.scm", &root_pkg, &valid_specs, None).unwrap_err();
     assert!(err.contains("corrupted"), "{err}");
+}
+
+/// `load_verified_packaged_trees` rejects dependency cycles, missing
+/// `techne.lock` when root declares dependencies, and lockfile `tree-sha256`
+/// mismatches against uploaded/cached dependency specs.
+#[test]
+fn load_verified_packaged_trees_rejects_cycles_and_lock_mismatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let trees = dir.path().join("trees");
+
+    let stage = |name: &str, pairs: &[(&str, &str)]| -> String {
+        let src = dir.path().join(name);
+        for (rel, content) in pairs {
+            write(&src, rel, content);
+        }
+        let mut total = 0;
+        let files = read_clean_package_tree(&src, &mut total, BUNDLE_BYTES).unwrap();
+        let sha = canonical_tree_sha256(&files);
+        for (rel, bytes) in &files {
+            let p = trees.join(&sha).join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
+        sha
+    };
+
+    // 1. Dependency cycle: (acme a) -> (acme b) -> (acme a).
+    let b_sha = stage(
+        "cyc-b",
+        &[
+            ("techne-package.scm", r#"(package (acme b) (version "0.1.0") (depends ((acme a) (path "../a"))))"#),
+            ("lib/acme/b.sld", "(define-library (acme b) (export b) (import (techne)) (begin (define b 1)))"),
+        ],
+    );
+    let a_sha = stage(
+        "cyc-a",
+        &[
+            ("techne-package.scm", r#"(package (acme a) (version "0.1.0") (depends ((acme b) (path "../b"))) (cloud "app.scm"))"#),
+            (
+                "techne.lock",
+                &format!(
+                    r#"(lock
+                         (techne "0.1.0")
+                         (package (acme b) "0.1.0"
+                           (source (path "../b"))
+                           (tree-sha256 "{b_sha}")))"#
+                ),
+            ),
+            ("app.scm", "(provide fetch) (define (fetch r e c) \"ok\")"),
+        ],
+    );
+    let cyc_specs = vec![
+        PackageSpec { owner: "acme".into(), pkg: "a".into(), tree_sha256: a_sha, depends: vec![("acme".into(), "b".into())] },
+        PackageSpec { owner: "acme".into(), pkg: "b".into(), tree_sha256: b_sha, depends: vec![("acme".into(), "a".into())] },
+    ];
+    let err = load_verified_packaged_trees(&trees, "app.scm", &("acme".into(), "a".into()), &cyc_specs, None).unwrap_err();
+    assert!(err.to_lowercase().contains("cycle"), "{err}");
+
+    // 2. Missing techne.lock when root declares dependencies.
+    let dep_sha = stage(
+        "dep-plain",
+        &[
+            ("techne-package.scm", r#"(package (acme dep) (version "0.1.0"))"#),
+            ("lib/acme/dep.sld", "(define-library (acme dep) (export v) (import (techne)) (begin (define v 1)))"),
+        ],
+    );
+    let nolock_sha = stage(
+        "root-nolock",
+        &[
+            ("techne-package.scm", r#"(package (acme nolock) (version "0.1.0") (depends ((acme dep) (path "../dep"))) (cloud "app.scm"))"#),
+            ("app.scm", "(provide fetch) (define (fetch r e c) \"ok\")"),
+        ],
+    );
+    let nolock_specs = vec![
+        PackageSpec { owner: "acme".into(), pkg: "nolock".into(), tree_sha256: nolock_sha, depends: vec![("acme".into(), "dep".into())] },
+        PackageSpec { owner: "acme".into(), pkg: "dep".into(), tree_sha256: dep_sha.clone(), depends: vec![] },
+    ];
+    let err = load_verified_packaged_trees(&trees, "app.scm", &("acme".into(), "nolock".into()), &nolock_specs, None).unwrap_err();
+    assert!(err.contains("techne.lock"), "{err}");
+
+    // 3. Root techne.lock records a different tree-sha256 than the dep spec.
+    let wrong_sha = "a".repeat(64);
+    let badlock_sha = stage(
+        "root-badlock",
+        &[
+            (
+                "techne-package.scm",
+                r#"(package (acme badlock) (version "0.1.0") (depends ((acme dep) (path "../dep"))) (cloud "app.scm"))"#,
+            ),
+            (
+                "techne.lock",
+                &format!(
+                    r#"(lock
+                         (techne "0.1.0")
+                         (package (acme dep) "0.1.0"
+                           (source (path "../dep"))
+                           (tree-sha256 "{wrong_sha}")))"#
+                ),
+            ),
+            ("app.scm", "(provide fetch) (define (fetch r e c) \"ok\")"),
+        ],
+    );
+    let badlock_specs = vec![
+        PackageSpec { owner: "acme".into(), pkg: "badlock".into(), tree_sha256: badlock_sha, depends: vec![("acme".into(), "dep".into())] },
+        PackageSpec { owner: "acme".into(), pkg: "dep".into(), tree_sha256: dep_sha, depends: vec![] },
+    ];
+    let err = load_verified_packaged_trees(&trees, "app.scm", &("acme".into(), "badlock".into()), &badlock_specs, None).unwrap_err();
+    assert!(err.contains("techne.lock") || err.contains("mismatch"), "{err}");
+}
+
+/// `Supervisor::prepare` enforces the declared `(cloud ... (bindings ...))`
+/// contract for packaged deployments, and `Supervisor::sleep()` clears the
+/// supervisor's in-memory `TreeCache`.
+#[test]
+fn supervisor_prepare_enforces_bindings_and_sleep_clears_tree_cache() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let workspace = tempfile::tempdir().unwrap();
+        let dep_dir = workspace.path().join("dep");
+        let app_dir = workspace.path().join("app");
+
+        write(&dep_dir, "techne-package.scm", r#"(package (acme dep) (version "0.1.0"))"#);
+        write(&dep_dir, "lib/acme/dep.sld", r#"(define-library (acme dep) (export tag) (import (techne)) (begin (define tag "D1")))"#);
+
+        write(
+            &app_dir,
+            "techne-package.scm",
+            r#"(package (acme app)
+                 (version "0.1.0")
+                 (depends ((acme dep) (path "../dep")))
+                 (cloud "app.scm" (bindings (greeting text))))"#,
+        );
+        write(
+            &app_dir,
+            "app.scm",
+            r#"(import (acme dep))
+(provide fetch)
+(define (fetch req env ctx)
+  (dict 'status 200 'body (string-append (dict-ref env 'greeting) ":" tag)))"#,
+        );
+        lock_project(&app_dir);
+
+        let mut total = 0;
+        let dep_sha = canonical_tree_sha256(&read_clean_package_tree(&dep_dir, &mut total, BUNDLE_BYTES).unwrap());
+        let sup = Supervisor::start(options(&[], Sandboxing::Off)).await.unwrap();
+
+        // Missing declared binding rejected by Supervisor::prepare.
+        let err = sup.prepare("app", &app_dir, Bindings::default()).await.unwrap_err();
+        assert!(err.contains("greeting") || err.contains("missing"), "{err}");
+
+        // Wrong binding kind (kv instead of text) rejected by Supervisor::prepare.
+        let kv_handle = Data::Dict(vec![
+            (Data::Symbol("kind".into()), Data::Symbol("kv".into())),
+            (Data::Symbol("name".into()), Data::String("greeting".into())),
+        ]);
+        let wrong_kind = Bindings {
+            env: Data::Dict(vec![(Data::Symbol("greeting".into()), kv_handle)]),
+            stores: std::collections::HashMap::from([("greeting".into(), "ns".into())]),
+        };
+        let err = sup.prepare("app", &app_dir, wrong_kind).await.unwrap_err();
+        assert!(err.contains("greeting") && err.contains("text"), "{err}");
+
+        // Extra undeclared binding rejected by Supervisor::prepare.
+        let extra = Bindings {
+            env: Data::Dict(vec![
+                (Data::Symbol("greeting".into()), Data::String("hi".into())),
+                (Data::Symbol("extra".into()), Data::String("no".into())),
+            ]),
+            stores: Default::default(),
+        };
+        let err = sup.prepare("app", &app_dir, extra).await.unwrap_err();
+        assert!(err.contains("extra") && err.to_lowercase().contains("undeclared"), "{err}");
+
+        // Exact contract succeeds and caches dep_sha.
+        let good =
+            Bindings { env: Data::Dict(vec![(Data::Symbol("greeting".into()), Data::String("hello".into()))]), stores: Default::default() };
+        let prepared = sup.prepare("app", &app_dir, good).await.unwrap();
+        sup.publish("app", &prepared.id, None).unwrap();
+        assert!(sup.has_cached_tree(&dep_sha));
+        let resp = sup.fetch("app", request("/"), None).await.unwrap();
+        assert_eq!(answer(&resp.head), (200, "hello:D1".into()));
+
+        // Sleeping the supervisor clears its in-memory TreeCache.
+        assert!(sup.sleep());
+        assert!(!sup.has_cached_tree(&dep_sha));
+    });
 }

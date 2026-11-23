@@ -629,3 +629,226 @@ fn packaged_deploy_caches_trees_and_enforces_contracts() {
     assert_eq!(get(port, host, "/get"), (200, "v1/prod".into()));
     assert_eq!(get(port, host, "/secret"), (200, "prod-s3cret".into()));
 }
+
+/// Multi-tenant cloud security & hardening regressions:
+/// - Hosted legacy uploads NEVER consult `techne-package.scm` / `techne.lock`
+///   or ancestor directories (stay strictly in legacy mode).
+/// - Project name `"trees"` is reserved and rejected.
+/// - Per-tenant tree caches (`tenants/<tenant>/trees/`) are isolated across
+///   tenants (`has-trees` and packaged `deploy`).
+/// - Rejected packaged deploys never persist uploaded dependency trees.
+/// - Corrupted cached dependency trees are quarantined on `has-trees` and
+///   cleanly re-uploaded on the next deploy.
+/// - Combined cached + uploaded file count cannot exceed 1000 files.
+#[test]
+fn hosted_legacy_isolation_tenant_tree_cache_quarantine_and_combined_caps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let store = tmp.path().join("store");
+
+    let invite = |tenant: &str| {
+        let (ok, token) = cloud(&["invite", "--state", state.to_str().unwrap(), tenant], None);
+        assert!(ok, "{token}");
+        token.trim().to_string()
+    };
+    let (acme, bolt) = (invite("acme"), invite("bolt"));
+    let (_child, port, ops, _) = serve(&state);
+
+    // 1. Project name "trees" is reserved and rejected.
+    let (status, body) = post_ops(&ops, &acme, "acme/trees", r#"{"op":"deployments","tenant":"acme","project":"trees"}"#);
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("not-a-project") || body.contains("project"), "{body}");
+
+    // 2. Hosted legacy upload containing a crafted techne-package.scm + techne.lock
+    //    referencing `../escape` stays strictly in legacy mode and succeeds.
+    let crafted_legacy = format!(
+        r#"{{"op":"deploy","tenant":"acme","project":"legacy-crafted","entry":"app.scm","files":{{"app.scm":{},"techne-package.scm":{},"techne.lock":{}}}}}"#,
+        json_str(&b64(b"(import (techne http)) (provide fetch) (define (fetch req env ctx) (response \"legacy-isolated\"))")),
+        json_str(&b64(b"(package (evil app) (version \"0.1.0\") (depends ((evil esc) (path \"../escape\"))) (cloud \"app.scm\" (bindings (never secret))))")),
+        json_str(&b64(b"(lock (techne \"0.1.0\") (package (evil esc) \"0.1.0\" (source (path \"../escape\")) (tree-sha256 \"0000000000000000000000000000000000000000000000000000000000000000\")))")),
+    );
+    let (status, body) = post_ops(&ops, &acme, "acme/legacy-crafted", &crafted_legacy);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(get(port, "legacy-crafted.acme.cloud.test", "/"), (200, "legacy-isolated".into()));
+
+    // 3. Set up a packaged app for acme and deploy it so acme caches `dep_sha`.
+    let dep_repo = tmp.path().join("dep-shared");
+    let app_dir = tmp.path().join("app-acme");
+    write_pkg_file(&dep_repo, "techne-package.scm", r#"(package (acme shared) (version "0.1.0"))"#);
+    write_pkg_file(
+        &dep_repo,
+        "lib/acme/shared.sld",
+        r#"(define-library (acme shared) (export shared-val) (import (scheme base)) (begin (define shared-val "S1")))"#,
+    );
+    git_init_commit(&dep_repo, "init shared dep");
+
+    write_pkg_file(
+        &app_dir,
+        "techne-package.scm",
+        &format!(
+            r#"(package (acme app)
+                 (version "0.1.0")
+                 (depends ((acme shared) (local {:?})))
+                 (cloud "app.scm" (bindings (greeting text))))"#,
+            dep_repo.display().to_string()
+        ),
+    );
+    write_pkg_file(
+        &app_dir,
+        "app.scm",
+        r#"(import (techne http) (acme shared))
+(provide fetch)
+(define (fetch req env ctx)
+  (response (string-append (dict-ref env 'greeting) ":" shared-val)))"#,
+    );
+    write_pkg_file(&app_dir, "manifest.scm", r#"{bindings {greeting (text "hi")}}"#);
+
+    let lock_out = techne().args(["lock", app_dir.to_str().unwrap()]).env("TECHNE_PACKAGE_STORE", &store).output().unwrap();
+    assert!(lock_out.status.success(), "{}", String::from_utf8_lossy(&lock_out.stderr));
+
+    let acme_target = ["--to", ops.as_str(), "--tenant", "acme", "--project", "pkg"];
+    let (ok, said) = cloud_with_store(&[&["deploy", app_dir.to_str().unwrap()], &acme_target[..]].concat(), Some(&acme), &store);
+    assert!(ok, "{said}");
+    assert_eq!(get(port, "pkg.acme.cloud.test", "/"), (200, "hi:S1".into()));
+
+    let dep_files = techne_host::package::read_clean_package_tree(&dep_repo, &mut 0, 16 << 20).unwrap();
+    let dep_sha = techne_host::package::canonical_tree_sha256(&dep_files);
+    let root_files = techne_host::package::read_clean_package_tree(&app_dir, &mut 0, 16 << 20).unwrap();
+    let root_sha = techne_host::package::canonical_tree_sha256(&root_files);
+    let root_json: Vec<String> = root_files.iter().map(|(k, v)| format!("{}:{}", json_str(k), json_str(&b64(v)))).collect();
+    let dep_json: Vec<String> = dep_files.iter().map(|(k, v)| format!("{}:{}", json_str(k), json_str(&b64(v)))).collect();
+
+    assert!(state.join("tenants/acme/trees").join(&dep_sha).is_dir());
+
+    // 4. Cross-tenant tree cache isolation: bolt must NOT see acme's cached dep_sha
+    //    via `has-trees` and cannot reference it without uploading `files`.
+    let (status, body) = post_ops(
+        &ops,
+        &bolt,
+        "bolt/pkg",
+        &format!(r#"{{"op":"has-trees","tenant":"bolt","project":"pkg","trees":[{}]}}"#, json_str(&dep_sha)),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""have":[]"#), "{body}");
+    assert!(body.contains(&format!(r#""missing":[{}]"#, json_str(&dep_sha))), "{body}");
+
+    let bolt_borrow = format!(
+        r#"{{"op":"deploy","tenant":"bolt","project":"pkg","entry":"app.scm","package":{{"root":["acme","app"],"packages":[{{"owner":"acme","pkg":"app","tree_sha256":{},"depends":[["acme","shared"]],"files":{{{}}}}},{{"owner":"acme","pkg":"shared","tree_sha256":{},"depends":[]}}]}}}}"#,
+        json_str(&root_sha),
+        root_json.join(","),
+        json_str(&dep_sha),
+    );
+    let (status, body) = post_ops(&ops, &bolt, "bolt/pkg", &bolt_borrow);
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains("Missing cached package tree"), "{body}");
+
+    // 5. Stage-before-commit: a rejected packaged deploy must NOT persist uploaded
+    //    dependency trees into `<state>/tenants/bolt/trees/`.
+    let mut bad_root_files = root_files.clone();
+    bad_root_files.retain(|(k, _)| k != "manifest.scm");
+    bad_root_files.push(("manifest.scm".into(), b"{bindings {greeting (kv \"wrong\")}}".to_vec()));
+    bad_root_files.sort_by(|a, b| a.0.cmp(&b.0));
+    let bad_root_sha = techne_host::package::canonical_tree_sha256(&bad_root_files);
+    let bad_root_json: Vec<String> = bad_root_files.iter().map(|(k, v)| format!("{}:{}", json_str(k), json_str(&b64(v)))).collect();
+    let bolt_rejected = format!(
+        r#"{{"op":"deploy","tenant":"bolt","project":"bad","entry":"app.scm","package":{{"root":["acme","app"],"packages":[{{"owner":"acme","pkg":"app","tree_sha256":{},"depends":[["acme","shared"]],"files":{{{}}}}},{{"owner":"acme","pkg":"shared","tree_sha256":{},"depends":[],"files":{{{}}}}}]}}}}"#,
+        json_str(&bad_root_sha),
+        bad_root_json.join(","),
+        json_str(&dep_sha),
+        dep_json.join(","),
+    );
+    let (status, body) = post_ops(&ops, &bolt, "bolt/bad", &bolt_rejected);
+    assert_eq!(status, 422, "{body}");
+    assert!(!state.join("tenants/bolt/trees").join(&dep_sha).exists(), "rejected deploy must not commit dep tree");
+    assert!(!state.join("tenants/bolt/bad/source").exists(), "rejected deploy must not commit project source");
+    let leftovers: Vec<_> = std::fs::read_dir(state.join("tenants/bolt/bad"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".stage-"))
+        .collect();
+    assert!(leftovers.is_empty(), "rejected deploy left ephemeral stage dirs behind: {leftovers:?}");
+
+    // 6. Corrupt cached tree quarantine + recovery: corrupting a file inside
+    //    acme's cached dep causes `has-trees` to delete it and report it missing;
+    //    a subsequent deploy re-uploads it cleanly.
+    let cached_dep_dir = state.join("tenants/acme/trees").join(&dep_sha);
+    std::fs::write(cached_dep_dir.join("lib/acme/shared.sld"), "CORRUPTED").unwrap();
+    let (status, body) = post_ops(
+        &ops,
+        &acme,
+        "acme/pkg",
+        &format!(r#"{{"op":"has-trees","tenant":"acme","project":"pkg","trees":[{}]}}"#, json_str(&dep_sha)),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""have":[]"#), "{body}");
+    assert!(body.contains(&format!(r#""missing":[{}]"#, json_str(&dep_sha))), "{body}");
+    assert!(!cached_dep_dir.exists(), "corrupted cached tree must be quarantined (deleted)");
+
+    // Next deploy via CLI re-uploads the missing dep cleanly.
+    let (ok, said) = cloud_with_store(&[&["deploy", app_dir.to_str().unwrap()], &acme_target[..]].concat(), Some(&acme), &store);
+    assert!(ok, "{said}");
+    assert!(cached_dep_dir.is_dir(), "re-uploaded dep tree should be cached again");
+    assert_eq!(get(port, "pkg.acme.cloud.test", "/"), (200, "hi:S1".into()));
+
+    // 7. Combined cached + uploaded file count cap (> 1000 files total rejected):
+    //    Deploy a dep with 600 files (cached), then attempt a deploy referencing
+    //    that cached 600-file dep alongside a 405-file root (total 1005 > 1000).
+    let big_dep = tmp.path().join("big-dep");
+    write_pkg_file(&big_dep, "techne-package.scm", r#"(package (acme bigdep) (version "0.1.0"))"#);
+    write_pkg_file(
+        &big_dep,
+        "lib/acme/bigdep.sld",
+        r#"(define-library (acme bigdep) (export big-ok) (import (scheme base)) (begin (define big-ok "BIG")))"#,
+    );
+    for i in 0..598 {
+        write_pkg_file(&big_dep, &format!("d/f{i:03}.txt"), "x");
+    }
+    git_init_commit(&big_dep, "init big dep");
+
+    let big_app = tmp.path().join("big-app");
+    write_pkg_file(
+        &big_app,
+        "techne-package.scm",
+        &format!(
+            r#"(package (acme bigapp)
+                 (version "0.1.0")
+                 (depends ((acme bigdep) (local {:?})))
+                 (cloud "app.scm"))"#,
+            big_dep.display().to_string()
+        ),
+    );
+    write_pkg_file(
+        &big_app,
+        "app.scm",
+        r#"(import (techne http) (acme bigdep)) (provide fetch) (define (fetch req env ctx) (response big-ok))"#,
+    );
+    let lock_out = techne().args(["lock", big_app.to_str().unwrap()]).env("TECHNE_PACKAGE_STORE", &store).output().unwrap();
+    assert!(lock_out.status.success(), "{}", String::from_utf8_lossy(&lock_out.stderr));
+
+    let big_target = ["--to", ops.as_str(), "--tenant", "acme", "--project", "big"];
+    let (ok, said) = cloud_with_store(&[&["deploy", big_app.to_str().unwrap()], &big_target[..]].concat(), Some(&acme), &store);
+    assert!(ok, "{said}");
+    assert_eq!(get(port, "big.acme.cloud.test", "/"), (200, "BIG".into()));
+
+    let big_dep_files = techne_host::package::read_clean_package_tree(&big_dep, &mut 0, 16 << 20).unwrap();
+    let big_dep_sha = techne_host::package::canonical_tree_sha256(&big_dep_files);
+    assert!(state.join("tenants/acme/trees").join(&big_dep_sha).is_dir());
+
+    // Now add 405 root files (600 cached + 408 uploaded = 1008 > 1000) and deploy omitting dep files.
+    for i in 0..405 {
+        write_pkg_file(&big_app, &format!("r/g{i:03}.txt"), "y");
+    }
+    let big_root_files = techne_host::package::read_clean_package_tree(&big_app, &mut 0, 16 << 20).unwrap();
+    let big_root_sha = techne_host::package::canonical_tree_sha256(&big_root_files);
+    let big_root_json: Vec<String> = big_root_files.iter().map(|(k, v)| format!("{}:{}", json_str(k), json_str(&b64(v)))).collect();
+    let over_cap = format!(
+        r#"{{"op":"deploy","tenant":"acme","project":"big","entry":"app.scm","package":{{"root":["acme","bigapp"],"packages":[{{"owner":"acme","pkg":"bigapp","tree_sha256":{},"depends":[["acme","bigdep"]],"files":{{{}}}}},{{"owner":"acme","pkg":"bigdep","tree_sha256":{},"depends":[]}}]}}}}"#,
+        json_str(&big_root_sha),
+        big_root_json.join(","),
+        json_str(&big_dep_sha),
+    );
+    let (status, body) = post_ops(&ops, &acme, "acme/big", &over_cap);
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains("1000 files at most"), "{body}");
+}

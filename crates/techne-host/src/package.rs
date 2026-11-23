@@ -920,4 +920,54 @@ mod tests {
         let scheme_sha: String = vm.get(&val).unwrap();
         assert_eq!(rust_sha, scheme_sha);
     }
+
+    #[test]
+    fn tree_cache_fifo_eviction_and_bounds() {
+        let mut cache = TreeCache::with_max_bytes(10);
+        let mk = |len: usize| Arc::new(vec![("a".to_string(), vec![b'x'; len])]);
+        cache.insert("k1".into(), mk(4));
+        cache.insert("k2".into(), mk(4));
+        assert!(cache.contains_key("k1"));
+        assert!(cache.contains_key("k2"));
+        // Inserting k3 (4 bytes) exceeds 10 bytes -> evicts oldest (k1).
+        cache.insert("k3".into(), mk(4));
+        assert!(!cache.contains_key("k1"));
+        assert!(cache.contains_key("k2"));
+        assert!(cache.contains_key("k3"));
+        // Single entry larger than cap is not cached and does not panic.
+        cache.insert("huge".into(), mk(11));
+        assert!(!cache.contains_key("huge"));
+        // Clear empties cache.
+        cache.clear();
+        assert!(!cache.contains_key("k2"));
+        assert!(!cache.contains_key("k3"));
+    }
+
+    #[test]
+    fn resolve_cloud_target_ancestor_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(pkg.join("sub")).unwrap();
+        std::fs::create_dir_all(pkg.join("unrelated")).unwrap();
+        std::fs::write(pkg.join("techne-package.scm"), r#"(package (acme app) (version "0.1.0") (cloud "sub/app.scm"))"#).unwrap();
+        std::fs::write(pkg.join("sub/app.scm"), "(provide fetch)").unwrap();
+        std::fs::write(pkg.join("unrelated/plain.scm"), "(provide fetch)").unwrap();
+
+        // File explicitly named by ancestor `(cloud "sub/app.scm")` resolves as Package.
+        match resolve_cloud_target(&pkg.join("sub/app.scm")).unwrap() {
+            CloudTarget::Package { root_dir, explicit_entry } => {
+                assert_eq!(root_dir, pkg.canonicalize().unwrap());
+                assert_eq!(explicit_entry, Some(pkg.join("sub/app.scm").canonicalize().unwrap()));
+            }
+            other => panic!("expected Package, got {other:?}"),
+        }
+
+        // Unrelated file under an ancestor `techne-package.scm` resolves as Legacy, NOT Package.
+        match resolve_cloud_target(&pkg.join("unrelated/plain.scm")).unwrap() {
+            CloudTarget::Legacy { entry } => {
+                assert_eq!(entry, pkg.join("unrelated/plain.scm").canonicalize().unwrap());
+            }
+            other => panic!("expected Legacy for unrelated file under ancestor manifest, got {other:?}"),
+        }
+    }
 }

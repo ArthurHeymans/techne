@@ -205,7 +205,45 @@
   (w "cyc-b/techne-package.scm" '(package (cyc b) (depends ((cyc a) (path "../cyc-a")))))
   (let ((msg (or (why (lambda () (lock-project! (path-join ws "cyc-a") #:store store))) "")))
     (check "cycle detected with chain" #t
-           (and (string-contains msg "Dependency cycle") (string-contains msg "(cyc a) -> (cyc b) -> (cyc a)") #t))))
+           (and (string-contains msg "Dependency cycle") (string-contains msg "(cyc a) -> (cyc b) -> (cyc a)") #t)))
+
+  ;; Frozen hydration rejects non-root `(local ...)` BEFORE accessing or fetching that local path.
+  (let* ((app (path-join ws "frozen-local-reject"))
+         (mid (path-join ws "frozen-mid"))
+         (never-repo (path-join ws "must-never-be-fetched-nonroot-local"))
+         (fresh-store (path-join ws "frozen-store")))
+    (w "frozen-mid/techne-package.scm"
+       `(package (alice mid) (version "0.1.0")
+          (depends ((bob leaf) (local ,never-repo)))))
+    (w "frozen-mid/lib/alice/mid.sld"
+       '(define-library (alice mid) (export m) (import (scheme base)) (begin (define m 1))))
+    (w "frozen-local-reject/techne-package.scm"
+       '(package (root app) (version "0.1.0")
+          (depends ((alice mid) (path "../frozen-mid")))))
+    (let ((mid-sha (directory-tree-sha256 mid)))
+      (write-lockfile
+       (path-join app "techne.lock")
+       (parse-lockfile
+        `(lock
+           (techne "0.4")
+           (package (alice mid) "0.1.0"
+             (source (path "../frozen-mid"))
+             (tree-sha256 ,mid-sha)
+             (depends (bob leaf)))
+           (package (bob leaf) "0.1.0"
+             (source (local ,never-repo (commit ,oid1)))
+             (tree-sha256 ,h1)
+             (depends))))))
+    ;; `never-repo` does not exist on disk: if materialize-lockfile! attempted
+    ;; to access or git-clone it before enforcing the non-root local ban, it
+    ;; would fail with a git/missing-path error instead of the policy error.
+    (let ((msg (or (why (lambda () (materialize-lockfile! app #:store fresh-store))) "")))
+      (check "non-root local rejected before fetch" #t
+             (and (string-contains msg "local")
+                  (not (string-contains msg "git"))
+                  (not (string-contains msg "clone"))
+                  #t))
+      (check "no checkout created in fresh store" #f (file-exists? (path-join fresh-store "trees" h1))))))
 
 (delete-path root #t)
 (test-summary)

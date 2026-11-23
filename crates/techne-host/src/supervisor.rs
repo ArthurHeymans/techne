@@ -2406,5 +2406,46 @@ mod tests {
         assert!(read_bindings_with_contract(empty.path(), &[]).is_ok());
         let err = read_bindings_with_contract(empty.path(), &[decl("cache", BindingKind::Kv)]).unwrap_err();
         assert!(err.contains("cache") && err.contains("kv"), "{err}");
+
+        // Trailing garbage datum in manifest.scm is rejected.
+        let trailing = tempfile::tempdir().unwrap();
+        std::fs::write(trailing.path().join("manifest.scm"), "{bindings {}} (extra-datum)").unwrap();
+        let err = read_bindings(trailing.path()).unwrap_err();
+        assert!(err.contains("trailing datum"), "{err}");
+    }
+
+    #[test]
+    fn bundle_decode_rejects_tampered_package_digest() {
+        let files = vec![
+            ("app.scm".to_string(), b"(provide fetch)".to_vec()),
+            ("techne-package.scm".to_string(), b"(package (acme app) (version \"0.1.0\"))".to_vec()),
+        ];
+        let good_sha = crate::package::canonical_tree_sha256(&files);
+        let bundle = Bundle {
+            name: "app".into(),
+            id: "1".repeat(64),
+            entry: "app.scm".into(),
+            files: vec![],
+            bindings: Bindings::default(),
+            root_package: Some(("acme".into(), "app".into())),
+            packages: vec![BundledPackage {
+                owner: "acme".into(),
+                pkg: "app".into(),
+                tree_sha256: good_sha,
+                depends: vec![],
+                files: Arc::new(files.clone()),
+            }],
+        };
+        let encoded = bundle.encode();
+        assert!(Bundle::decode(&encoded).is_ok());
+
+        // Mutate a byte inside the encoded bundle's `app.scm` contents without updating tree_sha256.
+        let mut tampered_bundle = bundle;
+        let mut bad_files = files;
+        bad_files[0].1 = b"(provide hacked)".to_vec();
+        tampered_bundle.packages[0].files = Arc::new(bad_files);
+        let tampered_bytes = tampered_bundle.encode();
+        let err = Bundle::decode(&tampered_bytes).err().expect("tampered bundle must be rejected");
+        assert!(err.contains("tree-sha256 mismatch"), "{err}");
     }
 }

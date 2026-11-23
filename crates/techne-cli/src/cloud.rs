@@ -1261,3 +1261,55 @@ impl Attached for DevRepl {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_have_trees;
+
+    #[test]
+    fn parse_have_trees_fails_loudly_on_malformed_and_error_replies() {
+        let sha_a = "a".repeat(64);
+        let sha_b = "0123456789abcdef".repeat(4);
+
+        // Valid reply succeeds and returns the exact set of 64-hex digests.
+        let valid = format!(r#"[{{"status":["done"],"have":["{sha_a}","{sha_b}"],"missing":[]}}]"#);
+        let have = parse_have_trees(&valid).unwrap();
+        assert_eq!(have.len(), 2);
+        assert!(have.contains(&sha_a));
+        assert!(have.contains(&sha_b));
+
+        // Empty `have` array with status ["done"] succeeds.
+        let empty = parse_have_trees(r#"[{"status":["done"],"have":[],"missing":[]}]"#).unwrap();
+        assert!(empty.is_empty());
+
+        // Malformed JSON fails loudly.
+        assert!(parse_have_trees("not json").is_err());
+
+        // Non-array JSON fails loudly.
+        assert!(parse_have_trees(r#"{"status":["done"],"have":[]}"#).is_err());
+
+        // Empty array fails loudly.
+        assert!(parse_have_trees("[]").is_err());
+
+        // Non-object first element fails loudly.
+        assert!(parse_have_trees("[123]").is_err());
+
+        // Server error status fails loudly with the error message.
+        let err = parse_have_trees(r#"[{"status":["error","done"],"message":"unauthenticated"}]"#).unwrap_err();
+        assert!(err.contains("unauthenticated"), "{err}");
+
+        // Missing "done" status fails loudly.
+        assert!(parse_have_trees(r#"[{"status":["pending"],"have":[]}]"#).is_err());
+
+        // Missing `have` array fails loudly.
+        assert!(parse_have_trees(r#"[{"status":["done"]}]"#).is_err());
+
+        // Non-string entry in `have` fails loudly.
+        assert!(parse_have_trees(r#"[{"status":["done"],"have":[42]}]"#).is_err());
+
+        // Non-64-hex digest in `have` (wrong length or uppercase) fails loudly.
+        assert!(parse_have_trees(r#"[{"status":["done"],"have":["deadbeef"]}]"#).is_err());
+        let upper = "A".repeat(64);
+        assert!(parse_have_trees(&format!(r#"[{{"status":["done"],"have":["{upper}"]}}]"#)).is_err());
+    }
+}

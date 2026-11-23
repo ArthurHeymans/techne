@@ -294,3 +294,203 @@ fn provider_ownership_stdlib_shadowing_and_include_containment() {
 
     fs::remove_dir_all(&root).unwrap();
 }
+
+/// Regression tests for BundleVfs security and semantics:
+/// 1. Caller-supplied filenames in `eval-source` / `load-module-from` cannot
+///    forge package or stdlib ownership or canonicalize host paths.
+/// 2. Direct-dependency enforcement is fail-closed for `(environment ...)`,
+///    `(eval ... "/pkg/...")`, `(in-module "/pkg/...")`, and unattributed callers.
+/// 3. Legacy `BundleVfs` (`root_package: None`) imports sibling `.sld` libraries.
+/// 4. Nested `include-library-declarations` resolves relative to the included
+///    file's own directory (both in `BundleVfs` and on the host filesystem).
+#[test]
+fn bundle_provenance_dep_isolation_legacy_sld_and_nested_include() {
+    use std::{collections::BTreeMap, sync::Arc};
+    use techne_vm::{
+        bundle::{BundlePackage, BundleVfs, PackagePrefix},
+        vm::{Capability, Grants, Vm},
+    };
+
+    let files_map = |entries: &[(&str, &[u8])]| -> BTreeMap<String, Arc<[u8]>> {
+        entries.iter().map(|(k, v)| ((*k).into(), Arc::<[u8]>::from(*v))).collect()
+    };
+
+    let make_pkg_bundle = |app_source: &str| {
+        let mut pkgs = BTreeMap::new();
+        pkgs.insert(
+            PackagePrefix::new("acme", "app"),
+            BundlePackage {
+                tree_sha256: "a".repeat(64),
+                declared_deps: vec![PackagePrefix::new("acme", "mid")],
+                files: files_map(&[
+                    ("techne-package.scm", b"(package (acme app) (version \"0.1.0\"))"),
+                    ("app.scm", app_source.as_bytes()),
+                ]),
+            },
+        );
+        pkgs.insert(
+            PackagePrefix::new("acme", "mid"),
+            BundlePackage {
+                tree_sha256: "b".repeat(64),
+                declared_deps: vec![PackagePrefix::new("acme", "leaf")],
+                files: files_map(&[
+                    ("techne-package.scm", b"(package (acme mid) (version \"0.1.0\"))"),
+                    ("lib/acme/mid.sld", br#"(define-library (acme mid) (include-library-declarations "decls/outer.inc"))"#),
+                    (
+                        "lib/acme/decls/outer.inc",
+                        br#"(export mid-val)
+                            (import (scheme base) (acme leaf))
+                            (include-library-declarations "inner.inc")"#,
+                    ),
+                    ("lib/acme/decls/inner.inc", br#"(begin (define mid-val (string-append "mid+" leaf-val)))"#),
+                ]),
+            },
+        );
+        pkgs.insert(
+            PackagePrefix::new("acme", "leaf"),
+            BundlePackage {
+                tree_sha256: "c".repeat(64),
+                declared_deps: vec![],
+                files: files_map(&[
+                    ("techne-package.scm", b"(package (acme leaf) (version \"0.1.0\"))"),
+                    (
+                        "lib/acme/leaf.sld",
+                        br#"(define-library (acme leaf)
+                              (export leaf-val)
+                              (import (scheme base))
+                              (begin (define leaf-val "leaf")))"#,
+                    ),
+                ]),
+            },
+        );
+        Arc::new(BundleVfs::new(BTreeMap::new(), Some(PackagePrefix::new("acme", "app")), pkgs).expect("valid packaged bundle"))
+    };
+
+    // (1) Valid direct import + nested `include-library-declarations` inside `BundleVfs`.
+    {
+        let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        vm.install_bundle(make_pkg_bundle("(import (scheme base) (acme mid)) mid-val"));
+        let v = vm.eval_bundle_entry("app.scm").expect("valid packaged entry");
+        assert_eq!(vm.get::<String>(&v).unwrap(), "mid+leaf");
+
+        // Attributed root package (acme app) can dynamically import direct dep (acme mid)
+        // via (environment ...), but fails closed for undeclared transitive dep (acme leaf).
+        let err = vm.eval_source("(eval 'leaf-val (environment '(acme leaf)))").expect_err("undeclared transitive env import must fail");
+        assert!(err.msg.contains("does not depend on (acme leaf)"), "{}", err.msg);
+
+        // Truly unattributed caller (fresh USER_MODULE with bundle installed) fails closed
+        // even for a valid bundle package like (acme mid).
+        let mut unattributed = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        unattributed.install_bundle(make_pkg_bundle("(import (scheme base)) #t"));
+        let err =
+            unattributed.eval_source("(eval 'mid-val (environment '(acme mid)))").expect_err("unattributed bundle import must fail closed");
+        assert!(err.msg.contains("unattributed") || err.msg.contains("not allowed") || err.msg.contains("depend"), "{}", err.msg);
+    }
+
+    // (2) Spoofed `eval-source` filename claiming `/pkg/acme/leaf/...` or stdlib path cannot forge ownership.
+    {
+        let stdlib_spoof = techne_vm::library::lisp_dir().join("techne/spoof.sld");
+        let spoof_src = r#"(import (scheme base))
+               (eval-source "(define-library (acme leaf spoof) (export x) (import (scheme base)) (begin (define x 1)))"
+                            "user" "/pkg/acme/leaf/lib/acme/leaf/spoof.sld")"#;
+        let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        vm.install_bundle(make_pkg_bundle(spoof_src));
+        assert!(vm.eval_bundle_entry("app.scm").is_err(), "eval-source spoofed /pkg/... filename must be rejected");
+
+        let stdlib_src = format!(
+            r#"(import (scheme base))
+               (eval-source "(define-library (techne spoof) (export x) (import (scheme base)) (begin (define x 1)))"
+                            "user" {})"#,
+            techne_vm::reader::string_repr(&stdlib_spoof.display().to_string())
+        );
+        let mut vm2 = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        vm2.install_bundle(make_pkg_bundle(&stdlib_src));
+        assert!(vm2.eval_bundle_entry("app.scm").is_err(), "eval-source spoofed stdlib filename must be rejected");
+    }
+
+    // (3) `load-module-from` with spoofed `/pkg/acme/leaf/...` or host OS path is rejected under BundleVfs.
+    {
+        let host_tmp = tempfile::NamedTempFile::new().unwrap();
+        let lmf_pkg = r#"(import (scheme base))
+            (load-module-from "/pkg/acme/leaf/lib/acme/leaf/spoof.sld"
+                              "(define-library (acme leaf spoof) (export x) (import (scheme base)) (begin (define x 1)))")"#;
+        let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        vm.install_bundle(make_pkg_bundle(lmf_pkg));
+        assert!(vm.eval_bundle_entry("app.scm").is_err(), "load-module-from spoofed /pkg/... must be rejected");
+
+        let lmf_host = format!(
+            r#"(import (scheme base)) (load-module-from {} "(define x 1)")"#,
+            techne_vm::reader::string_repr(&host_tmp.path().display().to_string())
+        );
+        let mut vm2 = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        vm2.install_bundle(make_pkg_bundle(&lmf_host));
+        assert!(vm2.eval_bundle_entry("app.scm").is_err(), "load-module-from host path must be rejected in bundle mode");
+    }
+
+    // (4) Dynamic `(environment '(acme leaf))`, `(eval ... "/pkg/acme/leaf/...")`, and `(in-module "/pkg/acme/leaf/...")`
+    //     cannot bypass direct-dependency boundaries from root `(acme app)`.
+    for attack in [
+        r#"(import (scheme base) (acme mid)) (eval 'leaf-val (environment '(acme leaf)))"#,
+        r#"(import (scheme base) (acme mid)) (eval 'leaf-val "/pkg/acme/leaf/lib/acme/leaf.sld")"#,
+        r#"(import (scheme base) (acme mid)) (in-module "/pkg/acme/leaf/lib/acme/leaf.sld")"#,
+    ] {
+        let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        vm.install_bundle(make_pkg_bundle(attack));
+        let err = vm.eval_bundle_entry("app.scm").expect_err(&format!("bundle boundary bypass must fail: {attack}"));
+        assert!(
+            err.msg.contains("depend") || err.msg.contains("not permitted") || err.msg.contains("not allowed"),
+            "{attack}: unexpected error: {}",
+            err.msg
+        );
+    }
+
+    // (5) Legacy BundleVfs (`root_package: None`) imports sibling `.sld` libraries cleanly.
+    {
+        let legacy = Arc::new(
+            BundleVfs::new(
+                files_map(&[
+                    ("app.scm", b"(import (scheme base) (helper) (sub nested)) (string-append h-val \":\" n-val)"),
+                    ("helper.sld", b"(define-library (helper) (export h-val) (import (scheme base)) (begin (define h-val \"sib\")))"),
+                    (
+                        "sub/nested.sld",
+                        b"(define-library (sub nested) (export n-val) (import (scheme base)) (begin (define n-val \"nest\")))",
+                    ),
+                ]),
+                None,
+                BTreeMap::new(),
+            )
+            .expect("valid legacy bundle with sibling .sld"),
+        );
+        let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        vm.install_bundle(legacy);
+        let v = vm.eval_bundle_entry("app.scm").expect("legacy bundle with sibling .sld must load");
+        assert_eq!(vm.get::<String>(&v).unwrap(), "sib:nest");
+    }
+
+    // (6) Nested `include-library-declarations` on host filesystem resolves relative to the included file's directory.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        fs::create_dir_all(pkg.join("lib/acme/inc/decls")).unwrap();
+        fs::write(pkg.join("techne-package.scm"), "(package (acme inc) (version \"0.1.0\"))").unwrap();
+        fs::write(pkg.join("lib/acme/inc.sld"), "(define-library (acme inc) (include-library-declarations \"inc/decls/outer.inc\"))")
+            .unwrap();
+        fs::write(
+            pkg.join("lib/acme/inc/decls/outer.inc"),
+            "(export inc-val) (import (scheme base)) (include-library-declarations \"inner.inc\")",
+        )
+        .unwrap();
+        fs::write(pkg.join("lib/acme/inc/decls/inner.inc"), "(begin (define inc-val \"host-nested-ok\"))").unwrap();
+        fs::write(pkg.join("main.scm"), "(import (scheme base) (scheme write) (acme inc)) (display inc-val)").unwrap();
+
+        let out = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
+            .arg(pkg.join("main.scm"))
+            .current_dir(dir.path())
+            .env_remove("TECHNE_LIBRARY_PATH")
+            .env_remove("TECHNE_LISP_DIR")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "host-nested-ok");
+    }
+}

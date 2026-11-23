@@ -481,3 +481,49 @@ pub(crate) fn build_bundle_vfs(
     let entry_vpath = vfs.entry_virtual_path(entry).map_err(|e| e.msg.clone())?;
     Ok((Arc::new(vfs), entry_vpath))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_bundle_vfs_verifies_digests_and_consistency() {
+        let files = vec![
+            ("app.scm".to_string(), b"(provide fetch)".to_vec()),
+            ("techne-package.scm".to_string(), b"(package (acme app) (version \"0.1.0\"))".to_vec()),
+        ];
+        let good_sha = crate::package::canonical_tree_sha256(&files);
+        let good_pkg = BundledPackage {
+            owner: "acme".into(),
+            pkg: "app".into(),
+            tree_sha256: good_sha.clone(),
+            depends: vec![],
+            files: Arc::new(files.clone()),
+        };
+
+        // Valid packaged bundle succeeds.
+        let (_, vpath) = build_bundle_vfs("app.scm", vec![], Some(("acme".into(), "app".into())), vec![good_pkg.clone()]).unwrap();
+        assert_eq!(vpath, PathBuf::from("/pkg/acme/app/app.scm"));
+
+        // Tampered file byte with stale tree_sha256 is rejected.
+        let mut tampered_files = files;
+        tampered_files[0].1 = b"(provide fetch) ;; tampered".to_vec();
+        let bad_pkg = BundledPackage { files: Arc::new(tampered_files), ..good_pkg.clone() };
+        let err = build_bundle_vfs("app.scm", vec![], Some(("acme".into(), "app".into())), vec![bad_pkg]).unwrap_err();
+        assert!(err.contains("tree-sha256 mismatch"), "{err}");
+
+        // Non-hex digest rejected.
+        let bad_hex = BundledPackage { tree_sha256: "not-a-sha256".into(), ..good_pkg.clone() };
+        let err = build_bundle_vfs("app.scm", vec![], Some(("acme".into(), "app".into())), vec![bad_hex]).unwrap_err();
+        assert!(err.contains("invalid tree-sha256"), "{err}");
+
+        // Root files + packaged deployment rejected.
+        let err = build_bundle_vfs("app.scm", vec![("x.scm".into(), vec![])], Some(("acme".into(), "app".into())), vec![good_pkg.clone()])
+            .unwrap_err();
+        assert!(err.contains("cannot carry root files"), "{err}");
+
+        // Packages without root_package rejected.
+        let err = build_bundle_vfs("app.scm", vec![], None, vec![good_pkg]).unwrap_err();
+        assert!(err.contains("without a root package"), "{err}");
+    }
+}

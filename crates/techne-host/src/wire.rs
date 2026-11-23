@@ -796,4 +796,64 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
     }
+
+    #[test]
+    fn wire_rejects_trailing_fields_and_inconsistent_deploy_shapes() {
+        // Trailing top-level fields on ToWorker and FromWorker are rejected.
+        assert!(ToWorker::from_data(Data::List(vec![sym("retire"), Data::String("a".into()), sym("extra")])).is_err());
+        assert!(FromWorker::from_data(Data::List(vec![sym("ready"), Data::Int(1)])).is_err());
+
+        // Trailing element inside a deploy file tuple is rejected.
+        let bad_tuple = Data::List(vec![
+            sym("deploy"),
+            int(1),
+            Data::String("a@1".into()),
+            Data::String("app.scm".into()),
+            Data::List(vec![Data::List(vec![Data::String("app.scm".into()), Data::Bytes(vec![]), Data::Int(99)])]),
+            int(5000),
+            Data::Bool(false),
+            Data::Dict(vec![]),
+        ]);
+        assert!(ToWorker::from_data(bad_tuple).is_err());
+
+        // Packaged deploy carrying legacy root files is rejected.
+        let both = ToWorker::Deploy {
+            id: 3,
+            name: "a@3".into(),
+            entry: "app.scm".into(),
+            files: vec![("app.scm".into(), b"x".to_vec())],
+            wall_ms: 5000,
+            dev: false,
+            env: Data::Dict(vec![]),
+            root_package: Some(("alice".into(), "app".into())),
+            packages: vec![BundledPackage {
+                owner: "alice".into(),
+                pkg: "app".into(),
+                tree_sha256: "a".repeat(64),
+                depends: vec![],
+                files: Arc::new(vec![("app.scm".into(), b"x".to_vec())]),
+            }],
+        };
+        assert!(ToWorker::from_data(both.to_data()).is_err());
+
+        // Legacy deploy (root_package: None) carrying packages is rejected.
+        let no_root = ToWorker::Deploy {
+            id: 4,
+            name: "a@4".into(),
+            entry: "app.scm".into(),
+            files: vec![],
+            wall_ms: 5000,
+            dev: false,
+            env: Data::Dict(vec![]),
+            root_package: None,
+            packages: vec![BundledPackage {
+                owner: "alice".into(),
+                pkg: "app".into(),
+                tree_sha256: "a".repeat(64),
+                depends: vec![],
+                files: Arc::new(vec![("app.scm".into(), b"x".to_vec())]),
+            }],
+        };
+        assert!(ToWorker::from_data(no_root.to_data()).is_err());
+    }
 }
