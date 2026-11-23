@@ -272,7 +272,57 @@
           (let ((v2-entries (directory-list (path-join up-dir "store"))))
             (check "old and new store entries both exist" 2 (length v2-entries))
             (check "old tree-sha256 entry was not clobbered" #t
-                   (and (member (car v1-entries) v2-entries) #t))))))))
+                   (and (member (car v1-entries) v2-entries) #t)))
+          ;; Repeat install without #:upgrade #t in the same session stays offline and hits updated index!
+          (check "repeat install after upgrade succeeds in same session" '(acme pure-lib)
+                 (package-install! `(local ,lib-repo (branch "track")) #:directory up-dir))))))
+  (install-sole-subdir-and-locking tmp))
+
+(define (install-sole-subdir-and-locking tmp)
+  ;; Sole package in a repo subdirectory: repeat install stays offline both
+  ;; without and with `(package (owner pkg))`, and pre-existing `.publishing`
+  ;; refuses concurrent writes cleanly without clobbering metadata.
+  (let* ((sole-repo (path-join tmp "sole-subdir-repo"))
+         (dir (path-join tmp "store-sole")))
+    (create-directory sole-repo #o700)
+    (git sole-repo "init" "--quiet")
+    (write-file! sole-repo "packages/only/techne-package.scm"
+                 '(package (acme sole-sub) (version "0.1.0")))
+    (write-file! sole-repo "packages/only/lib/acme/sole-sub/v.sld"
+                 '(define-library (acme sole-sub v) (export sole-val) (import (scheme base))
+                    (begin (define sole-val 7))))
+    (git sole-repo "add" ".")
+    (git sole-repo "-c" "user.name=Test" "-c" "user.email=test@example.org" "-c" "commit.gpgSign=false" "commit" "-qm" "sole")
+    (check "install sole subdir package without selector" '(acme sole-sub)
+           (package-install! `(local ,sole-repo) #:directory dir))
+    (delete-path sole-repo #t)
+    (check "repeat sole subdir without remote (no selector)" '(acme sole-sub)
+           (package-install! `(local ,sole-repo) #:directory dir))
+    (check "repeat sole subdir without remote (with selector)" '(acme sole-sub)
+           (package-install! `(local ,sole-repo (package (acme sole-sub))) #:directory dir))
+    ;; Pre-existing `.publishing` lock refuses concurrent write cleanly and preserves world.lock + installed.scm.
+    (let ((before-lock (call-with-input-file (path-join dir "world.lock") (lambda (p) (read p))))
+          (before-roots (call-with-input-file (path-join dir "installed.scm") (lambda (p) (read p))))
+          (pub-lock (path-join dir ".publishing"))
+          (other-repo (path-join tmp "other-for-lock")))
+      (create-directory other-repo #o700)
+      (git other-repo "init" "--quiet")
+      (write-file! other-repo "techne-package.scm" '(package (acme lock-other) (version "0.1.0")))
+      (git other-repo "add" ".")
+      (git other-repo "-c" "user.name=Test" "-c" "user.email=test@example.org" "-c" "commit.gpgSign=false" "commit" "-qm" "other")
+      (create-directory pub-lock #o700)
+      (check "concurrent install refused while .publishing held" #t
+             (bad? (lambda () (package-install! `(local ,other-repo) #:directory dir))))
+      (delete-path pub-lock #f)
+      (check "world.lock unchanged after refused concurrent install" before-lock
+             (call-with-input-file (path-join dir "world.lock") (lambda (p) (read p))))
+      (check "installed.scm unchanged after refused concurrent install" before-roots
+             (call-with-input-file (path-join dir "installed.scm") (lambda (p) (read p))))
+      ;; Once lock is released, sequential install adds the second package while preserving the first.
+      (check "sequential install after lock release succeeds" '(acme lock-other)
+             (package-install! `(local ,other-repo) #:directory dir))
+      (check "both roots recorded in installed.scm" 2
+             (length (cdr (call-with-input-file (path-join dir "installed.scm") (lambda (p) (read p)))))))))
 
 (define (restore-offline tmp)
   (let ((owner (make-scope 'restore-option)))
@@ -298,9 +348,7 @@
          (string-prefix? (file-truename (path-join tmp "store-non-editor/store")) (%library-provider '(acme pure-lib))))
   ;; Tampering with a materialized store entry must fail offline restore loudly!
   (let* ((up-dir (path-join tmp "store-upgrade"))
-         (entries (directory-list (path-join up-dir "store")))
-         (tampered-dir (path-join (path-join up-dir "store") (car entries)))
-         (tampered-file (path-join tampered-dir "tampered.txt")))
+         (entries (directory-list (path-join up-dir "store"))))
     ;; Tamper with BOTH entries so whichever world.lock points to fails tree-sha256 verification.
     (for-each (lambda (e)
                 (call-with-output-file (path-join (path-join (path-join up-dir "store") e) "tampered.txt")
@@ -308,4 +356,24 @@
               entries)
     (check "restore rejects tampered store tree-sha256" #t
            (bad? (lambda () (package-restore! #:directory up-dir)))))
+  ;; Strict world.lock invariants on restore:
+  ;; 1. Extra unrelated entry in world.lock (not reachable from installed.scm) must be rejected and NOT registered.
+  (let* ((sole-dir (path-join tmp "store-sole"))
+         (roots-path (path-join sole-dir "installed.scm"))
+         (lock-path (path-join sole-dir "world.lock"))
+         (orig-roots (call-with-input-file roots-path (lambda (p) (read p)))))
+    ;; Remove `(acme lock-other)` from installed.scm while leaving it in world.lock.
+    (delete-file roots-path)
+    (call-with-output-file roots-path
+      (lambda (p)
+        (write (cons 'installed (filter (lambda (r) (equal? (cadr r) '(acme sole-sub))) (cdr orig-roots))) p)
+        (newline p)))
+    (check "restore rejects extra unrelated entry in world.lock" #t
+           (bad? (lambda () (package-restore! #:directory sole-dir))))
+    (check "rejected extra entry not registered as provider" #f (%library-provider '(acme lock-other)))
+    ;; 2. Missing world.lock with non-empty installed.scm must fail loudly instead of silently returning '().
+    (delete-file lock-path)
+    (check "restore fails loudly when world.lock is missing with non-empty installed.scm" #t
+           (bad? (lambda () (package-restore! #:directory sole-dir)))))
   (test-failures))
+

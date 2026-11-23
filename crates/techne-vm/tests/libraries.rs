@@ -205,3 +205,92 @@ fn own_lisp_where_installed() {
     assert_eq!(run(Some(&root.join("elsewhere"))), "\"elsewhere\"");
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Inline `define-library` and `%name-library` cannot spoof a registered package
+/// provider or Techne stdlib library; importing directories cannot shadow stdlib;
+/// and `include` / `include-ci` inside a package rejects hidden files and paths
+/// escaping the package directory.
+#[test]
+fn provider_ownership_stdlib_shadowing_and_include_containment() {
+    let root = std::env::temp_dir().join(format!("techne-vm-security-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("dep/lib/acme/dep")).unwrap();
+    fs::create_dir_all(root.join("evil/lib/acme/evil/techne")).unwrap();
+    fs::create_dir_all(root.join("outside")).unwrap();
+
+    fs::write(root.join("dep/techne-package.scm"), "(package (acme dep) (version \"0.1.0\"))").unwrap();
+    fs::write(
+        root.join("dep/lib/acme/dep/real.sld"),
+        "(define-library (acme dep real) (export real-val) (import (scheme base)) (begin (define real-val 'real)))",
+    )
+    .unwrap();
+
+    // Package shipping a shadowed `techne/http.sld` right beside its own library,
+    // plus hidden and escaping include targets.
+    fs::write(root.join("evil/techne-package.scm"), "(package (acme evil) (version \"0.1.0\") (depends ((acme dep) (path \"../dep\"))))")
+        .unwrap();
+    fs::write(
+        root.join("evil/lib/acme/evil/techne/http.sld"),
+        "(define-library (techne http) (export hijacked) (import (scheme base)) (begin (define hijacked #t)))",
+    )
+    .unwrap();
+    fs::write(
+        root.join("evil/lib/acme/evil/use-stdlib.sld"),
+        "(define-library (acme evil use-stdlib) (export ok) (import (scheme base) (techne http)) (begin (define ok (procedure? read-request))))",
+    )
+    .unwrap();
+    fs::write(root.join("evil/lib/acme/evil/.secret.scm"), "(define secret 'leaked)").unwrap();
+    fs::write(
+        root.join("evil/lib/acme/evil/inc-hidden.sld"),
+        "(define-library (acme evil inc-hidden) (export secret) (import (scheme base)) (include \".secret.scm\"))",
+    )
+    .unwrap();
+    fs::write(root.join("outside/escape.scm"), "(define escaped 'leaked)").unwrap();
+    fs::write(
+        root.join("evil/lib/acme/evil/inc-escape.sld"),
+        "(define-library (acme evil inc-escape) (export escaped) (import (scheme base)) (include \"../../../../outside/escape.scm\"))",
+    )
+    .unwrap();
+
+    let run = |script_name: &str, code: &str| {
+        let script = root.join("evil").join(script_name);
+        fs::write(&script, code).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_techne-vm"))
+            .arg(&script)
+            .current_dir(&root)
+            .env_remove("TECHNE_LIBRARY_PATH")
+            .env_remove("TECHNE_LISP_DIR")
+            .output()
+            .unwrap()
+    };
+
+    // 1. Importing `(techne http)` from a package that ships `techne/http.sld` beside its library
+    //    must load real stdlib `(techne http)`, never the local shadow!
+    let out = run("check-stdlib.scm", "(import (scheme base) (scheme write) (acme evil use-stdlib)) (write ok)");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "#t");
+
+    // 2. Inline `define-library` spoofing a registered provider `(acme dep spoof)` is rejected.
+    let out = run("spoof-provider.scm", "(define-library (acme dep spoof) (export x) (import (scheme base)) (begin (define x 1)))");
+    assert!(!out.status.success(), "inline define-library must not spoof registered provider");
+
+    // 3. Inline `define-library` spoofing a stdlib module `(techne http)` is rejected.
+    let out = run("spoof-stdlib.scm", "(define-library (techne http) (export x) (import (scheme base)) (begin (define x 1)))");
+    assert!(!out.status.success(), "inline define-library must not spoof stdlib");
+
+    // 4. `%name-library` spoofing a registered provider or stdlib is rejected.
+    let out = run("rename-provider.scm", "(import (scheme base)) (%name-library (make-module 'fake) '(acme dep spoof))");
+    assert!(!out.status.success(), "%name-library must not spoof registered provider");
+    let out = run("rename-stdlib.scm", "(import (scheme base)) (%name-library (make-module 'fake) '(techne http))");
+    assert!(!out.status.success(), "%name-library must not spoof stdlib");
+
+    // 5. Hidden file `include` inside a package library is rejected.
+    let out = run("use-hidden-inc.scm", "(import (scheme base) (acme evil inc-hidden)) secret");
+    assert!(!out.status.success(), "hidden file include inside package must be rejected");
+
+    // 6. Escaping `include` outside the package directory is rejected.
+    let out = run("use-escape-inc.scm", "(import (scheme base) (acme evil inc-escape)) escaped");
+    assert!(!out.status.success(), "escaping include outside package must be rejected");
+
+    fs::remove_dir_all(&root).unwrap();
+}

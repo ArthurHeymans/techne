@@ -27,8 +27,11 @@
 (check "valid techne package name" #t (package-name? '(techne mail)))
 (check "valid with punctuation" #t (package-name? '(my-org pkg_2.0)))
 (for-each (lambda (bad) (check "invalid package name" #f (package-name? bad)))
-          (append '(alpha (alpha) (a b c) (Alice pkg) (alice Pkg) ("alice" pkg) (alice "pkg") (.. pkg))
-                  (list (list 'alice (string->symbol ".")))))
+          (append '(alpha (alpha) (a b c) (Alice pkg) (alice Pkg) ("alice" pkg) (alice "pkg") (.. pkg)
+                    (-flag pkg) (alice -flag) (café pkg) (alice café))
+                  (list (list 'alice (string->symbol "."))
+                        (list (string->symbol ".hidden") 'pkg)
+                        (list 'alice (string->symbol ".hidden")))))
 
 ;; A manifest is data: v2 clauses, and the shorthand editor form.
 (write-file! (at "editing" "entry.scm") '(define loaded #t))

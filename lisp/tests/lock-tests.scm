@@ -42,6 +42,32 @@
     (check "subdir preserved" `(github "bob/zed" (commit ,oid2) (subdir "packages/zed"))
            (locked-package-source (cadr (lockfile-packages lf2))))))
 
+;; Persisted `(ref ...)` selectors round-trip deterministically across tag, branch, and commit.
+(let* ((raw `(lock
+               (techne "0.4")
+               (package (alice by-branch) "0.1.0"
+                 (source (github "alice/b" (commit ,oid1) (ref (branch "main"))))
+                 (tree-sha256 ,h1)
+                 (depends))
+               (package (alice by-commit) "0.1.0"
+                 (source (git "https://example.org/c.git" (commit ,oid2) (ref (commit ,oid2))))
+                 (tree-sha256 ,h2)
+                 (depends))
+               (package (alice by-tag) "0.1.0"
+                 (source (local "/tmp/t" (commit ,oid1) (ref (tag "v1.2.3")) (subdir "pkg")))
+                 (tree-sha256 ,h1)
+                 (depends))))
+       (lf (parse-lockfile raw))
+       (text (format-lockfile lf))
+       (lf2 (parse-lockfile (read (open-input-string text)))))
+  (check "ref round-trip text identical" text (format-lockfile lf2))
+  (check "ref branch preserved" `(github "alice/b" (commit ,oid1) (ref (branch "main")))
+         (locked-package-source (list-ref (lockfile-packages lf2) 0)))
+  (check "ref commit preserved" `(git "https://example.org/c.git" (commit ,oid2) (ref (commit ,oid2)))
+         (locked-package-source (list-ref (lockfile-packages lf2) 1)))
+  (check "ref tag + subdir preserved" `(local "/tmp/t" (commit ,oid1) (ref (tag "v1.2.3")) (subdir "pkg"))
+         (locked-package-source (list-ref (lockfile-packages lf2) 2))))
+
 ;; Malformed lockfiles are rejected cleanly as pure data.
 (for-each
   (lambda (case)

@@ -365,3 +365,146 @@ fn a_package_resolves_locked_git_dependencies_and_overrides() {
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(messages, ["cannot find library (acme trans secret)"], "expected only undeclared transitive dep missing");
 }
+
+#[test]
+fn store_dependency_uses_workspace_lock_ignores_dep_override_and_rejects_escaping_lock_paths() {
+    let root = std::env::temp_dir().join(format!("techne-lsp-isolation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = root.join("store");
+    let ws = root.join("workspace");
+    let app = ws.join("app");
+    let outside = root.join("outside-secret");
+    let hash_dep = "3333333333333333333333333333333333333333333333333333333333333333";
+    let hash_trans = "4444444444444444444444444444444444444444444444444444444444444444";
+    let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // Outside package that malicious overrides and malicious lockfile paths try to reach.
+    std::fs::create_dir_all(outside.join("lib/acme/evil")).unwrap();
+    std::fs::write(outside.join("techne-package.scm"), "(package (acme evil) (version \"0.1.0\"))").unwrap();
+    std::fs::write(
+        outside.join("lib/acme/evil/pwn.sld"),
+        "(define-library (acme evil pwn) (export pwned) (import (scheme base)) (begin (define pwned 1)))",
+    )
+    .unwrap();
+    std::fs::create_dir_all(outside.join("lib/acme/trans")).unwrap();
+    std::fs::write(
+        outside.join("lib/acme/trans/api.sld"),
+        "(define-library (acme trans api) (export wrong-from-override) (import (scheme base)) (begin (define wrong-from-override 1)))",
+    )
+    .unwrap();
+
+    // Locked transitive dep in store: exports `trans-ok`.
+    let trans_dir = store.join(hash_trans);
+    std::fs::create_dir_all(trans_dir.join("lib/acme/trans")).unwrap();
+    std::fs::write(trans_dir.join("techne-package.scm"), "(package (acme trans) (version \"0.1.0\"))").unwrap();
+    std::fs::write(
+        trans_dir.join("lib/acme/trans/api.sld"),
+        "(define-library (acme trans api) (export trans-ok) (import (scheme base)) (begin (define trans-ok 42)))",
+    )
+    .unwrap();
+
+    // Direct dep in store: declares `(depends ((acme trans) ...))` AND a malicious non-root `(override ...)`
+    // trying to redirect `(acme trans)` to `../../outside-secret`! LSP must ignore the non-root override
+    // and resolve `(acme trans)` from the workspace's `techne.lock` + store.
+    let dep_dir = store.join(hash_dep);
+    std::fs::create_dir_all(dep_dir.join("lib/acme/dep")).unwrap();
+    std::fs::write(
+        dep_dir.join("techne-package.scm"),
+        "(package (acme dep)
+           (version \"0.1.0\")
+           (depends ((acme trans) (github \"acme/trans\" (tag \"v1\"))))
+           (override ((acme trans) (path \"../../outside-secret\"))))",
+    )
+    .unwrap();
+    let dep_api = dep_dir.join("lib/acme/dep/api.sld");
+    let dep_api_text = "(define-library (acme dep api) (export use-it) (import (scheme base) (acme trans api)) (begin (define (use-it) \"Return trans-ok.\" trans-ok)))";
+    std::fs::write(&dep_api, dep_api_text).unwrap();
+
+    // Consuming workspace app with `techne.lock` containing:
+    // - valid store entries for `(acme dep)` and `(acme trans)`
+    // - malicious absolute `(source (path "/..."))` for `(acme abs-evil)`
+    // - malicious escaping `(source (path "../../outside-secret"))` for `(acme esc-evil)`
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("techne-package.scm"),
+        "(package (acme app)
+           (version \"0.1.0\")
+           (depends
+             ((acme dep) (github \"acme/dep\" (tag \"v1\")))
+             ((acme abs-evil) (github \"acme/abs-evil\" (tag \"v1\")))
+             ((acme esc-evil) (github \"acme/esc-evil\" (tag \"v1\")))))",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("techne.lock"),
+        format!(
+            "(lock
+               (techne \"0.4\")
+               (package (acme abs-evil) \"0.1.0\"
+                 (source (path {:?}))
+                 (tree-sha256 \"{hash_dep}\")
+                 (depends))
+               (package (acme dep) \"0.1.0\"
+                 (source (github \"acme/dep\" (commit \"{commit}\")))
+                 (tree-sha256 \"{hash_dep}\")
+                 (depends (acme trans)))
+               (package (acme esc-evil) \"0.1.0\"
+                 (source (path \"../../outside-secret\"))
+                 (tree-sha256 \"{hash_dep}\")
+                 (depends))
+               (package (acme trans) \"0.1.0\"
+                 (source (github \"acme/trans\" (commit \"{commit}\")))
+                 (tree-sha256 \"{hash_trans}\")
+                 (depends)))",
+            outside.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_techne-lsp"))
+        .env("TECHNE_PACKAGE_STORE", &store)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let init = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},"workspaceFolders":[{{"uri":"file://{}","name":"app"}}]}}}}"#,
+        app.display()
+    );
+    send(&mut stdin, &init);
+    recv(&mut out);
+    send(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+
+    // 1. Opening `store/<hash>/lib/acme/dep/api.sld` resolves `(acme trans api)` from `app/techne.lock`
+    //    (finding `trans-ok`, ignoring dep's malicious `(override ...)`): zero diagnostics!
+    let open_dep = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file://{}","languageId":"scheme","version":1,"text":{:?}}}}}}}"#,
+        dep_api.display(),
+        dep_api_text
+    );
+    send(&mut stdin, &open_dep);
+    let dep_msgs = published(&mut out);
+    assert_eq!(dep_msgs, Vec::<String>::new(), "store dep should resolve its locked dep and ignore its own override");
+
+    // 2. Opening `app/main.scm` importing `(acme abs-evil pwn)` and `(acme esc-evil pwn)`:
+    //    both malicious lockfile paths (absolute and workspace-escaping) must be rejected!
+    let app_main = app.join("main.scm");
+    let open_app = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file://{}","languageId":"scheme","version":1,"text":{:?}}}}}}}"#,
+        app_main.display(),
+        "(import (scheme base) (acme abs-evil pwn) (acme esc-evil pwn))"
+    );
+    send(&mut stdin, &open_app);
+    let app_msgs = published(&mut out);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        app_msgs,
+        ["cannot find library (acme abs-evil pwn)", "cannot find library (acme esc-evil pwn)"],
+        "absolute and escaping lockfile paths must be rejected"
+    );
+}

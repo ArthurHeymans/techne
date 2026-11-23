@@ -115,6 +115,8 @@ fn rust_tree_sha256(dir: &Path) -> String {
                 walk(&path, &rel, out);
             } else if meta.is_file() {
                 out.push((rel, path));
+            } else {
+                panic!("unexpected non-regular file: {}", path.display());
             }
         }
     }
@@ -169,6 +171,7 @@ fn lock_and_run_locked_offline_single_and_monorepo() {
     let expected_util_hash = rust_tree_sha256(&util_repo);
 
     // 2. Monorepo holding (acme mono-a) -> intra-repo (acme mono-b) AND cross-repo (acme util).
+    // Non-root manifests must not use (local ...); root overrides (acme util) to local util_repo.
     let mono_repo = root.join("mono-repo");
     write_file(&mono_repo, "packages/mono-b/techne-package.scm", "(package (acme mono-b) (version \"0.1.0\"))");
     write_file(
@@ -179,14 +182,11 @@ fn lock_and_run_locked_offline_single_and_monorepo() {
     write_file(
         &mono_repo,
         "packages/mono-a/techne-package.scm",
-        &format!(
-            "(package (acme mono-a)
-               (version \"0.3.0\")
-               (depends
-                 ((acme mono-b) (path \"../mono-b\"))
-                 ((acme util) (local {:?} (tag \"v1\")))))",
-            util_repo.display().to_string()
-        ),
+        "(package (acme mono-a)
+           (version \"0.3.0\")
+           (depends
+             ((acme mono-b) (path \"../mono-b\"))
+             ((acme util) (github \"acme/util\" (tag \"v1\")))))",
     );
     write_file(
         &mono_repo,
@@ -209,8 +209,11 @@ fn lock_and_run_locked_offline_single_and_monorepo() {
            (depends
              ((acme mono-a) (local {:?} (package (acme mono-a))))
              ((acme util) (local {:?} (tag \"v1\"))))
+           (override
+             ((acme util) (local {:?} (tag \"v1\"))))
            (cloud \"main.scm\" (bindings (kv-store kv))))",
         mono_repo.display().to_string(),
+        util_repo.display().to_string(),
         util_repo.display().to_string()
     );
     write_file(&app, "techne-package.scm", &app_manifest);
@@ -235,6 +238,7 @@ fn lock_and_run_locked_offline_single_and_monorepo() {
     // Verify techne.lock contents and exact Rust/Scheme tree-sha256 bit-for-bit equality.
     let lock_text = std::fs::read_to_string(app.join("techne.lock")).unwrap();
     assert!(lock_text.contains(&format!("(commit \"{util_oid}\")")), "{lock_text}");
+    assert!(lock_text.contains("(ref (tag \"v1\"))"), "{lock_text}");
     assert!(lock_text.contains(&format!("(commit \"{mono_oid}\")")), "{lock_text}");
     assert!(lock_text.contains("(subdir \"packages/mono-a\")"), "{lock_text}");
     assert!(lock_text.contains("(subdir \"packages/mono-b\")"), "{lock_text}");
@@ -332,7 +336,7 @@ fn diamond_conflict_names_both_chains_and_override_resolves_it() {
     let root = tmp.path();
     let store = root.join("store");
 
-    // Shared dep (acme util) with v1 and v2 tags.
+    // Shared dep (acme util) with v1 and v2 tags for root override.
     let util_repo = root.join("util");
     write_file(&util_repo, "techne-package.scm", "(package (acme util) (version \"1.0.0\"))");
     write_file(
@@ -352,39 +356,41 @@ fn diamond_conflict_names_both_chains_and_override_resolves_it() {
     git_init_commit(&util_repo, "v2");
     git(&util_repo, &["-c", "tag.gpgSign=false", "tag", "v2"]);
 
-    // (acme left) -> (acme util) @ v1
-    let left_repo = root.join("left");
+    // Hermetic monorepo containing (acme left) -> util-v1 and (acme right) -> util-v2.
+    let diamond_repo = root.join("diamond-repo");
+    write_file(&diamond_repo, "packages/util-v1/techne-package.scm", "(package (acme util) (version \"1.0.0\"))");
     write_file(
-        &left_repo,
-        "techne-package.scm",
-        &format!(
-            "(package (acme left) (version \"0.1.0\") (depends ((acme util) (local {:?} (tag \"v1\")))))",
-            util_repo.display().to_string()
-        ),
+        &diamond_repo,
+        "packages/util-v1/lib/acme/util/v.sld",
+        "(define-library (acme util v) (export util-val) (import (scheme base)) (begin (define (util-val) 'v1)))",
+    );
+    write_file(&diamond_repo, "packages/util-v2/techne-package.scm", "(package (acme util) (version \"2.0.0\"))");
+    write_file(
+        &diamond_repo,
+        "packages/util-v2/lib/acme/util/v.sld",
+        "(define-library (acme util v) (export util-val) (import (scheme base)) (begin (define (util-val) 'v2)))",
     );
     write_file(
-        &left_repo,
-        "lib/acme/left/api.sld",
+        &diamond_repo,
+        "packages/left/techne-package.scm",
+        "(package (acme left) (version \"0.1.0\") (depends ((acme util) (path \"../util-v1\"))))",
+    );
+    write_file(
+        &diamond_repo,
+        "packages/left/lib/acme/left/api.sld",
         "(define-library (acme left api) (export left-v) (import (scheme base) (acme util v)) (begin (define (left-v) (util-val))))",
     );
-    git_init_commit(&left_repo, "left");
-
-    // (acme right) -> (acme util) @ v2
-    let right_repo = root.join("right");
     write_file(
-        &right_repo,
-        "techne-package.scm",
-        &format!(
-            "(package (acme right) (version \"0.1.0\") (depends ((acme util) (local {:?} (tag \"v2\")))))",
-            util_repo.display().to_string()
-        ),
+        &diamond_repo,
+        "packages/right/techne-package.scm",
+        "(package (acme right) (version \"0.1.0\") (depends ((acme util) (path \"../util-v2\"))))",
     );
     write_file(
-        &right_repo,
-        "lib/acme/right/api.sld",
+        &diamond_repo,
+        "packages/right/lib/acme/right/api.sld",
         "(define-library (acme right api) (export right-v) (import (scheme base) (acme util v)) (begin (define (right-v) (util-val))))",
     );
-    git_init_commit(&right_repo, "right");
+    git_init_commit(&diamond_repo, "diamond");
 
     // Root (acme app) depends on both (acme left) and (acme right).
     let app = root.join("app");
@@ -395,10 +401,10 @@ fn diamond_conflict_names_both_chains_and_override_resolves_it() {
             "(package (acme app)
                (version \"0.1.0\")
                (depends
-                 ((acme left) (local {:?}))
-                 ((acme right) (local {:?}))))",
-            left_repo.display().to_string(),
-            right_repo.display().to_string()
+                 ((acme left) (local {:?} (package (acme left))))
+                 ((acme right) (local {:?} (package (acme right))))))",
+            diamond_repo.display().to_string(),
+            diamond_repo.display().to_string()
         ),
     );
     write_file(
@@ -426,12 +432,12 @@ fn diamond_conflict_names_both_chains_and_override_resolves_it() {
             "(package (acme app)
                (version \"0.1.0\")
                (depends
-                 ((acme left) (local {:?}))
-                 ((acme right) (local {:?})))
+                 ((acme left) (local {:?} (package (acme left))))
+                 ((acme right) (local {:?} (package (acme right)))))
                (override
                  ((acme util) (local {:?} (tag \"v2\")))))",
-            left_repo.display().to_string(),
-            right_repo.display().to_string(),
+            diamond_repo.display().to_string(),
+            diamond_repo.display().to_string(),
             util_repo.display().to_string()
         ),
     );
@@ -449,8 +455,7 @@ fn diamond_conflict_names_both_chains_and_override_resolves_it() {
 
     // Delete Git repos first to prove the git-override lock runs offline.
     std::fs::remove_dir_all(&util_repo).unwrap();
-    std::fs::remove_dir_all(&left_repo).unwrap();
-    std::fs::remove_dir_all(&right_repo).unwrap();
+    std::fs::remove_dir_all(&diamond_repo).unwrap();
 
     let run_v2 = techne().args(["run", "--locked", "--store"]).arg(&store).arg(app.join("main.scm")).output().unwrap();
     assert_ok(&run_v2, "run --locked with v2 override offline");
@@ -535,4 +540,385 @@ fn cycle_detection_and_symlink_rejection() {
         assert!(!out2.status.success(), "symlink in Git package tree must fail");
         assert!(stderr_str(&out2).contains("Symlink not allowed"), "{}", stderr_str(&out2));
     }
+}
+
+#[test]
+fn locked_run_ignores_library_path_shadowing_and_unprovided_prefixes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store = root.join("store");
+
+    let app = root.join("app");
+    write_file(&app, "techne-package.scm", "(package (acme app) (version \"0.1.0\"))");
+    write_file(
+        &app,
+        "use-crypto.scm",
+        "(import (scheme base) (scheme write) (techne crypto) (techne package))
+         (write (list (hex-encode (sha-256 \"\")) (package-name? '(acme app))))
+         (newline)",
+    );
+    write_file(&app, "use-unprovided.scm", "(import (scheme base) (evil spoof)) (display spoofed)");
+
+    let locked = techne().args(["lock"]).arg(&app).arg("--store").arg(&store).output().unwrap();
+    assert_ok(&locked, "techne lock empty deps");
+
+    // Malicious TECHNE_LIBRARY_PATH trying to shadow (techne crypto), (techne package),
+    // and inject an unprovided (evil spoof) library.
+    let hijack = root.join("hijack");
+    write_file(
+        &hijack,
+        "techne/crypto.sld",
+        "(define-library (techne crypto) (export sha-256 hex-encode) (import (scheme base))
+           (begin (define (sha-256 _) \"HIJACKED\") (define (hex-encode _) \"HIJACKED\")))",
+    );
+    write_file(
+        &hijack,
+        "techne/package.sld",
+        "(define-library (techne package) (export package-name?) (import (scheme base))
+           (begin (define (package-name? _) 'hijacked)))",
+    );
+    write_file(
+        &hijack,
+        "evil/spoof.sld",
+        "(define-library (evil spoof) (export spoofed) (import (scheme base)) (begin (define spoofed 'pwned)))",
+    );
+
+    // `--locked` ignores TECHNE_LIBRARY_PATH and CWD: real stdlib (techne crypto) & (techne package) load!
+    let run_crypto = techne()
+        .args(["run", "--locked", "--store"])
+        .arg(&store)
+        .arg(app.join("use-crypto.scm"))
+        .current_dir(&hijack)
+        .env("TECHNE_LIBRARY_PATH", &hijack)
+        .output()
+        .unwrap();
+    assert_ok(&run_crypto, "run --locked uses real stdlib despite TECHNE_LIBRARY_PATH");
+    assert_eq!(
+        String::from_utf8_lossy(&run_crypto.stdout).trim(),
+        "(\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" #t)"
+    );
+
+    // `--locked` refuses unprovided non-stdlib prefixes even when present in TECHNE_LIBRARY_PATH and CWD.
+    let run_unprovided = techne()
+        .args(["run", "--locked", "--store"])
+        .arg(&store)
+        .arg(app.join("use-unprovided.scm"))
+        .current_dir(&hijack)
+        .env("TECHNE_LIBRARY_PATH", &hijack)
+        .output()
+        .unwrap();
+    assert!(!run_unprovided.status.success(), "--locked must refuse unprovided (evil spoof)");
+
+    // Passing `--store` to `techne run` without `--locked` fails clearly with exit code 2.
+    let bad_store = techne().args(["run", "--store"]).arg(&store).arg(app.join("use-crypto.scm")).output().unwrap();
+    assert_eq!(bad_store.status.code(), Some(2), "stderr: {}", stderr_str(&bad_store));
+    assert!(stderr_str(&bad_store).contains("--store requires --locked"), "{}", stderr_str(&bad_store));
+}
+
+#[test]
+fn frozen_hydrates_pinned_commit_without_moving_pins_and_rejects_hash_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store1 = root.join("store1");
+    let store2 = root.join("store2");
+
+    // Dep repo on moving branch `main`: v1 then v2.
+    let dep_repo = root.join("dep-repo");
+    write_file(&dep_repo, "techne-package.scm", "(package (acme dep) (version \"1.0.0\"))");
+    write_file(
+        &dep_repo,
+        "lib/acme/dep/val.sld",
+        "(define-library (acme dep val) (export dep-val) (import (scheme base)) (begin (define dep-val 'v1)))",
+    );
+    let oid_v1 = git_init_commit(&dep_repo, "v1");
+    git(&dep_repo, &["branch", "-M", "main"]);
+
+    let app = root.join("app");
+    write_file(
+        &app,
+        "techne-package.scm",
+        &format!(
+            "(package (acme app) (version \"0.1.0\") (depends ((acme dep) (local {:?} (branch \"main\")))))",
+            dep_repo.display().to_string()
+        ),
+    );
+    write_file(&app, "main.scm", "(import (scheme base) (scheme write) (acme dep val)) (write dep-val) (newline)");
+
+    // Initial lock pins v1.
+    let lock1 = techne().args(["lock"]).arg(&app).arg("--store").arg(&store1).output().unwrap();
+    assert_ok(&lock1, "initial techne lock");
+    let lock_v1_text = std::fs::read_to_string(app.join("techne.lock")).unwrap();
+    assert!(lock_v1_text.contains(&format!("(commit \"{oid_v1}\")")), "{lock_v1_text}");
+    assert!(lock_v1_text.contains("(ref (branch \"main\"))"), "{lock_v1_text}");
+
+    // Advance `main` branch in dep_repo to v2.
+    write_file(&dep_repo, "techne-package.scm", "(package (acme dep) (version \"2.0.0\"))");
+    write_file(
+        &dep_repo,
+        "lib/acme/dep/val.sld",
+        "(define-library (acme dep val) (export dep-val) (import (scheme base)) (begin (define dep-val 'v2)))",
+    );
+    let oid_v2 = git_init_commit(&dep_repo, "v2");
+    assert_ne!(oid_v1, oid_v2);
+
+    // `techne run --locked` against an empty store2 fails offline and points to `techne lock --frozen`.
+    let run_missing = techne().args(["run", "--locked", "--store"]).arg(&store2).arg(app.join("main.scm")).output().unwrap();
+    assert!(!run_missing.status.success(), "run --locked with empty store must fail offline");
+    assert!(stderr_str(&run_missing).contains("techne lock --frozen"), "{}", stderr_str(&run_missing));
+
+    // `techne lock --frozen` hydrates store2 at exact pinned oid_v1 WITHOUT moving pins or modifying techne.lock!
+    let frozen = techne().args(["lock"]).arg(&app).args(["--frozen", "--store"]).arg(&store2).output().unwrap();
+    assert_ok(&frozen, "techne lock --frozen");
+    assert_eq!(std::fs::read_to_string(app.join("techne.lock")).unwrap(), lock_v1_text);
+
+    // Running against store2 returns v1 (not v2!).
+    let run_v1 = techne().args(["run", "--locked", "--store"]).arg(&store2).arg(app.join("main.scm")).output().unwrap();
+    assert_ok(&run_v1, "run --locked after --frozen");
+    assert_eq!(String::from_utf8_lossy(&run_v1.stdout).trim(), "v1");
+
+    // Plain `techne lock` (without `--update`) ALSO preserves the existing valid v1 pin!
+    let lock_preserve = techne().args(["lock"]).arg(&app).arg("--store").arg(&store2).output().unwrap();
+    assert_ok(&lock_preserve, "techne lock preserves pins");
+    assert_eq!(std::fs::read_to_string(app.join("techne.lock")).unwrap(), lock_v1_text);
+
+    // Corrupted tree-sha256 in techne.lock causes `techne lock --frozen` to fail loudly on hash mismatch!
+    let bad_lock_path = app.join("techne.lock");
+    let bogus_hash = "0".repeat(64);
+    let corrupted_lock = lock_v1_text
+        .lines()
+        .map(|l| if l.contains("(tree-sha256 ") { format!("    (tree-sha256 \"{bogus_hash}\")") } else { l.to_string() })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&bad_lock_path, &corrupted_lock).unwrap();
+    let store3 = root.join("store3");
+    let frozen_bad = techne().args(["lock"]).arg(&app).args(["--frozen", "--store"]).arg(&store3).output().unwrap();
+    assert!(!frozen_bad.status.success(), "--frozen must reject tree-sha256 mismatch");
+    assert!(stderr_str(&frozen_bad).contains("tree-sha256 mismatch"), "{}", stderr_str(&frozen_bad));
+    assert!(!store3.join(&bogus_hash).exists(), "corrupted hash must not be published");
+
+    // Restore valid lock, then `techne lock --update` advances the pin to oid_v2!
+    std::fs::write(&bad_lock_path, &lock_v1_text).unwrap();
+    let updated = techne().args(["lock"]).arg(&app).args(["--update", "--store"]).arg(&store2).output().unwrap();
+    assert_ok(&updated, "techne lock --update");
+    let lock_v2_text = std::fs::read_to_string(&bad_lock_path).unwrap();
+    assert!(lock_v2_text.contains(&format!("(commit \"{oid_v2}\")")), "{lock_v2_text}");
+    let run_v2 = techne().args(["run", "--locked", "--store"]).arg(&store2).arg(app.join("main.scm")).output().unwrap();
+    assert_ok(&run_v2, "run --locked after --update");
+    assert_eq!(String::from_utf8_lossy(&run_v2.stdout).trim(), "v2");
+}
+
+#[test]
+fn ref_change_and_techne_version_change_fail_offline_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store = root.join("store");
+
+    let dep_repo = root.join("dep-repo");
+    write_file(&dep_repo, "techne-package.scm", "(package (acme dep) (version \"1.0.0\"))");
+    write_file(
+        &dep_repo,
+        "lib/acme/dep/val.sld",
+        "(define-library (acme dep val) (export dep-val) (import (scheme base)) (begin (define dep-val 'v1)))",
+    );
+    git_init_commit(&dep_repo, "v1");
+    git(&dep_repo, &["-c", "tag.gpgSign=false", "tag", "v1"]);
+    git(&dep_repo, &["-c", "tag.gpgSign=false", "tag", "v2"]);
+
+    let app = root.join("app");
+    let manifest_v1 = format!(
+        "(package (acme app) (version \"0.1.0\") (techne \"0.4\") (depends ((acme dep) (local {:?} (tag \"v1\")))))",
+        dep_repo.display().to_string()
+    );
+    write_file(&app, "techne-package.scm", &manifest_v1);
+    write_file(&app, "main.scm", "(import (scheme base) (acme dep val)) dep-val");
+
+    let locked = techne().args(["lock"]).arg(&app).arg("--store").arg(&store).output().unwrap();
+    assert_ok(&locked, "lock tag v1");
+
+    // Changing (tag "v1") -> (tag "v2") in manifest must immediately fail --check, --frozen, and run --locked offline!
+    let manifest_v2 = format!(
+        "(package (acme app) (version \"0.1.0\") (techne \"0.4\") (depends ((acme dep) (local {:?} (tag \"v2\")))))",
+        dep_repo.display().to_string()
+    );
+    write_file(&app, "techne-package.scm", &manifest_v2);
+
+    let chk = techne().args(["lock"]).arg(&app).args(["--check", "--store"]).arg(&store).output().unwrap();
+    assert!(!chk.status.success(), "tag change must fail --check");
+    assert!(stderr_str(&chk).contains("requested ref changed"), "{}", stderr_str(&chk));
+
+    let frz = techne().args(["lock"]).arg(&app).args(["--frozen", "--store"]).arg(&store).output().unwrap();
+    assert!(!frz.status.success(), "tag change must fail --frozen");
+    assert!(stderr_str(&frz).contains("requested ref changed"), "{}", stderr_str(&frz));
+
+    let run = techne().args(["run", "--locked", "--store"]).arg(&store).arg(app.join("main.scm")).output().unwrap();
+    assert!(!run.status.success(), "tag change must fail run --locked");
+    assert!(stderr_str(&run).contains("requested ref changed"), "{}", stderr_str(&run));
+
+    // Changing (techne "0.4") -> (techne "0.5") must also fail --check offline!
+    let manifest_ver = format!(
+        "(package (acme app) (version \"0.1.0\") (techne \"0.5\") (depends ((acme dep) (local {:?} (tag \"v1\")))))",
+        dep_repo.display().to_string()
+    );
+    write_file(&app, "techne-package.scm", &manifest_ver);
+    let chk_ver = techne().args(["lock"]).arg(&app).args(["--check", "--store"]).arg(&store).output().unwrap();
+    assert!(!chk_ver.status.success(), "techne version change must fail --check");
+    assert!(stderr_str(&chk_ver).contains("techne version changed"), "{}", stderr_str(&chk_ver));
+}
+
+#[test]
+fn non_root_local_source_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store = root.join("store");
+
+    let secret_repo = root.join("secret-local");
+    write_file(&secret_repo, "techne-package.scm", "(package (acme secret) (version \"0.1.0\"))");
+    git_init_commit(&secret_repo, "secret");
+
+    let mid_repo = root.join("mid-repo");
+    write_file(
+        &mid_repo,
+        "techne-package.scm",
+        &format!("(package (acme mid) (version \"0.1.0\") (depends ((acme secret) (local {:?}))))", secret_repo.display().to_string()),
+    );
+    git_init_commit(&mid_repo, "mid");
+
+    let app = root.join("app");
+    write_file(
+        &app,
+        "techne-package.scm",
+        &format!("(package (acme app) (version \"0.1.0\") (depends ((acme mid) (local {:?}))))", mid_repo.display().to_string()),
+    );
+
+    let out = techne().args(["lock"]).arg(&app).arg("--store").arg(&store).output().unwrap();
+    assert!(!out.status.success(), "non-root (local ...) must be rejected");
+    assert!(stderr_str(&out).contains("Non-root manifest cannot use (local ...)"), "{}", stderr_str(&out));
+}
+
+#[test]
+fn mirror_diamond_fails_at_lock_time_naming_both_chains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store = root.join("store");
+
+    // Two distinct repo locations cloned from the exact same Git commit (mirrors):
+    // root depends on (acme mid) from mono1 (which pulls (acme util) from mono1)
+    // AND directly on (acme util) from mono2. Even with identical commit and
+    // tree-sha256, different source locations must conflict at lock time.
+    let mono1 = root.join("mono-mirror-1");
+    write_file(&mono1, "packages/util/techne-package.scm", "(package (acme util) (version \"1.0.0\"))");
+    write_file(
+        &mono1,
+        "packages/mid/techne-package.scm",
+        "(package (acme mid) (version \"1.0.0\") (depends ((acme util) (path \"../util\"))))",
+    );
+    git_init_commit(&mono1, "mono");
+
+    let mono2 = root.join("mono-mirror-2");
+    git(root, &["clone", "--quiet", mono1.to_str().unwrap(), mono2.to_str().unwrap()]);
+
+    let app = root.join("app");
+    write_file(
+        &app,
+        "techne-package.scm",
+        &format!(
+            "(package (acme app)
+               (version \"0.1.0\")
+               (depends
+                 ((acme mid) (local {:?} (package (acme mid))))
+                 ((acme util) (local {:?} (package (acme util))))))",
+            mono1.display().to_string(),
+            mono2.display().to_string()
+        ),
+    );
+
+    let out = techne().args(["lock"]).arg(&app).arg("--store").arg(&store).output().unwrap();
+    assert!(!out.status.success(), "mirror diamond must fail loudly at lock time");
+    let err = stderr_str(&out);
+    assert!(err.contains("Diamond dependency conflict for (acme util)"), "{err}");
+    assert!(err.contains("(acme app) -> (acme mid) -> (acme util)"), "{err}");
+    assert!(err.contains("(acme app) -> (acme util)"), "{err}");
+    assert!(!app.join("techne.lock").exists(), "failed mirror diamond must not write techne.lock");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_directory_in_git_repo_cannot_escape_discovery_or_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store = root.join("store");
+
+    // Outside package directory that a symlink inside a Git repo tries to point to.
+    let outside = root.join("outside-pkg");
+    write_file(&outside, "techne-package.scm", "(package (acme escaped) (version \"0.1.0\"))");
+    write_file(&outside, "secret.txt", "top-secret");
+
+    let evil_repo = root.join("evil-repo");
+    std::fs::create_dir_all(evil_repo.join("packages")).unwrap();
+    write_file(&evil_repo, "packages/legit/techne-package.scm", "(package (acme legit) (version \"0.1.0\"))");
+    std::os::unix::fs::symlink(&outside, evil_repo.join("packages/escape")).unwrap();
+    git_init_commit(&evil_repo, "symlinked dir");
+
+    // Attempting to select `(acme escaped)` through the symlinked directory must fail!
+    let app = root.join("app");
+    write_file(
+        &app,
+        "techne-package.scm",
+        &format!(
+            "(package (acme app) (version \"0.1.0\") (depends ((acme escaped) (local {:?} (package (acme escaped))))))",
+            evil_repo.display().to_string()
+        ),
+    );
+    let out = techne().args(["lock"]).arg(&app).arg("--store").arg(&store).output().unwrap();
+    assert!(!out.status.success(), "symlinked dir in Git repo must never escape discovery/staging");
+    assert!(!app.join("techne.lock").exists());
+}
+
+#[test]
+fn git_dir_env_does_not_corrupt_lock_and_special_paths_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store = root.join("café's store");
+
+    let dep_repo = root.join("dep-repo");
+    write_file(&dep_repo, "techne-package.scm", "(package (acme dep) (version \"0.1.0\"))");
+    write_file(
+        &dep_repo,
+        "lib/acme/dep/hi.sld",
+        "(define-library (acme dep hi) (export hi) (import (scheme base)) (begin (define hi \"ok\")))",
+    );
+    git_init_commit(&dep_repo, "dep");
+
+    // Bogus external Git repo pointed to by GIT_DIR / GIT_WORK_TREE (simulating git hooks / rebase --exec).
+    let bogus_git = root.join("bogus-git");
+    write_file(&bogus_git, "README.md", "bogus");
+    git_init_commit(&bogus_git, "bogus");
+
+    // Project directory with apostrophe and non-ASCII Unicode characters!
+    let app = root.join("café's app");
+    write_file(
+        &app,
+        "techne-package.scm",
+        &format!(
+            "(package (acme app) (version \"0.1.0\") (depends ((acme dep) (local {}))))",
+            techne_vm::cli::scheme_string_literal(&dep_repo.display().to_string())
+        ),
+    );
+    write_file(&app, "main.scm", "(import (scheme base) (scheme write) (acme dep hi)) (display hi) (newline)");
+
+    let locked = techne()
+        .args(["lock"])
+        .arg(&app)
+        .arg("--store")
+        .arg(&store)
+        .env("GIT_DIR", bogus_git.join(".git"))
+        .env("GIT_WORK_TREE", &bogus_git)
+        .output()
+        .unwrap();
+    assert_ok(&locked, "techne lock with GIT_DIR set and unicode/apostrophe paths");
+
+    let run = techne().args(["run", "--locked", "--store"]).arg(&store).arg(app.join("main.scm")).output().unwrap();
+    assert_ok(&run, "techne run --locked with unicode/apostrophe paths");
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "ok");
 }
