@@ -1279,7 +1279,7 @@ pub fn install(vm: &mut Vm) {
         /// SOURCE-STRING is the updated `(define-library ...)` text.
         /// OPTIONS accepts `#:check-retained` boolean (default `#t`).
         "(patch-library! library-name source-string . options)" => |vm: &mut Vm, a, n| {
-            vm.check_loading()?;
+            vm.need(crate::vm::Capability::Patching, "patch-library!")?;
             let items = crate::builtins::list_values(arg(vm, a, 0))
                 .filter(|v| !v.is_empty())
                 .ok_or_else(|| Error::new("patch-library!: expected a non-empty library name list"))?;
@@ -1295,6 +1295,7 @@ pub fn install(vm: &mut Vm) {
                     return Err(Error::new("patch-library!: library name parts must be symbols, strings, or non-negative integers"));
                 }
             }
+            vm.check_scheme_patch_authority(&parts)?;
             let source = string(vm, arg(vm, a, 1), "patch-library!")?;
             let check_retained = match n {
                 2 => true,
@@ -1311,7 +1312,7 @@ pub fn install(vm: &mut Vm) {
             let report = vm.patch_library_raw(&parts, &source, check_retained).map_err(|e| Error::new(e.to_string()))?;
 
             // Build result dict with full GC rooting across allocations:
-            // {library ("a" "b") patched #("f") unchanged N stale-holders #({binding "f" chain #(...)}) source-sha256 "..."}
+            // {library ("a" "b") patched #("f") unchanged N stale-holders #({binding "f" chain #(...)}) stale-holders-truncated #f source-sha256 "..."}
             let lib_roots: Vec<_> = report.library.iter().map(|p| { let v = vm.make_string_raw(p); vm.root(v) }).collect();
             let lib_vals: Vec<Value> = lib_roots.iter().map(|r| r.get()).collect();
             let v = vm.make_list_raw(&lib_vals);
@@ -1355,6 +1356,13 @@ pub fn install(vm: &mut Vm) {
             let v = crate::dict::insert(vm, d.get(), Value::symbol(reader::intern("unchanged")), unchanged_val.get());
             let d = vm.root(v);
             let v = crate::dict::insert(vm, d.get(), Value::symbol(reader::intern("stale-holders")), holders_vec.get());
+            let d = vm.root(v);
+            let v = crate::dict::insert(
+                vm,
+                d.get(),
+                Value::symbol(reader::intern("stale-holders-truncated")),
+                Value::bool(report.stale_holders_truncated),
+            );
             let d = vm.root(v);
             Ok(crate::dict::insert(vm, d.get(), Value::symbol(reader::intern("source-sha256")), sha_str.get())) };
         // The names a module sees, for completion: a list of (name kind),

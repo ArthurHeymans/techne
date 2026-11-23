@@ -563,35 +563,57 @@ fn patch_across_snapshot_bundle_vfs_and_capability_gating() {
   (begin
     (define (greet who) (string-append "patched " who))))"#;
 
-    // Scheme `(patch-library! ...)` is denied when Capability::Loading is revoked.
+    // Scheme `(patch-library! ...)` is denied when Capability::Patching is not granted (even if Loading is granted).
     let err = patched_world.eval_source(&format!("(patch-library! '(bob util) {v2:?})")).unwrap_err();
-    assert!(err.msg.contains("loading") || err.msg.contains("not granted") || err.msg.contains("capability"), "{err}");
+    assert!(err.msg.contains("patching") || err.msg.contains("not granted") || err.msg.contains("capability"), "{err}");
 
-    // Rust `Vm::patch_library` succeeds on the snapshot-instantiated world!
+    patched_world.set_grant(Capability::Loading, true);
+    let err = patched_world.eval_source(&format!("(patch-library! '(bob util) {v2:?})")).unwrap_err();
+    assert!(err.msg.contains("patching") || err.msg.contains("not granted") || err.msg.contains("capability"), "{err}");
+
+    // Even with Capability::Patching granted, untrusted eval_source in bundle mode cannot patch a bundle package.
+    patched_world.set_grant(Capability::Patching, true);
+    let err = patched_world.eval_source(&format!("(patch-library! '(bob util) {v2:?})")).unwrap_err();
+    assert!(err.msg.contains("owned by package") || err.msg.contains("not accessible"), "{err}");
+
+    // Rust `Vm::patch_library` succeeds on the snapshot-instantiated world (without requiring Scheme capabilities)!
+    patched_world.set_grant(Capability::Patching, false);
+    patched_world.set_grant(Capability::Loading, false);
     let report = patched_world.patch_library(&parts(&["bob", "util"]), v2, true).unwrap();
     assert_eq!(report.patched, vec!["greet"]);
+    assert!(!report.stale_holders_truncated);
     assert_eq!(eval_str(&mut patched_world, "(run-app)"), "\"patched world\"");
     // Sibling world from the same snapshot is completely untouched.
     assert_eq!(eval_str(&mut untouched_world, "(run-app)"), "\"hello world\"");
 
-    // When Capability::Loading is granted, Scheme `(patch-library! ...)` succeeds and returns a report dict.
-    patched_world.set_grant(Capability::Loading, true);
-    let v3 = r#"(define-library (bob util)
+    // In a non-bundle/non-locked world with Capability::Patching, Scheme `(patch-library! ...)` returns a report dict.
+    let mut dev_vm = Vm::with_grants(Grants::NONE.with(Capability::Loading).with(Capability::Patching));
+    dev_vm
+        .eval_source(
+            r#"(define-library (dev util)
+                 (export greet)
+                 (import (techne))
+                 (begin (define (greet who) (string-append "hi " who))))
+               (import (dev util))"#,
+        )
+        .unwrap();
+    let v3 = r#"(define-library (dev util)
   (export greet)
   (import (techne))
   (begin
     (define (greet who) (string-append "scheme " who))))"#;
     let res = eval_str(
-        &mut patched_world,
+        &mut dev_vm,
         &format!(
-            "(let ((r (patch-library! '(bob util) {v3:?} #:check-retained #f)))
+            "(let ((r (patch-library! '(dev util) {v3:?} #:check-retained #f)))
                (list (dict-ref r 'library)
                      (dict-ref r 'patched)
                      (dict-ref r 'unchanged)
                      (dict-ref r 'stale-holders)
+                     (dict-ref r 'stale-holders-truncated)
                      (string? (dict-ref r 'source-sha256))))"
         ),
     );
-    assert_eq!(res, "((\"bob\" \"util\") #(\"greet\") 0 #() #t)");
-    assert_eq!(eval_str(&mut patched_world, "(run-app)"), "\"scheme world\"");
+    assert_eq!(res, "((\"dev\" \"util\") #(\"greet\") 0 #() #f #t)");
+    assert_eq!(eval_str(&mut dev_vm, "(greet \"world\")"), "\"scheme world\"");
 }

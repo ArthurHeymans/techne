@@ -577,8 +577,9 @@ impl Vm {
         let result = (|| {
             let mut imports = Vec::new();
             let mut body = Vec::new();
-            self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body)?;
-            self.record_library_snapshot(m, &imports, &body);
+            let mut cond_expand_decisions = Vec::new();
+            self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body, &mut cond_expand_decisions)?;
+            self.record_library_snapshot(m, &imports, &body, cond_expand_decisions);
             for (form, file) in imports {
                 let dir = self.import_dir(file);
                 self.import_for(m, Some(file), &form.list().unwrap()[1..], &dir)?;
@@ -590,6 +591,7 @@ impl Vm {
                 self.eval_form(m, *file, form)?;
             }
             self.exported(m, &self.modules[m as usize].name)?;
+            self.finalize_library_snapshot(m);
             Ok(())
         })();
         match result {
@@ -605,11 +607,12 @@ impl Vm {
         let m = self.new_library(form, owner, file)?;
         let mut imports = Vec::new();
         let mut body = Vec::new();
-        if let Err(e) = self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body) {
+        let mut cond_expand_decisions = Vec::new();
+        if let Err(e) = self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body, &mut cond_expand_decisions) {
             self.abort_library(m);
             return Err(e);
         }
-        self.record_library_snapshot(m, &imports, &body);
+        self.record_library_snapshot(m, &imports, &body, cond_expand_decisions);
         imports.extend(body);
         Ok(self.queued_forms(m, file, imports, true))
     }
@@ -664,6 +667,7 @@ impl Vm {
     }
 
     /// Collect declarations without running their imports or body forms.
+    #[allow(clippy::too_many_arguments)]
     fn library_declarations(
         &mut self,
         m: u32,
@@ -672,6 +676,7 @@ impl Vm {
         dir: &Path,
         imports: &mut Vec<(Sexp, u32)>,
         body: &mut Vec<(Sexp, u32)>,
+        cond_expand_decisions: &mut Vec<crate::patch::CondExpandDecision>,
     ) -> R<()> {
         for decl in decls {
             let items = decl.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new("define-library: bad declaration"))?;
@@ -702,12 +707,13 @@ impl Vm {
                 "include-library-declarations" => {
                     for (forms, included_file) in self.include(&items[1..], dir, false)? {
                         let child_dir = self.form_source_dir(included_file);
-                        self.library_declarations(m, &forms, included_file, &child_dir, imports, body)?;
+                        self.library_declarations(m, &forms, included_file, &child_dir, imports, body, cond_expand_decisions)?;
                     }
                 }
                 "cond-expand" => {
-                    let chosen = self.cond_expand_for(m, Some(file), &items[1..], dir)?;
-                    self.library_declarations(m, &chosen, file, dir, imports, body)?;
+                    let (decision, chosen) = self.cond_expand_for_decision(m, Some(file), &items[1..], dir)?;
+                    cond_expand_decisions.push(decision);
+                    self.library_declarations(m, &chosen, file, dir, imports, body, cond_expand_decisions)?;
                 }
                 _ => return err(format!("define-library: unknown declaration {}", display_sexp(decl))),
             }
@@ -800,14 +806,29 @@ impl Vm {
     }
 
     pub(crate) fn cond_expand_for(&mut self, module: u32, file: Option<u32>, clauses: &[Sexp], dir: &Path) -> R<Vec<Sexp>> {
+        self.cond_expand_for_decision(module, file, clauses, dir).map(|(_, chosen)| chosen)
+    }
+
+    fn cond_expand_for_decision(
+        &mut self,
+        module: u32,
+        file: Option<u32>,
+        clauses: &[Sexp],
+        dir: &Path,
+    ) -> R<(crate::patch::CondExpandDecision, Vec<Sexp>)> {
         let caller = self.resolve_caller_package(module, file);
-        for clause in clauses {
+        let mut requirements = Vec::with_capacity(clauses.len());
+        let mut chosen_idx = None;
+        let mut chosen_body = Vec::new();
+        for (idx, clause) in clauses.iter().enumerate() {
             let items = clause.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new("cond-expand: bad clause"))?;
-            if items[0].is_sym("else") || self.requirement(&items[0], caller.as_ref(), dir)? {
-                return Ok(items[1..].to_vec());
+            requirements.push(items[0].clone());
+            if chosen_idx.is_none() && (items[0].is_sym("else") || self.requirement(&items[0], caller.as_ref(), dir)?) {
+                chosen_idx = Some(idx);
+                chosen_body = items[1..].to_vec();
             }
         }
-        Ok(Vec::new())
+        Ok((crate::patch::CondExpandDecision { requirements, chosen: chosen_idx }, chosen_body))
     }
 
     fn requirement(&mut self, req: &Sexp, caller: Option<&CallerPackage>, dir: &Path) -> R<bool> {

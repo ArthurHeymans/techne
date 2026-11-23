@@ -4,10 +4,11 @@
 //! loaded library's stored [`LibrarySnapshot`]. Unchanged forms (including
 //! `define-record-type`, `define-syntax`, and state initializers) are never
 //! re-evaluated. Only pure procedure definitions owned by the library module
-//! may change; structural changes are refused with typed [`PatchRefusal`]
-//! errors before any VM state is mutated. All changed procedures are compiled
-//! and instantiated first, then committed atomically in a single non-yielding
-//! loop over `vm.globals`.
+//! whose runtime slot still holds the installed procedure may change;
+//! structural changes are refused with typed [`PatchRefusal`] errors before
+//! any VM state is mutated. All changed procedures are compiled and
+//! instantiated first in read-only `patch_staging` mode, then committed
+//! atomically in a single non-yielding loop over `vm.globals`.
 
 use std::{fmt, rc::Rc};
 
@@ -19,8 +20,23 @@ use crate::{
     library::{FEATURES, builtin, module_name, name_parts, syms},
     reader::{self, Sexp, display_sexp, strip, symbol_name},
     value::Value,
-    vm::{GlobalBinding, Vm, meter::Meter},
+    vm::{Capability, Error, GlobalBinding, Vm, meter::Meter},
 };
+
+/// Maximum heap nodes visited by a single-pass Mode 2 retention scan.
+pub const MAX_RETENTION_NODES: usize = 200_000;
+/// Maximum stale-holder entries returned in a single [`PatchReport`].
+pub const MAX_STALE_HOLDERS: usize = 256;
+/// Maximum steps reported per stale-holder retention chain.
+pub const MAX_STALE_CHAIN: usize = 64;
+
+/// Load-time `cond-expand` clause decision captured in a [`LibrarySnapshot`]
+/// so live patching can verify that `cond-expand` branches have not diverged.
+#[derive(Clone)]
+pub(crate) struct CondExpandDecision {
+    pub(crate) requirements: Vec<Sexp>,
+    pub(crate) chosen: Option<usize>,
+}
 
 /// Expanded library declarations and body forms retained at load time so
 /// Mode 2 patching can perform span-insensitive form-by-form diffs without
@@ -31,9 +47,83 @@ pub(crate) struct LibrarySnapshot {
     pub(crate) exports: Vec<(u32, u32)>,
     /// Canonical import sets from all `(import set ...)` declarations.
     pub(crate) imports: Vec<Sexp>,
-    /// Expanded top-level body forms (flattened across `begin`, `cond-expand`,
-    /// `include`, `include-ci`, and `include-library-declarations`).
+    /// Expanded top-level body forms (flattened across unshadowed `begin`,
+    /// `cond-expand`, `include`, `include-ci`, and `include-library-declarations`).
     pub(crate) body_forms: Vec<Sexp>,
+    /// Pre-order `cond-expand` clause selections recorded at library load time.
+    pub(crate) cond_expand_decisions: Vec<CondExpandDecision>,
+    /// Expected closed-procedure `code_id` for each owned procedure slot,
+    /// populated at load finalization and updated on each successful patch.
+    pub(crate) installed_procs: FxHashMap<u32, u32>,
+    /// Approximate retained memory in bytes, charged via `Module::table_bytes`.
+    approx_bytes: usize,
+}
+
+impl LibrarySnapshot {
+    pub(crate) fn new(
+        exports: Vec<(u32, u32)>,
+        imports: Vec<Sexp>,
+        body_forms: Vec<Sexp>,
+        cond_expand_decisions: Vec<CondExpandDecision>,
+        installed_procs: FxHashMap<u32, u32>,
+    ) -> Self {
+        let mut approx_bytes = std::mem::size_of::<LibrarySnapshot>()
+            + exports.capacity() * std::mem::size_of::<(u32, u32)>()
+            + imports.capacity() * std::mem::size_of::<Sexp>()
+            + body_forms.capacity() * std::mem::size_of::<Sexp>()
+            + cond_expand_decisions.capacity() * std::mem::size_of::<CondExpandDecision>()
+            + installed_procs.capacity() * (std::mem::size_of::<(u32, u32)>() + 1);
+        for s in &imports {
+            approx_bytes += sexp_bytes(s);
+        }
+        for s in &body_forms {
+            approx_bytes += sexp_bytes(s);
+        }
+        for d in &cond_expand_decisions {
+            approx_bytes += d.requirements.capacity() * std::mem::size_of::<Sexp>();
+            for r in &d.requirements {
+                approx_bytes += sexp_bytes(r);
+            }
+        }
+        Self { exports, imports, body_forms, cond_expand_decisions, installed_procs, approx_bytes }
+    }
+
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.approx_bytes
+    }
+}
+
+fn sexp_bytes(s: &Sexp) -> usize {
+    crate::nested(|| sexp_bytes_step(s))
+}
+
+fn sexp_bytes_step(s: &Sexp) -> usize {
+    let mut n = std::mem::size_of::<Sexp>();
+    match s {
+        Sexp::BigInt(_) => n += 32,
+        Sexp::Ratio(_) => n += 64,
+        Sexp::Complex(a, b) => n += sexp_bytes(a) + sexp_bytes(b),
+        Sexp::Str(s) => n += s.len(),
+        Sexp::Bytes(b) => n += b.len(),
+        Sexp::Labeled(_, inner) => n += sexp_bytes(inner),
+        Sexp::List(items, tail, _) => {
+            n += items.capacity() * std::mem::size_of::<Sexp>();
+            for item in items {
+                n += sexp_bytes(item);
+            }
+            if let Some(t) = tail {
+                n += sexp_bytes(t);
+            }
+        }
+        Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => {
+            n += items.capacity() * std::mem::size_of::<Sexp>();
+            for item in items {
+                n += sexp_bytes(item);
+            }
+        }
+        _ => {}
+    }
+    n
 }
 
 /// Typed refusal reason returned when Mode 2 live patching cannot apply a
@@ -125,6 +215,7 @@ pub struct PatchReport {
     pub patched: Vec<String>,
     pub unchanged: usize,
     pub stale_holders: Vec<StaleHolder>,
+    pub stale_holders_truncated: bool,
     pub source_sha256: String,
 }
 
@@ -148,18 +239,49 @@ pub fn parse_library_name(text: &str) -> Result<Vec<String>, String> {
     name_parts(&forms[0]).ok_or_else(|| format!("bad library name: {}", display_sexp(&forms[0])))
 }
 
-/// Flatten nested literal `(begin ...)` forms in top-level library bodies so
-/// load-time snapshots and patch sources share an identical form sequence.
-pub(crate) fn flatten_body_forms(forms: &[Sexp], out: &mut Vec<Sexp>) {
+/// Flatten nested unshadowed `(begin ...)` forms in top-level library bodies
+/// so load-time snapshots and patch sources share an identical form sequence.
+/// Respects both imported `begin` shadowing and in-body `(define-syntax begin ...)`
+/// or `(define begin ...)` declarations.
+fn flatten_body_forms_in_module(vm: &Vm, m: u32, forms: &[Sexp], out: &mut Vec<Sexp>) {
+    let begin_sym = reader::intern("begin");
+    let mut begin_shadowed = vm.modules[m as usize].imports.contains_key(&begin_sym);
+    flatten_body_forms_step(vm, m, begin_sym, &mut begin_shadowed, forms, out);
+}
+
+fn flatten_body_forms_step(vm: &Vm, m: u32, begin_sym: u32, begin_shadowed: &mut bool, forms: &[Sexp], out: &mut Vec<Sexp>) {
     for form in forms {
-        if let Some(items) = form.list()
+        if !*begin_shadowed
+            && let Some(items) = form.list()
             && let Some(head) = items.first().and_then(Sexp::sym)
-            && reader::special_form(strip(head)) == Some("begin")
+            && strip(head) == begin_sym
         {
-            crate::nested(|| flatten_body_forms(&items[1..], out));
-        } else {
-            out.push(form.clone());
+            crate::nested(|| flatten_body_forms_step(vm, m, begin_sym, begin_shadowed, &items[1..], out));
+            continue;
         }
+        if !*begin_shadowed && defines_symbol(vm, m, form, begin_sym) {
+            *begin_shadowed = true;
+        }
+        out.push(form.clone());
+    }
+}
+
+fn defines_symbol(vm: &Vm, m: u32, form: &Sexp, target: u32) -> bool {
+    let Some(special) = top_level_special(vm, m, form) else {
+        return false;
+    };
+    let Some(items) = form.list() else {
+        return false;
+    };
+    match special {
+        "define-syntax" => items.get(1).and_then(Sexp::sym).map(strip) == Some(target),
+        "define" => match items.get(1) {
+            Some(Sexp::Sym(s)) => strip(*s) == target,
+            Some(sig @ Sexp::List(..)) => procedure_define_name(sig) == Some(target),
+            _ => false,
+        },
+        "define-record-type" => items.get(1).and_then(Sexp::sym).map(strip) == Some(target),
+        _ => false,
     }
 }
 
@@ -273,8 +395,48 @@ struct PendingProc {
 }
 
 impl Vm {
-    /// Save the expanded declarations and body forms of a freshly declared library.
-    pub(crate) fn record_library_snapshot(&mut self, m: u32, imports: &[(Sexp, u32)], body: &[(Sexp, u32)]) {
+    /// Whether any library in this world has been mutated by Mode 2 live patching.
+    pub fn is_patch_dirty(&self) -> bool {
+        !self.patched_libraries.is_empty()
+    }
+
+    /// Libraries patched in this world instance `(library_parts, source_sha256)`.
+    pub fn patch_deltas(&self) -> Vec<(Vec<String>, String)> {
+        let mut out: Vec<(Vec<String>, String)> = self.patched_libraries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Enforce Scheme-level authority for `(patch-library! ...)`:
+    /// requires `Capability::Patching`, and in bundle/locked mode additionally
+    /// requires package ownership and bundle module accessibility so untrusted
+    /// packages or production initializers cannot patch other libraries.
+    pub(crate) fn check_scheme_patch_authority(&mut self, parts: &[String]) -> Result<(), Error> {
+        self.need(Capability::Patching, "patch-library!")?;
+        if self.bundle.is_some() || self.locked_libraries {
+            let provenance = self.current_eval_provenance();
+            self.check_library_ownership(parts, &provenance, "patch-library!")?;
+            if self.bundle.is_some()
+                && let Some(m) = self.loaded_library_parts(parts)?
+            {
+                let caller = self.active_caller_package();
+                if !self.bundle_module_accessible(caller.as_ref(), m) {
+                    return Err(Error::new(format!("patch-library!: {} is not accessible from this package", module_name(parts))));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Save the raw declarations, body forms, and `cond-expand` decisions of a
+    /// freshly declared library before its imports and body run.
+    pub(crate) fn record_library_snapshot(
+        &mut self,
+        m: u32,
+        imports: &[(Sexp, u32)],
+        body: &[(Sexp, u32)],
+        cond_expand_decisions: Vec<CondExpandDecision>,
+    ) {
         let exports = self.modules[m as usize].exports.clone().unwrap_or_default();
         let mut import_sets = Vec::new();
         for (decl, _) in imports {
@@ -283,9 +445,38 @@ impl Vm {
             }
         }
         let raw_body: Vec<Sexp> = body.iter().map(|(f, _)| f.clone()).collect();
+        self.modules[m as usize].library_snapshot =
+            Some(Rc::new(LibrarySnapshot::new(exports, import_sets, raw_body, cond_expand_decisions, FxHashMap::default())));
+        self.recharge_module(m);
+    }
+
+    /// Finalize a library's snapshot once its imports and body have finished
+    /// evaluating: flatten unshadowed `begin` forms using the module's final
+    /// bindings and record the installed `code_id` for each owned procedure.
+    pub(crate) fn finalize_library_snapshot(&mut self, m: u32) {
+        let Some(prev) = self.modules[m as usize].library_snapshot.clone() else {
+            return;
+        };
         let mut body_forms = Vec::new();
-        flatten_body_forms(&raw_body, &mut body_forms);
-        self.modules[m as usize].library_snapshot = Some(Rc::new(LibrarySnapshot { exports, imports: import_sets, body_forms }));
+        flatten_body_forms_in_module(self, m, &prev.body_forms, &mut body_forms);
+        let mut installed_procs = FxHashMap::default();
+        for form in &body_forms {
+            if let FormKind::DefineProc { name, .. } = classify_form(self, m, form)
+                && let Some(GlobalBinding::Var(slot)) = self.bindings.get(&(m, name))
+                && self.global_module[*slot as usize] == m
+                && let Some(code_id) = self.closed_closure_code_id(self.globals[*slot as usize])
+            {
+                installed_procs.insert(*slot, code_id);
+            }
+        }
+        self.modules[m as usize].library_snapshot = Some(Rc::new(LibrarySnapshot::new(
+            prev.exports.clone(),
+            prev.imports.clone(),
+            body_forms,
+            prev.cond_expand_decisions.clone(),
+            installed_procs,
+        )));
+        self.recharge_module(m);
     }
 
     /// Live-patch procedures of an already loaded library in place (Mode 2).
@@ -371,9 +562,23 @@ impl Vm {
         let mut new_exports: Vec<(u32, u32)> = Vec::new();
         let mut new_imports: Vec<Sexp> = Vec::new();
         let mut raw_body: Vec<Sexp> = Vec::new();
-        self.parse_patch_declarations(&lib_items[2..], &mut new_exports, &mut new_imports, &mut raw_body)?;
+        let mut decision_idx: usize = 0;
+        self.parse_patch_declarations(
+            &lib_items[2..],
+            &snapshot.cond_expand_decisions,
+            &mut decision_idx,
+            &mut new_exports,
+            &mut new_imports,
+            &mut raw_body,
+        )?;
+        if decision_idx != snapshot.cond_expand_decisions.len() {
+            return Err(PatchError::new(
+                PatchRefusal::UnsupportedDeclaration,
+                format!("library {lib_display}: cond-expand declarations changed since load"),
+            ));
+        }
         let mut new_body_forms = Vec::new();
-        flatten_body_forms(&raw_body, &mut new_body_forms);
+        flatten_body_forms_in_module(self, m, &raw_body, &mut new_body_forms);
 
         // Compare exports: removed -> binding-removed; added/renamed/changed -> export-rebound.
         check_exports(&snapshot.exports, &new_exports)?;
@@ -389,13 +594,26 @@ impl Vm {
         }
 
         // 3. Structural form-by-form diff (span-insensitive).
-        let (changes, unchanged) = self.diff_library_body(m, &lib_display, &snapshot.body_forms, &new_body_forms)?;
+        let (changes, unchanged) = self.diff_library_body(m, &lib_display, &snapshot, &new_body_forms)?;
 
         if changes.is_empty() {
-            // Only whitespace/comments/order changed: update snapshot without recompiling.
-            self.modules[m as usize].library_snapshot =
-                Some(Rc::new(LibrarySnapshot { exports: new_exports, imports: new_imports, body_forms: new_body_forms }));
-            return Ok(PatchReport { library: parts.to_vec(), patched: Vec::new(), unchanged, stale_holders: Vec::new(), source_sha256 });
+            // Only whitespace/comments/procedure order changed: update snapshot without recompiling or marking dirty.
+            self.modules[m as usize].library_snapshot = Some(Rc::new(LibrarySnapshot::new(
+                new_exports,
+                new_imports,
+                new_body_forms,
+                snapshot.cond_expand_decisions.clone(),
+                snapshot.installed_procs.clone(),
+            )));
+            self.recharge_module(m);
+            return Ok(PatchReport {
+                library: parts.to_vec(),
+                patched: Vec::new(),
+                unchanged,
+                stale_holders: Vec::new(),
+                stale_holders_truncated: false,
+                source_sha256,
+            });
         }
 
         // 4. Stage & compile ALL changed procedures before any commit.
@@ -412,27 +630,29 @@ impl Vm {
                 .add_file_with_provenance(&file_name, source, orig_provenance)
                 .map_err(|e| PatchError::new(PatchRefusal::CompileError, e.msg.clone()))?;
 
-            let mut staged_roots = Vec::with_capacity(changes.len());
+            let mut staged = Vec::with_capacity(changes.len());
             for change in &changes {
                 let code = Compiler::new(vm, m, file)
                     .compile_named_procedure(&change.form)
-                    .map_err(|e| PatchError::with_binding(PatchRefusal::CompileError, &change.name, e.msg.clone()))?;
+                    .map_err(|(refusal, e)| PatchError::with_binding(refusal, &change.name, e.msg.clone()))?;
                 // Allocate the closed procedure closure directly without executing user code.
                 let closure = vm.alloc_closed_closure_raw(code);
-                staged_roots.push(vm.root(closure));
+                staged.push((code, vm.root(closure)));
             }
 
             // 5. Atomic commit: single non-yielding loop, zero GC allocations.
             let mut old_values = Vec::with_capacity(changes.len());
             let mut patched_names = Vec::with_capacity(changes.len());
-            for (change, root) in changes.iter().zip(staged_roots.iter()) {
+            let mut new_installed = snapshot.installed_procs.clone();
+            for (change, (code_id, root)) in changes.iter().zip(staged.iter()) {
                 let old = vm.globals[change.slot as usize];
                 old_values.push((change.name.clone(), old));
                 vm.globals[change.slot as usize] = root.get();
+                new_installed.insert(change.slot, *code_id);
                 patched_names.push(change.name.clone());
             }
             // Drop staging roots before inspecting retention so our own roots are gone.
-            drop(staged_roots);
+            drop(staged);
 
             for change in &changes {
                 match &change.var_doc {
@@ -444,28 +664,52 @@ impl Vm {
                     }
                 }
             }
-            vm.modules[m as usize].library_snapshot =
-                Some(Rc::new(LibrarySnapshot { exports: new_exports, imports: new_imports, body_forms: new_body_forms }));
+            vm.modules[m as usize].library_snapshot = Some(Rc::new(LibrarySnapshot::new(
+                new_exports,
+                new_imports,
+                new_body_forms,
+                snapshot.cond_expand_decisions.clone(),
+                new_installed,
+            )));
+            vm.recharge_module(m);
+            vm.patched_libraries.insert(parts.to_vec(), source_sha256.clone());
 
             Ok((patched_names, old_values))
         })?;
 
-        // 6. Optional stale-holder diagnostics (still before any further GC allocation).
+        // 6. Optional bounded single-pass stale-holder diagnostics.
         let mut stale_holders = Vec::new();
-        if check_retained {
-            for (binding, old_val) in old_values {
-                if let Some(chain) = self.why_retained_raw(old_val, 0..0) {
+        let mut stale_holders_truncated = false;
+        if check_retained && !old_values.is_empty() {
+            let targets: Vec<Value> = old_values.iter().map(|(_, v)| *v).collect();
+            let (chains, truncated) = self.why_retained_many_raw(&targets, MAX_RETENTION_NODES, MAX_STALE_CHAIN);
+            stale_holders_truncated = truncated;
+            for ((binding, _), chain) in old_values.into_iter().zip(chains) {
+                if let Some(chain) = chain {
+                    if stale_holders.len() >= MAX_STALE_HOLDERS {
+                        stale_holders_truncated = true;
+                        break;
+                    }
                     stale_holders.push(StaleHolder { binding, chain });
                 }
             }
         }
 
-        Ok(PatchReport { library: parts.to_vec(), patched: patched_names, unchanged, stale_holders, source_sha256 })
+        Ok(PatchReport {
+            library: parts.to_vec(),
+            patched: patched_names,
+            unchanged,
+            stale_holders,
+            stale_holders_truncated,
+            source_sha256,
+        })
     }
 
     fn parse_patch_declarations(
         &self,
         decls: &[Sexp],
+        recorded: &[CondExpandDecision],
+        decision_idx: &mut usize,
         exports: &mut Vec<(u32, u32)>,
         imports: &mut Vec<Sexp>,
         body: &mut Vec<Sexp>,
@@ -503,8 +747,38 @@ impl Vm {
                     ));
                 }
                 "cond-expand" => {
-                    let chosen = self.eval_cond_expand_pure(&items[1..])?;
-                    crate::nested(|| self.parse_patch_declarations(&chosen, exports, imports, body))?;
+                    let clauses = &items[1..];
+                    let Some(expected) = recorded.get(*decision_idx) else {
+                        return Err(PatchError::new(
+                            PatchRefusal::UnsupportedDeclaration,
+                            "cond-expand declarations changed since library load",
+                        ));
+                    };
+                    *decision_idx += 1;
+                    let mut reqs = Vec::with_capacity(clauses.len());
+                    for clause in clauses {
+                        let clause_items = clause
+                            .list()
+                            .filter(|l| !l.is_empty())
+                            .ok_or_else(|| PatchError::new(PatchRefusal::SyntaxError, "cond-expand: bad clause"))?;
+                        reqs.push(&clause_items[0]);
+                    }
+                    if expected.requirements.len() != reqs.len()
+                        || !expected.requirements.iter().zip(reqs.iter()).all(|(a, b)| sexp_eq_ignore_pos(a, b))
+                    {
+                        return Err(PatchError::new(
+                            PatchRefusal::UnsupportedDeclaration,
+                            "cond-expand clauses changed since library load",
+                        ));
+                    }
+                    let (current_chosen, chosen_decls) = self.eval_cond_expand_pure(clauses)?;
+                    if current_chosen != expected.chosen {
+                        return Err(PatchError::new(
+                            PatchRefusal::UnsupportedDeclaration,
+                            "cond-expand branch diverged from load-time selection; use a full reload or snapshot swap",
+                        ));
+                    }
+                    crate::nested(|| self.parse_patch_declarations(&chosen_decls, recorded, decision_idx, exports, imports, body))?;
                 }
                 _ => {
                     return Err(PatchError::new(
@@ -517,17 +791,17 @@ impl Vm {
         Ok(())
     }
 
-    fn eval_cond_expand_pure(&self, clauses: &[Sexp]) -> Result<Vec<Sexp>, PatchError> {
-        for clause in clauses {
+    fn eval_cond_expand_pure(&self, clauses: &[Sexp]) -> Result<(Option<usize>, Vec<Sexp>), PatchError> {
+        for (idx, clause) in clauses.iter().enumerate() {
             let items = clause
                 .list()
                 .filter(|l| !l.is_empty())
                 .ok_or_else(|| PatchError::new(PatchRefusal::SyntaxError, "cond-expand: bad clause"))?;
             if items[0].is_sym("else") || self.cond_expand_req_pure(&items[0])? {
-                return Ok(items[1..].to_vec());
+                return Ok((Some(idx), items[1..].to_vec()));
             }
         }
-        Ok(Vec::new())
+        Ok((None, Vec::new()))
     }
 
     fn cond_expand_req_pure(&self, req: &Sexp) -> Result<bool, PatchError> {
@@ -574,15 +848,18 @@ impl Vm {
         &self,
         m: u32,
         lib_display: &str,
-        old_forms: &[Sexp],
+        snapshot: &LibrarySnapshot,
         new_forms: &[Sexp],
     ) -> Result<(Vec<PendingProc>, usize), PatchError> {
-        // Index old forms by structural kind.
+        let old_forms = &snapshot.body_forms;
+
+        // Index old forms by structural kind, keeping combined sequence order
+        // for all non-procedure top-level forms (state initializers and expressions).
         let mut old_records: Vec<(Option<u32>, &Sexp)> = Vec::new();
         let mut old_macros: Vec<(Option<u32>, &Sexp)> = Vec::new();
         let mut old_procs: FxHashMap<u32, &Sexp> = FxHashMap::default();
         let mut old_values: FxHashMap<u32, &Sexp> = FxHashMap::default();
-        let mut old_others: Vec<&Sexp> = Vec::new();
+        let mut old_non_proc: Vec<&Sexp> = Vec::new();
 
         for form in old_forms {
             match classify_form(self, m, form) {
@@ -593,8 +870,9 @@ impl Vm {
                 }
                 FormKind::DefineValue { name } => {
                     old_values.insert(name, form);
+                    old_non_proc.push(form);
                 }
-                FormKind::Include | FormKind::OtherExpr => old_others.push(form),
+                FormKind::Include | FormKind::OtherExpr => old_non_proc.push(form),
             }
         }
 
@@ -603,7 +881,8 @@ impl Vm {
         let mut new_macros: Vec<(Option<u32>, &Sexp)> = Vec::new();
         let mut new_procs: Vec<(u32, Option<Rc<str>>, &Sexp)> = Vec::new();
         let mut new_values: Vec<(u32, &Sexp)> = Vec::new();
-        let mut new_others: Vec<&Sexp> = Vec::new();
+        let mut new_others_count: usize = 0;
+        let mut new_non_proc: Vec<&Sexp> = Vec::new();
         let mut seen_defs: FxHashSet<u32> = FxHashSet::default();
 
         for form in new_forms {
@@ -661,8 +940,12 @@ impl Vm {
                         ));
                     }
                     new_values.push((name, form));
+                    new_non_proc.push(form);
                 }
-                FormKind::OtherExpr => new_others.push(form),
+                FormKind::OtherExpr => {
+                    new_others_count += 1;
+                    new_non_proc.push(form);
+                }
             }
         }
 
@@ -720,11 +1003,16 @@ impl Vm {
             }
         }
 
-        // 5. Check non-define top-level expressions (added, removed, or changed -> state-initializer-changed).
-        if old_others.len() != new_others.len() || !old_others.iter().zip(new_others.iter()).all(|(a, b)| sexp_eq_ignore_pos(a, b)) {
-            return Err(PatchError::new(PatchRefusal::StateInitializerChanged, format!("top-level expressions changed in {lib_display}")));
+        // 5. Check exact sequence order of all non-procedure top-level forms
+        //    (both state initializers and top-level expressions).
+        if old_non_proc.len() != new_non_proc.len() || !old_non_proc.iter().zip(new_non_proc.iter()).all(|(a, b)| sexp_eq_ignore_pos(a, b))
+        {
+            return Err(PatchError::new(
+                PatchRefusal::StateInitializerChanged,
+                format!("top-level state initializers or expressions changed in {lib_display}"),
+            ));
         }
-        unchanged += new_others.len();
+        unchanged += new_others_count;
 
         // 6. Check procedure definitions.
         let mut changes = Vec::new();
@@ -765,6 +1053,16 @@ impl Vm {
                         PatchRefusal::ExportRebound,
                         &n,
                         format!("slot for `{n}` is owned by another library, not {lib_display}"),
+                    ));
+                }
+                // Verify the slot still holds the installed closed procedure (not repurposed
+                // as state or wrapped at runtime via `set!`).
+                let current_code_id = self.closed_closure_code_id(self.globals[slot as usize]);
+                if current_code_id.is_none() || snapshot.installed_procs.get(&slot).copied() != current_code_id {
+                    return Err(PatchError::with_binding(
+                        PatchRefusal::StateInitializerChanged,
+                        &n,
+                        format!("binding `{n}` in {lib_display} was mutated at runtime and no longer holds its installed procedure"),
                     ));
                 }
                 changes.push(PendingProc { name: n, slot, form: new_form.clone(), var_doc });

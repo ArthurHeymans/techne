@@ -355,6 +355,12 @@ pub(crate) struct Compiler<'v> {
     lambda_sym: u32,
     /// Meters macro expansion, compiling and constants (`Meter`).
     meter: Meter,
+    /// When true, compiling a Mode 2 live-patched procedure: loader-dependent
+    /// splices (`include`, `include-ci`, `cond-expand`) are refused and no
+    /// live module bindings or globals may be created or mutated.
+    patch_staging: bool,
+    /// Typed refusal recorded when `patch_staging` rejects a form.
+    patch_refusal: Option<crate::patch::PatchRefusal>,
 }
 
 type R<T> = Result<T, Error>;
@@ -390,6 +396,8 @@ impl<'v> Compiler<'v> {
             fn_stack: Vec::new(),
             inlining: 0,
             lambda_sym: intern("lambda"),
+            patch_staging: false,
+            patch_refusal: None,
         }
     }
 
@@ -425,22 +433,27 @@ impl<'v> Compiler<'v> {
     }
 
     /// Compile a top-level procedure `(define ...)` form into a closed
-    /// procedure code object without mutating global slots or running user code.
-    pub(crate) fn compile_named_procedure(mut self, form: &Sexp) -> R<u32> {
-        let items = form.list().ok_or_else(|| Error::new("patch-library: expected a (define ...) form"))?;
-        let (name, definiens) = define_parts(items)?;
-        let outer = self.new_fn("toplevel".into(), None);
-        self.fn_stack.push(outer);
-        let Expr::Lambda(f) = self.definiens(name, definiens)? else {
-            return err("patch-library: expected a pure procedure definition");
-        };
-        if !self.funcs[f].free.is_empty() {
-            return err("patch-library: patched procedure must not capture outer lexical variables");
-        }
-        self.fn_stack.pop();
-        self.optimize(f)?;
-        let code = self.generate(f);
-        self.meter.error(self.vm).map_or(code, Err)
+    /// procedure code object without mutating global slots, creating forward
+    /// bindings, touching the filesystem, or running user code.
+    pub(crate) fn compile_named_procedure(mut self, form: &Sexp) -> Result<u32, (crate::patch::PatchRefusal, Error)> {
+        self.patch_staging = true;
+        let res: R<u32> = (|| {
+            let items = form.list().ok_or_else(|| Error::new("patch-library: expected a (define ...) form"))?;
+            let (name, definiens) = define_parts(items)?;
+            let outer = self.new_fn("toplevel".into(), None);
+            self.fn_stack.push(outer);
+            let Expr::Lambda(f) = self.definiens(name, definiens)? else {
+                return err("patch-library: expected a pure procedure definition");
+            };
+            if !self.funcs[f].free.is_empty() {
+                return err("patch-library: patched procedure must not capture outer lexical variables");
+            }
+            self.fn_stack.pop();
+            self.optimize(f)?;
+            let code = self.generate(f);
+            self.meter.error(self.vm).map_or(code, Err)
+        })();
+        res.map_err(|e| (self.patch_refusal.unwrap_or(crate::patch::PatchRefusal::CompileError), e))
     }
 
     fn new_fn(&mut self, name: Rc<str>, parent: Option<FnId>) -> FnId {
@@ -496,6 +509,7 @@ impl<'v> Compiler<'v> {
                 Some(GlobalBinding::Var(g)) => Head::Global(g),
                 None => match special_form(sym) {
                     Some(name) => Head::Special(name),
+                    None if self.patch_staging => Head::Other,
                     None => Head::Global(self.vm.global_var(module, sym)),
                 },
             },
@@ -714,6 +728,14 @@ impl<'v> Compiler<'v> {
     /// splices: reading them runs no Scheme, and compiling each separately
     /// would lose the enclosing lexical bindings.
     fn spliced(&mut self, special: &str, items: &[Sexp]) -> R<Vec<(Sexp, u32)>> {
+        if self.patch_staging {
+            let refusal = match special {
+                "include" | "include-ci" => crate::patch::PatchRefusal::IncludeNotSupported,
+                _ => crate::patch::PatchRefusal::UnsupportedDeclaration,
+            };
+            self.patch_refusal = Some(refusal);
+            return err(format!("patch-library: `{special}` is not allowed inside a patched procedure body"));
+        }
         let dir = self.source_dir();
         match special {
             "cond-expand" => {
@@ -907,6 +929,7 @@ impl<'v> Compiler<'v> {
                 Some(GlobalBinding::Macro(_)) => err(format!("syntax {} used as a value", display_name(sym))),
                 Some(GlobalBinding::Var(g)) => Ok(Expr::Global(g)),
                 None if special_form(sym).is_some() => err(format!("syntax {} used as a value", display_name(sym))),
+                None if self.patch_staging => err(format!("unbound variable {}", display_name(sym))),
                 None => Ok(Expr::Global(self.vm.global_var(module, sym))),
             },
         }
@@ -1015,7 +1038,22 @@ impl<'v> Compiler<'v> {
                     }
                     Resolved::Local(_) => err(format!("set!: {} is not a variable", display_name(target))),
                     Resolved::Global { module, sym } => {
-                        let g = self.vm.global_var(module, sym);
+                        let g = if self.patch_staging {
+                            match self.vm.lookup_global(module, sym) {
+                                Some(GlobalBinding::Var(g)) => g,
+                                Some(GlobalBinding::Macro(_)) => {
+                                    return err(format!("set!: {} is not a variable", display_name(target)));
+                                }
+                                None if special_form(sym).is_some() => {
+                                    return err(format!("set!: {} is not a variable", display_name(target)));
+                                }
+                                None => {
+                                    return err(format!("set!: unbound variable {}", display_name(target)));
+                                }
+                            }
+                        } else {
+                            self.vm.global_var(module, sym)
+                        };
                         // Primitives are sealed: code elsewhere may have them
                         // inlined. A module shadows one by defining it.
                         if self.module != ROOT_MODULE && self.vm.inlinable(g) {

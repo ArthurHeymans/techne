@@ -549,7 +549,7 @@ impl FromWorker {
                             })
                             .collect::<io::Result<Vec<_>>>()?;
                         let source_sha256 = p.string()?;
-                        Ok(crate::PatchReport { library, patched, unchanged, stale_holders, source_sha256 })
+                        Ok(crate::PatchReport { library, patched, unchanged, stale_holders, stale_holders_truncated: false, source_sha256 })
                     }
                     false => {
                         let reason = p.string()?;
@@ -1023,6 +1023,7 @@ mod tests {
                 patched: vec!["f".into()],
                 unchanged: 3,
                 stale_holders: vec![crate::StaleHolder { binding: "f".into(), chain: vec!["global saved".into(), "pair car".into()] }],
+                stale_holders_truncated: false,
                 source_sha256: "a".repeat(64),
             }),
         };

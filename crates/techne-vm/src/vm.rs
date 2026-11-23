@@ -114,6 +114,8 @@ pub enum Capability {
     Clock,
     /// Random bytes from the operating system.
     Entropy,
+    /// Live-patching already loaded libraries in place (`patch-library!`).
+    Patching,
 }
 
 impl Capability {
@@ -128,13 +130,14 @@ impl Capability {
             Capability::Console => "console",
             Capability::Clock => "clock",
             Capability::Entropy => "entropy",
+            Capability::Patching => "patching",
         }
     }
 
     /// Whether it is checked when used, not when natives are registered,
     /// so that it can be granted to a running world or taken back.
     pub fn checked_when_called(self) -> bool {
-        matches!(self, Capability::Loading | Capability::Clock | Capability::Entropy)
+        matches!(self, Capability::Loading | Capability::Clock | Capability::Entropy | Capability::Patching)
     }
 }
 
@@ -144,7 +147,7 @@ pub struct Grants(u16);
 
 impl Grants {
     pub const NONE: Grants = Grants(0);
-    pub const ALL: Grants = Grants(0x1ff);
+    pub const ALL: Grants = Grants(0x3ff);
 
     pub const fn with(self, c: Capability) -> Grants {
         Grants(self.0 | 1 << c as u16)
@@ -647,6 +650,7 @@ impl Module {
                 .as_ref()
                 .map_or(0, |parts| parts.capacity() * size_of::<Box<str>>() + parts.iter().map(|p| p.len()).sum::<usize>())
             + self.path.as_ref().map_or(0, |p| p.as_os_str().len())
+            + self.library_snapshot.as_ref().map_or(0, |s| s.approx_bytes())
     }
 }
 
@@ -726,6 +730,9 @@ pub(crate) struct SourceFile {
     pub text: Rc<str>,
     /// Trusted loader-issued provenance, independent of display `name`.
     pub(crate) provenance: SourceProvenance,
+    /// True only for VM-internal sources (prelude and VM-compiled helpers),
+    /// never for user-supplied source names like `eval-source`.
+    pub(crate) internal: bool,
     /// Where each line after the first starts, once a position was asked
     /// for (`line_col`): help asks for thousands.
     lines: Rc<std::cell::OnceCell<Box<[u32]>>>,
@@ -737,7 +744,7 @@ impl SourceFile {
     }
 
     pub(crate) fn with_provenance(name: &str, text: &str, provenance: SourceProvenance) -> SourceFile {
-        SourceFile { name: name.into(), text: text.into(), provenance, lines: Rc::default() }
+        SourceFile { name: name.into(), text: text.into(), provenance, internal: false, lines: Rc::default() }
     }
 
     /// The line and column, from 1, of byte position `pos`, as
@@ -963,6 +970,10 @@ pub struct Vm {
     pub(crate) locked_libraries: bool,
     /// Read-only in-memory deployment filesystem (`BundleVfs`), if installed.
     pub(crate) bundle: Option<Arc<crate::bundle::BundleVfs>>,
+    /// Libraries modified via Mode 2 live patching in this world instance
+    /// (library name parts -> latest patched source SHA-256). Always empty
+    /// on freshly booted or snapshot-thawed worlds.
+    pub(crate) patched_libraries: FxHashMap<Vec<String>, String>,
     /// A package generation being loaded: its files load into fresh
     /// modules, kept apart until published.
     staging: Option<Staging>,
@@ -1523,6 +1534,11 @@ impl Vm {
         if let Err(e) = vm.eval_in_raw(ROOT_MODULE, crate::PRELUDE_PATH, crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
         }
+        for sf in &mut vm.files {
+            if !sf.name.is_empty() {
+                sf.internal = true;
+            }
+        }
         // What the prelude made lives for good: promote it now, so programs
         // start with an empty nursery, and count only their own collections.
         vm.collect_raw();
@@ -1602,6 +1618,7 @@ impl Vm {
             package_imports: Vec::new(),
             locked_libraries: false,
             bundle: None,
+            patched_libraries: FxHashMap::default(),
             staging: None,
             staged: None,
             staged_by: None,
@@ -2169,7 +2186,7 @@ impl Vm {
             // SAFETY: active call frames hold live pointers into `self.codes`.
             let file_idx = unsafe { (*frame.code).file as usize };
             let Some(sf) = self.files.get(file_idx) else { continue };
-            if &*sf.name == crate::PRELUDE_PATH || &*sf.name == "<vm helper>" {
+            if sf.internal {
                 continue;
             }
             if let Some(caller) = self.caller_from_provenance(&sf.provenance) {
@@ -2190,7 +2207,7 @@ impl Vm {
             // SAFETY: active call frames hold live pointers into `self.codes`.
             let file_idx = unsafe { (*frame.code).file as usize };
             let Some(sf) = self.files.get(file_idx) else { continue };
-            if &*sf.name == crate::PRELUDE_PATH || &*sf.name == "<vm helper>" {
+            if sf.internal {
                 continue;
             }
             return sf.provenance.clone();
@@ -2199,8 +2216,8 @@ impl Vm {
     }
 
     /// Whether `caller` may access module `m` by name/path in bundle mode
-    /// (`find_module_raw`, `eval`, `eval-source`, `in-module`).
-    fn bundle_module_accessible(&self, caller: Option<&CallerPackage>, m: u32) -> bool {
+    /// (`find_module_raw`, `eval`, `eval-source`, `in-module`, `patch-library!`).
+    pub(crate) fn bundle_module_accessible(&self, caller: Option<&CallerPackage>, m: u32) -> bool {
         if m == ROOT_MODULE {
             return true;
         }
@@ -2782,6 +2799,7 @@ impl Vm {
     pub(crate) fn complete_forms_load(&mut self, forms: &Forms) -> Result<(), Error> {
         if forms.library {
             self.exported(forms.module, &self.modules[forms.module as usize].name)?;
+            self.finalize_library_snapshot(forms.module);
             self.end_module_load(forms.module);
         }
         Ok(())
@@ -3935,6 +3953,26 @@ impl Vm {
         Value::ptr(p)
     }
 
+    /// Return the code index of a zero-capture closure, or `None` if `val` is
+    /// not a closed procedure closure.
+    pub(crate) fn closed_closure_code_id(&self, val: Value) -> Option<u32> {
+        if !is_kind(val, Kind::Closure) {
+            return None;
+        }
+        let p = val.as_ptr();
+        // SAFETY: `val` is a live Closure pointer on the VM heap.
+        unsafe {
+            if len_of(p) != 1 {
+                return None;
+            }
+            let code_val = field(p, 0);
+            if !code_val.is_int() {
+                return None;
+            }
+            u32::try_from(code_val.as_int()).ok()
+        }
+    }
+
     /// Allocate a string. Bytevectors, not strings, hold arbitrary bytes.
     pub(crate) fn make_string_raw(&mut self, text: &str) -> Value {
         let bytes = text.as_bytes();
@@ -5055,6 +5093,7 @@ impl Vm {
     fn compile_vm_helper(&mut self, special: SpecialObj, source: &str) -> Result<SpecialObj, Error> {
         self.pinning(|vm| {
             let file = vm.add_file("<vm helper>", source)?;
+            vm.files[file as usize].internal = true;
             let form = reader::read(source).map_err(Error::new)?.remove(0);
             let compiling = vm.compiling.len();
             let code = Compiler::new(vm, ROOT_MODULE, file).compile_closed_lambda(&form)?;

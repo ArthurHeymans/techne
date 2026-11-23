@@ -277,6 +277,8 @@ impl Vm {
             package_imports,
             locked_libraries,
             bundle,
+            // Thawed worlds always start cleanly unpatched from the snapshot.
+            patched_libraries: _,
             current_module,
             grants,
             reading_access,
