@@ -27,6 +27,7 @@
 (require "keymaps.scm")
 (require "dispatch.scm")
 (require "operations.scm")
+(require "project-settings-bridge.scm")
 (require "../schema.scm")
 
 (provide make-buffer buffer? buffer-document buffer-name set-buffer-name! buffer-mode set-buffer-mode!
@@ -37,8 +38,11 @@
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          register-mode-line-segment! mode-line-segments
          define-option register-option! advertise-package!
-         find-option option-names option-name option-default option-doc option-type option-user-only?
-         set-option! unset-option! option explain-option
+         find-option option-names option-name option-default option-doc option-type
+         option-user-only? option-directory-safe option-merge
+         set-option! unset-option! option option-json-overlay explain-option
+         add-option-changed-hook! remove-option-changed-hook! project-settings-refresh-display!
+         set-document-logical-path-hook! set-remote-path-hook! set-execution-site-inspector-hook!
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
          buffer-directory buffer-input buffer-display-options)
 
@@ -138,7 +142,10 @@ input."
 ;; settings clear the buffer's cache, and the cache key includes its mode.
 (define %display-generation 0)
 (define (display-changed! key value) (set! %display-generation (+ 1 %display-generation)))
-(define %modes (make-registry 'modes #:changed (lambda (key value) (set! %minor-names #f) (display-changed! key value))))
+(define %modes (make-registry 'modes #:changed (lambda (key value)
+                                                 (set! %minor-names #f)
+                                                 (display-changed! key value)
+                                                 (notify-option-changed! 'lsp-settings))))
 
 (define (find-mode name)
   "Return the mode NAME, or #f if there is none."
@@ -266,19 +273,135 @@ That is the one with the longest suffix of PATH, else
 ;;; Options
 
 (define-record-type option-declaration
-  (%make-option name default doc type user-only)
+  (%make-option name default doc type user-only safe merge)
   option-declaration?
   (name option-name)
   (default option-default)
   (doc option-doc)
   (type option-type)
-  (user-only option-user-only?))
+  (user-only option-user-only?)
+  (safe option-directory-safe)
+  (merge option-merge))
+
+(define %option-changed-hooks (make-registry 'option-changed-hooks))
+
+(define (add-option-changed-hook! name proc)
+  "Register PROC under NAME to run when an option changes.
+PROC is called as `(PROC option-name)` whenever an option is set, unset,
+or its defining scope shuts down."
+  (registry-add! %option-changed-hooks name (scope-procedure proc))
+  name)
+
+(define (remove-option-changed-hook! name)
+  "Remove the option-changed hook registered under NAME."
+  (registry-remove! %option-changed-hooks name))
+
+(define (notify-option-changed! opt-name)
+  (for-each (lambda (k)
+              (let ((p (registry-ref %option-changed-hooks k)))
+                (when p (guard (e (#t #f)) (p opt-name)))))
+            (registry-keys %option-changed-hooks)))
+
+(define (project-settings-refresh-display!)
+  "Invalidate cached buffer display options after settings changes."
+  (set! %display-generation (+ 1 %display-generation)))
+
+(define (settings-registry-changed! key value)
+  (display-changed! key value)
+  (when (pair? key) (notify-option-changed! (car key))))
 
 (define %options (make-registry 'options #:changed display-changed!))
 
 ;; Settings made with set-option!, by (name mode) or (name): the value and
 ;; who made it, each owned by the scope it was made in.
-(define %settings (make-registry 'settings #:changed display-changed!))
+(define %settings (make-registry 'settings #:changed settings-registry-changed!))
+
+;; User per-directory settings made with set-option! #:directory, keyed by
+;; (name dir mode-or-#f).
+(define %has-dir-settings? #f)
+(define (dir-settings-changed! key value)
+  (set! %has-dir-settings? (pair? (registry-keys %dir-settings)))
+  (settings-registry-changed! key value))
+(define %dir-settings (make-registry 'dir-settings #:changed dir-settings-changed!))
+
+(define %document-logical-path-hook (lambda (d) (document-path d)))
+(define %remote-path-hook (lambda (s) #f))
+(define %execution-site-inspector-hook (lambda (x) #f))
+
+(define (set-document-logical-path-hook! proc)
+  "Register PROC mapping a document to its logical path."
+  (unless (procedure? proc)
+    (error "set-document-logical-path-hook!: expected procedure" proc))
+  (set! %document-logical-path-hook proc))
+
+(define (set-remote-path-hook! proc)
+  "Register PROC testing whether a path string is remote."
+  (unless (procedure? proc)
+    (error "set-remote-path-hook!: expected procedure" proc))
+  (set! %remote-path-hook proc))
+
+(define (set-execution-site-inspector-hook! proc)
+  "Register PROC inspecting an `execution-site`."
+  (unless (procedure? proc)
+    (error "set-execution-site-inspector-hook!: expected procedure" proc))
+  (set! %execution-site-inspector-hook proc))
+
+(define (local-path-directory path)
+  (let ((n (string-length path)))
+    (let trim ((end n))
+      (if (and (> end 1) (char=? (string-ref path (- end 1)) #\/))
+          (trim (- end 1))
+          (let find-slash ((i (- end 1)))
+            (cond
+              ((< i 0) (if (and (= end 1) (char=? (string-ref path 0) #\/)) "/" "."))
+              ((char=? (string-ref path i) #\/)
+               (let strip ((j i))
+                 (cond ((zero? j) "/")
+                       ((char=? (string-ref path (- j 1)) #\/) (strip (- j 1)))
+                       (else (substring path 0 j)))))
+              (else (find-slash (- i 1)))))))))
+
+(define (expand-tilde dir)
+  (cond
+    ((string=? dir "~") (or (get-environment-variable "HOME") "/"))
+    ((string-prefix? "~/" dir)
+     (string-append (or (get-environment-variable "HOME") "")
+                    (substring dir 1 (string-length dir))))
+    (else dir)))
+
+(define (option-path-has-parent-component? p)
+  (and (string? p)
+       (any (lambda (seg) (string=? seg "..")) (string-split p "/"))))
+
+(define (normalize-option-dir dir)
+  ;; Pure, zero-I/O lexical normalization for local directories; returns #f for
+  ;; remote paths, non-strings, or paths containing `..` parent components.
+  (cond
+    ((or (not (string? dir)) (%remote-path-hook dir) (option-path-has-parent-component? dir)) #f)
+    ((string=? dir "") "/")
+    (else
+     (let* ((abs? (string-prefix? "/" dir))
+            (parts (string-split dir "/"))
+            (stack (let loop ((xs parts) (acc '()))
+                     (if (null? xs)
+                         (reverse acc)
+                         (let ((seg (car xs)))
+                           (cond ((or (string=? seg "") (string=? seg "."))
+                                  (loop (cdr xs) acc))
+                                 (else (loop (cdr xs) (cons seg acc)))))))))
+       (if abs?
+           (if (null? stack) "/" (string-append "/" (string-join stack "/") "/"))
+           (if (null? stack) "/" (string-append (string-join stack "/") "/")))))))
+
+(define (normalize-option-dir-write who dir)
+  (unless (string? dir)
+    (error (string-append who ": #:directory must be a string") dir))
+  (when (%remote-path-hook dir)
+    (error (string-append who ": #:directory cannot be a remote path") dir))
+  (let ((expanded (expand-tilde dir)))
+    (unless (string-prefix? "/" expanded)
+      (error (string-append who ": #:directory must be an absolute local path") dir))
+    (project-settings-canonical-dir expanded)))
 
 (define (find-option name)
   "Return the declaration of the option NAME, or #f."
@@ -287,14 +410,32 @@ That is the one with the longest suffix of PATH, else
   "Return the names of the options declared."
   (registry-keys %options))
 
-(define (register-option! name default doc #:type [type 'any] #:user-only [user-only #f])
+(define (register-option! name default doc #:type [type 'any] #:user-only [user-only #f]
+                          #:directory-safe [directory-safe #f] #:merge [merge 'replace])
   "Declare the option NAME, its DEFAULT and its documentation DOC.
 TYPE is the schema of its values, as `valid?` takes it: boolean, natural,
 (one-of value ...), (or schema ...) and so on. When USER-ONLY is true,
 NAME may only be set globally by the user (not per-buffer, per-mode, from
-project settings, or by external agent principals)."
+project settings, or by external agent principals). DIRECTORY-SAFE controls
+whether project `.techne.scm` files may set NAME without explicit user
+trust: `#f` (the default) requires value-based trust, `#t` allows any
+valid value, or a predicate `(VALUE) -> boolean` checks safety per value.
+MERGE is `'replace` (the default) or `'json-object` for deep dict
+overlays."
   (unless (schema? type) (error "Not a schema:" type))
-  (registry-add! %options name (%make-option name default doc type (and user-only #t)))
+  (unless (or (boolean? directory-safe) (procedure? directory-safe))
+    (error "directory-safe must be a boolean or procedure:" directory-safe))
+  (unless (memq merge '(replace json-object))
+    (error "merge must be replace or json-object:" merge))
+  (when (and user-only directory-safe)
+    (error "Option cannot be both user-only and directory-safe:" name))
+  (let ((existing (find-option name)))
+    (when (and existing (option-user-only? existing) (not user-only))
+      (error "Cannot weaken #:user-only option:" name)))
+  (registry-add! %options name
+                 (%make-option name default doc type (and user-only #t)
+                               (if (procedure? directory-safe) (scope-procedure directory-safe) (and directory-safe #t))
+                               merge))
   name)
 
 (define-syntax define-option
@@ -321,104 +462,321 @@ declarations: if one of them fails, none is left."
 ;; Raise an error unless VALUE is a value of the option NAME.
 (define (check-option name value)
   (let ((o (find-option name)))
-    (when (and o (not (valid? (option-type o) value)))
-      (error (string-append "Not a value of " (symbol->string name) ": expected " (schema-description (option-type o)) ", got")
-             value))))
+    (when o
+      (let ((checked (if (and (eq? (option-merge o) 'json-object) (dict? value))
+                         (json-object-strip-unset value)
+                         value)))
+        (unless (valid? (option-type o) checked)
+          (error (string-append "Not a value of " (symbol->string name) ": expected " (schema-description (option-type o)) ", got")
+                 value))))))
 
-(define (check-user-only-write! name b mode)
+(define (check-user-only-write! name b mode dir)
   (let ((o (find-option name)))
     (when (and o (option-user-only? o))
-      (when (or b mode)
-        (error (string-append "Option " (symbol->string name) " is user-only and cannot be set per-buffer or per-mode")))
+      (when (or b mode dir)
+        (error (string-append "Option " (symbol->string name) " is user-only and cannot be set per-buffer, per-mode, or per-directory")))
       (let ((who (current-principal)))
         (unless (equal? who "user")
           (error (string-append "Option " (symbol->string name) " is user-only and cannot be set by principal "
                                 (if (string? who) who "non-user"))))))))
 
-(define (set-option! name value #:buffer [b #f] #:mode [mode #f])
-  "Set the option NAME to VALUE in buffer B or the major mode MODE.
-Without either, it is set globally."
-  (check-user-only-write! name b mode)
+(define (set-option! name value #:buffer [b #f] #:mode [mode #f] #:directory [dir #f])
+  "Set the option NAME to VALUE in buffer B, directory DIR, or mode MODE.
+Without any target, it is set globally. B cannot be combined with MODE or
+DIR; DIR and MODE together set a user directory override for that mode."
+  (when (and b (or mode dir))
+    (error "set-option!: #:buffer cannot be combined with #:mode or #:directory"))
+  (check-user-only-write! name b mode dir)
   (check-option name value)
   (note-effect! 'settings)
-  (if b
-      (set-buffer-settings! b (cons (cons name value) (remove (lambda (e) (eq? (car e) name)) (buffer-settings b))))
-      (registry-add! %settings (if mode (list name mode) (list name)) (cons value (scope-name (current-scope)))))
+  (cond
+    (b
+     (set-buffer-settings! b (cons (cons name value) (remove (lambda (e) (eq? (car e) name)) (buffer-settings b))))
+     (notify-option-changed! name))
+    (dir
+     (let ((nd (normalize-option-dir-write "set-option!" dir)))
+       (registry-add! %dir-settings (list name nd mode) (cons value (scope-name (current-scope))))))
+    (else
+     (registry-add! %settings (if mode (list name mode) (list name)) (cons value (scope-name (current-scope))))))
   value)
 
-(define (unset-option! name #:buffer [b #f] #:mode [mode #f])
-  "Take back the setting of the option NAME in buffer B or mode MODE.
-Without either, the global setting is taken back."
-  (check-user-only-write! name b mode)
+(define (unset-option! name #:buffer [b #f] #:mode [mode #f] #:directory [dir #f])
+  "Take back the setting of NAME in buffer B, directory DIR, or mode MODE.
+Without any target, the global setting is taken back."
+  (when (and b (or mode dir))
+    (error "unset-option!: #:buffer cannot be combined with #:mode or #:directory"))
+  (check-user-only-write! name b mode dir)
   (note-effect! 'settings)
-  (if b
-      (set-buffer-settings! b (remove (lambda (e) (eq? (car e) name)) (buffer-settings b)))
-      (registry-remove! %settings (if mode (list name mode) (list name)))))
+  (cond
+    (b
+     (set-buffer-settings! b (remove (lambda (e) (eq? (car e) name)) (buffer-settings b)))
+     (notify-option-changed! name))
+    (dir
+     (let ((nd (normalize-option-dir-write "unset-option!" dir)))
+       (registry-remove! %dir-settings (list name nd mode))))
+    (else
+     (registry-remove! %settings (if mode (list name mode) (list name))))))
 
-(define (explain-option b name)
-  "Return the settings of the option NAME that apply in buffer B.
-B #f means no buffer. Each is (cell value by), the one that wins first:
-CELL is `buffer`, a mode's name, `global` or `default`; BY is who made
-it (a package, `root` for the editor's own code and what is evaluated
-in it, a mode for its own options)."
+;; Extract (values buf dir path modes snap) from WHERE without I/O.
+(define (resolve-where where)
+  (cond
+    ((not where) (values #f #f #f '() #f))
+    ((buffer? where)
+     (let* ((d (buffer-document where))
+            (raw-path (and d (document-path d)))
+            (modes (map mode-name (mode-chain (buffer-mode where)))))
+       (if (and raw-path (%remote-path-hook raw-path))
+           (values where #f #f modes #f)
+           (let* ((logical (and d (guard (e (#t raw-path)) (%document-logical-path-hook d))))
+                  (raw-dir (cond (raw-path (local-path-directory raw-path))
+                                 ((buffer-directory where) => values)
+                                 (else #f)))
+                  (parent-comp? (or (option-path-has-parent-component? raw-path)
+                                    (option-path-has-parent-component? raw-dir)
+                                    (option-path-has-parent-component? logical)))
+                  (dir (and (not parent-comp?) (normalize-option-dir raw-dir)))
+                  (snap (and dir (project-settings-cached-snapshot dir)))
+                  (eff-dir (if snap (project-settings-snapshot-directory snap) dir)))
+             (values where eff-dir (and dir logical) modes snap)))))
+    ((settings-context? where)
+     (let* ((raw-dir (settings-context-directory where))
+            (raw-path (settings-context-path where))
+            (modes (settings-context-modes where)))
+       (if (or (and raw-dir (%remote-path-hook raw-dir))
+               (and raw-path (%remote-path-hook raw-path))
+               (option-path-has-parent-component? raw-dir)
+               (option-path-has-parent-component? raw-path))
+           (values #f #f #f modes #f)
+           (let* ((dir (normalize-option-dir raw-dir))
+                  (snap (or (and dir (project-settings-cached-snapshot dir))
+                            (settings-context-snapshot where)))
+                  (eff-dir (if snap (project-settings-snapshot-directory snap) dir)))
+             (values #f eff-dir raw-path modes snap)))))
+    ((%execution-site-inspector-hook where)
+     => (lambda (info)
+          (let ((remote? (car info))
+                (raw-dir (cdr info)))
+            (if (or remote? (option-path-has-parent-component? raw-dir))
+                (values #f #f #f '() #f)
+                (let* ((dir (normalize-option-dir raw-dir))
+                       (snap (and dir (project-settings-cached-snapshot dir)))
+                       (eff-dir (if snap (project-settings-snapshot-directory snap) dir)))
+                  (values #f eff-dir #f '() snap))))))
+    ((string? where)
+     (if (or (%remote-path-hook where) (option-path-has-parent-component? where))
+         (values #f #f #f '() #f)
+         (let* ((dir (normalize-option-dir where))
+                (snap (and dir (project-settings-cached-snapshot dir)))
+                (eff-dir (if snap (project-settings-snapshot-directory snap) dir)))
+           (values #f eff-dir #f '() snap))))
+    (else
+     (error "option: expected buffer, settings-context, execution-site, directory string, or #f" where))))
+
+(define (matching-user-dir-entries name dir user-only?)
+  (if (or user-only? (not dir) (not %has-dir-settings?))
+      '()
+      (let ((keys (registry-keys %dir-settings)))
+        (if (null? keys)
+            '()
+            (append-map
+             (lambda (k)
+               (if (and (pair? k) (eq? (car k) name))
+                   (let ((entry-dir (cadr k))
+                         (entry-mode (caddr k)))
+                     (if (or (string=? entry-dir dir) (string-prefix? entry-dir dir))
+                         (map (lambda (e)
+                                (list entry-dir entry-mode (car (car e)) (cdr (car e))))
+                              (reverse (registry-entries %dir-settings k)))
+                         '()))
+                   '()))
+             keys)))))
+
+(define (resolve-dir-layers o name dir path modes snap)
+  (let* ((user-only? (and o (option-user-only? o)))
+         (user-entries (matching-user-dir-entries name dir user-only?)))
+    (if (and (not snap) (null? user-entries))
+        '()
+        (let-values (((applied pending rejected)
+                      (project-settings-resolve-option
+                       snap path modes user-entries name
+                       #:known? (and o #t)
+                       #:user-only? user-only?
+                       #:safe (if o (option-directory-safe o) #f)
+                       #:valid? (if o (lambda (v) (valid? (option-type o) v)) (lambda (v) #t))
+                       #:merge (if o (option-merge o) 'replace))))
+          applied))))
+
+(define (format-dir-source entry)
+  (let ((dir (list-ref entry 0))
+        (kind (list-ref entry 1))
+        (label (list-ref entry 2)))
+    (cond
+      ((eq? kind 'user)
+       (string-append (if (symbol? label)
+                          (symbol->string label)
+                          (call-with-output-string (lambda (p) (display label p))))
+                      " (" dir ")"))
+      ((string? label) label)
+      (else (symbol->string kind)))))
+
+(define (mode-objects-from-names names)
+  (filter-map find-mode names))
+
+(define (explain-option where name)
+  "Return the settings of the option NAME that apply at WHERE.
+WHERE may be a buffer, a `settings-context`, an `execution-site`, a
+directory string, or `#f` for global settings only. Performs no I/O. Each
+row is `(cell value by)`, the highest-precedence setting first: CELL is
+`buffer`, `directory`, a mode's name, `global` or `default`; BY is who
+made it (a package, `root`, a mode, or a `.techne.scm` / `.editorconfig`
+file path)."
   (let* ((o (find-option name))
          (user-only? (and o (option-user-only? o)))
          (settings (lambda (cell key)
-                     (map (lambda (e) (list cell (car (car e)) (cdr (car e)))) (registry-entries %settings key))))
-         (in-buffer (and (not user-only?) b (assq name (buffer-settings b))))
-         (in-modes (if (and (not user-only?) b)
-                       (append-map (lambda (m)
-                                     (let ((own (assq name (mode-options m))))
-                                       (append (settings (mode-name m) (list name (mode-name m)))
-                                               (if own (list (list (mode-name m) (cdr own) (mode-name m))) '()))))
-                                   (mode-chain (buffer-mode b)))
-                       '())))
-    (append (if in-buffer (list (list 'buffer (cdr in-buffer) 'buffer)) '())
-            in-modes
-            (settings 'global (list name))
-            (list (list 'default (and o (option-default o)) 'default)))))
+                     (map (lambda (e) (list cell (car (car e)) (cdr (car e))))
+                          (registry-entries %settings key)))))
+    (if (and (buffer? where) (not %has-dir-settings?) (not (project-settings-loaded?)))
+        (let* ((in-buffer (and (not user-only?) (assq name (buffer-settings where))))
+               (in-modes (if (not user-only?)
+                             (append-map (lambda (m)
+                                           (let ((own (assq name (mode-options m))))
+                                             (append (settings (mode-name m) (list name (mode-name m)))
+                                                     (if own (list (list (mode-name m) (cdr own) (mode-name m))) '()))))
+                                         (mode-chain (buffer-mode where)))
+                             '())))
+          (append (if in-buffer (list (list 'buffer (cdr in-buffer) 'buffer)) '())
+                  in-modes
+                  (settings 'global (list name))
+                  (list (list 'default (and o (option-default o)) 'default))))
+        (let-values (((b dir path modes snap) (resolve-where where)))
+          (let* ((in-buffer (and (not user-only?) b (assq name (buffer-settings b))))
+                 (in-dirs (if user-only?
+                              '()
+                              (map (lambda (e)
+                                     (list 'directory (list-ref e 3) (format-dir-source e)))
+                                   (resolve-dir-layers o name dir path modes snap))))
+                 (in-modes (if (and (not user-only?) (pair? modes))
+                               (append-map (lambda (m)
+                                             (let ((own (assq name (mode-options m))))
+                                               (append (settings (mode-name m) (list name (mode-name m)))
+                                                       (if own (list (list (mode-name m) (cdr own) (mode-name m))) '()))))
+                                           (mode-objects-from-names modes))
+                               '())))
+            (append (if in-buffer (list (list 'buffer (cdr in-buffer) 'buffer)) '())
+                    in-dirs
+                    in-modes
+                    (settings 'global (list name))
+                    (list (list 'default (and o (option-default o)) 'default))))))))
 
 (define (buffer-display-options b)
   "Return a vector of the resolved display options of buffer B.
 In order: line numbers, end marker, syntax highlighting, word wrapping,
 truncation and pointer reporting. With B false, return global values."
-  (let ((cached (and b (buffer-display-cache b))) (mode (and b (buffer-mode b))))
-    (if (and cached (= %display-generation (vector-ref cached 0)) (eq? mode (vector-ref cached 1)))
-        (vector-copy (vector-ref cached 2))
+  (let ((cached (and b (buffer-display-cache b)))
+        (mode (and b (buffer-mode b)))
+        (ps-gen (project-settings-generation)))
+    (if (and cached
+             (= %display-generation (vector-ref cached 0))
+             (= ps-gen (vector-ref cached 1))
+             (eq? mode (vector-ref cached 2)))
+        (vector-copy (vector-ref cached 3))
         (let ((values (vector (option b 'line-numbers) (option b 'eob-marker) (option b 'syntax-highlight)
                               (option b 'word-wrap) (option b 'truncate-lines) (option b 'report-pointer))))
-          (when b (set-buffer-display-cache! b (vector %display-generation mode (vector-copy values))))
+          (when b (set-buffer-display-cache! b (vector %display-generation ps-gen mode (vector-copy values))))
           values))))
 
-;; The value of option NAME in buffer B (#f: what applies to no buffer).
-(define (option b name)
-  "Return the value of the option NAME in buffer B, #f meaning no buffer."
+(define (collect-json-overlay-layers where name o)
+  (let-values (((b dir path modes snap) (resolve-where where)))
+    (let* ((user-only? (and o (option-user-only? o)))
+           (layers '())
+           (push! (lambda (v) (when (dict? v) (set! layers (cons v layers))))))
+      ;; Lowest to highest: default -> global -> modes (far to near) -> dirs (far to near) -> buffer
+      (when (and o (dict? (option-default o)) (pair? (dict-keys (option-default o))))
+        (push! (option-default o)))
+      (let ((entry (registry-ref %settings (list name))))
+        (when entry (push! (car entry))))
+      (unless user-only?
+        (for-each (lambda (m)
+                    (let ((own (assq name (mode-options m))))
+                      (when own (push! (cdr own))))
+                    (let ((entry (registry-ref %settings (list name (mode-name m)))))
+                      (when entry (push! (car entry)))))
+                  (reverse (mode-objects-from-names modes)))
+        (for-each (lambda (e) (push! (list-ref e 3)))
+                  (reverse (resolve-dir-layers o name dir path modes snap)))
+        (let ((local (and b (assq name (buffer-settings b)))))
+          (when local (push! (cdr local)))))
+      (reverse layers))))
+
+(define (option-json-overlay where name)
+  "Return the composed JSON-object overlay for option NAME at WHERE.
+Preserves `json-unset` tombstones so callers such as LSP configuration can
+overlay the result onto a server base dict via `json-object-overlay`.
+Performs no I/O."
+  (let* ((o (find-option name))
+         (layers (collect-json-overlay-layers where name o)))
+    (fold (lambda (layer acc) (json-object-compose-overlays acc layer))
+          (dict)
+          layers)))
+
+(define (option-global-value o name)
+  (let ((entry (registry-ref %settings (list name))))
+    (if entry (car entry) (and o (option-default o)))))
+
+(define (option-from-where o where name)
+  (let-values (((b dir path modes snap) (resolve-where where)))
+    (let ((dirs (resolve-dir-layers o name dir path modes snap)))
+      (if (pair? dirs)
+          (list-ref (car dirs) 3)
+          (let loop ((ms modes))
+            (if (null? ms)
+                (option-global-value o name)
+                (let* ((mname (car ms))
+                       (m (find-mode mname)))
+                  (if (not m)
+                      (loop (cdr ms))
+                      (let ((entry (registry-ref %settings (list name mname))))
+                        (if entry
+                            (car entry)
+                            (let ((own (assq name (mode-options m))))
+                              (if own (cdr own) (loop (cdr ms))))))))))))))
+
+;; The value of option NAME at WHERE (#f: global only).
+(define (option where name)
+  "Return the value of the option NAME at WHERE, performing no I/O.
+WHERE may be a buffer, a `settings-context`, an `execution-site`, a
+directory string, or `#f` for global settings only."
   ;; Same precedence as explain-option, without building provenance rows or
   ;; looking up settings that cannot win. Entries are pairs even for #f.
   (let* ((o (find-option name))
          (user-only? (and o (option-user-only? o))))
-    (define (global-value)
-      (let ((entry (registry-ref %settings (list name))))
-        (if entry (car entry) (and o (option-default o)))))
-    (if user-only?
-        (global-value)
-        (let ((local (and b (assq name (buffer-settings b)))))
-          (cond (local (cdr local))
-                ((not b) (global-value))
-                (else
-                 (let loop ((mode (buffer-mode b)) (seen '()))
+    (cond
+      ((and o (eq? (option-merge o) 'json-object))
+       (json-object-overlay (dict) (option-json-overlay where name)))
+      ((or user-only? (not where))
+       (option-global-value o name))
+      ((buffer? where)
+       (let ((local (assq name (buffer-settings where))))
+         (if local
+             (cdr local)
+             (if (and (not %has-dir-settings?) (not (project-settings-loaded?)))
+                 (let loop ((mode (buffer-mode where)) (seen '()))
                    (let ((m (and mode (not (memq mode seen)) (find-mode mode))))
-                     (if (not m) (global-value)
+                     (if (not m) (option-global-value o name)
                          (let ((entry (registry-ref %settings (list name mode))))
                            (if entry (car entry)
                                (let ((own (assq name (mode-options m))))
-                                 (if own (cdr own) (loop (mode-parent m) (cons mode seen)))))))))))))))
+                                 (if own (cdr own) (loop (mode-parent m) (cons mode seen)))))))))
+                 (option-from-where o where name)))))
+      (else (option-from-where o where name)))))
 
 ;;; Mode line segments: what a package says of a buffer in its mode
 ;;; line (a language server's state, its diagnostics' count), after the
 ;;; modes. Scope-owned, so a package's segment goes with it.
 
-(define %mode-line-segments (make-registry 'mode-line-segments))
+(define %mode-line-segment-names #f)
+(define %mode-line-segments
+  (make-registry 'mode-line-segments #:changed (lambda (k v) (set! %mode-line-segment-names #f))))
 
 (define (register-mode-line-segment! name proc)
   "Show (PROC buffer) in the mode line of the buffer's panes, as NAME.
@@ -432,7 +790,12 @@ order of their names; one that fails shows nothing."
   (filter-map (lambda (name)
                 (let ((text (guard (e (#t #f)) ((registry-ref %mode-line-segments name) b))))
                   (and (string? text) (not (string=? text "")) text)))
-              (sort (registry-keys %mode-line-segments) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
+              (or %mode-line-segment-names
+                  (begin
+                    (set! %mode-line-segment-names
+                          (sort (registry-keys %mode-line-segments)
+                                (lambda (a b) (string<? (symbol->string a) (symbol->string b)))))
+                    %mode-line-segment-names))))
 
 ;;; Minor modes
 
@@ -443,8 +806,9 @@ setting."
   ;; Sorted after the major modes are left out, few as minor ones are:
   ;; this runs on every key.
   (filter-map (lambda (name)
-                (let ((winner (car (explain-option b name))))
-                  (and (cadr winner) (cons (find-mode name) (not (memq (car winner) '(global default)))))))
+                (and (option b name)
+                     (let ((winner (car (explain-option b name))))
+                       (and (cadr winner) (cons (find-mode name) (not (memq (car winner) '(global default))))))))
               (or %minor-names
                   (begin
                     (set! %minor-names
@@ -617,39 +981,94 @@ The nearest mode of B that completes says: (start . candidates)."
 (define-option line-numbers #f
   "Line numbers beside the text: absolute, relative, or none.
 Relative numbers count from the caret's line, which shows its own."
-  #:type '(one-of #f absolute relative))
+  #:type '(one-of #f absolute relative)
+  #:directory-safe #t)
 
 (define-option word-wrap #f
   "Whether terminal visual lines wrap at spaces rather than within words.
 Oversized words still wrap by grapheme. This changes layout, never source
 text, caret positions or logical rows. Rich prose enables it."
-  #:type 'boolean)
+  #:type 'boolean
+  #:directory-safe #t)
 
 (define-option report-pointer #f
   "Whether the frontend delivers pointer events in text cells."
-  #:type 'boolean)
+  #:type 'boolean
+  #:directory-safe #t)
 
 (define-option truncate-lines #f
   "Whether long lines are clipped instead of wrapped."
-  #:type 'boolean)
+  #:type 'boolean
+  #:directory-safe #t)
 
 (define-option eob-marker #f
   "What is drawn on the lines past the end of the text, or nothing.
 Vim draws a ~."
-  #:type '(or (one-of #f) string))
+  #:type '(or (one-of #f) string)
+  #:directory-safe #t)
 
 (define-option syntax-highlight #t
   "Whether the text is coloured by its language's syntax.
 The runtime's tree-sitter grammars name faces under the buffer's own
 layers; which language is the buffer's is `syntax-language'."
-  #:type 'boolean)
+  #:type 'boolean
+  #:directory-safe #t)
 
 (define-option syntax-language #f
   "The language of the buffer's syntax: rust, scheme, markdown, ...
 #f asks the file's name, as the languages' file suffixes say
 (`define-language'). A mode for one language sets this, as
 scheme-mode does, so buffers without a file are coloured too."
-  #:type '(or (one-of #f) symbol))
+  #:type '(or (one-of #f) symbol)
+  #:directory-safe #t)
+
+;;; Formatting options: safe for `.editorconfig` and `.techne.scm`.
+
+(define-option indent-width 4
+  "Width in columns of one indentation step.
+Mapped from EditorConfig `indent_size` and safe in `.techne.scm`."
+  #:type '(integer #:min 1 #:max 32)
+  #:directory-safe #t)
+
+(define-option tab-width 8
+  "Width in columns of a literal tab character.
+Mapped from EditorConfig `tab_width` and safe in `.techne.scm`."
+  #:type '(integer #:min 1 #:max 32)
+  #:directory-safe #t)
+
+(define-option indent-tabs #f
+  "Whether indentation uses tab characters instead of spaces.
+Mapped from EditorConfig `indent_style` and safe in `.techne.scm`."
+  #:type 'boolean
+  #:directory-safe #t)
+
+(define-option fill-column 80
+  "Preferred line-length limit in columns, or `#f` for none.
+Mapped from EditorConfig `max_line_length` and safe in `.techne.scm`."
+  #:type '(or (one-of #f) (integer #:min 1 #:max 1000))
+  #:directory-safe #t)
+
+(define-option insert-final-newline 'preserve
+  "Whether saving ensures a trailing newline: `'preserve`, `#t`, or `#f`.
+When `#t`, saving an editable non-empty buffer appends a newline if
+missing as an undoable edit. Mapped from EditorConfig
+`insert_final_newline`."
+  #:type '(one-of preserve #t #f)
+  #:directory-safe #t)
+
+(define-option trim-trailing-whitespace #f
+  "Whether saving removes trailing spaces and tabs on lines.
+When `#t`, saving an editable buffer trims trailing horizontal
+whitespace as an undoable edit. Mapped from EditorConfig
+`trim_trailing_whitespace`."
+  #:type 'boolean
+  #:directory-safe #t)
+
+(define-option end-of-line 'preserve
+  "Line-ending convention: `'preserve`, `'lf`, `'crlf`, or `'cr`.
+Mapped from EditorConfig `end_of_line` and safe in `.techne.scm`."
+  #:type '(one-of preserve lf crlf cr)
+  #:directory-safe #t)
 
 ;;; The modes others build on, as Emacs has them. Until a language has a
 ;;; mode of its own, its files get prog-mode. Line numbers and ~ are where
@@ -672,7 +1091,8 @@ scheme-mode does, so buffers without a file are coloured too."
 (define-option read-only #f "Whether the buffer's text can be edited from its views." #:type 'boolean)
 (define-option cursor-visible #t
   "Whether the buffer shows a text caret."
-  #:type 'boolean)
+  #:type 'boolean
+  #:directory-safe #t)
 (define-option inherit-on-attach #t
   "Whether a frontend attaching without a file may inherit this buffer."
   #:type 'boolean)

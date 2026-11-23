@@ -190,8 +190,9 @@ Each entry is an `(id-string message)` pair."
   "Whether other programs may evaluate code in the editor: `techne eval`.
 Only programs running as you reach the editor's socket, but those can
 then do what the editor can, as with Emacs's server. *Server log* says
-what they evaluated."
-  #:type 'boolean)
+what they evaluated. User-scope only."
+  #:type 'boolean
+  #:user-only #t)
 
 (define server-eval-max-chars (* 64 1024)
   "The most characters of a value, an error or output `techne eval` gets.

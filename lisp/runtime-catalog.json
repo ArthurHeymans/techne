@@ -28,8 +28,16 @@
       "description": "(add-hook! hook name proc)  procedure, @lisp@/editor/dispatch.scm:79\n\nRun (PROC session args ...) at each HOOK, as NAME.",
       "is_macro": false
     },
+    "add-option-changed-hook!": {
+      "description": "(add-option-changed-hook! name proc)  procedure, @lisp@/editor/modes.scm:288\n\nRegister PROC under NAME to run when an option changes.\nPROC is called as `(PROC option-name)` whenever an option is set, unset,\nor its defining scope shuts down.",
+      "is_macro": false
+    },
+    "add-project-settings-changed-hook!": {
+      "description": "(add-project-settings-changed-hook! name proc)  procedure, @lisp@/editor/project-settings.scm:28\n\nRegister PROC under NAME to run when project settings or trust change.\nPROC is called as `(PROC dir)` where DIR is the affected directory or `#f`.",
+      "is_macro": false
+    },
     "advertise-package!": {
-      "description": "(advertise-package! name entry commands options)  procedure, @lisp@/editor/modes.scm:306\n\nAdvertise the package NAME without loading the file ENTRY; return NAME.\nWhat a package's manifest declares for the editor (doc/packages.md) is\nthere from now on: OPTIONS, each (name default schema documentation),\nare declared, and COMMANDS, each (name documentation), offered, the\nfirst use of one loading ENTRY as the package\n(`register-command-package!`). A scope of the package's name owns the\ndeclarations: if one of them fails, none is left.",
+      "description": "(advertise-package! name entry commands options)  procedure, @lisp@/editor/modes.scm:447\n\nAdvertise the package NAME without loading the file ENTRY; return NAME.\nWhat a package's manifest declares for the editor (doc/packages.md) is\nthere from now on: OPTIONS, each (name default schema documentation),\nare declared, and COMMANDS, each (name documentation), offered, the\nfirst use of one loading ENTRY as the package\n(`register-command-package!`). A scope of the package's name owns the\ndeclarations: if one of them fails, none is left.",
       "is_macro": false
     },
     "append-bounded-output!": {
@@ -45,7 +53,7 @@
       "is_macro": false
     },
     "buffer-document": {
-      "description": "(buffer-document record)  procedure, @lisp@/editor/modes.scm:51\n\nReturn the `document` field of RECORD, a `buffer` record.",
+      "description": "(buffer-document record)  procedure, @lisp@/editor/modes.scm:55\n\nReturn the `document` field of RECORD, a `buffer` record.",
       "is_macro": false
     },
     "buffer-language": {
@@ -53,31 +61,39 @@
       "is_macro": false
     },
     "buffer-list": {
-      "description": "(buffer-list)  procedure, @lisp@/editor/modes.scm:74\n\nReturn the buffers, the most recently shown first.",
+      "description": "(buffer-list)  procedure, @lisp@/editor/modes.scm:78\n\nReturn the buffers, the most recently shown first.",
       "is_macro": false
     },
     "buffer-mode": {
-      "description": "(buffer-mode record)  procedure, @lisp@/editor/modes.scm:55\n\nReturn the `mode` field of RECORD, a `buffer` record.",
+      "description": "(buffer-mode record)  procedure, @lisp@/editor/modes.scm:59\n\nReturn the `mode` field of RECORD, a `buffer` record.",
       "is_macro": false
     },
     "buffer-name": {
-      "description": "(buffer-name record)  procedure, @lisp@/editor/modes.scm:52\n\nReturn the `name` field of RECORD, a `buffer` record.",
+      "description": "(buffer-name record)  procedure, @lisp@/editor/modes.scm:56\n\nReturn the `name` field of RECORD, a `buffer` record.",
       "is_macro": false
     },
     "buffer-named": {
       "description": "(buffer-named name)  procedure, @lisp@/editor/buffers.scm:29\n\nReturn the buffer called NAME, or #f.",
       "is_macro": false
     },
+    "buffer-project-settings-diagnostics": {
+      "description": "(buffer-project-settings-diagnostics b)  procedure, @lisp@/editor/project-settings.scm:108\n\nReturn cached `.techne.scm` diagnostics for buffer B without I/O.\nEach entry is a `settings-diagnostic` record.",
+      "is_macro": false
+    },
+    "buffer-project-settings-pending": {
+      "description": "(buffer-project-settings-pending b)  procedure, @lisp@/editor/project-settings.scm:81\n\nReturn pending untrusted `.techne.scm` entries for buffer B without I/O.\nEach entry is `(scope option-name effective-value source-path verdict)`.",
+      "is_macro": false
+    },
     "buffer-projections": {
-      "description": "(buffer-projections doc from to)  procedure, @lisp@/editor/modes.scm:562\n\nReturn how the modes of DOC's buffer lay out its text from FROM to TO.\nEach is (hang LINE AT), the line starting at LINE wrapping under the\ncharacter at AT, its wrapped lines starting where that character does\n(a list item's under its text, not its bullet); or (block AT IMAGE),\nIMAGE (`image-load') shown as a block of its own above the line AT is\non, fitted to the pane's width. A frontend that cannot draw one\nignores it: a terminal shows no images.",
+      "description": "(buffer-projections doc from to)  procedure, @lisp@/editor/modes.scm:926\n\nReturn how the modes of DOC's buffer lay out its text from FROM to TO.\nEach is (hang LINE AT), the line starting at LINE wrapping under the\ncharacter at AT, its wrapped lines starting where that character does\n(a list item's under its text, not its bullet); or (block AT IMAGE),\nIMAGE (`image-load') shown as a block of its own above the line AT is\non, fitted to the pane's width. A frontend that cannot draw one\nignores it: a terminal shows no images.",
       "is_macro": false
     },
     "buffer-state": {
-      "description": "(buffer-state record)  procedure, @lisp@/editor/modes.scm:56\n\nReturn the `state` field of RECORD, a `buffer` record.",
+      "description": "(buffer-state record)  procedure, @lisp@/editor/modes.scm:60\n\nReturn the `state` field of RECORD, a `buffer` record.",
       "is_macro": false
     },
     "buffer?": {
-      "description": "(buffer? obj)  procedure, @lisp@/editor/modes.scm:48\n\nReturn #t if OBJ is a `buffer` record.",
+      "description": "(buffer? obj)  procedure, @lisp@/editor/modes.scm:52\n\nReturn #t if OBJ is a `buffer` record.",
       "is_macro": false
     },
     "call-in-operation": {
@@ -145,7 +161,7 @@
       "is_macro": false
     },
     "changed-on-disk?": {
-      "description": "(changed-on-disk? e)  procedure, @lisp@/editor/files.scm:746\n\nReturn #t if E is the error of a save refused: the file changed since.",
+      "description": "(changed-on-disk? e)  procedure, @lisp@/editor/files.scm:751\n\nReturn #t if E is the error of a save refused: the file changed since.",
       "is_macro": false
     },
     "char-start": {
@@ -313,7 +329,7 @@
       "is_macro": false
     },
     "current-buffer": {
-      "description": "(current-buffer s)  procedure, @lisp@/editor/modes.scm:92\n\nReturn the buffer of the focused pane of S, whatever has the keys.",
+      "description": "(current-buffer s)  procedure, @lisp@/editor/modes.scm:96\n\nReturn the buffer of the focused pane of S, whatever has the keys.",
       "is_macro": false
     },
     "current-operation": {
@@ -408,6 +424,10 @@
       "description": "(default-gzip-program)  procedure, @lisp@/techne/codec/params.sld:31\n\nExecutable name or absolute path used by the built-in `gzip` codec.",
       "is_macro": false
     },
+    "default-trust-store-path": {
+      "description": "(default-trust-store-path)  procedure, @source@/crates/techne-vm/src/prelude.scm:273\n\nOptional file path for persisting approved project-setting digests.\nWhen `#f`, falls back to the editor trust-store hook (if registered), or\nkeeps trust decisions in memory in headless mode. Set to `'none` to keep\ndecisions in memory only.",
+      "is_macro": false
+    },
     "define-action": {
       "description": "define-action: macro, @lisp@/editor/targets.scm:60\n\nDefine the action NAME on targets of KIND.\nIt is a procedure of the session S and the target's value V; DOC\ndocuments both the procedure and the action.",
       "is_macro": true
@@ -437,7 +457,7 @@
       "is_macro": true
     },
     "define-lsp-server": {
-      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:159\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
+      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:137\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
       "is_macro": true
     },
     "define-method": {
@@ -445,15 +465,15 @@
       "is_macro": false
     },
     "define-minor-mode": {
-      "description": "define-minor-mode: macro, @lisp@/editor/modes.scm:236\n\nDefine the minor mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-minor-mode!` takes them.",
+      "description": "define-minor-mode: macro, @lisp@/editor/modes.scm:243\n\nDefine the minor mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-minor-mode!` takes them.",
       "is_macro": true
     },
     "define-mode": {
-      "description": "define-mode: macro, @lisp@/editor/modes.scm:212\n\nDefine the major mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-mode!` takes them.",
+      "description": "define-mode: macro, @lisp@/editor/modes.scm:219\n\nDefine the major mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-mode!` takes them.",
       "is_macro": true
     },
     "define-option": {
-      "description": "define-option: macro, @lisp@/editor/modes.scm:301\n\nDeclare the option NAME, its DEFAULT and documentation DOC.\nThe other arguments are keywords, as `register-option!` takes them.",
+      "description": "define-option: macro, @lisp@/editor/modes.scm:442\n\nDeclare the option NAME, its DEFAULT and documentation DOC.\nThe other arguments are keywords, as `register-option!` takes them.",
       "is_macro": true
     },
     "define-reader!": {
@@ -469,11 +489,11 @@
       "is_macro": false
     },
     "derived-mode?": {
-      "description": "(derived-mode? name ancestor)  procedure, @lisp@/editor/modes.scm:248\n\nReturn #t if the mode NAME is ANCESTOR or extends it.",
+      "description": "(derived-mode? name ancestor)  procedure, @lisp@/editor/modes.scm:255\n\nReturn #t if the mode NAME is ANCESTOR or extends it.",
       "is_macro": false
     },
     "directory-entries": {
-      "description": "(directory-entries dir)  procedure, @lisp@/editor/files.scm:841\n\nReturn the entries of the directory DIR, sorted.\nA directory's has a slash after its name. DIR may be a location on\nanother machine.",
+      "description": "(directory-entries dir)  procedure, @lisp@/editor/files.scm:850\n\nReturn the entries of the directory DIR, sorted.\nA directory's has a slash after its name. DIR may be a location on\nanother machine.",
       "is_macro": false
     },
     "dismiss-decision!": {
@@ -493,7 +513,7 @@
       "is_macro": false
     },
     "document-buffer": {
-      "description": "(document-buffer d)  procedure, @lisp@/editor/modes.scm:78\n\nReturn the buffer of the document D, or #f.\nIts identity is the document's: the list holds the document, so the\naddress is not reused while it is there.",
+      "description": "(document-buffer d)  procedure, @lisp@/editor/modes.scm:82\n\nReturn the buffer of the document D, or #f.\nIts identity is the document's: the list holds the document, so the\naddress is not reused while it is there.",
       "is_macro": false
     },
     "document-change-at": {
@@ -621,7 +641,7 @@
       "is_macro": false
     },
     "document-save-description": {
-      "description": "(document-save-description d)  procedure, @lisp@/editor/files.scm:461\n\nReturn a short save description for codec-backed document D, or #f.",
+      "description": "(document-save-description d)  procedure, @lisp@/editor/files.scm:463\n\nReturn a short save description for codec-backed document D, or #f.",
       "is_macro": false
     },
     "document-save-overwriting!": {
@@ -741,11 +761,11 @@
       "is_macro": false
     },
     "explain-key": {
-      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:504\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
+      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:868\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
       "is_macro": false
     },
     "explain-option": {
-      "description": "(explain-option b name)  procedure, @lisp@/editor/modes.scm:358\n\nReturn the settings of the option NAME that apply in buffer B.\nB #f means no buffer. Each is (cell value by), the one that wins first:\nCELL is `buffer`, a mode's name, `global` or `default`; BY is who made\nit (a package, `root` for the editor's own code and what is evaluated\nin it, a mode for its own options).",
+      "description": "(explain-option where name)  procedure, @lisp@/editor/modes.scm:625\n\nReturn the settings of the option NAME that apply at WHERE.\nWHERE may be a buffer, a `settings-context`, an `execution-site`, a\ndirectory string, or `#f` for global settings only. Performs no I/O. Each\nrow is `(cell value by)`, the highest-precedence setting first: CELL is\n`buffer`, `directory`, a mode's name, `global` or `default`; BY is who\nmade it (a package, `root`, a mode, or a `.techne.scm` / `.editorconfig`\nfile path).",
       "is_macro": false
     },
     "exposed-command-schemas": {
@@ -765,7 +785,7 @@
       "is_macro": false
     },
     "file-document": {
-      "description": "(file-document path #:document (d #f) #:private (private? #f) #:codec (codec-arg (quote auto)) #:journal-path (journal-path #f) #:alias (alias #f) #:pinned (pinned? #f))  procedure, @lisp@/editor/files.scm:582\n\nReturn the document of the file at PATH.\nIt is opened once; D, a document already open, is registered as the file's.\nCodec and privacy matching follow symlinks via the canonical file path (both\nlocally and on remote nodes, failing closed if canonicalization fails or if\na symlink's own name matches a different codec than its canonical target), and\nany matching private codec forces the private profile even if a higher-priority\nnon-private codec also matches. When PRIVATE? is true or the path is private,\nthe document uses `Retention::None` (no journal or lock file) and fails closed\nif the file is already open with a journal or has an existing journal on disk.\nCODEC-ARG defaults to `'auto` (match via `codec-for-path`), may be `#f` to open\nraw bytes without a codec, or a codec name/object. JOURNAL-PATH, when given for\na non-private local file, overrides the default state-directory journal path.\nALIAS records the original symlink pathname when PATH is already canonical, and\nPINNED? suppresses re-canonicalization so a previously pinned path cannot adopt\na different target on disk.",
+      "description": "(file-document path #:document (d #f) #:private (private? #f) #:codec (codec-arg (quote auto)) #:journal-path (journal-path #f) #:alias (alias #f) #:pinned (pinned? #f))  procedure, @lisp@/editor/files.scm:584\n\nReturn the document of the file at PATH.\nIt is opened once; D, a document already open, is registered as the file's.\nCodec and privacy matching follow symlinks via the canonical file path (both\nlocally and on remote nodes, failing closed if canonicalization fails or if\na symlink's own name matches a different codec than its canonical target), and\nany matching private codec forces the private profile even if a higher-priority\nnon-private codec also matches. When PRIVATE? is true or the path is private,\nthe document uses `Retention::None` (no journal or lock file) and fails closed\nif the file is already open with a journal or has an existing journal on disk.\nCODEC-ARG defaults to `'auto` (match via `codec-for-path`), may be `#f` to open\nraw bytes without a codec, or a codec name/object. JOURNAL-PATH, when given for\na non-private local file, overrides the default state-directory journal path.\nALIAS records the original symlink pathname when PATH is already canonical, and\nPINNED? suppresses re-canonicalization so a previously pinned path cannot adopt\na different target on disk.",
       "is_macro": false
     },
     "file-location": {
@@ -781,7 +801,7 @@
       "is_macro": false
     },
     "file-text": {
-      "description": "(file-text d)  procedure, @lisp@/editor/files.scm:818\n\nReturn the text of the file of the document D now, \"\" if it has none.\nA file on another machine is read through its endpoint; a codec-backed\ndocument's stored bytes are decoded through its codec.",
+      "description": "(file-text d)  procedure, @lisp@/editor/files.scm:827\n\nReturn the text of the file of the document D now, \"\" if it has none.\nA file on another machine is read through its endpoint; a codec-backed\ndocument's stored bytes are decoded through its codec.",
       "is_macro": false
     },
     "file-visit!": {
@@ -805,7 +825,7 @@
       "is_macro": false
     },
     "find-mode": {
-      "description": "(find-mode name)  procedure, @lisp@/editor/modes.scm:143\n\nReturn the mode NAME, or #f if there is none.",
+      "description": "(find-mode name)  procedure, @lisp@/editor/modes.scm:150\n\nReturn the mode NAME, or #f if there is none.",
       "is_macro": false
     },
     "find-operation-record": {
@@ -813,7 +833,7 @@
       "is_macro": false
     },
     "find-option": {
-      "description": "(find-option name)  procedure, @lisp@/editor/modes.scm:283\n\nReturn the declaration of the option NAME, or #f.",
+      "description": "(find-option name)  procedure, @lisp@/editor/modes.scm:406\n\nReturn the declaration of the option NAME, or #f.",
       "is_macro": false
     },
     "forget-operation!": {
@@ -920,6 +940,22 @@
       "description": "(invoke s name args #:principal (principal \"user\") #:mode (mode (quote apply)) #:parent (parent #f) #:started (started #f))  procedure, @lisp@/editor/dispatch.scm:493\n\nRun the command NAME in session S with ARGS, a dict of its arguments.\nKeys are the arguments' names, symbols or strings (JSON's). The command\nmust have a contract; it checks that PRINCIPAL (\"user\", or an agent's\nname) may invoke it, that it is available, and conforms and validates\nARGS, refusing with what is wrong, values of sensitive arguments left\nout. It runs as an operation, a child of the current one, recording the\narguments as data. MODE `check` stops there and returns #t; `apply`\nruns it and returns what it returns. `stage` runs reads and queries,\nbut edits become revision-checked proposals; settings and external\neffects are refused, as are edits through presentations and undo, and\nthe `edit` effect of a command that does not declare #:stageable.\nErrors are raised to the caller, sensitive irritants redacted.\nThe operation is a child of PARENT when given (the failed one a recovery\nchoice is of), and\nSTARTED, if given, is called with its record before the command runs.",
       "is_macro": false
     },
+    "json-object-compose-overlays": {
+      "description": "(json-object-compose-overlays base overlay)  procedure, @lisp@/techne/project-settings/params.sld:64\n\nCompose two JSON-object overlay dicts BASE and OVERLAY.\nLike `json-object-overlay`, recurses only when both values are dicts and\nreplaces arrays/scalars wholesale, but preserves `json-unset` markers so\nthe resulting overlay can still remove keys from an even lower base.",
+      "is_macro": false
+    },
+    "json-object-overlay": {
+      "description": "(json-object-overlay base overlay)  procedure, @lisp@/techne/project-settings/params.sld:43\n\nOverlay JSON-object dict OVERLAY onto BASE.\nRecurses only when both values are dicts; replaces arrays and scalars\nwholesale. Preserves `'null` as JSON null and deletes keys mapped to\n`json-unset`.",
+      "is_macro": false
+    },
+    "json-unset": {
+      "description": "json-unset = #<%json-unset-type>\n\nSentinel value removing a key during `json-object-overlay`.",
+      "is_macro": false
+    },
+    "json-unset?": {
+      "description": "(json-unset? obj)  procedure, @lisp@/techne/project-settings/params.sld:23\n\nReturn #t if OBJ is a `%json-unset-type` record.",
+      "is_macro": false
+    },
     "kbd": {
       "description": "(kbd keys)  procedure, @lisp@/editor/keymaps.scm:30\n\nReturn the keys of KEYS, a key description such as `\"C-x C-s\"`.",
       "is_macro": false
@@ -933,7 +969,7 @@
       "is_macro": false
     },
     "keymap-sources": {
-      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:486\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
+      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:850\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
       "is_macro": false
     },
     "kill-ring": {
@@ -1093,19 +1129,31 @@
       "is_macro": false
     },
     "lsp-attach!": {
-      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:708\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
+      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:252\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
       "is_macro": false
     },
     "lsp-buffer-sessions": {
-      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:749\n\nReturn the live sessions buffer B's document is open in.",
+      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:260\n\nReturn the live sessions buffer B's document is open in.",
+      "is_macro": false
+    },
+    "lsp-effective-settings": {
+      "description": "(lsp-effective-settings server where)  procedure, @lisp@/editor/lsp.scm:234\n\nReturn the effective LSP settings dict for SERVER at WHERE.\nOverlays `lsp-settings` at WHERE (preserving `(unset)` removals) onto\nSERVER's declared defaults.",
+      "is_macro": false
+    },
+    "lsp-refresh-configuration!": {
+      "description": "(lsp-refresh-configuration! (dir #f))  procedure, @lisp@/editor/lsp.scm:240\n\nPush `workspace/didChangeConfiguration` to live sessions under DIR.\nWhen DIR is `#f`, checks all live sessions and notifies those whose\neffective settings changed without restarting them. Sessions still\ninitializing are marked dirty and flushed upon becoming ready.",
       "is_macro": false
     },
     "lsp-server-doc": {
-      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:168\n\nReturn the documentation of the language server NAME, or #f.",
+      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:146\n\nReturn the documentation of the language server NAME, or #f.",
       "is_macro": false
     },
     "lsp-server-names": {
-      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:164\n\nReturn the names of the language servers declared.",
+      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:142\n\nReturn the names of the language servers declared.",
+      "is_macro": false
+    },
+    "lsp-session-env-id": {
+      "description": "(lsp-session-env-id ls)  procedure, @lisp@/editor/lsp.scm:208\n\nReturn the environment identity hash of the language server session LS.",
       "is_macro": false
     },
     "make-choice": {
@@ -1166,6 +1214,10 @@
     },
     "make-service": {
       "description": "(make-service name file (deadline #f) #:files (files #f) #:memory (memory #f))  procedure, <techne-editor service>:2\n\nReturn a service named NAME, its world made from the Lisp file FILE.\nThe world is of its own, on a thread of its own, started when first\nasked. Making it needs this world's loading capability, and its world\nreads no more than this one may. Loading FILE, and each request, is\nkilled past DEADLINE milliseconds, ten seconds if not given. With\nFILES, its world has the files capability too, which this one must\nhave, reading and writing as this one may: it can list and search\nfiles (`project-files`, `search-file`). Its world holds MEMORY\nmegabytes at most, 512 if not given: past that, what it runs is\nrefused, as in any world. The current scope owns it: shutting the scope\ncloses it, as `service-close!` does.",
+      "is_macro": false
+    },
+    "make-settings-context": {
+      "description": "(make-settings-context dir #:path (path #f) #:modes (modes (quote ())) #:load? (load? #t))  procedure, @lisp@/editor/project-settings-bridge.scm:137\n\nReturn a `settings-context` for DIR with optional PATH, MODES, LOAD?.",
       "is_macro": false
     },
     "make-view": {
@@ -1233,35 +1285,35 @@
       "is_macro": false
     },
     "mode-chain": {
-      "description": "(mode-chain name)  procedure, @lisp@/editor/modes.scm:241\n\nReturn the mode NAME and its parents, nearest first.\nModes no longer defined end the chain.",
+      "description": "(mode-chain name)  procedure, @lisp@/editor/modes.scm:248\n\nReturn the mode NAME and its parents, nearest first.\nModes no longer defined end the chain.",
       "is_macro": false
     },
     "mode-doc": {
-      "description": "(mode-doc record)  procedure, @lisp@/editor/modes.scm:108\n\nReturn the `doc` field of RECORD, a `mode` record.",
+      "description": "(mode-doc record)  procedure, @lisp@/editor/modes.scm:112\n\nReturn the `doc` field of RECORD, a `mode` record.",
       "is_macro": false
     },
     "mode-for-file": {
-      "description": "(mode-for-file path)  procedure, @lisp@/editor/modes.scm:252\n\nReturn the major mode for a file at PATH.\nThat is the one with the longest suffix of PATH, else\n`fundamental-mode`.",
+      "description": "(mode-for-file path)  procedure, @lisp@/editor/modes.scm:259\n\nReturn the major mode for a file at PATH.\nThat is the one with the longest suffix of PATH, else\n`fundamental-mode`.",
       "is_macro": false
     },
     "mode-map": {
-      "description": "(mode-map name #:state (state (quote chord)))  procedure, @lisp@/editor/modes.scm:150\n\nReturn the keymap of the mode NAME for STATE, to bind keys in.\nSTATE is `chord` (the default) or `normal`.",
+      "description": "(mode-map name #:state (state (quote chord)))  procedure, @lisp@/editor/modes.scm:157\n\nReturn the keymap of the mode NAME for STATE, to bind keys in.\nSTATE is `chord` (the default) or `normal`.",
       "is_macro": false
     },
     "mode-name": {
-      "description": "(mode-name record)  procedure, @lisp@/editor/modes.scm:107\n\nReturn the `name` field of RECORD, a `mode` record.",
+      "description": "(mode-name record)  procedure, @lisp@/editor/modes.scm:111\n\nReturn the `name` field of RECORD, a `mode` record.",
       "is_macro": false
     },
     "mode-names": {
-      "description": "(mode-names)  procedure, @lisp@/editor/modes.scm:146\n\nReturn the names of the modes defined.",
+      "description": "(mode-names)  procedure, @lisp@/editor/modes.scm:153\n\nReturn the names of the modes defined.",
       "is_macro": false
     },
     "mode-on?": {
-      "description": "(mode-on? s name)  procedure, @lisp@/editor/modes.scm:455\n\nReturn #t if the minor mode NAME is on in the focused buffer of S.",
+      "description": "(mode-on? s name)  procedure, @lisp@/editor/modes.scm:819\n\nReturn #t if the minor mode NAME is on in the focused buffer of S.",
       "is_macro": false
     },
     "mode-parent": {
-      "description": "(mode-parent record)  procedure, @lisp@/editor/modes.scm:110\n\nReturn the `parent` field of RECORD, a `mode` record.",
+      "description": "(mode-parent record)  procedure, @lisp@/editor/modes.scm:114\n\nReturn the `parent` field of RECORD, a `mode` record.",
       "is_macro": false
     },
     "move!": {
@@ -1521,11 +1573,23 @@
       "is_macro": false
     },
     "option": {
-      "description": "(option b name)  procedure, @lisp@/editor/modes.scm:394\n\nReturn the value of the option NAME in buffer B, #f meaning no buffer.",
+      "description": "(option where name)  procedure, @lisp@/editor/modes.scm:745\n\nReturn the value of the option NAME at WHERE, performing no I/O.\nWHERE may be a buffer, a `settings-context`, an `execution-site`, a\ndirectory string, or `#f` for global settings only.",
+      "is_macro": false
+    },
+    "option-directory-safe": {
+      "description": "(option-directory-safe record)  procedure, @lisp@/editor/modes.scm:283\n\nReturn the `safe` field of RECORD, a `option-declaration` record.",
+      "is_macro": false
+    },
+    "option-json-overlay": {
+      "description": "(option-json-overlay where name)  procedure, @lisp@/editor/modes.scm:711\n\nReturn the composed JSON-object overlay for option NAME at WHERE.\nPreserves `json-unset` tombstones so callers such as LSP configuration can\noverlay the result onto a server base dict via `json-object-overlay`.\nPerforms no I/O.",
+      "is_macro": false
+    },
+    "option-merge": {
+      "description": "(option-merge record)  procedure, @lisp@/editor/modes.scm:284\n\nReturn the `merge` field of RECORD, a `option-declaration` record.",
       "is_macro": false
     },
     "option-user-only?": {
-      "description": "(option-user-only? record)  procedure, @lisp@/editor/modes.scm:275\n\nReturn the `user-only` field of RECORD, a `option-declaration` record.",
+      "description": "(option-user-only? record)  procedure, @lisp@/editor/modes.scm:282\n\nReturn the `user-only` field of RECORD, a `option-declaration` record.",
       "is_macro": false
     },
     "palette-color": {
@@ -1533,7 +1597,7 @@
       "is_macro": false
     },
     "path-exists?": {
-      "description": "(path-exists? path)  procedure, @lisp@/editor/files.scm:849\n\nReturn #t if something is at PATH, here or on another machine.",
+      "description": "(path-exists? path)  procedure, @lisp@/editor/files.scm:858\n\nReturn #t if something is at PATH, here or on another machine.",
       "is_macro": false
     },
     "path-language": {
@@ -1678,6 +1742,46 @@
     },
     "project-root": {
       "description": "(project-root dir)  procedure, @lisp@/editor/projects.scm:19\n\nReturn the root of the project the directory DIR is in.\nThat is the nearest directory up from DIR with a .jj or .git in it,\nelse DIR itself; with a slash, as DIR has. DIR may be on another\nmachine: its endpoint looks, in one request.",
+      "is_macro": false
+    },
+    "project-settings-approve!": {
+      "description": "(project-settings-approve! scope option-name effective-value)  procedure, @lisp@/editor/project-settings.scm:282\n\nApprove EFFECTIVE-VALUE for OPTION-NAME in SCOPE and refresh live state.\nUser principal only; refreshes display caches and notifies subscribers.",
+      "is_macro": false
+    },
+    "project-settings-cached-snapshot": {
+      "description": "(project-settings-cached-snapshot dir)  procedure, @lisp@/editor/project-settings-bridge.scm:125\n\nReturn the cached project-settings snapshot for DIR without I/O, or #f.",
+      "is_macro": false
+    },
+    "project-settings-deny!": {
+      "description": "(project-settings-deny! scope option-name effective-value)  procedure, @lisp@/editor/project-settings.scm:290\n\nDeny EFFECTIVE-VALUE for OPTION-NAME in SCOPE and refresh live state.\nUser principal only; refreshes display caches and notifies subscribers.",
+      "is_macro": false
+    },
+    "project-settings-invalidate!": {
+      "description": "(project-settings-invalidate! (dir #f))  procedure, @lisp@/editor/project-settings-bridge.scm:129\n\nInvalidate cached project-settings state for DIR, or all when `#f`.",
+      "is_macro": false
+    },
+    "project-settings-invalidate-ancestors!": {
+      "description": "(project-settings-invalidate-ancestors! dir)  procedure, @lisp@/editor/project-settings-bridge.scm:133\n\nInvalidate cached project-settings state for DIR and its ancestors.",
+      "is_macro": false
+    },
+    "project-settings-load!": {
+      "description": "(project-settings-load! dir)  procedure, @lisp@/editor/project-settings-bridge.scm:121\n\nLoad and cache the project-settings snapshot for directory DIR.",
+      "is_macro": false
+    },
+    "project-settings-revoke!": {
+      "description": "(project-settings-revoke! scope (option-name #f))  procedure, @lisp@/editor/project-settings.scm:298\n\nRevoke stored trust in SCOPE for OPTION-NAME (or all when `#f`).\nUser principal only; refreshes display caches and notifies subscribers.",
+      "is_macro": false
+    },
+    "project-trust-clear-memory!": {
+      "description": "(project-trust-clear-memory!)  procedure, @lisp@/editor/project-settings-bridge.scm:202\n\nClear in-memory trust verdicts and reset the loaded store path.",
+      "is_macro": false
+    },
+    "project-trust-entries": {
+      "description": "(project-trust-entries)  procedure, @lisp@/editor/project-settings-bridge.scm:198\n\nReturn all stored trust entries as `(SCOPE OPTION DIGEST VERDICT)`.",
+      "is_macro": false
+    },
+    "project-trust-verdict": {
+      "description": "(project-trust-verdict scope option-name effective-value)  procedure, @lisp@/editor/project-settings-bridge.scm:194\n\nReturn trust verdict for OPTION-NAME and EFFECTIVE-VALUE in SCOPE.",
       "is_macro": false
     },
     "proposal-accept!": {
@@ -1833,27 +1937,27 @@
       "is_macro": false
     },
     "register-lsp-server!": {
-      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:142\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
+      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:120\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
       "is_macro": false
     },
     "register-minor-mode!": {
-      "description": "(register-minor-mode! name doc #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:inlays (inlays #f) #:projections (projections #f))  procedure, @lisp@/editor/modes.scm:217\n\nDefine the minor mode NAME, documented by DOC.\nIt is on where the boolean option NAME is. KEYS and NORMAL are\n(key-description command) bindings for chords and for modal normal\nstate, LAYER a procedure (document from to) giving highlights (from to\nface), INLAYS one (document from to) giving text shown in the line and\nnot in the document (position text face): a type after a name,\nPROJECTIONS one (document from to) giving how the text is laid out\n(`buffer-projections'). It defines the command NAME, which turns the\nmode on and off in the focused buffer.",
+      "description": "(register-minor-mode! name doc #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:inlays (inlays #f) #:projections (projections #f))  procedure, @lisp@/editor/modes.scm:224\n\nDefine the minor mode NAME, documented by DOC.\nIt is on where the boolean option NAME is. KEYS and NORMAL are\n(key-description command) bindings for chords and for modal normal\nstate, LAYER a procedure (document from to) giving highlights (from to\nface), INLAYS one (document from to) giving text shown in the line and\nnot in the document (position text face): a type after a name,\nPROJECTIONS one (document from to) giving how the text is laid out\n(`buffer-projections'). It defines the command NAME, which turns the\nmode on and off in the focused buffer.",
       "is_macro": false
     },
     "register-mode!": {
-      "description": "(register-mode! name doc #:parent (parent (quote fundamental-mode)) #:files (files (quote ())) #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:target-at (target-at #f) #:complete (complete #f) #:indent (indent #f) #:directory (directory #f) #:options (options (quote ())) #:projections (projections #f) #:input (input #f))  procedure, @lisp@/editor/modes.scm:181\n\nDefine the major mode NAME, documented by DOC, extending PARENT.\nIt has PARENT's keys, layers and options, and its own: KEYS and NORMAL\nare (key-description command) bindings for chords and for modal normal\nstate, a string in place of the command naming a prefix, LAYER a\nprocedure (document from to) giving highlights (from to face),\nTARGET-AT a procedure (buffer position) giving the target there,\nCOMPLETE a procedure (buffer position) giving what completes the text\nbefore it, (start . candidates), INDENT a procedure (document starts)\ngiving the edits (from to text) that indent the lines at STARTS,\nDIRECTORY a procedure (buffer) giving the directory the buffer is in,\nwith its slash, for a buffer of no file (a directory's listing); OPTIONS\nan alist of (option . value) set in the mode, FILES the file name\nsuffixes it is for, PROJECTIONS a procedure (document from to) giving\nhow the text is laid out (`buffer-projections'). It defines the command\nNAME, which gives the focused buffer this mode. INPUT is a procedure\n(session key) returning true if it handled the key before the profile.",
+      "description": "(register-mode! name doc #:parent (parent (quote fundamental-mode)) #:files (files (quote ())) #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:target-at (target-at #f) #:complete (complete #f) #:indent (indent #f) #:directory (directory #f) #:options (options (quote ())) #:projections (projections #f) #:input (input #f))  procedure, @lisp@/editor/modes.scm:188\n\nDefine the major mode NAME, documented by DOC, extending PARENT.\nIt has PARENT's keys, layers and options, and its own: KEYS and NORMAL\nare (key-description command) bindings for chords and for modal normal\nstate, a string in place of the command naming a prefix, LAYER a\nprocedure (document from to) giving highlights (from to face),\nTARGET-AT a procedure (buffer position) giving the target there,\nCOMPLETE a procedure (buffer position) giving what completes the text\nbefore it, (start . candidates), INDENT a procedure (document starts)\ngiving the edits (from to text) that indent the lines at STARTS,\nDIRECTORY a procedure (buffer) giving the directory the buffer is in,\nwith its slash, for a buffer of no file (a directory's listing); OPTIONS\nan alist of (option . value) set in the mode, FILES the file name\nsuffixes it is for, PROJECTIONS a procedure (document from to) giving\nhow the text is laid out (`buffer-projections'). It defines the command\nNAME, which gives the focused buffer this mode. INPUT is a procedure\n(session key) returning true if it handled the key before the profile.",
       "is_macro": false
     },
     "register-mode-line-segment!": {
-      "description": "(register-mode-line-segment! name proc)  procedure, @lisp@/editor/modes.scm:423\n\nShow (PROC buffer) in the mode line of the buffer's panes, as NAME.\nPROC returns a string, or #f for nothing. Segments are shown in the\norder of their names; one that fails shows nothing.",
+      "description": "(register-mode-line-segment! name proc)  procedure, @lisp@/editor/modes.scm:781\n\nShow (PROC buffer) in the mode line of the buffer's panes, as NAME.\nPROC returns a string, or #f for nothing. Segments are shown in the\norder of their names; one that fails shows nothing.",
       "is_macro": false
     },
     "register-option!": {
-      "description": "(register-option! name default doc #:type (type (quote any)) #:user-only (user-only #f))  procedure, @lisp@/editor/modes.scm:290\n\nDeclare the option NAME, its DEFAULT and its documentation DOC.\nTYPE is the schema of its values, as `valid?` takes it: boolean, natural,\n(one-of value ...), (or schema ...) and so on. When USER-ONLY is true,\nNAME may only be set globally by the user (not per-buffer, per-mode, from\nproject settings, or by external agent principals).",
+      "description": "(register-option! name default doc #:type (type (quote any)) #:user-only (user-only #f) #:directory-safe (directory-safe #f) #:merge (merge (quote replace)))  procedure, @lisp@/editor/modes.scm:413\n\nDeclare the option NAME, its DEFAULT and its documentation DOC.\nTYPE is the schema of its values, as `valid?` takes it: boolean, natural,\n(one-of value ...), (or schema ...) and so on. When USER-ONLY is true,\nNAME may only be set globally by the user (not per-buffer, per-mode, from\nproject settings, or by external agent principals). DIRECTORY-SAFE controls\nwhether project `.techne.scm` files may set NAME without explicit user\ntrust: `#f` (the default) requires value-based trust, `#t` allows any\nvalid value, or a predicate `(VALUE) -> boolean` checks safety per value.\nMERGE is `'replace` (the default) or `'json-object` for deep dict\noverlays.",
       "is_macro": false
     },
     "reload-document!": {
-      "description": "(reload-document! d)  procedure, @lisp@/editor/files.scm:793\n\nRead the file of the document D again if it changed since it was read.\nIt is refused while D has unsaved edits. Return #t if the text changed.",
+      "description": "(reload-document! d)  procedure, @lisp@/editor/files.scm:802\n\nRead the file of the document D again if it changed since it was read.\nIt is refused while D has unsaved edits. Return #t if the text changed.",
       "is_macro": false
     },
     "relocation-cancel!": {
@@ -1880,6 +1984,14 @@
       "description": "(remove-hook! hook name)  procedure, @lisp@/editor/dispatch.scm:87\n\nRemove the procedure added to HOOK as NAME.",
       "is_macro": false
     },
+    "remove-option-changed-hook!": {
+      "description": "(remove-option-changed-hook! name)  procedure, @lisp@/editor/modes.scm:295\n\nRemove the option-changed hook registered under NAME.",
+      "is_macro": false
+    },
+    "remove-project-settings-changed-hook!": {
+      "description": "(remove-project-settings-changed-hook! name)  procedure, @lisp@/editor/project-settings.scm:34\n\nRemove the project-settings-changed hook registered under NAME.",
+      "is_macro": false
+    },
     "replace-region!": {
       "description": "(replace-region! s f)  procedure, @lisp@/editor/commands.scm:288\n\nReplace the text of every range of session S by (F text).\nIt is one undo unit.",
       "is_macro": false
@@ -1897,7 +2009,7 @@
       "is_macro": false
     },
     "revert-document!": {
-      "description": "(revert-document! d)  procedure, @lisp@/editor/files.scm:805\n\nRead the file of the document D again, its unsaved edits replaced.\nThe text becomes the file's as one edit by the current principal, which\nundo takes back. Return #t if the text changed.",
+      "description": "(revert-document! d)  procedure, @lisp@/editor/files.scm:814\n\nRead the file of the document D again, its unsaved edits replaced.\nThe text becomes the file's as one edit by the current principal, which\nundo takes back. Return #t if the text changed.",
       "is_macro": false
     },
     "review-operation-proposals": {
@@ -2001,7 +2113,7 @@
       "is_macro": false
     },
     "save-document!": {
-      "description": "(save-document! d #:overwrite (overwrite #f))  procedure, @lisp@/editor/files.scm:693\n\nWrite the document D to its file, refusing an external change.\nWith OVERWRITE, an external change is replaced. A codec-backed document\nencodes a snapshot of D's text asynchronously and commits via a checked\nsave at that revision, preserving any edits made while encoding. A file\non another machine is written through its endpoint, only if it still has\nthe stored bytes D was read or last saved with. Then `document-saved` runs.\nRefused, the error offers recovery choices (doc/operations.md,\n\"Recovery\"): to overwrite the file, to revert the buffer to it, to\ncompare the two; each expects D as it is now, and is refused once D has\nchanged since.",
+      "description": "(save-document! d #:overwrite (overwrite #f))  procedure, @lisp@/editor/files.scm:695\n\nWrite the document D to its file, refusing an external change.\nWith OVERWRITE, an external change is replaced. A codec-backed document\nencodes a snapshot of D's text asynchronously and commits via a checked\nsave at that revision, preserving any edits made while encoding. A file\non another machine is written through its endpoint, only if it still has\nthe stored bytes D was read or last saved with. Then `document-saved` runs.\nRefused, the error offers recovery choices (doc/operations.md,\n\"Recovery\"): to overwrite the file, to revert the buffer to it, to\ncompare the two; each expects D as it is now, and is refused once D has\nchanged since.",
       "is_macro": false
     },
     "save-document-in-session!": {
@@ -2073,7 +2185,7 @@
       "is_macro": false
     },
     "session-buffer": {
-      "description": "(session-buffer s)  procedure, @lisp@/editor/modes.scm:96\n\nReturn the buffer the commands of S act on.\nThat is the focused pane's, or #f while they edit the minibuffer's\ninput.",
+      "description": "(session-buffer s)  procedure, @lisp@/editor/modes.scm:100\n\nReturn the buffer the commands of S act on.\nThat is the focused pane's, or #f while they edit the minibuffer's\ninput.",
       "is_macro": false
     },
     "session-document": {
@@ -2097,15 +2209,15 @@
       "is_macro": false
     },
     "set-buffer-mode!": {
-      "description": "(set-buffer-mode! record value)  procedure, @lisp@/editor/modes.scm:55\n\nSet the `mode` field of RECORD, a `buffer` record, to VALUE.",
+      "description": "(set-buffer-mode! record value)  procedure, @lisp@/editor/modes.scm:59\n\nSet the `mode` field of RECORD, a `buffer` record, to VALUE.",
       "is_macro": false
     },
     "set-buffer-name!": {
-      "description": "(set-buffer-name! record value)  procedure, @lisp@/editor/modes.scm:52\n\nSet the `name` field of RECORD, a `buffer` record, to VALUE.",
+      "description": "(set-buffer-name! record value)  procedure, @lisp@/editor/modes.scm:56\n\nSet the `name` field of RECORD, a `buffer` record, to VALUE.",
       "is_macro": false
     },
     "set-buffer-state!": {
-      "description": "(set-buffer-state! record value)  procedure, @lisp@/editor/modes.scm:56\n\nSet the `state` field of RECORD, a `buffer` record, to VALUE.",
+      "description": "(set-buffer-state! record value)  procedure, @lisp@/editor/modes.scm:60\n\nSet the `state` field of RECORD, a `buffer` record, to VALUE.",
       "is_macro": false
     },
     "set-face!": {
@@ -2117,7 +2229,7 @@
       "is_macro": false
     },
     "set-option!": {
-      "description": "(set-option! name value #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:338\n\nSet the option NAME to VALUE in buffer B or the major mode MODE.\nWithout either, it is set globally.",
+      "description": "(set-option! name value #:buffer (b #f) #:mode (mode #f) #:directory (dir #f))  procedure, @lisp@/editor/modes.scm:483\n\nSet the option NAME to VALUE in buffer B, directory DIR, or mode MODE.\nWithout any target, it is set globally. B cannot be combined with MODE or\nDIR; DIR and MODE together set a user directory override for that mode.",
       "is_macro": false
     },
     "set-palette!": {
@@ -2134,6 +2246,10 @@
     },
     "set-view-read-only!": {
       "description": "(set-view-read-only! view read-only)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1858\n\nMake VIEW refuse edits if READ-ONLY is true.",
+      "is_macro": false
+    },
+    "settings-context?": {
+      "description": "(settings-context? x)  procedure, @lisp@/editor/project-settings-bridge.scm:141\n\nReturn #t if X is a `settings-context`.",
       "is_macro": false
     },
     "sget": {
@@ -2389,7 +2505,7 @@
       "is_macro": false
     },
     "toggle-mode!": {
-      "description": "(toggle-mode! s name)  procedure, @lisp@/editor/modes.scm:460\n\nTurn the minor mode NAME on or off in the focused buffer of S.",
+      "description": "(toggle-mode! s name)  procedure, @lisp@/editor/modes.scm:824\n\nTurn the minor mode NAME on or off in the focused buffer of S.",
       "is_macro": false
     },
     "traced-operation-records": {
@@ -2413,7 +2529,7 @@
       "is_macro": false
     },
     "unset-option!": {
-      "description": "(unset-option! name #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:349\n\nTake back the setting of the option NAME in buffer B or mode MODE.\nWithout either, the global setting is taken back.",
+      "description": "(unset-option! name #:buffer (b #f) #:mode (mode #f) #:directory (dir #f))  procedure, @lisp@/editor/modes.scm:503\n\nTake back the setting of NAME in buffer B, directory DIR, or mode MODE.\nWithout any target, the global setting is taken back.",
       "is_macro": false
     },
     "view-document": {

@@ -35,6 +35,7 @@
 (require "syntax.scm")
 (require "xref.scm")
 (require "eldoc.scm")
+(require "project-settings.scm")
 (require "lsp.scm")
 (require "host.scm")
 (require "checkdoc.scm")

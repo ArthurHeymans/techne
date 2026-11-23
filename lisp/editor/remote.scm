@@ -251,3 +251,12 @@ ENVIRONMENT overrides site variables. PTY is as `process-spawn` takes it."
   (note-effect! 'external)
   (call-with-process-at-site (execution-site-for dir #:policy policy)
                              program args f #:pty pty #:environment environment))
+
+(set-remote-path-hook! remote-path?)
+(set-execution-site-inspector-hook!
+ (lambda (x)
+   (and (execution-site? x)
+        (let ((dir (execution-site-directory x)))
+          (cons (or (pair? (execution-site-route x))
+                    (and dir (remote-path? dir)))
+                dir)))))

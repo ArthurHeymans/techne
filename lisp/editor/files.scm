@@ -444,6 +444,8 @@ Used for mode and syntax detection; for codec-backed documents, applies
          (let ((c (document-codec d)))
            (if c (codec-logical-path c path) path)))))
 
+(set-document-logical-path-hook! document-logical-path)
+
 (define (canonical-file-location abs)
   (if (remote-path? abs)
       (location-at abs (node-file-canonical (location-endpoint abs) (location-path abs)))
@@ -701,6 +703,9 @@ Refused, the error offers recovery choices (doc/operations.md,
 \"Recovery\"): to overwrite the file, to revert the buffer to it, to
 compare the two; each expects D as it is now, and is refused once D has
 changed since."
+  (when (and (document-codec d) (hash-table-ref/default %saving-docs (document-id d) #f))
+    (error "a save of this document is under way"))
+  (run-hook! (current-session) 'before-save d)
   (let* ((path (document-path d))
          (codec (document-codec d)))
     (when (and (document-decoded? d) (not codec))
@@ -761,6 +766,10 @@ changed since."
                        #:doc "Read the file again, the buffer's unsaved edits replaced; undo takes them back.")
           (make-choice "Compare" 'diff-buffer-with-file at #:settles #f
                        #:doc "Show what differs between the buffer and the file."))))
+
+(define-hook before-save
+  "Before a document is written to its file: (session document).
+The session is the current one then, or #f when saved headless.")
 
 (define-hook document-saved
   "After a document is written to its file: (session document).

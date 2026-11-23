@@ -59,6 +59,99 @@ pub fn truename(path: &Path) -> io::Result<std::path::PathBuf> {
     }
 }
 
+fn path_to_utf8(path: std::path::PathBuf) -> io::Result<String> {
+    path.into_os_string().into_string().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "canonical path is not valid UTF-8"))
+}
+
+/// `path` absolute, its symbolic links and `.` and `..` resolved, verified as valid UTF-8.
+pub fn truename_utf8(path: &Path) -> io::Result<String> {
+    path_to_utf8(truename(path)?)
+}
+
+/// Canonicalize a local absolute directory path for trust/settings identity,
+/// verifying the result is valid UTF-8 (never lossy `U+FFFD` display text).
+///
+/// - When `path` contains a `..` component, requires the full path to resolve
+///   via `fs::canonicalize` to an existing directory (refusing missing,
+///   dangling, or non-directory targets).
+/// - When `path` has no `..` component and exists, requires it to resolve to
+///   an existing directory with a valid UTF-8 canonical path.
+/// - When `path` has no `..` component and does not exist yet, refuses any
+///   dangling symlink along the path, canonicalizes the deepest existing
+///   ancestor directory (verifying valid UTF-8), and appends the remaining
+///   normal tail components.
+pub fn canonical_dir_path(path: &Path) -> io::Result<String> {
+    use std::path::{Component, PathBuf};
+
+    if !path.is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "canonical_dir_path requires an absolute path"));
+    }
+    let has_parent = path.components().any(|c| matches!(c, Component::ParentDir));
+    if has_parent {
+        let canon = fs::canonicalize(path)?;
+        if !fs::metadata(&canon)?.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path does not resolve to an existing directory"));
+        }
+        return path_to_utf8(canon);
+    }
+
+    match fs::canonicalize(path) {
+        Ok(canon) => {
+            if !fs::metadata(&canon)?.is_dir() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "path does not resolve to a directory"));
+            }
+            path_to_utf8(canon)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut clean = PathBuf::new();
+            for comp in path.components() {
+                match comp {
+                    Component::RootDir => clean.push(Path::new("/")),
+                    Component::CurDir => {}
+                    Component::Normal(s) => clean.push(s),
+                    _ => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported path component in canonical_dir_path"));
+                    }
+                }
+            }
+            let mut cur: &Path = &clean;
+            let mut tail = Vec::new();
+            loop {
+                match fs::canonicalize(cur) {
+                    Ok(canon) => {
+                        if !fs::metadata(&canon)?.is_dir() {
+                            return Err(io::Error::new(io::ErrorKind::InvalidInput, "ancestor path is not a directory"));
+                        }
+                        let mut resolved = canon;
+                        for comp in tail.into_iter().rev() {
+                            resolved.push(comp);
+                        }
+                        return path_to_utf8(resolved);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        if fs::symlink_metadata(cur).is_ok() {
+                            return Err(io::Error::new(io::ErrorKind::NotFound, "dangling symbolic link"));
+                        }
+                        let Some(name) = cur.file_name() else {
+                            return Err(err);
+                        };
+                        let Some(parent) = cur.parent() else {
+                            return Err(err);
+                        };
+                        if parent == cur {
+                            return Err(err);
+                        }
+                        tail.push(name);
+                        cur = parent;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The entries of `dir`, sorted, a directory's name with a slash after it.
 /// One that cannot be read is an error, not a listing short of it.
 pub fn list(dir: &Path) -> io::Result<Vec<String>> {
@@ -268,27 +361,29 @@ pub fn open_pinned_dir(root: &Path, missing: RootMissing) -> io::Result<Option<r
     if !root.is_absolute() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "root must be an absolute path"));
     }
-    let mut cur =
-        openat(rustix::fs::CWD, "/", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(io::Error::from)?;
+    let mut segments = Vec::new();
     for comp in root.components() {
         match comp {
             Component::RootDir | Component::CurDir => {}
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "root must not contain parent components"));
             }
-            Component::Normal(seg) => {
-                match openat(&cur, seg, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()) {
-                    Ok(next) => cur = next,
-                    Err(rustix::io::Errno::NOENT) if missing == RootMissing::ReturnNone => return Ok(None),
-                    Err(rustix::io::Errno::NOENT) => {
-                        return Err(io::Error::new(io::ErrorKind::NotFound, "allowed root does not exist"));
-                    }
-                    Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::MLINK) => {
-                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "allowed root contains a symlink or non-directory"));
-                    }
-                    Err(e) => return Err(io::Error::from(e)),
-                }
+            Component::Normal(seg) => segments.push(seg),
+        }
+    }
+    let mut cur =
+        openat(rustix::fs::CWD, "/", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(io::Error::from)?;
+    for seg in segments {
+        match openat(&cur, seg, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(next) => cur = next,
+            Err(rustix::io::Errno::NOENT) if missing == RootMissing::ReturnNone => return Ok(None),
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "allowed root does not exist"));
             }
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::MLINK) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "allowed root contains a symlink or non-directory"));
+            }
+            Err(e) => return Err(io::Error::from(e)),
         }
     }
     Ok(Some(cur))
@@ -306,45 +401,45 @@ pub fn open_or_create_pinned_dir(root: &Path, create_mode: u32, chmod_leaf: bool
     if !root.is_absolute() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "directory must be an absolute path"));
     }
-    let euid = rustix::process::geteuid().as_raw();
-    let mut cur =
-        openat(rustix::fs::CWD, "/", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(io::Error::from)?;
-    let mut has_normal = false;
+    let mut segments = Vec::new();
     for comp in root.components() {
         match comp {
             Component::RootDir | Component::CurDir => {}
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "directory must not contain parent components"));
             }
-            Component::Normal(seg) => {
-                has_normal = true;
-                match openat(&cur, seg, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()) {
-                    Ok(next) => cur = next,
-                    Err(rustix::io::Errno::NOENT) => {
-                        match mkdirat(&cur, seg, Mode::from_raw_mode(create_mode)) {
-                            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                            Err(e) => return Err(io::Error::from(e)),
-                        }
-                        let next =
-                            openat(&cur, seg, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
-                                .map_err(|e| match e {
-                                    rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::MLINK => {
-                                        io::Error::new(io::ErrorKind::PermissionDenied, "directory contains a symlink or non-directory")
-                                    }
-                                    other => io::Error::from(other),
-                                })?;
-                        let st = fstat(&next).map_err(io::Error::from)?;
-                        if FileType::from_raw_mode(st.st_mode) != FileType::Directory || st.st_uid != euid {
-                            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "created directory failed ownership verification"));
-                        }
-                        cur = next;
-                    }
-                    Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::MLINK) => {
-                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "directory contains a symlink or non-directory"));
-                    }
+            Component::Normal(seg) => segments.push(seg),
+        }
+    }
+    let euid = rustix::process::geteuid().as_raw();
+    let mut cur =
+        openat(rustix::fs::CWD, "/", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(io::Error::from)?;
+    let has_normal = !segments.is_empty();
+    for seg in segments {
+        match openat(&cur, seg, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(next) => cur = next,
+            Err(rustix::io::Errno::NOENT) => {
+                match mkdirat(&cur, seg, Mode::from_raw_mode(create_mode)) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(e) => return Err(io::Error::from(e)),
                 }
+                let next = openat(&cur, seg, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+                    .map_err(|e| match e {
+                        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::MLINK => {
+                            io::Error::new(io::ErrorKind::PermissionDenied, "directory contains a symlink or non-directory")
+                        }
+                        other => io::Error::from(other),
+                    })?;
+                let st = fstat(&next).map_err(io::Error::from)?;
+                if FileType::from_raw_mode(st.st_mode) != FileType::Directory || st.st_uid != euid {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "created directory failed ownership verification"));
+                }
+                cur = next;
             }
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::MLINK) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "directory contains a symlink or non-directory"));
+            }
+            Err(e) => return Err(io::Error::from(e)),
         }
     }
     if chmod_leaf && has_normal {
@@ -382,6 +477,16 @@ pub fn read_pinned_bytes_in_dir(dir_fd: &rustix::fd::OwnedFd, leaf: &Path, max_b
         return Err(io::Error::other(format!("file exceeds maximum size ({max_bytes} bytes)")));
     }
     Ok(Some(buf))
+}
+
+/// Read up to `max_bytes` UTF-8 text from regular file `leaf` directly inside
+/// pinned `dir_fd` without following symlinks. Returns `Ok(None)` if `leaf`
+/// does not exist.
+pub fn read_pinned_file_in_dir(dir_fd: &rustix::fd::OwnedFd, leaf: &Path, max_bytes: usize) -> io::Result<Option<String>> {
+    let Some(bytes) = read_pinned_bytes_in_dir(dir_fd, leaf, max_bytes)? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes).map(Some).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not valid UTF-8"))
 }
 
 /// Atomically publish `bytes` to regular file `leaf` strictly inside pinned `dir_fd`
@@ -891,7 +996,79 @@ pub fn read_confined_file(root: &Path, relative: &Path, max_bytes: usize) -> io:
 pub fn read_confined_file_nofollow(root: &Path, relative: &Path, max_bytes: usize) -> io::Result<Option<String>> {
     read_confined_file_inner(root, relative, max_bytes, false, RootMissing::ReturnNone)
 }
+/// An exclusive advisory lock held on a regular file inside a pinned directory
+/// descriptor. Reading and atomically replacing sibling files through this
+/// handle stays anchored to the locked directory fd without re-resolving any
+/// pathnames. Released on `unlock` or drop.
+pub struct FileLock {
+    dir_fd: Option<rustix::fd::OwnedFd>,
+    lock_file: Option<fs::File>,
+}
 
+impl FileLock {
+    /// Explicitly release the held lock and close both descriptors.
+    pub fn unlock(&mut self) {
+        if let Some(file) = self.lock_file.take() {
+            let _ = file.unlock();
+        }
+        self.dir_fd.take();
+    }
+
+    fn dir_fd(&self) -> io::Result<&rustix::fd::OwnedFd> {
+        self.dir_fd.as_ref().ok_or_else(|| io::Error::other("file lock has been released"))
+    }
+
+    /// Read regular UTF-8 file `leaf` directly inside the locked directory fd
+    /// without following symlinks. Returns `Ok(None)` if `leaf` does not exist.
+    pub fn read_text(&self, leaf: &Path, max_bytes: usize) -> io::Result<Option<String>> {
+        read_pinned_file_in_dir(self.dir_fd()?, leaf, max_bytes)
+    }
+
+    /// Atomically replace regular file `leaf` directly inside the locked
+    /// directory fd with private mode `0o600` without following symlinks.
+    pub fn replace_private(&self, leaf: &Path, text: &str) -> io::Result<()> {
+        write_pinned_private_file_in_dir(self.dir_fd()?, leaf, text.as_bytes())
+    }
+}
+
+/// Open `dir` via no-follow traversal from `/` (creating any missing tail
+/// directories strictly relative to verified parent fds with mode `0o700`),
+/// open or create regular file `lock_leaf` inside that pinned directory fd
+/// with `O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` and mode
+/// `0o600`, verify ownership by the current effective UID, and try to acquire
+/// a non-blocking exclusive advisory lock. Refuses symlinks, parent components,
+/// and non-regular files BEFORE creating any directory or lock file. Returns
+/// `Ok(None)` if already locked.
+pub fn try_lock_pinned(dir: &Path, lock_leaf: &Path) -> io::Result<Option<FileLock>> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+
+    let name = validate_leaf_name(lock_leaf)?;
+    let dir_fd = open_or_create_pinned_dir(dir, 0o700, false)?;
+    let fd = openat(
+        &dir_fd,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| match e {
+        rustix::io::Errno::LOOP | rustix::io::Errno::MLINK => io::Error::new(io::ErrorKind::PermissionDenied, "lock file is a symlink"),
+        other => io::Error::from(other),
+    })?;
+    let euid = rustix::process::geteuid().as_raw();
+    let st = fstat(&fd).map_err(io::Error::from)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(io::Error::other("not a regular file"));
+    }
+    if st.st_uid != euid {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "lock file is not owned by current user"));
+    }
+    let file = fs::File::from(fd);
+    match file.try_lock() {
+        Ok(()) => Ok(Some(FileLock { dir_fd: Some(dir_fd), lock_file: Some(file) })),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(e),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,5 +1272,104 @@ mod tests {
         let dangling_root = outer_canon.join("dangling-root");
         std::os::unix::fs::symlink(outer_canon.join("no-such-dir"), &dangling_root).unwrap();
         assert!(read_confined_file_nofollow(&dangling_root, Path::new(".gpg-id"), 1024).is_err());
+    }
+
+    #[test]
+    fn pinned_file_lock_stays_anchored_across_parent_swap_and_rejects_symlinks() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(outer.path()).unwrap();
+
+        // 1. Symlinked ancestor creates neither subdirectory nor lock file in target.
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(try_lock_pinned(&alias.join("sub"), Path::new("ledger.scm.lock")).is_err());
+        assert!(!target.join("sub").exists(), "rejected alias must not create sub/");
+        assert!(!target.join("ledger.scm.lock").exists(), "rejected alias must not create lock");
+
+        // 2. Path with trailing '..' fails BEFORE creating earlier missing directory.
+        assert!(try_lock_pinned(&root.join("should-not-exist/../other"), Path::new("ledger.scm.lock")).is_err());
+        assert!(!root.join("should-not-exist").exists(), "trailing '..' must not create earlier dirs");
+
+        // 3. Parent directory renamed away and replaced with a symlink to attacker dir
+        //    after acquiring lock: read_text and replace_private remain pinned to the
+        //    original directory fd and never touch attacker_dir.
+        let store_dir = root.join("state/techne");
+        let moved_dir = root.join("state/techne-moved");
+        let attacker_dir = root.join("attacker");
+        fs::create_dir_all(&attacker_dir).unwrap();
+        fs::write(attacker_dir.join("ledger.scm"), "ATTACKER").unwrap();
+
+        let mut lock = try_lock_pinned(&store_dir, Path::new("ledger.scm.lock")).unwrap().unwrap();
+        assert_eq!(fs::metadata(&store_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(store_dir.join("ledger.scm.lock")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(try_lock_pinned(&store_dir, Path::new("ledger.scm.lock")).unwrap().is_none());
+        assert_eq!(lock.read_text(Path::new("ledger.scm"), 4096).unwrap(), None);
+        lock.replace_private(Path::new("ledger.scm"), "v1").unwrap();
+
+        // Swap the parent directory path to a symlink pointing to attacker_dir while lock is held.
+        fs::rename(&store_dir, &moved_dir).unwrap();
+        std::os::unix::fs::symlink(&attacker_dir, &store_dir).unwrap();
+
+        // Reads and writes through the held lock stay pinned to moved_dir (original dir_fd).
+        assert_eq!(lock.read_text(Path::new("ledger.scm"), 4096).unwrap().as_deref(), Some("v1"));
+        lock.replace_private(Path::new("ledger.scm"), "v2").unwrap();
+        assert_eq!(fs::read_to_string(moved_dir.join("ledger.scm")).unwrap(), "v2");
+        assert_eq!(fs::metadata(moved_dir.join("ledger.scm")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(attacker_dir.join("ledger.scm")).unwrap(), "ATTACKER");
+
+        // Unlocking closes descriptors and rejects subsequent operations on the handle.
+        lock.unlock();
+        assert!(lock.read_text(Path::new("ledger.scm"), 4096).is_err());
+        assert!(lock.replace_private(Path::new("ledger.scm"), "v3").is_err());
+    }
+
+    #[test]
+    fn canonical_dir_path_and_truename_utf8_reject_unresolved_parent_and_non_utf8() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let outer = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(outer.path()).unwrap();
+        let existing = root.join("existing");
+        let real_dir = root.join("real-dir");
+        let regular_file = root.join("regular-file");
+        let dangling = root.join("dangling-link");
+        let good_link = root.join("good-link");
+        fs::create_dir(&existing).unwrap();
+        fs::create_dir(&real_dir).unwrap();
+        fs::write(&regular_file, "file").unwrap();
+        std::os::unix::fs::symlink(root.join("does-not-exist"), &dangling).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &good_link).unwrap();
+
+        // '..' paths MUST resolve completely to an existing directory.
+        assert_eq!(canonical_dir_path(&existing.join("../real-dir")).unwrap(), real_dir.to_str().unwrap());
+        assert!(canonical_dir_path(&existing.join("../missing")).is_err());
+        assert!(canonical_dir_path(&existing.join("../dangling-link")).is_err());
+        assert!(canonical_dir_path(&existing.join("../regular-file")).is_err());
+        assert!(canonical_dir_path(&root.join("missing-mid/../real-dir")).is_err());
+
+        // Non-'..' paths reject dangling symlinks and regular files, while
+        // resolving valid existing ancestors for not-yet-created subdirectories.
+        assert!(canonical_dir_path(&dangling).is_err());
+        assert!(canonical_dir_path(&dangling.join("sub")).is_err());
+        assert!(canonical_dir_path(&regular_file).is_err());
+        assert_eq!(canonical_dir_path(&good_link.join("future/sub")).unwrap(), real_dir.join("future/sub").to_str().unwrap());
+
+        // Non-UTF-8 canonical target must NEVER be lossily converted to U+FFFD
+        // and aliased onto a sibling directory with literal U+FFFD in its name.
+        let non_utf8_dir = root.join(OsStr::from_bytes(b"bad-\xff-dir"));
+        let literal_fffd_dir = root.join("bad-\u{FFFD}-dir");
+        let utf8_link = root.join("utf8-alias");
+        fs::create_dir(&non_utf8_dir).unwrap();
+        fs::create_dir(&literal_fffd_dir).unwrap();
+        std::os::unix::fs::symlink(&non_utf8_dir, &utf8_link).unwrap();
+
+        assert_eq!(truename_utf8(&utf8_link).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(truename_utf8(&utf8_link.join("future.txt")).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(canonical_dir_path(&utf8_link).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(canonical_dir_path(&utf8_link.join("missing-sub")).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(canonical_dir_path(&existing.join("../utf8-alias")).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(canonical_dir_path(&literal_fffd_dir).unwrap(), literal_fffd_dir.to_str().unwrap());
     }
 }

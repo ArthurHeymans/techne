@@ -126,11 +126,20 @@ command again, \\[kill-compilation] stops it."
 
 ;;; Running
 
-;; The command each project's root ran last.
+;; The command each project's root ran last: root -> (command . default-at-run).
 (define %commands (make-hash-table))
 
-(define (default-command root)
-  (if (guard (e (#t #f)) (path-exists? (string-append root "Cargo.toml"))) "cargo build" "make -k "))
+(define (option-compile-command root [b #f])
+  (let* ((rows (and b (explain-option b 'compile-command)))
+         (buf-local? (and (pair? rows) (eq? (caar rows) 'buffer))))
+    (cond
+      (buf-local? (option b 'compile-command))
+      ((and b (option b 'compile-command)) => values)
+      (else (option (make-settings-context root #:load? (not (remote-path? root))) 'compile-command)))))
+
+(define (default-command root [b #f])
+  (or (option-compile-command root b)
+      (if (guard (e (#t #f)) (path-exists? (string-append root "Cargo.toml"))) "cargo build" "make -k ")))
 
 (define (status-text status)
   (cond ((eqv? status 0) "finished")
@@ -158,8 +167,8 @@ command again, \\[kill-compilation] stops it."
     (view-set-ranges! (state b 'at) '((0 0)) 0)
     b))
 
-(define (start-compilation! s dir command)
-  (hash-table-set! %commands dir command)
+(define (start-compilation! s dir command [default-at-run #f])
+  (hash-table-set! %commands dir (cons command (or default-at-run command)))
   (let* ((b (fresh-buffer! dir command))
          (out (cons (buffer-document b) (state b 'writer)))
          (say! (lambda (text)
@@ -191,12 +200,17 @@ command again, \\[kill-compilation] stops it."
   "Run a command in the project's root; show its output as it comes.
 The command is the one the project ran last, to edit; it runs in a
 shell, and its output and errors go to *compilation*."
-  (let ((root (project-root (default-directory s))))
+  (let* ((b (current-buffer s))
+         (root (project-root (default-directory s)))
+         (prev (hash-table-ref/default %commands root #f))
+         (custom? (and prev (not (string=? (car prev) (cdr prev)))))
+         (cur-default (if custom? (cdr prev) (default-command root b)))
+         (initial (if custom? (car prev) cur-default)))
     (completing-read s (string-append "Compile in " (abbreviate-path root) ": ") '()
-                     #:initial (hash-table-ref/default %commands root (default-command root))
+                     #:initial initial
                      #:require-match #f
                      #:history 'compile
-                     #:accept (lambda (s c) (start-compilation! s root (candidate-text c))))))
+                     #:accept (lambda (s c) (start-compilation! s root (candidate-text c) cur-default)))))
 
 (define-command (recompile s n)
   "Run the compilation again: *compilation*'s, else the project's.
@@ -204,8 +218,10 @@ Without one, it is read as \\[compile] reads it."
   (let* ((b (compilation-buffer))
          (here (and b (eq? (session-buffer s) b)))
          (root (if here (state b 'dir) (project-root (default-directory s))))
-         (command (if here (state b 'command) (hash-table-ref/default %commands root #f))))
-    (if command (start-compilation! s root command) (compile s n))))
+         (prev (hash-table-ref/default %commands root #f))
+         (command (if here (state b 'command) (and prev (car prev))))
+         (def (and prev (cdr prev))))
+    (if command (start-compilation! s root command def) (compile s n))))
 
 (define-command (kill-compilation s n)
   "Stop the compilation running."

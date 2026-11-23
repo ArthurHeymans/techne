@@ -381,8 +381,17 @@ fn what_an_evaluation_runs_is_its_principals() {
 fn evaluation_can_be_turned_off() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("socket");
-    let e = editor(&socket, "emacs");
-    value(&socket, "(set-option! 'server-eval #f)");
+    let mut e = editor(&socket, "emacs");
+    // A non-user principal ("a test") cannot mutate the #:user-only server-eval option.
+    let denied = eval(&socket, "(set-option! 'server-eval #f)");
+    assert!(denied.result.as_ref().is_err_and(|err| err.contains("user-only")), "{denied:?}");
+    // The user turns server-eval off interactively (C-u M-x set-option).
+    e.keys("C-u M-x s e t - o p t i o n M-RET");
+    e.snapshot(|s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Set option")));
+    e.keys("s e r v e r - e v a l RET");
+    e.snapshot(|s| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("server-eval")));
+    e.keys("# f RET");
+    e.snapshot(|s| s.echo.contains("server-eval is #f"));
     let refused = server::eval(&socket, &request("1", false, None));
     assert!(matches!(&refused, Err(OpenError::Failed(e)) if e.contains("server-eval is off")), "{refused:?}");
     e.host.close();
