@@ -718,34 +718,38 @@ fn file_error(path: &str, e: std::io::Error) -> Error {
     Error::new(format!("{path}: {e}")).with_kind(ErrorKind::File)
 }
 
-/// That the file at `path` may be read here (`Vm::confine_reading`): one
-/// that may not reads as missing.
-fn readable(vm: &Vm, path: &str) -> Result<(), Error> {
-    if vm.may_read(std::path::Path::new(path)) { Ok(()) } else { Err(file_error(path, std::io::ErrorKind::NotFound.into())) }
+/// That the host OS file at `path` may be read here (`Vm::confine_reading`,
+/// `Vm::install_bundle`, `Vm::snapshot`): refuses under `BundleVfs` or
+/// `ReadingAccess::DenyAll`, and outside a confined reading root.
+fn readable(vm: &Vm, path: &str, who: &str) -> Result<(), Error> {
+    vm.check_os_files(who)?;
+    if vm.may_read_os(std::path::Path::new(path)) { Ok(()) } else { Err(file_error(path, std::io::ErrorKind::NotFound.into())) }
 }
 
 fn open_input_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-input-file")?;
-    readable(vm, &path)?;
+    readable(vm, &path, "open-input-file")?;
     let f = File::open(&path).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(f))), console: false })
 }
 
 fn open_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-output-file")?;
+    vm.check_os_files("open-output-file")?;
     let f = File::create(&path).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::FileOut(BufWriter::new(f)))
 }
 
 fn open_binary_input_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-binary-input-file")?;
-    readable(vm, &path)?;
+    readable(vm, &path, "open-binary-input-file")?;
     let f = File::open(&path).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::BytesIn { bytes: Vec::new(), pos: 0, source: Some(Box::new(f)) })
 }
 
 fn open_binary_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-binary-output-file")?;
+    vm.check_os_files("open-binary-output-file")?;
     let f = File::create(&path).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::BinaryFileOut(BufWriter::new(f)))
 }

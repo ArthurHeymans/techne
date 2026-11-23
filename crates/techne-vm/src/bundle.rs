@@ -310,6 +310,29 @@ impl BundleVfs {
         pkg.files.contains_key(&rel).then(|| package_virtual_path(&prefix, &rel))
     }
 
+    /// For legacy plain-file deployments (`root_package: None`), resolve library
+    /// `parts` (e.g. `["my", "helper"]`) to a sibling `.sld` contained in
+    /// `root_files`, checking relative to `dir` (if under `/bundle`) and then
+    /// at the bundle root `/bundle`.
+    pub fn root_library_virtual_path(&self, parts: &[String], dir: &Path) -> Option<PathBuf> {
+        if self.root_package.is_some() || parts.is_empty() || !parts.iter().all(|p| valid_library_part(p)) {
+            return None;
+        }
+        if matches!(parts[0].as_str(), "scheme" | "srfi") || crate::library::is_stdlib_library(parts) {
+            return None;
+        }
+        let rel_sld = format!("{}.sld", parts.join("/"));
+        if let Some(VirtualDir::Root(base_rel)) = parse_virtual_dir(dir)
+            && !base_rel.is_empty()
+        {
+            let nested = format!("{base_rel}/{rel_sld}");
+            if self.root_files.contains_key(&nested) {
+                return Some(root_virtual_path(&nested));
+            }
+        }
+        self.root_files.contains_key(&rel_sld).then(|| root_virtual_path(&rel_sld))
+    }
+
     /// Whether `path` is a valid virtual file path (under `/bundle/...` or `/pkg/...`).
     pub fn is_virtual_file_path(&self, path: &Path) -> bool {
         parse_virtual_file(path).is_some()

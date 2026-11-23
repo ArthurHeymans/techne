@@ -107,7 +107,7 @@ const LISP: &str = r#"
   ;; for, 2 on every error. A `retry` restart evaluates the input again
   ;; (after a redefinition, say).
   (parameterize ((current-output-port port))
-    (in-module module)
+    (%nrepl-in-module module)
     (let* ((trace '())
            (result
             (let again ()
@@ -157,7 +157,7 @@ const LISP: &str = r#"
   (apply invoke-restart (list-ref restarts (car choice))
          (if (equal? (cdr choice) "")
              '()
-             (eval-source (string-append "(list " (cdr choice) ")") module "<restart arguments>"))))
+             (%nrepl-eval-in module "<restart arguments>" (string-append "(list " (cdr choice) ")")))))
 (define (%nrepl-debug-request c)
   ;; A debugger for C, raised in a task no evaluation waits for (a request
   ;; a host serves), with every restart there is, for the client
@@ -1115,6 +1115,17 @@ fn attach(vm: &mut Vm, shared: Arc<Shared>) -> Result<Rc<State>, Error> {
     techne_vm::procedures! { vm;
         #[vm]
         "(%nrepl-debug-close key id)" => move |_vm: &mut Vm, key: i64, id: i64| { debug_close(&s, key as u64, id as u64); };
+        #[vm]
+        "(%nrepl-in-module name)" => |vm: &mut Vm, name: String| -> Result<(), Error> {
+            let m = vm.find_module(&name)?;
+            vm.set_current_module(m);
+            Ok(())
+        };
+        #[vm]
+        "(%nrepl-eval-in module name source)" => |vm: &mut Vm, module: String, name: String, source: String| -> Result<Value, Error> {
+            let m = vm.find_module(&module)?;
+            vm.eval_in(m, &name, &source)
+        };
     }
     // In the root module, so `*1` and the helpers are seen from every module.
     vm.eval_in(ROOT_MODULE, INTERNAL, LISP)?;

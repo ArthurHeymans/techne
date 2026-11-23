@@ -549,6 +549,52 @@ pub(crate) enum GlobalBinding {
     Macro(Rc<Macro>),
 }
 
+/// Host OS reading policy for a world (`Vm::confine_reading`,
+/// `Vm::install_bundle`, `Vm::snapshot`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadingAccess {
+    /// No reading confinement (default for trusted worlds).
+    Unrestricted,
+    /// Confined to files inside this canonical directory (plus `lisp_dir()`).
+    Confined(PathBuf),
+    /// Host OS reading is forbidden (bundle virtual paths and `lisp_dir()`
+    /// stdlib loading only). Never widened across snapshots.
+    DenyAll,
+}
+
+/// Trusted loader-issued provenance for a source file or module, separate
+/// from its display filename. Only actual VM file/bundle loaders confer
+/// `Stdlib`, `BundlePackage`, `BundleRoot`, or `HostFile` provenance;
+/// caller-supplied strings in `eval-source` or `load-module-from` receive
+/// `Untrusted`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SourceProvenance {
+    #[default]
+    Untrusted,
+    Stdlib(PathBuf),
+    BundlePackage {
+        prefix: crate::bundle::PackagePrefix,
+        rel: Box<str>,
+        path: PathBuf,
+    },
+    BundleRoot {
+        rel: Box<str>,
+        path: PathBuf,
+    },
+    HostFile(PathBuf),
+}
+
+/// Importer attribution for fail-closed direct-dependency enforcement.
+/// Propagated to dynamic `(environment ...)` modules without granting
+/// library-definition ownership (`SourceProvenance`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CallerPackage {
+    Package(crate::bundle::PackagePrefix),
+    LegacyBundleRoot,
+    Stdlib,
+    HostDir(PathBuf),
+}
+
 #[derive(Clone)]
 pub(crate) struct Module {
     pub name: Rc<str>,
@@ -556,6 +602,10 @@ pub(crate) struct Module {
     /// is a library. Used for collision-free lookup and ownership checks.
     pub(crate) library_parts: Option<Vec<Box<str>>>,
     pub path: Option<PathBuf>,
+    /// Trusted loader provenance (for library ownership checks).
+    pub(crate) provenance: SourceProvenance,
+    /// Importer attribution (for direct-dependency checks on dynamic eval/environment).
+    pub(crate) caller_package: Option<CallerPackage>,
     pub(crate) imports: FxHashMap<u32, GlobalBinding>,
     /// What `provide` or a library's `export` makes visible: each binding's
     /// name inside the module and the name importers see.
@@ -672,6 +722,8 @@ impl Labels<'_> {
 pub(crate) struct SourceFile {
     pub name: Rc<str>,
     pub text: Rc<str>,
+    /// Trusted loader-issued provenance, independent of display `name`.
+    pub(crate) provenance: SourceProvenance,
     /// Where each line after the first starts, once a position was asked
     /// for (`line_col`): help asks for thousands.
     lines: Rc<std::cell::OnceCell<Box<[u32]>>>,
@@ -679,7 +731,11 @@ pub(crate) struct SourceFile {
 
 impl SourceFile {
     pub(crate) fn new(name: &str, text: &str) -> SourceFile {
-        SourceFile { name: name.into(), text: text.into(), lines: Rc::default() }
+        Self::with_provenance(name, text, SourceProvenance::Untrusted)
+    }
+
+    pub(crate) fn with_provenance(name: &str, text: &str, provenance: SourceProvenance) -> SourceFile {
+        SourceFile { name: name.into(), text: text.into(), provenance, lines: Rc::default() }
     }
 
     /// The line and column, from 1, of byte position `pos`, as
@@ -918,9 +974,9 @@ pub struct Vm {
     current_module: u32,
     /// What this world may reach outside the VM.
     grants: Grants,
-    /// The directory the files this world reads to load code are in, if
-    /// it is confined to one (`confine_reading`).
-    reading_root: Option<PathBuf>,
+    /// Host OS reading policy for this world (`confine_reading`,
+    /// `install_bundle`, `snapshot`).
+    pub(crate) reading_access: ReadingAccess,
     /// The clock's resolution in microseconds: what the clock natives
     /// return is a multiple of it.
     clock_resolution: u64,
@@ -1549,7 +1605,7 @@ impl Vm {
             staged_by: None,
             current_module: USER_MODULE,
             grants,
-            reading_root: None,
+            reading_access: ReadingAccess::Unrestricted,
             clock_resolution: 1,
             requiring: None,
             files: Vec::new(),
@@ -1675,6 +1731,8 @@ impl Vm {
             name: name.into(),
             library_parts: None,
             path,
+            provenance: SourceProvenance::Untrusted,
+            caller_package: None,
             imports: FxHashMap::default(),
             exports: None,
             defined: Vec::new(),
@@ -2002,11 +2060,13 @@ impl Vm {
         // the newest module of that name.
         // A name already canonical, as `loaded-modules` gives them, is found
         // without asking the file system.
-        let file = self
-            .module_paths
-            .get(Path::new(name))
-            .copied()
-            .or_else(|| Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied()));
+        let file = self.module_paths.get(Path::new(name)).copied().or_else(|| {
+            if self.bundle.is_some() || self.is_reading_denied() {
+                None
+            } else {
+                Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied())
+            }
+        });
         file.or_else(|| self.named_module(name))
     }
 
@@ -2024,15 +2084,16 @@ impl Vm {
 
     /// Install an immutable in-memory [`crate::bundle::BundleVfs`] on this world.
     ///
-    /// Automatically locks library resolution, disables ambient OS filesystem
-    /// lookups for user/package code, and clears any OS-based provider,
-    /// import-declaration, and reading-root state.
+    /// Automatically locks library resolution, denies host OS file access,
+    /// revokes `Capability::Files`, and clears any OS-based provider and
+    /// import-declaration state.
     pub fn install_bundle(&mut self, bundle: Arc<crate::bundle::BundleVfs>) {
         self.bundle = Some(bundle);
         self.locked_libraries = true;
         self.library_providers.clear();
         self.package_imports.clear();
-        self.reading_root = None;
+        self.reading_access = ReadingAccess::DenyAll;
+        self.grants = self.grants.without(Capability::Files);
     }
 
     /// The installed [`crate::bundle::BundleVfs`], if any.
@@ -2046,6 +2107,112 @@ impl Vm {
             return Err(Error::new("no bundle installed in this world"));
         };
         bundle.entry_virtual_path(entry)
+    }
+
+    /// Derive trusted loader provenance for a file path actually loaded by
+    /// the VM's own bundle/OS file loaders.
+    pub(crate) fn derive_provenance(&self, path: &Path) -> SourceProvenance {
+        if self.bundle.is_some() {
+            if let Some(vf) = crate::bundle::parse_virtual_file(path) {
+                return match vf {
+                    crate::bundle::VirtualFile::Package { owner, pkg, rel } => SourceProvenance::BundlePackage {
+                        prefix: crate::library::PackagePrefix::new(owner, pkg),
+                        rel: rel.into(),
+                        path: path.to_path_buf(),
+                    },
+                    crate::bundle::VirtualFile::Root(rel) => SourceProvenance::BundleRoot { rel: rel.into(), path: path.to_path_buf() },
+                };
+            }
+            if crate::library::is_under_lisp_dir(path) {
+                let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                return SourceProvenance::Stdlib(canon);
+            }
+            return SourceProvenance::Untrusted;
+        }
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if crate::library::is_under_lisp_dir(&canon) { SourceProvenance::Stdlib(canon) } else { SourceProvenance::HostFile(canon) }
+    }
+
+    /// Derive package attribution for dependency checks from a file's provenance.
+    pub(crate) fn caller_from_provenance(&self, provenance: &SourceProvenance) -> Option<CallerPackage> {
+        match provenance {
+            SourceProvenance::Untrusted => None,
+            SourceProvenance::Stdlib(p) => {
+                if self.bundle.is_none() {
+                    let dir = p.parent().unwrap_or(p);
+                    if self.package_imports.iter().any(|pi| dir.starts_with(&pi.root)) {
+                        return Some(CallerPackage::HostDir(dir.to_path_buf()));
+                    }
+                }
+                Some(CallerPackage::Stdlib)
+            }
+            SourceProvenance::BundlePackage { prefix, .. } => Some(CallerPackage::Package(prefix.clone())),
+            SourceProvenance::BundleRoot { .. } => Some(CallerPackage::LegacyBundleRoot),
+            SourceProvenance::HostFile(p) => {
+                let dir = p.parent().unwrap_or(p).to_path_buf();
+                Some(CallerPackage::HostDir(dir))
+            }
+        }
+    }
+
+    /// Derive the active calling package from the VM call stack (skipping
+    /// prelude and internal VM helper frames), falling back to the current
+    /// module's attributed package.
+    pub(crate) fn active_caller_package(&self) -> Option<CallerPackage> {
+        for frame in self.frames.iter().rev() {
+            if frame.code.is_null() {
+                continue;
+            }
+            // SAFETY: active call frames hold live pointers into `self.codes`.
+            let file_idx = unsafe { (*frame.code).file as usize };
+            let Some(sf) = self.files.get(file_idx) else { continue };
+            if &*sf.name == crate::PRELUDE_PATH || &*sf.name == "<vm helper>" {
+                continue;
+            }
+            if let Some(caller) = self.caller_from_provenance(&sf.provenance) {
+                return Some(caller);
+            }
+        }
+        self.modules.get(self.current_module as usize).and_then(|m| m.caller_package.clone())
+    }
+
+    /// Trusted provenance of the currently executing code (for `%name-library`),
+    /// determined from the innermost non-prelude/non-helper call frame, or the
+    /// current module when invoked directly from Rust.
+    pub(crate) fn current_eval_provenance(&self) -> SourceProvenance {
+        for frame in self.frames.iter().rev() {
+            if frame.code.is_null() {
+                continue;
+            }
+            // SAFETY: active call frames hold live pointers into `self.codes`.
+            let file_idx = unsafe { (*frame.code).file as usize };
+            let Some(sf) = self.files.get(file_idx) else { continue };
+            if &*sf.name == crate::PRELUDE_PATH || &*sf.name == "<vm helper>" {
+                continue;
+            }
+            return sf.provenance.clone();
+        }
+        self.modules.get(self.current_module as usize).map_or(SourceProvenance::Untrusted, |m| m.provenance.clone())
+    }
+
+    /// Whether `caller` may access module `m` by name/path in bundle mode
+    /// (`find_module_raw`, `eval`, `eval-source`, `in-module`).
+    fn bundle_module_accessible(&self, caller: Option<&CallerPackage>, m: u32) -> bool {
+        if m == ROOT_MODULE {
+            return true;
+        }
+        let module = &self.modules[m as usize];
+        if module.isolated && module.library_parts.is_none() {
+            return true;
+        }
+        match &module.provenance {
+            SourceProvenance::BundlePackage { prefix: target, .. } => {
+                matches!(caller, Some(CallerPackage::Package(caller_pkg)) if caller_pkg == target)
+            }
+            SourceProvenance::BundleRoot { .. } => matches!(caller, Some(CallerPackage::LegacyBundleRoot)),
+            SourceProvenance::Stdlib(_) | SourceProvenance::HostFile(_) => false,
+            SourceProvenance::Untrusted => m == USER_MODULE,
+        }
     }
 
     /// The name of a library loaded whose structured name begins with
@@ -2116,11 +2283,15 @@ impl Vm {
 
     /// The module called `name`, or the module of the file at path `name`
     /// (relative to the working directory), loading the file if needed.
+    ///
+    /// This is the trusted Rust host API (used by nREPL, LSP, and hosts);
+    /// Scheme-callable module lookups go through [`Self::find_module_raw`],
+    /// which enforces bundle package boundaries.
     pub fn find_module(&mut self, name: &str) -> Result<u32, Error> {
-        self.host_try(|vm| vm.find_module_raw(name))
+        self.host_try(|vm| vm.find_module_trusted(name))
     }
 
-    pub(crate) fn find_module_raw(&mut self, name: &str) -> Result<u32, Error> {
+    fn find_module_trusted(&mut self, name: &str) -> Result<u32, Error> {
         if let Some(m) = self.loaded_module(name) {
             return Ok(m);
         }
@@ -2130,6 +2301,45 @@ impl Vm {
             if bundle.read_virtual_path(p).is_some() {
                 return self.load_module(p).map_err(|e| Error::new(format!("module {name}: {}", e.msg)));
             }
+            return Err(Error::new(format!("no module {name}")));
+        }
+        if self.is_reading_denied() {
+            return Err(Error::new(format!("no module {name}")));
+        }
+        let path = Path::new(name).canonicalize().map_err(|_| Error::new(format!("no module {name}")))?;
+        self.load_module(&path).map_err(|e| Error::new(format!("module {name}: {}", e.msg)))
+    }
+
+    pub(crate) fn find_module_raw(&mut self, name: &str) -> Result<u32, Error> {
+        if let Some(m) = self.loaded_module(name) {
+            if self.bundle.is_some() {
+                let caller = self.active_caller_package();
+                if !self.bundle_module_accessible(caller.as_ref(), m) {
+                    return Err(Error::new(format!("module {name}: access outside caller package is not permitted in bundle mode")));
+                }
+            }
+            return Ok(m);
+        }
+        self.check_loading()?;
+        if let Some(bundle) = self.bundle.clone() {
+            let p = Path::new(name);
+            let caller = self.active_caller_package();
+            let allowed = match crate::bundle::parse_virtual_file(p) {
+                Some(crate::bundle::VirtualFile::Package { owner, pkg, .. }) => {
+                    matches!(caller.as_ref(), Some(CallerPackage::Package(c)) if c.matches(owner, pkg))
+                }
+                Some(crate::bundle::VirtualFile::Root(_)) => matches!(caller.as_ref(), Some(CallerPackage::LegacyBundleRoot)),
+                None => false,
+            };
+            if !allowed {
+                return Err(Error::new(format!("module {name}: access outside caller package is not permitted in bundle mode")));
+            }
+            if bundle.read_virtual_path(p).is_some() {
+                return self.load_module(p).map_err(|e| Error::new(format!("module {name}: {}", e.msg)));
+            }
+            return Err(Error::new(format!("no module {name}")));
+        }
+        if self.is_reading_denied() {
             return Err(Error::new(format!("no module {name}")));
         }
         let path = Path::new(name).canonicalize().map_err(|_| Error::new(format!("no module {name}")))?;
@@ -2146,18 +2356,30 @@ impl Vm {
     /// The path is checked, then opened: `dir` must not change meanwhile.
     /// The host's own `eval_file` is not confined.
     pub fn confine_reading(&mut self, dir: &Path) -> Result<(), Error> {
+        if self.bundle.is_some() {
+            return Err(Error::new("confine-reading: cannot confine OS reading when a bundle is installed"));
+        }
         let dir = dir.canonicalize().map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
-        self.reading_root = Some(dir);
+        self.reading_access = ReadingAccess::Confined(dir);
         Ok(())
     }
 
     /// The directory reading is confined to here, if it is
     /// (`confine_reading`).
     pub fn reading_root(&self) -> Option<&Path> {
-        self.reading_root.as_deref()
+        match &self.reading_access {
+            ReadingAccess::Confined(dir) => Some(dir.as_path()),
+            ReadingAccess::Unrestricted | ReadingAccess::DenyAll => None,
+        }
     }
 
-    /// Whether `path` may be read here (`confine_reading` or installed `BundleVfs`).
+    /// Whether host OS reading is explicitly denied (`ReadingAccess::DenyAll`).
+    pub fn is_reading_denied(&self) -> bool {
+        matches!(self.reading_access, ReadingAccess::DenyAll)
+    }
+
+    /// Whether `path` may be read here by VM loaders (`confine_reading` or
+    /// installed `BundleVfs`).
     pub fn may_read(&self, path: &Path) -> bool {
         if let Some(bundle) = &self.bundle {
             if bundle.is_virtual_file_path(path) {
@@ -2165,9 +2387,32 @@ impl Vm {
             }
             return crate::library::is_under_lisp_dir(path);
         }
-        let Some(root) = &self.reading_root else { return true };
-        let own = crate::library::lisp_dir().canonicalize();
-        path.canonicalize().is_ok_and(|p| p.starts_with(root) || own.is_ok_and(|own| p.starts_with(own)))
+        self.may_read_os(path)
+    }
+
+    /// Whether host OS file `path` may be opened by Scheme file ports/APIs.
+    /// Always `false` when a `BundleVfs` is installed or reading is `DenyAll`.
+    pub fn may_read_os(&self, path: &Path) -> bool {
+        if self.bundle.is_some() {
+            return false;
+        }
+        match &self.reading_access {
+            ReadingAccess::Unrestricted => true,
+            ReadingAccess::DenyAll => false,
+            ReadingAccess::Confined(root) => {
+                let own = crate::library::lisp_dir().canonicalize();
+                path.canonicalize().is_ok_and(|p| p.starts_with(root) || own.is_ok_and(|own| p.starts_with(own)))
+            }
+        }
+    }
+
+    /// Refuse host OS file operations when a `BundleVfs` is installed or
+    /// reading is `DenyAll`.
+    pub(crate) fn check_os_files(&self, who: &str) -> Result<(), Error> {
+        if self.bundle.is_some() || self.is_reading_denied() || !self.grants.has(Capability::Files) {
+            return Err(Error::new(format!("{who}: OS file access is not permitted in this world")).with_kind(ErrorKind::File));
+        }
+        Ok(())
     }
 
     pub(crate) fn check_loading(&self) -> Result<(), Error> {
@@ -2182,7 +2427,8 @@ impl Vm {
         // Its loader, if an execution runs: a body that waits is then told
         // apart from a cycle by a task requiring the module meanwhile.
         let loader = Some(self.running_execution()).filter(|&e| e != ExecId(0));
-        match self.begin_module_load(path, loader)? {
+        let provenance = self.derive_provenance(path);
+        match self.begin_module_load_from(path, loader, None, provenance.clone())? {
             ModuleLoad::Loaded(m) => Ok(m),
             ModuleLoad::Load(m, text) => {
                 // From the idle host (`find_module`, `require`), the body is
@@ -2190,9 +2436,9 @@ impl Vm {
                 let name = path.to_string_lossy();
                 let result = if self.input_ready() {
                     let mut module = m;
-                    self.eval_input_source(&mut module, &name, &text).map(drop)
+                    self.eval_input_source_with_provenance(&mut module, &name, &text, provenance).map(drop)
                 } else {
-                    self.eval_in_raw(m, &name, &text).map(drop)
+                    self.eval_in_raw_with_provenance(m, &name, &text, provenance).map(drop)
                 };
                 self.end_module_load(m);
                 result.map(|()| m)
@@ -2203,15 +2449,14 @@ impl Vm {
     /// The module of the file at canonical `path` if it is loaded, or else
     /// a new one for it, registered (so that requiring it again finds it,
     /// and a circular dependency is told) and marked loading, with the
-    /// file's text: evaluate that in it, then `end_module_load`. A
-    /// package's own files load afresh for each generation.
-    pub(crate) fn begin_module_load(&mut self, path: &Path, loader: Option<ExecId>) -> Result<ModuleLoad, Error> {
-        self.begin_module_load_from(path, loader, None)
-    }
-
-    /// `begin_module_load`, the module made from `text` rather than its
-    /// file's when it is not loaded yet.
-    fn begin_module_load_from(&mut self, path: &Path, loader: Option<ExecId>, text: Option<String>) -> Result<ModuleLoad, Error> {
+    /// file's text (or `text` if given), stamped with `provenance`.
+    fn begin_module_load_from(
+        &mut self,
+        path: &Path,
+        loader: Option<ExecId>,
+        text: Option<String>,
+        provenance: SourceProvenance,
+    ) -> Result<ModuleLoad, Error> {
         let staged = self.staging_here().filter(|s| self.staging_owns(s, path)).map(|s| s.modules.get(path).copied());
         let known = match staged {
             Some(m) => m,
@@ -2239,6 +2484,9 @@ impl Vm {
                     None => self.read_file_admitted(&path.to_string_lossy(), 2)?,
                 };
                 let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
+                let caller = self.caller_from_provenance(&provenance).or_else(|| self.active_caller_package());
+                self.modules[m as usize].provenance = provenance;
+                self.modules[m as usize].caller_package = caller;
                 match staged {
                     Some(_) => self.staging.as_mut().expect("staging").modules.insert(path.to_path_buf(), m),
                     None => self.module_paths.insert(path.to_path_buf(), m),
@@ -2250,7 +2498,7 @@ impl Vm {
         }
     }
 
-    /// The module `begin_module_load` made has been evaluated (or failed).
+    /// The module `begin_module_load_from` made has been evaluated (or failed).
     pub(crate) fn end_module_load(&mut self, m: u32) {
         self.modules[m as usize].loading = false;
         self.modules[m as usize].loader = None;
@@ -2263,16 +2511,22 @@ impl Vm {
         }
     }
 
-    /// Where `from` finds the file `spec` it requires: relative to its own
-    /// file, canonical (or virtual path inside an installed `BundleVfs`).
-    fn required_path(&self, from: u32, spec: &str) -> Result<PathBuf, Error> {
+    /// Where `from` (evaluating a form from optional `file`) finds the file
+    /// `spec` it requires: relative to its own file, canonical (or virtual
+    /// path inside an installed `BundleVfs`).
+    fn required_path_for(&self, from: u32, file: Option<u32>, spec: &str) -> Result<PathBuf, Error> {
         if let Some(bundle) = &self.bundle {
-            return match self.modules[from as usize].path.as_deref() {
-                Some(p) if bundle.is_virtual_file_path(p) => {
-                    let dir = p.parent().unwrap_or_else(|| Path::new("/bundle"));
+            let prov = file
+                .and_then(|f| self.files.get(f as usize))
+                .map(|sf| &sf.provenance)
+                .filter(|p| !matches!(p, SourceProvenance::Untrusted))
+                .unwrap_or(&self.modules[from as usize].provenance);
+            return match prov {
+                SourceProvenance::BundlePackage { path, .. } | SourceProvenance::BundleRoot { path, .. } => {
+                    let dir = path.parent().unwrap_or_else(|| Path::new("/bundle"));
                     bundle.resolve_relative_from_dir(dir, spec, "require")
                 }
-                Some(p) if crate::library::is_under_lisp_dir(p) => {
+                SourceProvenance::Stdlib(p) => {
                     let dir = p.parent().unwrap_or_else(|| Path::new("."));
                     let canonical = dir.join(spec).canonicalize().map_err(|e| Error::new(e.to_string()))?;
                     if !crate::library::is_under_lisp_dir(&canonical) {
@@ -2280,8 +2534,9 @@ impl Vm {
                     }
                     Ok(canonical)
                 }
-                None => bundle.entry_virtual_path(spec),
-                Some(_) => Err(Error::new(format!("require: cannot resolve {spec} outside bundle"))),
+                SourceProvenance::Untrusted | SourceProvenance::HostFile(_) => {
+                    Err(Error::new(format!("require: cannot resolve {spec} outside bundle")))
+                }
             };
         }
         let base =
@@ -2298,7 +2553,7 @@ impl Vm {
     pub(crate) fn next_required(&mut self, forms: &Forms) -> Result<Option<Forms>, Error> {
         // Splicing top-level source is distinct from lexical include:
         // these forms must compile only after the preceding forms ran.
-        let (head, specs) = loop {
+        let (head, req_file, specs) = loop {
             let (form, file, head) = {
                 let queue = forms.forms.borrow();
                 let Some((form, file)) = queue.front() else { return Ok(None) };
@@ -2320,7 +2575,9 @@ impl Vm {
             let dir = self.form_source_dir(file);
             let spliced = match head {
                 "begin" => Some(specs.iter().cloned().map(|f| (f, file)).collect::<Vec<_>>()),
-                "cond-expand" => Some(self.cond_expand(specs, &dir)?.into_iter().map(|f| (f, file)).collect()),
+                "cond-expand" => {
+                    Some(self.cond_expand_for(forms.module, Some(file), specs, &dir)?.into_iter().map(|f| (f, file)).collect())
+                }
                 "include" | "include-ci" => Some(self.pinning(|vm| {
                     let read = vm.include(specs, &dir, &*head == "include-ci")?;
                     let read: Vec<_> = read.into_iter().flat_map(|(fs, file)| fs.into_iter().map(move |f| (f, file))).collect();
@@ -2334,9 +2591,9 @@ impl Vm {
                 }
                 "import" => {
                     let dir = self.import_dir(file);
-                    return self.pinning(|vm| vm.next_imported(specs, &dir));
+                    return self.pinning(|vm| vm.next_imported(forms.module, Some(file), specs, &dir));
                 }
-                "require" => break (head, specs.to_vec()),
+                "require" => break (head, file, specs.to_vec()),
                 _ => return Ok(None),
             };
             if let Some(spliced) = spliced {
@@ -2359,11 +2616,12 @@ impl Vm {
         // after it.
         for spec in &specs {
             let Sexp::Str(spec) = spec else { return Ok(None) };
-            let Ok(path) = self.required_path(forms.module, spec) else { return Ok(None) };
+            let Ok(path) = self.required_path_for(forms.module, Some(req_file), spec) else { return Ok(None) };
             let loader = Some(self.running_execution());
-            match self.begin_module_load(&path, loader)? {
+            let provenance = self.derive_provenance(&path);
+            match self.begin_module_load_from(&path, loader, None, provenance.clone())? {
                 ModuleLoad::Load(m, text) => {
-                    let forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                    let forms = self.read_forms_with_provenance(m, &path.to_string_lossy(), &text, provenance);
                     if forms.is_err() {
                         self.end_module_load(m);
                     }
@@ -2379,53 +2637,67 @@ impl Vm {
 
     /// Directory of a form's source, not the module containing it: an
     /// included file may load another include beside itself.
+    ///
+    /// In bundle or locked mode, untrusted display filenames (from `eval-source`
+    /// or `load-module-from`) never supply a directory.
     pub(crate) fn form_source_dir(&self, file: u32) -> PathBuf {
-        let path = Path::new(&*self.files[file as usize].name);
-        if let Some(bundle) = &self.bundle
-            && bundle.is_virtual_file_path(path)
-        {
-            return path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/bundle"));
-        }
-        path.parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), Path::to_path_buf)
-    }
-
-    /// Where an `import` in the source `file` looks for libraries, and
-    /// whose it is (`check_declared`): its file's directory, as
-    /// `form_source_dir`, but empty for what comes from no file (the REPL,
-    /// `eval`, an environment). That finds libraries from the working
-    /// directory all the same, and is no package's: the directory a
-    /// program happens to run in does not make its evaluations a
-    /// package's files.
-    pub(crate) fn import_dir(&self, file: u32) -> PathBuf {
-        let path = Path::new(&*self.files[file as usize].name);
-        if let Some(bundle) = &self.bundle
-            && bundle.is_virtual_file_path(path)
-        {
-            return path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/bundle"));
-        }
-        match path.parent().filter(|p| p.is_dir()) {
-            Some(dir) => dir.to_path_buf(),
-            // A file named without a directory is in the working one.
-            None if path.is_file() => ".".into(),
-            None => PathBuf::new(),
-        }
-    }
-
-    /// Canonical path of source `file`, if it corresponds to an actual file on disk
-    /// (or a virtual file inside an installed `BundleVfs`).
-    pub(crate) fn source_file_path(&self, file: u32) -> Option<PathBuf> {
-        let name = &*self.files[file as usize].name;
-        if name.is_empty() || (name.starts_with('<') && name.ends_with('>')) {
-            return None;
-        }
-        let path = Path::new(name);
-        if let Some(bundle) = &self.bundle {
-            if bundle.is_virtual_file_path(path) {
-                return bundle.read_virtual_path(path).is_some().then(|| path.to_path_buf());
+        match &self.files[file as usize].provenance {
+            SourceProvenance::BundlePackage { path, .. } | SourceProvenance::BundleRoot { path, .. } => {
+                path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/bundle"))
             }
-            return path.canonicalize().ok().filter(|p| p.is_file() && crate::library::is_under_lisp_dir(p));
+            SourceProvenance::Stdlib(path) | SourceProvenance::HostFile(path) => {
+                path.parent().map(Path::to_path_buf).unwrap_or_else(|| ".".into())
+            }
+            SourceProvenance::Untrusted => {
+                if self.bundle.is_some() || self.locked_libraries || self.is_reading_denied() {
+                    return PathBuf::new();
+                }
+                let path = Path::new(&*self.files[file as usize].name);
+                path.parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), Path::to_path_buf)
+            }
         }
-        path.canonicalize().ok().filter(|p| p.is_file())
+    }
+
+    /// Where an `import` in the source `file` looks for libraries: its file's
+    /// directory, or empty for what comes from no file (the REPL, `eval`, an
+    /// environment, or an untrusted display name in locked/bundle mode).
+    pub(crate) fn import_dir(&self, file: u32) -> PathBuf {
+        match &self.files[file as usize].provenance {
+            SourceProvenance::BundlePackage { path, .. } | SourceProvenance::BundleRoot { path, .. } => {
+                path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/bundle"))
+            }
+            SourceProvenance::Stdlib(path) | SourceProvenance::HostFile(path) => {
+                path.parent().map(Path::to_path_buf).unwrap_or_else(|| ".".into())
+            }
+            SourceProvenance::Untrusted => {
+                if self.bundle.is_some() || self.locked_libraries || self.is_reading_denied() {
+                    return PathBuf::new();
+                }
+                let path = Path::new(&*self.files[file as usize].name);
+                match path.parent().filter(|p| p.is_dir()) {
+                    Some(dir) => dir.to_path_buf(),
+                    // A file named without a directory is in the working one.
+                    None if path.is_file() => ".".into(),
+                    None => PathBuf::new(),
+                }
+            }
+        }
+    }
+
+    /// Trusted loader provenance of source `file`.
+    pub(crate) fn source_provenance(&self, file: u32) -> SourceProvenance {
+        self.files[file as usize].provenance.clone()
+    }
+
+    /// Trusted path of `provenance`, if any.
+    pub(crate) fn provenance_path(provenance: &SourceProvenance) -> Option<PathBuf> {
+        match provenance {
+            SourceProvenance::Stdlib(p)
+            | SourceProvenance::BundlePackage { path: p, .. }
+            | SourceProvenance::BundleRoot { path: p, .. }
+            | SourceProvenance::HostFile(p) => Some(p.clone()),
+            SourceProvenance::Untrusted => None,
+        }
     }
 
     /// Drop ownership state a killed library loader could not clean up.
@@ -2547,22 +2819,50 @@ impl Vm {
         forms
     }
 
+    /// Trusted VM loader path (used by `next_imported` after reading a
+    /// library file from disk or `BundleVfs`): stamps loader-issued provenance
+    /// on both the module and the `SourceFile`.
+    pub(crate) fn load_module_forms(&mut self, path: &Path, text: String) -> Result<Option<Forms>, Error> {
+        self.check_loading()?;
+        let loader = Some(self.running_execution());
+        let provenance = self.derive_provenance(path);
+        match self.begin_module_load_from(path, loader, Some(text), provenance.clone())? {
+            ModuleLoad::Loaded(_) => Ok(None),
+            ModuleLoad::Load(m, text) => {
+                let forms = self.read_forms_with_provenance(m, &path.to_string_lossy(), &text, provenance);
+                if forms.is_err() {
+                    self.end_module_load(m);
+                }
+                forms.map(Some)
+            }
+        }
+    }
+
     /// The forms of the module of the file at `path`, read from `text`
     /// rather than the file (an editor's buffer, unsaved edits and all):
     /// made and marked loading as `begin_module_load` does, to evaluate in
     /// it (`%load-forms`). None if the module is loaded already.
+    ///
+    /// Caller-supplied text never receives trusted package/stdlib ownership
+    /// provenance, and is refused when a `BundleVfs` is installed or reading
+    /// is denied (without touching host OS paths).
     pub(crate) fn module_forms_from(&mut self, path: &Path, text: String) -> Result<Option<Forms>, Error> {
         self.check_loading()?;
-        let path = if self.bundle.as_ref().is_some_and(|b| b.is_virtual_file_path(path)) {
-            path.to_path_buf()
-        } else {
-            path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?
-        };
+        if self.bundle.is_some() {
+            return Err(Error::new("load-module-from: not permitted when a bundle is installed"));
+        }
+        if self.is_reading_denied() {
+            return Err(Error::new(format!("{}: {}", path.display(), std::io::Error::from(std::io::ErrorKind::NotFound))));
+        }
+        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        if !self.may_read(&path) {
+            return Err(Error::new(format!("{}: {}", path.display(), std::io::Error::from(std::io::ErrorKind::NotFound))));
+        }
         let loader = Some(self.running_execution());
-        match self.begin_module_load_from(&path, loader, Some(text))? {
+        match self.begin_module_load_from(&path, loader, Some(text), SourceProvenance::Untrusted)? {
             ModuleLoad::Loaded(_) => Ok(None),
             ModuleLoad::Load(m, text) => {
-                let forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                let forms = self.read_forms_with_provenance(m, &path.to_string_lossy(), &text, SourceProvenance::Untrusted);
                 if forms.is_err() {
                     self.end_module_load(m);
                 }
@@ -2604,6 +2904,9 @@ impl Vm {
             return Err(Error::new("a package is already being loaded"));
         }
         self.check_loading()?;
+        if self.bundle.is_some() || self.is_reading_denied() {
+            return Err(Error::new("stage-package: not permitted in this world"));
+        }
         let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         self.generations += 1;
@@ -2670,16 +2973,20 @@ impl Vm {
             return Err(Error::new("a package is already being loaded"));
         }
         self.check_loading()?;
+        if self.bundle.is_some() || self.is_reading_denied() {
+            return Err(Error::new("load-package: not permitted in this world"));
+        }
         let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         self.generations += 1;
         let generation = self.generations;
         let owner = Some(self.running_execution());
         self.staging = Some(Staging { dir, generation, modules: FxHashMap::default(), main: None, owner });
-        let forms = match self.begin_module_load(&path, owner) {
+        let provenance = self.derive_provenance(&path);
+        let forms = match self.begin_module_load_from(&path, owner, None, provenance.clone()) {
             Ok(ModuleLoad::Load(m, text)) => {
                 self.staging.as_mut().expect("staging").main = Some(m);
-                let forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                let forms = self.read_forms_with_provenance(m, &path.to_string_lossy(), &text, provenance);
                 if forms.is_err() {
                     self.end_module_load(m);
                 }
@@ -2801,13 +3108,17 @@ impl Vm {
     /// Load (once) the module at `spec`, relative to `from`'s file, and import
     /// its exports (all definitions when it has no `provide`) into `from`.
     pub fn require(&mut self, from: u32, spec: &str) -> Result<(), Error> {
-        self.as_execution(|vm| vm.require_running(from, spec))
+        self.require_for(from, None, spec)
     }
 
-    fn require_running(&mut self, from: u32, spec: &str) -> Result<(), Error> {
+    pub(crate) fn require_for(&mut self, from: u32, file: Option<u32>, spec: &str) -> Result<(), Error> {
+        self.as_execution(|vm| vm.require_running(from, file, spec))
+    }
+
+    fn require_running(&mut self, from: u32, file: Option<u32>, spec: &str) -> Result<(), Error> {
         // A module loaded already is imported without loading: where
         // loading is not granted, any other fails alike, there or not.
-        let path = self.required_path(from, spec);
+        let path = self.required_path_for(from, file, spec);
         if !path.as_ref().is_ok_and(|p| self.module_paths.contains_key(p)) {
             self.check_loading().map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
         }
@@ -3754,11 +4065,21 @@ impl Vm {
     /// worlds have a closed fallback; prelude boot/compiler calls keep the
     /// explicit synchronous path below.
     pub(crate) fn eval_input_source(&mut self, module: &mut u32, name: &str, source: &str) -> Result<crate::api::Value, Error> {
+        self.eval_input_source_with_provenance(module, name, source, SourceProvenance::Untrusted)
+    }
+
+    pub(crate) fn eval_input_source_with_provenance(
+        &mut self,
+        module: &mut u32,
+        name: &str,
+        source: &str,
+        provenance: SourceProvenance,
+    ) -> Result<crate::api::Value, Error> {
         self.as_execution(|vm| {
             vm.pinning(|vm| {
                 let saved = std::mem::replace(&mut vm.current_module, *module);
                 let result = (|| {
-                    let forms = Rc::new(vm.read_forms(*module, name, source)?);
+                    let forms = Rc::new(vm.read_forms_with_provenance(*module, name, source, provenance)?);
                     vm.drive_forms(forms)
                 })();
                 *module = std::mem::replace(&mut vm.current_module, saved);
@@ -3856,34 +4177,48 @@ impl Vm {
     pub(crate) fn eval_file_raw(&mut self, path: &Path) -> Result<Value, Error> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let provenance = self.derive_provenance(&canonical);
+        let caller = self.caller_from_provenance(&provenance);
         self.modules[USER_MODULE as usize].path = Some(canonical.clone());
+        self.modules[USER_MODULE as usize].provenance = provenance.clone();
+        self.modules[USER_MODULE as usize].caller_package = caller;
         self.module_paths.insert(canonical, USER_MODULE);
-        self.eval_in_raw(USER_MODULE, &path.to_string_lossy(), &text)
+        self.eval_in_raw_with_provenance(USER_MODULE, &path.to_string_lossy(), &text, provenance)
     }
 
     /// Evaluate source text in `*module` for a REPL or session, then set
     /// `*module` to the module current at the end (`in-module` switches it).
     pub(crate) fn eval_interactive_raw(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {
         let saved = std::mem::replace(&mut self.current_module, *module);
-        let result = self.eval_forms(*module, name, source);
+        let result = self.eval_forms(*module, name, source, SourceProvenance::Untrusted);
         *module = std::mem::replace(&mut self.current_module, saved);
         result
     }
 
     /// Evaluate source text in `module`, the file `name`.
     pub(crate) fn eval_in_raw(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
+        self.eval_in_raw_with_provenance(module, name, source, SourceProvenance::Untrusted)
+    }
+
+    pub(crate) fn eval_in_raw_with_provenance(
+        &mut self,
+        module: u32,
+        name: &str,
+        source: &str,
+        provenance: SourceProvenance,
+    ) -> Result<Value, Error> {
         let saved = std::mem::replace(&mut self.current_module, module);
-        let result = self.eval_forms(module, name, source);
+        let result = self.eval_forms(module, name, source, provenance);
         self.current_module = saved;
         result
     }
 
-    fn eval_forms(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
-        self.as_execution(|vm| vm.pinning(|vm| vm.eval_forms_pinned(module, name, source)))
+    fn eval_forms(&mut self, module: u32, name: &str, source: &str, provenance: SourceProvenance) -> Result<Value, Error> {
+        self.as_execution(|vm| vm.pinning(|vm| vm.eval_forms_pinned(module, name, source, provenance)))
     }
 
-    fn eval_forms_pinned(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
-        let file = self.add_file(name, source)?;
+    fn eval_forms_pinned(&mut self, module: u32, name: &str, source: &str, provenance: SourceProvenance) -> Result<Value, Error> {
+        let file = self.add_file_with_provenance(name, source, provenance)?;
         let meter = meter::Meter::new(self);
         let forms = reader::read_metered(source, false, &meter).map_err(|e| match e.pos {
             Some(pos) => {
@@ -3922,6 +4257,10 @@ impl Vm {
     /// is kept until the evaluation adding it ends (`pinning`), then as long
     /// as codes compiled from it live.
     pub(crate) fn add_file(&mut self, name: &str, text: &str) -> Result<u32, Error> {
+        self.add_file_with_provenance(name, text, SourceProvenance::Untrusted)
+    }
+
+    pub(crate) fn add_file_with_provenance(&mut self, name: &str, text: &str, provenance: SourceProvenance) -> Result<u32, Error> {
         self.release_unheld_files();
         // Admitted and charged before it is copied: a text the host hands
         // over (`eval_source`) was not admitted as a file read is.
@@ -3930,7 +4269,7 @@ impl Vm {
             self.admit_without_collecting(bytes)?;
         }
         let charged = self.regs.budget().charge(bytes).map_err(|_| self.refusal(bytes))?;
-        let source = SourceFile::new(name, text);
+        let source = SourceFile::with_provenance(name, text, provenance);
         let file = match self.free_files.pop() {
             Some(i) => {
                 self.files[i as usize] = source;
@@ -4003,9 +4342,19 @@ impl Vm {
     /// into Scheme can. Definitions anywhere in the text shadow imports
     /// and root names for all of it, as with `eval_in`.
     pub(crate) fn read_forms(&mut self, module: u32, name: &str, source: &str) -> Result<Forms, Error> {
+        self.read_forms_with_provenance(module, name, source, SourceProvenance::Untrusted)
+    }
+
+    pub(crate) fn read_forms_with_provenance(
+        &mut self,
+        module: u32,
+        name: &str,
+        source: &str,
+        provenance: SourceProvenance,
+    ) -> Result<Forms, Error> {
         // Held until the forms are dropped, not only while this runs.
         let file = self.pinning(|vm| {
-            let file = vm.add_file(name, source)?;
+            let file = vm.add_file_with_provenance(name, source, provenance)?;
             *vm.held_files.entry(file).or_default() += 1;
             Ok::<_, Error>(file)
         })?;

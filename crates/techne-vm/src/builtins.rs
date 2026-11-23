@@ -1989,6 +1989,7 @@ fn update_box(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn read_lines(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = str_arg(vm, arg(vm, args, 0), "read-lines")?.to_owned();
+    vm.check_os_files("read-lines")?;
     // The text, the strings of its lines and the pairs (for lines of at
     // least eight bytes; shorter ones are admitted with the list).
     let text = vm.read_file_admitted(&path, 6)?;

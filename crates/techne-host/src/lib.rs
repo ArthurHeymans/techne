@@ -1102,9 +1102,14 @@ impl Loading {
         // Scheme loads the module from Scheme too, where its task can be
         // preempted and stopped (`eval` would load it as it compiles,
         // where it cannot).
-        let source = format!("(require {require_target:?})");
         let prefixed = |e: Error| Error::new(format!("{entry}: {}", e.msg));
-        let load = vm.eval_source(&format!("(lambda () (eval-source {source:?} \"user\" \"<host>\"))")).map_err(prefixed)?;
+        let load = if vm.bundle().is_some() {
+            vm.bundle_entry_loader(require_target).map_err(prefixed)?
+        } else {
+            let source = format!("(require {})", techne_vm::reader::string_repr(require_target));
+            vm.eval_source(&format!("(lambda () (eval-source {} \"user\" \"<host>\"))", techne_vm::reader::string_repr(&source)))
+                .map_err(prefixed)?
+        };
         let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(limits.load), tasks: None });
         let task = vm.spawn_in(lifetime, &load).map_err(prefixed)?;
         let deadline = Instant::now() + limits.load;

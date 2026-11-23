@@ -114,10 +114,14 @@ impl Vm {
             }
             let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
             let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let provenance = vm.derive_provenance(&canonical);
+            let caller = vm.caller_from_provenance(&provenance);
             vm.modules[USER_MODULE as usize].path = Some(canonical.clone());
+            vm.modules[USER_MODULE as usize].provenance = provenance.clone();
+            vm.modules[USER_MODULE as usize].caller_package = caller;
             vm.module_paths.insert(canonical, USER_MODULE);
             let mut module = USER_MODULE;
-            vm.eval_input_source(&mut module, &path.to_string_lossy(), &text)
+            vm.eval_input_source_with_provenance(&mut module, &path.to_string_lossy(), &text, provenance)
         })
     }
 
@@ -128,14 +132,51 @@ impl Vm {
             let vpath = vm.bundle_entry_path(entry)?;
             let vpath_str = vpath.to_string_lossy().into_owned();
             let text = vm.read_file_admitted(&vpath_str, 2)?;
+            let provenance = vm.derive_provenance(&vpath);
+            let caller = vm.caller_from_provenance(&provenance);
             vm.modules[USER_MODULE as usize].path = Some(vpath.clone());
+            vm.modules[USER_MODULE as usize].provenance = provenance.clone();
+            vm.modules[USER_MODULE as usize].caller_package = caller;
             vm.module_paths.insert(vpath, USER_MODULE);
             if !vm.input_ready() {
-                return vm.eval_in_raw(USER_MODULE, &vpath_str, &text).map(|v| vm.export(v));
+                return vm.eval_in_raw_with_provenance(USER_MODULE, &vpath_str, &text, provenance).map(|v| vm.export(v));
             }
             let mut module = USER_MODULE;
-            vm.eval_input_source(&mut module, &vpath_str, &text)
+            vm.eval_input_source_with_provenance(&mut module, &vpath_str, &text, provenance)
         })
+    }
+
+    /// Build a zero-argument Scheme thunk that requires `entry` from the
+    /// installed [`crate::bundle::BundleVfs`] into `USER_MODULE` inside a
+    /// preemptible task, stamped with trusted bundle root provenance rather
+    /// than untrusted `eval-source`.
+    pub fn bundle_entry_loader(&mut self, entry: &str) -> Result<Value, Error> {
+        let provenance = {
+            let Some(bundle) = &self.bundle else {
+                return Err(Error::new("no bundle installed in this world"));
+            };
+            let _vpath = bundle.entry_virtual_path(entry)?;
+            match bundle.root_package() {
+                Some(root) => super::SourceProvenance::BundlePackage {
+                    prefix: root.clone(),
+                    rel: "".into(),
+                    path: std::path::PathBuf::from(format!("/pkg/{}/{}/__entry__", root.owner, root.name)),
+                },
+                None => super::SourceProvenance::BundleRoot { rel: "".into(), path: std::path::PathBuf::from("/bundle/__entry__") },
+            }
+        };
+        let source = format!("(require {})", crate::reader::string_repr(entry));
+        let forms_val = self.host_try(|vm| {
+            let forms = vm.read_forms_with_provenance(USER_MODULE, "<host>", &source, provenance)?;
+            let v = vm.make_foreign_raw(std::rc::Rc::new(forms), "forms");
+            Ok(vm.export(v))
+        })?;
+        let make_thunk = self.eval_in(
+            super::ROOT_MODULE,
+            "<host>",
+            "(lambda (forms) (lambda () (dynamic-wind (lambda () #f) (lambda () (%in-module-while \"user\" (lambda () (%eval-forms forms)))) (lambda () (%drop-forms forms)))))",
+        )?;
+        self.call(&make_thunk, &[forms_val])
     }
 
     pub fn eval_interactive(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {

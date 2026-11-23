@@ -110,10 +110,12 @@ impl Vm {
         self.release_unheld_files();
         self.drop_stale_timers();
         self.at_rest().map_err(|e| Error::new(format!("snapshot: {e}")))?;
-        if !self.grants.has(super::Capability::Loading) || self.bundle.is_some() {
+        if self.bundle.is_some() || !self.grants.has(super::Capability::Loading) {
             self.library_providers.clear();
             self.package_imports.clear();
-            self.reading_root = None;
+        }
+        if self.bundle.is_some() || (!self.grants.has(super::Capability::Loading) && !self.grants.has(super::Capability::Files)) {
+            self.reading_access = super::ReadingAccess::DenyAll;
         }
         Ok(Snapshot(Rc::new(Vm::freeze(self))))
     }
@@ -277,7 +279,7 @@ impl Vm {
             bundle,
             current_module,
             grants,
-            reading_root,
+            reading_access,
             clock_resolution,
             files,
             file_codes,
@@ -376,7 +378,7 @@ impl Vm {
         vm.package_imports.clone_from(package_imports);
         vm.locked_libraries = *locked_libraries;
         vm.bundle.clone_from(bundle);
-        vm.reading_root.clone_from(reading_root);
+        vm.reading_access.clone_from(reading_access);
         vm.current_module = *current_module;
         vm.files.clone_from(files);
         vm.file_codes.clone_from(file_codes);
@@ -597,33 +599,37 @@ mod tests {
         assert!(a.get_global_in(ROOT_MODULE, "map").is_some());
     }
 
-    /// Snapshotting without `Capability::Loading` or with an installed `BundleVfs`
-    /// strips host OS path tables (`library_providers`, `package_imports`, `reading_root`).
+    /// Snapshotting without `Capability::Loading` (and without `Capability::Files`)
+    /// or with an installed `BundleVfs` strips host OS path tables
+    /// (`library_providers`, `package_imports`) and sets `reading_access = DenyAll`.
     #[test]
     fn snapshot_clears_os_paths_without_loading_or_with_bundle() {
         let dir = tempfile::tempdir().unwrap();
         let lib = dir.path().join("lib");
         std::fs::create_dir_all(&lib).unwrap();
 
-        // Case 1: Capability::Loading revoked -> OS path tables stripped from snapshot.
+        // Case 1: Capability::Loading revoked (and no Files) -> OS path tables stripped, reading denied.
         let mut vm = Vm::with_grants(Grants::NONE.with(super::super::Capability::Loading));
         vm.confine_reading(dir.path()).unwrap();
         vm.provide_libraries("alice", "pkg", &lib).unwrap();
         vm.declare_imports(dir.path(), ("alice", "pkg"), &[("alice".into(), "pkg".into())]).unwrap();
-        assert!(vm.reading_root.is_some());
+        assert!(vm.reading_root().is_some());
         assert!(!vm.library_providers.is_empty());
         assert!(!vm.package_imports.is_empty());
         vm.set_grant(super::super::Capability::Loading, false);
         let snap = vm.snapshot().unwrap();
-        assert!(snap.0.reading_root.is_none());
+        assert!(snap.0.reading_root().is_none());
+        assert!(snap.0.is_reading_denied());
         assert!(snap.0.library_providers.is_empty());
         assert!(snap.0.package_imports.is_empty());
         let world = snap.world();
-        assert!(world.reading_root.is_none());
+        assert!(world.reading_root().is_none());
+        assert!(world.is_reading_denied());
+        assert!(!world.may_read(dir.path()));
         assert!(world.library_providers.is_empty());
         assert!(world.package_imports.is_empty());
 
-        // Case 2: BundleVfs installed (even if Loading is still granted) -> zero OS paths.
+        // Case 2: BundleVfs installed (even if Loading is still granted) -> zero OS paths, reading denied.
         let mut root_files = std::collections::BTreeMap::new();
         root_files.insert("app.scm".to_string(), std::sync::Arc::from(&b"(define ok 42)"[..]));
         let bundle = std::sync::Arc::new(crate::bundle::BundleVfs::from_root_files(root_files).unwrap());
@@ -633,12 +639,14 @@ mod tests {
         bvm.install_bundle(bundle);
         bvm.eval_bundle_entry("app.scm").unwrap();
         let bsnap = bvm.snapshot().unwrap();
-        assert!(bsnap.0.reading_root.is_none());
+        assert!(bsnap.0.reading_root().is_none());
+        assert!(bsnap.0.is_reading_denied());
         assert!(bsnap.0.library_providers.is_empty());
         assert!(bsnap.0.package_imports.is_empty());
         assert!(bsnap.0.bundle.is_some());
         let mut bworld = bsnap.world();
-        assert!(bworld.reading_root.is_none());
+        assert!(bworld.reading_root().is_none());
+        assert!(bworld.is_reading_denied());
         assert!(bworld.library_providers.is_empty());
         assert!(bworld.package_imports.is_empty());
         assert!(bworld.bundle.is_some());

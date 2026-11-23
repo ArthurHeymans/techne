@@ -648,7 +648,7 @@ impl<'v> Compiler<'v> {
             "require" => {
                 for spec in &items[1..] {
                     match spec {
-                        Sexp::Str(path) => self.vm.require(self.module, path)?,
+                        Sexp::Str(path) => self.vm.require_for(self.module, Some(self.file), path)?,
                         other => return err(format!("require: expected a file path string, got {}", reader::display_sexp(other))),
                     }
                 }
@@ -666,7 +666,7 @@ impl<'v> Compiler<'v> {
             }
             "import" => {
                 let dir = self.vm.import_dir(self.file);
-                self.vm.import(self.module, &items[1..], &dir)?;
+                self.vm.import_for(self.module, Some(self.file), &items[1..], &dir)?;
                 Ok(Expr::Void)
             }
             "include" | "include-ci" | "cond-expand" => {
@@ -697,7 +697,9 @@ impl<'v> Compiler<'v> {
     fn spliced(&mut self, special: &str, items: &[Sexp]) -> R<Vec<(Sexp, u32)>> {
         let dir = self.source_dir();
         match special {
-            "cond-expand" => Ok(self.vm.cond_expand(&items[1..], &dir)?.into_iter().map(|f| (f, self.file)).collect()),
+            "cond-expand" => {
+                Ok(self.vm.cond_expand_for(self.module, Some(self.file), &items[1..], &dir)?.into_iter().map(|f| (f, self.file)).collect())
+            }
             _ => Ok(self
                 .vm
                 .include(&items[1..], &dir, special == "include-ci")?

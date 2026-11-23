@@ -24,7 +24,7 @@ use std::{
 pub use crate::bundle::PackagePrefix;
 use crate::{
     reader::{self, Sexp, display_sexp, intern, strip, symbol_name},
-    vm::{Error, Forms, GlobalBinding, ROOT_MODULE, Vm, predeclare},
+    vm::{CallerPackage, Error, Forms, GlobalBinding, ROOT_MODULE, SourceProvenance, Vm, predeclare},
 };
 
 type R<T> = Result<T, Error>;
@@ -33,7 +33,7 @@ type R<T> = Result<T, Error>;
 #[derive(Clone)]
 pub(crate) struct PackageImports {
     /// The package's directory.
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     package: PackagePrefix,
     /// The packages whose libraries its files import: itself and those
     /// its manifest depends on.
@@ -335,40 +335,80 @@ fn syms(items: &[Sexp], who: &str) -> R<Vec<u32>> {
 }
 
 impl Vm {
+    /// Resolve the package/caller attribution for imports or `cond-expand`
+    /// evaluated in `(module, file)`: prefer the file's trusted provenance,
+    /// then the module's attributed package; in bundle/locked mode also derive
+    /// the caller from the active VM call stack so dynamic `(environment ...)`
+    /// and non-file `eval-source` fail closed under the calling package.
+    fn resolve_caller_package(&self, module: u32, file: Option<u32>) -> Option<CallerPackage> {
+        if let Some(f) = file
+            && let Some(caller) = self.caller_from_provenance(&self.files[f as usize].provenance)
+        {
+            return Some(caller);
+        }
+        let restricted = self.bundle.is_some() || self.locked_libraries;
+        if !restricted {
+            if file.is_some() {
+                return None;
+            }
+            return self.modules.get(module as usize).and_then(|m| m.caller_package.clone());
+        }
+        if let Some(m) = self.modules.get(module as usize) {
+            if m.isolated {
+                return m.caller_package.clone();
+            }
+            if let Some(active) = self.active_caller_package() {
+                return Some(active);
+            }
+            if let Some(caller) = &m.caller_package {
+                return Some(caller.clone());
+            }
+        }
+        self.active_caller_package()
+    }
+
     /// `(import set ...)` into `module`; libraries are looked up from `dir`.
     pub fn import(&mut self, module: u32, sets: &[Sexp], dir: &Path) -> R<()> {
+        self.import_for(module, None, sets, dir)
+    }
+
+    pub(crate) fn import_for(&mut self, module: u32, file: Option<u32>, sets: &[Sexp], dir: &Path) -> R<()> {
+        let caller = self.resolve_caller_package(module, file);
         for set in sets {
-            let bindings = self.import_set(set, dir)?;
+            let bindings = self.import_set(set, caller.as_ref(), dir)?;
             self.add_imports(module, bindings);
         }
         Ok(())
     }
 
     /// A fresh environment (R7RS `environment`): an isolated module that
-    /// sees what `sets` import.
+    /// sees what `sets` import. In bundle/locked mode it inherits the active
+    /// caller's package attribution so dynamic imports cannot bypass
+    /// direct-dependency rules.
     pub fn environment(&mut self, sets: &[Sexp]) -> R<u32> {
+        let caller = (self.bundle.is_some() || self.locked_libraries).then(|| self.active_caller_package()).flatten();
         let m = self.new_module(&format!("#<environment {}>", self.modules.len()), None);
         self.modules[m as usize].isolated = true;
+        self.modules[m as usize].caller_package = caller;
+        let dir = if self.bundle.as_ref().is_some_and(|b| b.root_package().is_none()) { Path::new("/bundle") } else { Path::new("") };
         // This host/compiler fallback still nests if an environment loads
         // a library. Unlike top-level import, it has no forms loop to run
         // dependencies before returning the environment's module id.
-        // From no file: libraries are found from the working directory,
-        // and the environment is no package's (`Vm::import_dir`).
-        self.import(m, sets, Path::new(""))?;
+        self.import_for(m, None, sets, dir)?;
         Ok(m)
     }
 
-    fn import_set(&mut self, set: &Sexp, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
-        crate::nested(|| self.import_set_step(set, dir))
+    fn import_set(&mut self, set: &Sexp, caller: Option<&CallerPackage>, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
+        crate::nested(|| self.import_set_step(set, caller, dir))
     }
 
-    fn import_set_step(&mut self, set: &Sexp, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
+    fn import_set_step(&mut self, set: &Sexp, caller: Option<&CallerPackage>, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
         let items =
             set.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new(format!("import: bad import set {}", display_sexp(set))))?;
         let head = items[0].sym().map(|s| symbol_name(strip(s)));
         let inner = |vm: &mut Vm| -> R<Vec<(u32, GlobalBinding)>> {
             let set = items.get(1).ok_or_else(|| Error::new(format!("import: bad import set {}", display_sexp(set))))?;
-            vm.import_set(set, dir)
+            vm.import_set(set, caller, dir)
         };
         match head.as_deref() {
             Some("only") if items.len() >= 2 => {
@@ -411,7 +451,7 @@ impl Vm {
                         })
                         .collect()),
                     None => {
-                        let m = self.library(&parts, dir)?;
+                        let m = self.library(&parts, caller, dir)?;
                         self.exported(m, &module_name(&parts))
                     }
                 }
@@ -425,14 +465,14 @@ impl Vm {
         self.bindings.iter().filter(|((m, _), _)| *m == ROOT_MODULE).map(|(&(_, s), b)| (s, b.clone())).collect()
     }
 
-    /// Verify that code from `source_path` may define or claim library `parts`.
-    pub(crate) fn check_library_ownership(&self, parts: &[String], source_path: Option<&Path>, who: &str) -> R<()> {
+    /// Verify that code with loader-issued `provenance` may define or claim library `parts`.
+    pub(crate) fn check_library_ownership(&self, parts: &[String], provenance: &SourceProvenance, who: &str) -> R<()> {
         if parts.is_empty() {
             return err(format!("{who}: bad library name"));
         }
         let name = module_name(parts);
         if is_stdlib_library(parts) {
-            if source_path.is_some_and(is_under_lisp_dir) {
+            if matches!(provenance, SourceProvenance::Stdlib(_)) {
                 return Ok(());
             }
             return err(format!("{who}: {name} belongs to Techne's own libraries"));
@@ -441,15 +481,31 @@ impl Vm {
             if let Some([owner, pkg]) = parts.get(..2)
                 && bundle.has_package(owner, pkg)
             {
-                if !bundle.owns_library_source(owner, pkg, source_path) {
+                let owned = matches!(
+                    provenance,
+                    SourceProvenance::BundlePackage { prefix, path, .. }
+                        if prefix.matches(owner, pkg) && bundle.owns_library_source(owner, pkg, Some(path.as_path()))
+                );
+                if !owned {
                     return err(format!("{who}: {name} is owned by package ({owner} {pkg})"));
                 }
                 return Ok(());
             }
+            if bundle.root_package().is_none() {
+                if matches!(parts.first().map(String::as_str), Some("scheme" | "srfi")) {
+                    return err(format!("{who}: namespace ({} ...) is reserved", parts[0]));
+                }
+                if matches!(provenance, SourceProvenance::BundleRoot { .. }) {
+                    return Ok(());
+                }
+            }
             return err(format!("{who}: {name} is not provided in locked mode"));
         }
         if let Some(provider) = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1])) {
-            let owned = source_path.is_some_and(|p| p.starts_with(provider));
+            let owned = matches!(
+                provenance,
+                SourceProvenance::HostFile(p) | SourceProvenance::Stdlib(p) if p.starts_with(provider)
+            );
             if !owned {
                 return err(format!("{who}: {name} is owned by package ({} {})", parts[0], parts[1]));
             }
@@ -462,11 +518,12 @@ impl Vm {
     }
 
     /// The module of library `parts`, loading its `.sld` file if needed.
-    fn library(&mut self, parts: &[String], dir: &Path) -> R<u32> {
+    fn library(&mut self, parts: &[String], caller: Option<&CallerPackage>, dir: &Path) -> R<u32> {
         let name = module_name(parts);
-        self.check_declared(parts, dir)?;
+        self.check_declared(parts, caller, dir)?;
         if let Some(m) = self.loaded_library_parts(parts)? {
-            self.check_library_ownership(parts, self.modules[m as usize].path.as_deref(), "import")?;
+            let prov = self.modules[m as usize].provenance.clone();
+            self.check_library_ownership(parts, &prov, "import")?;
             return Ok(m);
         }
         let file = self.library_file(parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
@@ -475,7 +532,8 @@ impl Vm {
             let m = self
                 .loaded_library_parts(parts)?
                 .ok_or_else(|| Error::new(format!("import: {} does not define {name}", file.display())))?;
-            self.check_library_ownership(parts, self.modules[m as usize].path.as_deref(), "import")?;
+            let prov = self.modules[m as usize].provenance.clone();
+            self.check_library_ownership(parts, &prov, "import")?;
             Ok(m)
         });
         if result.is_err() {
@@ -488,13 +546,20 @@ impl Vm {
     /// are rejected on every import path. No importer may use it yet.
     fn new_library(&mut self, form: &[Sexp], owner: u32, file: u32) -> R<u32> {
         let parts = form.get(1).and_then(name_parts).ok_or_else(|| Error::new("define-library: bad library name"))?;
-        let source_path = self.source_file_path(file);
-        self.check_library_ownership(&parts, source_path.as_deref(), "define-library")?;
+        let provenance = self.source_provenance(file);
+        self.check_library_ownership(&parts, &provenance, "define-library")?;
         let name = module_name(&parts);
         if self.loaded_library_parts(&parts)?.is_some() {
             return err(format!("define-library: {name} is already defined"));
         }
+        let source_path = Vm::provenance_path(&provenance);
+        let caller = self
+            .caller_from_provenance(&provenance)
+            .or_else(|| self.modules.get(owner as usize).and_then(|m| m.caller_package.clone()))
+            .or_else(|| (self.bundle.is_some() || self.locked_libraries).then(|| self.active_caller_package()).flatten());
         let m = self.new_module(&name, source_path);
+        self.modules[m as usize].provenance = provenance;
+        self.modules[m as usize].caller_package = caller;
         self.modules[m as usize].library_parts = Some(parts.into_iter().map(Into::into).collect());
         self.modules[m as usize].exports = Some(Vec::new());
         self.recharge_module(m);
@@ -515,7 +580,7 @@ impl Vm {
             self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body)?;
             for (form, file) in imports {
                 let dir = self.import_dir(file);
-                self.import(m, &form.list().unwrap()[1..], &dir)?;
+                self.import_for(m, Some(file), &form.list().unwrap()[1..], &dir)?;
             }
             for (form, _) in &body {
                 predeclare(self, m, form);
@@ -549,13 +614,18 @@ impl Vm {
 
     /// The next not-yet-loaded library selected by import sets, looking
     /// through modifiers without applying their binding transformations.
-    pub(crate) fn next_imported(&mut self, sets: &[Sexp], dir: &Path) -> R<Option<Forms>> {
+    pub(crate) fn next_imported(&mut self, module: u32, file: Option<u32>, sets: &[Sexp], dir: &Path) -> R<Option<Forms>> {
+        let caller = self.resolve_caller_package(module, file);
+        self.next_imported_with_caller(caller.as_ref(), sets, dir)
+    }
+
+    fn next_imported_with_caller(&mut self, caller: Option<&CallerPackage>, sets: &[Sexp], dir: &Path) -> R<Option<Forms>> {
         for set in sets {
             let items =
                 set.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new(format!("import: bad import set {}", display_sexp(set))))?;
             if items[0].sym().is_some_and(|s| matches!(&*symbol_name(strip(s)), "only" | "except" | "prefix" | "rename")) {
                 let inner = items.get(1).ok_or_else(|| Error::new("import: missing import set"))?;
-                if let Some(forms) = crate::nested(|| self.next_imported(std::slice::from_ref(inner), dir))? {
+                if let Some(forms) = crate::nested(|| self.next_imported_with_caller(caller, std::slice::from_ref(inner), dir))? {
                     return Ok(Some(forms));
                 }
                 continue;
@@ -566,16 +636,17 @@ impl Vm {
             }
             let name = module_name(&parts);
             // Before it loads: one refused is not run either.
-            self.check_declared(&parts, dir)?;
+            self.check_declared(&parts, caller, dir)?;
             if let Some(m) = self.loaded_library_parts(&parts)? {
-                self.check_library_ownership(&parts, self.modules[m as usize].path.as_deref(), "import")?;
+                let prov = self.modules[m as usize].provenance.clone();
+                self.check_library_ownership(&parts, &prov, "import")?;
                 self.exported(m, &name)?;
                 continue;
             }
             self.check_loading()?;
             let path = self.library_file(&parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
             let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
-            match self.module_forms_from(&path, text) {
+            match self.load_module_forms(&path, text) {
                 Ok(Some(forms)) => return Ok(Some(forms)),
                 Ok(None) => {
                     self.abort_library_file(&path);
@@ -627,12 +698,13 @@ impl Vm {
                     }
                 }
                 "include-library-declarations" => {
-                    for (forms, file) in self.include(&items[1..], dir, false)? {
-                        self.library_declarations(m, &forms, file, dir, imports, body)?;
+                    for (forms, included_file) in self.include(&items[1..], dir, false)? {
+                        let child_dir = self.form_source_dir(included_file);
+                        self.library_declarations(m, &forms, included_file, &child_dir, imports, body)?;
                     }
                 }
                 "cond-expand" => {
-                    let chosen = self.cond_expand(&items[1..], dir)?;
+                    let chosen = self.cond_expand_for(m, Some(file), &items[1..], dir)?;
                     self.library_declarations(m, &chosen, file, dir, imports, body)?;
                 }
                 _ => return err(format!("define-library: unknown declaration {}", display_sexp(decl))),
@@ -692,7 +764,8 @@ impl Vm {
                     let meter = crate::vm::meter::Meter::new(self);
                     let forms = reader::read_metered(&text, fold_case, &meter)
                         .map_err(|e| meter.error(self).unwrap_or_else(|| Error::new(format!("{}: {}", path.display(), e.message))))?;
-                    let file = self.add_file(&path.to_string_lossy(), &text)?;
+                    let provenance = self.derive_provenance(&path);
+                    let file = self.add_file_with_provenance(&path.to_string_lossy(), &text, provenance)?;
                     Ok((forms, file))
                 })
                 .collect();
@@ -712,7 +785,8 @@ impl Vm {
                 let meter = crate::vm::meter::Meter::new(self);
                 let forms = reader::read_metered(&text, fold_case, &meter)
                     .map_err(|e| meter.error(self).unwrap_or_else(|| Error::new(format!("{}: {}", path.display(), e.message))))?;
-                let file = self.add_file(&path.to_string_lossy(), &text)?;
+                let provenance = self.derive_provenance(&path);
+                let file = self.add_file_with_provenance(&path.to_string_lossy(), &text, provenance)?;
                 Ok((forms, file))
             })
             .collect()
@@ -720,27 +794,32 @@ impl Vm {
 
     /// The body of the first `cond-expand` clause whose requirement holds.
     pub fn cond_expand(&mut self, clauses: &[Sexp], dir: &Path) -> R<Vec<Sexp>> {
+        self.cond_expand_for(self.current_module(), None, clauses, dir)
+    }
+
+    pub(crate) fn cond_expand_for(&mut self, module: u32, file: Option<u32>, clauses: &[Sexp], dir: &Path) -> R<Vec<Sexp>> {
+        let caller = self.resolve_caller_package(module, file);
         for clause in clauses {
             let items = clause.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new("cond-expand: bad clause"))?;
-            if items[0].is_sym("else") || self.requirement(&items[0], dir)? {
+            if items[0].is_sym("else") || self.requirement(&items[0], caller.as_ref(), dir)? {
                 return Ok(items[1..].to_vec());
             }
         }
         Ok(Vec::new())
     }
 
-    fn requirement(&mut self, req: &Sexp, dir: &Path) -> R<bool> {
-        crate::nested(|| self.requirement_step(req, dir))
+    fn requirement(&mut self, req: &Sexp, caller: Option<&CallerPackage>, dir: &Path) -> R<bool> {
+        crate::nested(|| self.requirement_step(req, caller, dir))
     }
 
-    fn requirement_step(&mut self, req: &Sexp, dir: &Path) -> R<bool> {
+    fn requirement_step(&mut self, req: &Sexp, caller: Option<&CallerPackage>, dir: &Path) -> R<bool> {
         if let Some(s) = req.sym() {
             return Ok(FEATURES.contains(&&*symbol_name(strip(s))));
         }
         let items = req.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new("cond-expand: bad requirement"))?;
         let all = |vm: &mut Vm, and: bool| -> R<bool> {
             for r in &items[1..] {
-                if vm.requirement(r, dir)? != and {
+                if vm.requirement(r, caller, dir)? != and {
                     return Ok(!and);
                 }
             }
@@ -749,7 +828,7 @@ impl Vm {
         match &*items[0].sym().map(|s| symbol_name(strip(s))).unwrap_or_else(|| "".into()) {
             "and" => all(self, true),
             "or" => all(self, false),
-            "not" if items.len() == 2 => Ok(!self.requirement(&items[1], dir)?),
+            "not" if items.len() == 2 => Ok(!self.requirement(&items[1], caller, dir)?),
             "library" if items.len() == 2 => {
                 let parts = name_parts(&items[1]).ok_or_else(|| Error::new("cond-expand: bad library name"))?;
                 // File discovery still establishes availability; a dead
@@ -758,12 +837,12 @@ impl Vm {
                 if builtin(&parts).is_some() {
                     return Ok(true);
                 }
-                if self.check_declared(&parts, dir).is_err() {
+                if self.check_declared(&parts, caller, dir).is_err() {
                     return Ok(false);
                 }
                 let loaded = self
                     .loaded_module_by_parts(&parts)
-                    .is_some_and(|m| self.check_library_ownership(&parts, self.modules[m as usize].path.as_deref(), "cond-expand").is_ok());
+                    .is_some_and(|m| self.check_library_ownership(&parts, &self.modules[m as usize].provenance, "cond-expand").is_ok());
                 Ok(loaded || self.library_file(&parts, dir).is_some())
             }
             _ => err(format!("cond-expand: bad requirement {}", display_sexp(req))),
@@ -868,38 +947,53 @@ impl Vm {
         Ok(())
     }
 
-    /// Refuse the import of library `parts` from a file in `dir` if that
-    /// file is a package's and the library another's it does not depend on
-    /// (`declare_imports`): what a package needs is what its manifest says.
-    /// In locked mode, any non-stdlib library without a registered provider
-    /// is also refused.
-    fn check_declared(&self, parts: &[String], dir: &Path) -> R<()> {
+    /// Refuse the import of library `parts` from `caller` if that caller is a
+    /// package that does not declare a dependency on the library's package
+    /// (`declare_imports` or `BundleVfs`). In locked/bundle mode, fail closed
+    /// for unattributed callers and unprovided non-stdlib libraries.
+    fn check_declared(&self, parts: &[String], caller: Option<&CallerPackage>, dir: &Path) -> R<()> {
         if is_stdlib_library(parts) {
             return Ok(());
         }
         if let Some(bundle) = &self.bundle {
+            if bundle.root_package().is_none() {
+                if matches!(caller, Some(CallerPackage::LegacyBundleRoot))
+                    && (bundle.root_library_virtual_path(parts, dir).is_some()
+                        || self
+                            .loaded_module_by_parts(parts)
+                            .is_some_and(|m| matches!(self.modules[m as usize].provenance, SourceProvenance::BundleRoot { .. })))
+                {
+                    return Ok(());
+                }
+                return err(format!("import: {}: library is not provided in locked mode", module_name(parts)));
+            }
             let Some([owner, pkg]) = parts.get(..2) else {
                 return err(format!("import: {}: library is not provided in locked mode", module_name(parts)));
             };
             if !bundle.has_package(owner, pkg) {
                 return err(format!("import: {}: library is not provided in locked mode", module_name(parts)));
             }
-            if let Some(importer) = bundle.package_for_dir(dir)
-                && !bundle.package_allows(importer, owner, pkg)
-            {
-                return err(format!(
-                    "import: {}: the package {importer} does not depend on ({owner} {pkg}) (its techne-package.scm says what it depends on)",
-                    module_name(parts),
-                ));
+            match caller {
+                Some(CallerPackage::Package(importer)) => {
+                    if !bundle.package_allows(importer, owner, pkg) {
+                        return err(format!(
+                            "import: {}: the package {importer} does not depend on ({owner} {pkg}) (its techne-package.scm says what it depends on)",
+                            module_name(parts),
+                        ));
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    return err(format!(
+                        "import: {}: unattributed caller cannot import ({owner} {pkg}) in bundle mode",
+                        module_name(parts)
+                    ));
+                }
             }
-            return Ok(());
         }
         let provider = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1]));
         if self.locked_libraries && provider.is_none() {
             return err(format!("import: {}: library is not provided in locked mode", module_name(parts)));
-        }
-        if dir.as_os_str().is_empty() {
-            return Ok(());
         }
         let Some([owner, pkg]) = parts.get(..2) else {
             return Ok(());
@@ -907,14 +1001,40 @@ impl Vm {
         if self.package_imports.is_empty() || provider.is_none() {
             return Ok(());
         }
-        let Ok(dir) = dir.canonicalize() else { return Ok(()) };
-        match self.package_imports.iter().filter(|p| dir.starts_with(&p.root)).max_by_key(|p| p.root.as_os_str().len()) {
-            Some(p) if !p.names.iter().any(|n| n.matches(owner, pkg)) => err(format!(
-                "import: {}: the package {} does not depend on ({owner} {pkg}) (its techne-package.scm says what it depends on)",
-                module_name(parts),
-                p.package
-            )),
-            _ => Ok(()),
+        let check_dir = |d: &Path| -> R<()> {
+            let Ok(d) = d.canonicalize() else { return Ok(()) };
+            match self.package_imports.iter().filter(|p| d.starts_with(&p.root)).max_by_key(|p| p.root.as_os_str().len()) {
+                Some(p) if !p.names.iter().any(|n| n.matches(owner, pkg)) => err(format!(
+                    "import: {}: the package {} does not depend on ({owner} {pkg}) (its techne-package.scm says what it depends on)",
+                    module_name(parts),
+                    p.package
+                )),
+                _ => Ok(()),
+            }
+        };
+        match caller {
+            Some(CallerPackage::Package(importer)) => match self.package_imports.iter().find(|p| p.package == *importer) {
+                Some(p) if !p.names.iter().any(|n| n.matches(owner, pkg)) => err(format!(
+                    "import: {}: the package {} does not depend on ({owner} {pkg}) (its techne-package.scm says what it depends on)",
+                    module_name(parts),
+                    p.package
+                )),
+                _ => Ok(()),
+            },
+            Some(CallerPackage::HostDir(d)) => check_dir(d),
+            Some(CallerPackage::Stdlib) => Ok(()),
+            None | Some(CallerPackage::LegacyBundleRoot) => {
+                if self.locked_libraries {
+                    return err(format!(
+                        "import: {}: unattributed caller cannot import ({owner} {pkg}) in locked mode",
+                        module_name(parts)
+                    ));
+                }
+                if dir.as_os_str().is_empty() {
+                    return Ok(());
+                }
+                check_dir(dir)
+            }
         }
     }
 
@@ -934,6 +1054,9 @@ impl Vm {
             return contained_library_file(lisp_dir(), parts);
         }
         if let Some(bundle) = &self.bundle {
+            if bundle.root_package().is_none() {
+                return bundle.root_library_virtual_path(parts, dir);
+            }
             return bundle.library_virtual_path(parts);
         }
         if let Some(provider) = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1])) {

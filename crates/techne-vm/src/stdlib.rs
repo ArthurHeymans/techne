@@ -848,6 +848,7 @@ fn now_micros(vm: &Vm, who: &str) -> Result<u64, Error> {
 
 fn file_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(vm, arg(vm, args, 0), "file->string")?;
+    vm.check_os_files("file->string")?;
     let text = vm.read_file_admitted(&path, 2)?;
     Ok(vm.make_string_raw(&text))
 }
@@ -1235,6 +1236,9 @@ pub fn install(vm: &mut Vm) {
         "(%package-manifest directory)" => |vm: &mut Vm, a, _| {
             let directory = string(vm, arg(vm, a, 0), "%package-manifest")?;
             vm.check_loading()?;
+            if vm.bundle().is_some() || vm.is_reading_denied() {
+                return Ok(Value::FALSE);
+            }
             let Some(dir) = std::path::Path::new(&directory).canonicalize().ok() else { return Ok(Value::FALSE) };
             let file = dir.join("techne-package.scm");
             if !file.is_file() || !vm.may_read(&file) {
@@ -1247,6 +1251,9 @@ pub fn install(vm: &mut Vm) {
         "(%loadable-path path)" => |vm: &mut Vm, a, _| {
             let path = string(vm, arg(vm, a, 0), "%loadable-path")?;
             vm.check_loading()?;
+            if vm.bundle().is_some() || vm.is_reading_denied() {
+                return Ok(Value::FALSE);
+            }
             match std::path::Path::new(&path).canonicalize().ok().filter(|p| vm.may_read(p)) {
                 Some(p) => Ok(vm.make_string_raw(&p.display().to_string())),
                 None => Ok(Value::FALSE),
@@ -1314,12 +1321,12 @@ pub fn install(vm: &mut Vm) {
                 }
             }
             let m = vm.current_module();
-            let source_path = vm.modules[m as usize].path.clone();
-            let under_lisp = source_path.as_deref().is_some_and(crate::library::is_under_lisp_dir);
+            let provenance = vm.current_eval_provenance();
+            let under_lisp = matches!(provenance, crate::vm::SourceProvenance::Stdlib(_));
             if parts.first().is_some_and(|s| matches!(s.as_str(), "scheme" | "srfi")) && !under_lisp {
                 return Err(Error::new(format!("%name-library: namespace ({} ...) is reserved", parts[0])));
             }
-            vm.check_library_ownership(&parts, source_path.as_deref(), "%name-library")?;
+            vm.check_library_ownership(&parts, &provenance, "%name-library")?;
             let name = crate::library::module_name(&parts);
             if vm.loaded_module_by_parts(&parts).is_some_and(|existing| existing != m) {
                 return Err(Error::new(format!("%name-library: {name} is already defined")));
@@ -1355,10 +1362,14 @@ pub fn install(vm: &mut Vm) {
             /// Delete the file at PATH.
             "(delete-file path)" => |vm: &mut Vm, a, _| {
                 let path = string(vm, arg(vm, a, 0), "delete-file")?;
+                vm.check_os_files("delete-file")?;
                 std::fs::remove_file(&path).map_err(|e| Error::new(format!("{path}: {e}")).with_kind(crate::vm::ErrorKind::File))?;
                 Ok(Value::VOID) };
             /// Return #t if a file exists at PATH.
-            "(file-exists? path)" => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
+            "(file-exists? path)" => |vm: &mut Vm, a, _| {
+                let path = string(vm, arg(vm, a, 0), "file-exists?")?;
+                vm.check_os_files("file-exists?")?;
+                Ok(Value::bool(std::path::Path::new(&path).exists())) };
         }
         #[cfg(unix)]
         files(vm);
@@ -1391,52 +1402,92 @@ fn files(vm: &mut Vm) {
     techne_vm::procedures! { vm;
         /// Return the entries of DIRECTORY, sorted.
         /// Subdirectories have a slash after their name.
-        "(directory-list directory)" => |dir: String| files::list(Path::new(&dir)).map_err(|e| format!("{dir}: {e}"));
+        #[vm]
+        "(directory-list directory)" => |vm: &mut Vm, dir: String| -> Result<Vec<String>, Error> {
+            vm.check_os_files("directory-list")?;
+            files::list(Path::new(&dir)).map_err(|e| Error::new(format!("{dir}: {e}")))
+        };
         /// Return what is at PATH, or #f if nothing is there.
         /// It is (kind size modified mode target): KIND `file`,
         /// `directory`, `symlink` or `other`, a symbolic link not
         /// followed; MODIFIED in seconds since the epoch; MODE the
         /// permission bits; TARGET a link's target, else #f.
-        "(file-attributes path)" => |path: String| files::attributes(Path::new(&path)).map_err(|e| format!("{path}: {e}"));
+        #[vm]
+        "(file-attributes path)" => |vm: &mut Vm, path: String| -> Result<Option<crate::data::Data>, Error> {
+            vm.check_os_files("file-attributes")?;
+            files::attributes(Path::new(&path)).map_err(|e| Error::new(format!("{path}: {e}")))
+        };
         /// Move the file or directory FROM to TO, which must not exist.
         /// Where the system cannot refuse to replace TO as it renames, it
         /// checks first, and what appears at TO in between is replaced.
-        "(rename-file from to)" => |from: String, to: String| files::rename(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
+        #[vm]
+        "(rename-file from to)" => |vm: &mut Vm, from: String, to: String| -> Result<(), Error> {
+            vm.check_os_files("rename-file")?;
+            files::rename(Path::new(&from), Path::new(&to)).map_err(|e| Error::new(format!("{from} to {to}: {e}")))
+        };
         /// Write TEXT to the file PATH in place of what is there, at once:
         /// whole to a new file beside it, readable by its user only, then
         /// renamed over it. A write that fails leaves the file as it was.
-        "(replace-file path text)" => |path: String, text: String| files::replace(Path::new(&path), &text).map_err(|e| format!("{path}: {e}"));
+        #[vm]
+        "(replace-file path text)" => |vm: &mut Vm, path: String, text: String| -> Result<(), Error> {
+            vm.check_os_files("replace-file")?;
+            files::replace(Path::new(&path), &text).map_err(|e| Error::new(format!("{path}: {e}")))
+        };
         /// Copy the file or directory FROM to TO, which must not exist.
         /// A directory is copied with all it holds, a symbolic link as
         /// a link.
-        "(copy-file from to)" => |from: String, to: String| files::copy(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
+        #[vm]
+        "(copy-file from to)" => |vm: &mut Vm, from: String, to: String| -> Result<(), Error> {
+            vm.check_os_files("copy-file")?;
+            files::copy(Path::new(&from), Path::new(&to)).map_err(|e| Error::new(format!("{from} to {to}: {e}")))
+        };
         /// Return PATH absolute, its symbolic links and . and .. resolved.
         /// A file that does not exist yet is named in its directory's
         /// true name.
-        "(file-truename path)" => |path: String| files::truename(Path::new(&path)).map(|p| p.display().to_string()).map_err(|e| format!("{path}: {e}"));
+        #[vm]
+        "(file-truename path)" => |vm: &mut Vm, path: String| -> Result<String, Error> {
+            vm.check_os_files("file-truename")?;
+            files::truename(Path::new(&path)).map(|p| p.display().to_string()).map_err(|e| Error::new(format!("{path}: {e}")))
+        };
         /// Make the directory PATH, and those above it that are missing.
         /// One already there is left as it is.
-        "(make-directory path)" => |path: String| std::fs::create_dir_all(&path).map_err(|e| format!("{path}: {e}"));
+        #[vm]
+        "(make-directory path)" => |vm: &mut Vm, path: String| -> Result<(), Error> {
+            vm.check_os_files("make-directory")?;
+            std::fs::create_dir_all(&path).map_err(|e| Error::new(format!("{path}: {e}")))
+        };
         /// Make the directory PATH, with permission bits MODE (less the
         /// process's umask), in a directory that is there: an error if
         /// anything is at PATH, so that a directory made is this call's.
-        "(create-directory path mode)" => |path: String, mode: usize| -> Result<(), String> {
-            let mode = u32::try_from(mode).ok().filter(|m| *m <= 0o7777).ok_or_else(|| format!("create-directory: {mode} is not a mode"))?;
-            files::create_directory(Path::new(&path), mode).map_err(|e| format!("{path}: {e}"))
+        #[vm]
+        "(create-directory path mode)" => |vm: &mut Vm, path: String, mode: usize| -> Result<(), Error> {
+            vm.check_os_files("create-directory")?;
+            let mode = u32::try_from(mode).ok().filter(|m| *m <= 0o7777).ok_or_else(|| Error::new(format!("create-directory: {mode} is not a mode")))?;
+            files::create_directory(Path::new(&path), mode).map_err(|e| Error::new(format!("{path}: {e}")))
         };
         /// Set the permission bits of the file or directory PATH to MODE.
-        "(set-file-mode! path mode)" => |path: String, mode: usize| -> Result<(), String> {
+        #[vm]
+        "(set-file-mode! path mode)" => |vm: &mut Vm, path: String, mode: usize| -> Result<(), Error> {
             use std::os::unix::fs::PermissionsExt;
-            let mode = u32::try_from(mode).map_err(|_| format!("set-file-mode!: {mode} is not a mode"))?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(|e| format!("{path}: {e}"))
+            vm.check_os_files("set-file-mode!")?;
+            let mode = u32::try_from(mode).map_err(|_| Error::new(format!("set-file-mode!: {mode} is not a mode")))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(|e| Error::new(format!("{path}: {e}")))
         };
         /// Delete the file or directory at PATH.
         /// A directory must be empty unless RECURSIVE; a symbolic link
         /// is deleted, not what it points to.
-        "(delete-path path recursive)" => |path: String, recursive: bool| files::delete(Path::new(&path), recursive).map_err(|e| format!("{path}: {e}"));
+        #[vm]
+        "(delete-path path recursive)" => |vm: &mut Vm, path: String, recursive: bool| -> Result<(), Error> {
+            vm.check_os_files("delete-path")?;
+            files::delete(Path::new(&path), recursive).map_err(|e| Error::new(format!("{path}: {e}")))
+        };
         /// Return the first BYTES bytes of the file at PATH, as text.
         /// What is not UTF-8 is replaced; a character cut at the end is
         /// left out.
-        "(file-head path bytes)" => |path: String, bytes: usize| files::head(Path::new(&path), bytes).map_err(|e| format!("{path}: {e}"));
+        #[vm]
+        "(file-head path bytes)" => |vm: &mut Vm, path: String, bytes: usize| -> Result<String, Error> {
+            vm.check_os_files("file-head")?;
+            files::head(Path::new(&path), bytes).map_err(|e| Error::new(format!("{path}: {e}")))
+        };
     }
 }
