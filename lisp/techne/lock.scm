@@ -1110,29 +1110,58 @@ list of `(cons tree-sha256 store-dir)`."
 
 (define (materialize-lockfile! directory #:store [store (package-store-dir)])
   "Materialize missing STORE entries from DIRECTORY's `techne.lock`.
-Fetches each missing Git entry at its exact pinned commit, verifies its
-`tree-sha256` matches the lockfile, checks freshness against
+Walks the dependency graph top-down from `techne-package.scm` and root
+overrides, authorizing every edge (including rejecting any non-root
+`(local ...)` source) before fetching its pinned Git commit into STORE.
+Verifies each `tree-sha256` matches the lockfile, checks freshness against
 `techne-package.scm`, and never modifies `techne.lock`."
   (let* ((root-manifest (read-package-manifest directory))
+         (root-name (manifest-name root-manifest))
          (root-dir (manifest-directory root-manifest))
+         (overrides (manifest-overrides root-manifest))
          (lock-path (path-join root-dir lockfile-name))
-         (lf (read-lockfile lock-path)))
-    (preflight-lockfile! root-manifest lf)
+         (lf (read-lockfile lock-path))
+         (locked-map (preflight-lockfile! root-manifest lf)))
     (make-directory store)
     (let ((tmp-root (path-join store (string-append ".hydrate-" (hex-encode (random-bytes 12))))))
       (create-directory tmp-root #o700)
       (dynamic-wind
         (lambda () #f)
         (lambda ()
-          (let ((get-checkout (make-checkout-cache tmp-root)))
-            (for-each
-              (lambda (p)
-                (unless (eq? 'path (car (locked-package-source p)))
-                  (let-values (((_pkg-dir staged-dir _checkout-dir)
-                                (hydrate-pinned-git-package! tmp-root get-checkout store p)))
-                    (when staged-dir
-                      (publish-staged-tree! staged-dir (locked-package-tree-sha256 p) store)))))
-              (lockfile-packages lf))))
+          (let ((get-checkout (make-checkout-cache tmp-root))
+                (hydrated (make-hash-table equal?)))
+            (define (hydrate-edges! parent-locked parent-dir dep-sources visiting allow-local?)
+              (for-each
+                (lambda (dep)
+                  (let* ((dep-name (car dep))
+                         (override-hit (assoc dep-name overrides))
+                         (eff-src (if override-hit (cdr override-hit) (cdr dep)))
+                         (eff-parent-locked (if override-hit #f parent-locked))
+                         (eff-parent-dir (if override-hit root-dir parent-dir))
+                         (local-ok? (or allow-local? (and override-hit #t)))
+                         (chain (reverse (cons dep-name visiting))))
+                    (when (member dep-name visiting)
+                      (error (string-append "Dependency cycle detected: " (format-chain chain))))
+                    (when (and (eq? 'local (car eff-src)) (not local-ok?))
+                      (error (string-append "Non-root manifest cannot use (local ...) source for "
+                                            (format-pkg-name dep-name) " (" (format-chain chain) ")")))
+                    (let ((locked-pkg (hash-table-ref/default locked-map dep-name #f)))
+                      (unless locked-pkg
+                        (error (string-append "techne.lock is stale: missing dependency " (format-pkg-name dep-name))))
+                      (check-edge-source! dep-name eff-src eff-parent-locked eff-parent-dir root-dir locked-pkg)
+                      (unless (hash-table-ref/default hydrated dep-name #f)
+                        (unless (eq? 'path (car (locked-package-source locked-pkg)))
+                          (let-values (((_pkg-dir staged-dir _checkout-dir)
+                                        (hydrate-pinned-git-package! tmp-root get-checkout store locked-pkg)))
+                            (when staged-dir
+                              (publish-staged-tree! staged-dir (locked-package-tree-sha256 locked-pkg) store))))
+                        (let ((dep-manifest (verify-package-entry locked-pkg root-dir store)))
+                          (hash-table-set! hydrated dep-name dep-manifest)
+                          (hydrate-edges! locked-pkg (manifest-directory dep-manifest)
+                                          (manifest-dependency-sources dep-manifest)
+                                          (cons dep-name visiting) #f))))))
+                dep-sources))
+            (hydrate-edges! #f root-dir (manifest-dependency-sources root-manifest) (list root-name) #t)))
         (lambda ()
           (when (file-exists? tmp-root)
             (delete-path tmp-root #t)))))
