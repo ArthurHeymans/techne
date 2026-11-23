@@ -1,4 +1,11 @@
-# Editor packages
+# Packages
+
+Techne packages are self-contained directories with a pure-data manifest
+(`techne-package.scm`) and canonical two-symbol identity `(owner pkg)`. They
+serve editor extensions, `(cloud ...)` deployments, and plain R7RS libraries
+alike.
+
+## Installing packages in the editor
 
 In an editor Scheme session:
 
@@ -10,57 +17,94 @@ In an editor Scheme session:
 `github` is data, not a procedure. Sources are `(github "owner/repo")`,
 `(git "https://…")`, or `(local "/absolute/path/to/git/repository")`. Append
 `(branch "name")`, `(tag "name")`, or `(commit "full-object-id")` to select a
-revision. The default is the repository's HEAD. Package identities are canonical
+revision (default: the repository's `HEAD`). Package identities are canonical
 two-symbol names `(owner pkg)`, such as `(techne mail)` or `(alice rust-mode)`.
 To give a source a catalog name,
 `(register-package-recipe! '(recipe (alice rust-mode) (github "alice/techne-rust")))`
 then `(package-install! '(alice rust-mode))`. The name must match the manifest.
 
-A repository may hold several packages, each in a directory of its own (below).
-Of such a one, say which to install with `(package (owner pkg))` after the place:
+A repository may hold several packages, each in a directory of its own.
+Select one with `(package (owner pkg))` after the place:
 `(github "alice/techne-tools" (tag "v0.3") (package (alice rust-mode)))`. A catalog
-name says so too, and a repository holding one package needs neither. The
-packages it depends on must be beside it in the same repository: they come
-with the checkout, at the commit pinned, and are made known with it, their
-commands not advertised. The packages installed from one source (the same
-place and revision) share one checkout, so two of them depending on a
-third find the same one. From two revisions of a repository they do not:
-a package is in one directory in an editor, and the second is refused.
+name selects it too, and a repository holding one package needs neither.
+Transitive dependencies — whether `(path "...")` siblings inside the same
+repository or cross-repository Git dependencies — are resolved together under
+the one-version-per-world rule (below).
 
-Installation fetches a private checkout and records the exact commit under
-`$XDG_DATA_HOME/techne/packages` (normally `~/.local/share/techne/packages`).
-The same declaration reuses its pin offline. In a fresh editor call
-`(package-restore!)` to register the installed packages, or repeat just the
-install declarations you want. Both take `#:directory` to select another store.
-An installed declaration reserves its package identity, commands and option names,
-including while cold. Setting an existing option is not redeclaring it. Installation
-rejects collisions before publishing the checkout; restore preflights the store.
-If a publisher crashes leaving `.publishing` in the store, remove the empty directory
-only after confirming that no install is in progress.
-The store is managed data, not a working tree to edit. There is no central
-catalog, dependency solver or automatic update of moving branches in this version.
+Installation fetches and stages each package cleanly (excluding `.git`, `.jj`,
+and hidden dot-prefixed entries, and rejecting symlinks), computes its
+canonical `tree-sha256`, and atomically publishes it into the content-addressed
+store under `$XDG_DATA_HOME/techne/packages/store/<tree-sha256>/` (normally
+`~/.local/share/techne/packages/store/<tree-sha256>/`, overridable via
+`$TECHNE_PACKAGE_STORE` or `#:directory`). Installed roots and the resolved
+dependency graph are recorded in `installed.scm` and `world.lock` beside
+`store/`.
 
-In the package's directory, the root of a repository holding one package,
-put **one datum**, `techne-package.scm`:
+- Repeating the same `package-install!` declaration reuses `world.lock` and the
+  content-addressed store offline without running Git.
+- Pass `#:upgrade #t` to re-fetch a moving branch or tag: the new checkout is
+  published under its new `<tree-sha256>` without clobbering or mutating earlier
+  store entries, while still checking diamond-dependency compatibility with
+  other installed packages.
+- In a fresh editor, call `(package-restore!)` to verify every locked entry's
+  `tree-sha256` against `store/<tree-sha256>/` strictly offline, register
+  library providers, and advertise editor declarations.
+- Packages without an `(editor ...)` clause — pure library packages and
+  `(cloud ...)` packages — install, lock, verify, and restore cleanly without
+  requiring commands or options.
+
+An installed editor declaration reserves its package identity, commands and
+option names, including while cold. Setting an existing option is not
+redeclaring it. Installation rejects collisions before publishing; restore
+preflights the store and verifies every `tree-sha256`. If a publisher crashes
+leaving `.publishing` in the packages directory, remove the empty directory
+only after confirming that no install is in progress. The store is managed
+immutable data, not a working tree to edit.
+
+## `techne-package.scm`
+
+In the package's directory, put **one datum**, `techne-package.scm`:
 
 ```scheme
 (package (alice rust-mode)
   (version "0.1.0")
   (techne "0.4")
   (description "Rust editing commands and project helpers.")
+  (depends
+    ((alice text-util) (path "../text-util"))
+    ((bob lsp-helpers) (github "bob/techne-lsp-helpers" (tag "v1.2")))
+    ((bob mono-fmt) (git "https://example.org/bob/mono.git"
+                         (commit "0123456789abcdef0123456789abcdef01234567")
+                         (package (bob mono-fmt)))))
+  (override
+    ((bob lsp-helpers) (path "../my-lsp-helpers-fork")))
   (editor "rust.scm"
     (commands (rust-check "Check the Rust project."))
     (options (rust-edition "2024" string "Edition used for new projects."))))
 ```
 
 All clauses are pure data and may appear at most once; unknown or duplicate
-clauses are refused. Neither installation nor completion evaluates this file:
+clauses are refused. Neither locking, installation, nor completion evaluates
+this file:
 
 - `(version "0.1.0")` — optional package version string.
 - `(techne "0.4")` — optional minimum Techne runtime version string.
 - `(description "...")` — optional human-readable description string.
-- `(depends ((owner pkg) (path "relative/dir")) ...)` — optional dependencies on
-  other package directories (below).
+- `(depends ((owner pkg) <source>) ...)` — optional direct dependencies. Each
+  `<source>` is one of:
+  - `(path "relative/dir")` — local directory relative to this manifest.
+  - `(github "owner/repo" [(tag "...") | (branch "...") | (commit "...")] [(package (owner pkg))])`
+  - `(git "https://..." [(tag "...") | (branch "...") | (commit "...")] [(package (owner pkg))])`
+  - `(local "/absolute/path/to/repo" [(tag "...") | (branch "...") | (commit "...")] [(package (owner pkg))])`
+  At most one ref selector (`tag`, `branch`, or `commit`) and one optional
+  `(package (owner pkg))` monorepo selector may appear. Duplicate dependency
+  names and self-dependencies are refused.
+- `(override ((owner pkg) <source>) ...)` — optional root-only overrides using
+  the same validated `<source>` forms. When resolving a root project, overrides
+  replace the source used for any direct or transitive dependency on
+  `(owner pkg)`, allowing a project to resolve diamond conflicts or test a fork
+  or local `(path "...")` checkout without editing intermediate packages.
+  Overrides declared inside non-root dependency manifests are ignored.
 - `(editor "rust.scm" (commands ...) [(options ...)])` — optional editor entry.
   `commands` advertises public command names and short descriptions. `options`
   declares early options as `(name default schema documentation)` and may be
@@ -74,12 +118,102 @@ clauses are refused. Neither installation nor completion evaluates this file:
   entry contained in the package directory. `bindings` declares binding names
   and kinds (`kv`, `secret`, `text`) as distinct symbols, never secret values.
 
+## Canonical `tree-sha256`
+
+Every materialized package tree is identified and integrity-checked by its
+canonical `tree-sha256` (64 lowercase hexadecimal characters), exported as
+`directory-tree-sha256` and `package-tree-sha256` in `(techne package)`:
+
+1. Walk the package directory recursively.
+2. Skip any file or directory whose path component begins with `.` (including
+   `.git`, `.jj`, `.secrets.scm`, `.DS_Store`, and hidden subdirectories).
+3. Reject symlinks and non-regular files (sockets, FIFOs, devices) with an
+   error so hashed trees are self-contained and reproducible.
+4. Collect all remaining regular files with relative POSIX paths (`/`
+   separators, no leading `./`) and sort them in ascending UTF-8 code-point
+   order (`string<?`).
+5. Hash the concatenation of one record per regular file with SHA-256:
+
+   ```
+   "F " <relpath-utf8> "\0" <decimal-byte-length> "\0" <raw-file-bytes> "\n"
+   ```
+
+An empty directory hashes the empty byte stream (`e3b0c442…`).
+
+## `techne.lock` & One-Version Resolution
+
+`techne.lock` is a pure-data S-expression written beside `techne-package.scm`
+and read by `(techne lock)` without evaluation:
+
+```scheme
+(lock
+  (techne "0.4")
+  (package (alice text-util) "0.1.0"
+    (source (path "../text-util"))
+    (tree-sha256 "4f9e...64-hex...")
+    (depends))
+  (package (bob lsp-helpers) "1.2.0"
+    (source (github "bob/techne-lsp-helpers"
+              (commit "0123456789abcdef0123456789abcdef01234567")))
+    (tree-sha256 "9a1c...64-hex...")
+    (depends))
+  (package (bob mono-fmt) "0.3.0"
+    (source (git "https://example.org/bob/mono.git"
+              (commit "0123456789abcdef0123456789abcdef01234567")
+              (subdir "packages/mono-fmt")))
+    (tree-sha256 "7b2d...64-hex...")
+    (depends (bob lsp-helpers))))
+```
+
+- Package entries and their `(depends ...)` lists are sorted deterministically
+  by canonical `(owner pkg)` name for minimal diffs.
+- Every Git source (`github`, `git`, `local`) is pinned to its full resolved
+  `(commit "<sha>")` and optional `(subdir "...")` for monorepo packages.
+- **One version per `(owner pkg)` per world:** Each canonical `(owner pkg)`
+  may appear at most once in a resolved world.
+  - If two dependency paths resolve the same `(owner pkg)` to the same commit
+    and `tree-sha256` (or the same canonical local path), they deduplicate into
+    one entry.
+  - If they resolve to different commits, paths, or `tree-sha256` hashes,
+    resolution fails loudly with a diagnostic naming **both** full dependency
+    chains (for example `(root app) -> (alice a) -> (bob util)` vs
+    `(root app) -> (alice b) -> (bob util)`). Add a root `(override ...)` in
+    `techne-package.scm` to pick one version explicitly.
+- Dependency cycles are rejected with the full cycle chain.
+
+## CLI & LSP
+
+- **`techne lock [DIR] [--check] [--store DIR]`**
+  - Resolves `techne-package.scm` in `DIR` (default `.`), fetches and
+    materializes Git dependencies into the content-addressed store
+    (`$TECHNE_PACKAGE_STORE` or `$XDG_DATA_HOME/techne/packages/store`, or
+    `--store DIR`), checks for diamond conflicts and cycles, and writes
+    `techne.lock` beside `techne-package.scm`.
+  - With `--check`, verifies strictly offline (without running Git or modifying
+    `techne.lock`) that `techne.lock` exists, matches `techne-package.scm` and
+    root overrides, and every locked package's `tree-sha256` matches its
+    directory on disk or in the store.
+- **`techne run [--locked] [--package DIR] [--store DIR] FILE [ARGS]`**
+  - Without `--locked`, locates the nearest `techne-package.scm` above `FILE`
+    (or `--package DIR`) and registers local `(path ...)` packages via
+    `(use-package-directory!)`.
+  - With `--locked`, requires a valid, up-to-date `techne.lock`, verifies every
+    locked package's `tree-sha256` strictly offline against the content-addressed
+    store and local paths (never invoking Git or touching the network), wires
+    every `(owner pkg)` library provider and direct import boundary into the
+    VM, and runs `FILE`.
+- **`techne lsp`**
+  - Resolves a package's own `(owner pkg ...)` libraries from `lib/` and its
+    direct `(depends ...)` via root `(override ...)`, `techne.lock` + the
+    content-addressed store, or `(path ...)`, reading manifests and lockfiles
+    strictly as pure data while preserving direct-dependency boundaries.
+
 ## Package directories
 
-A package is a directory with that manifest, for the editor, cloud, or plain
-libraries; `(techne package)` reads one and needs no editor
-(`lisp/techne/package.sld`). A repository can hold several, side by side, as
-`packages/` does here; a package's directory holds no other package.
+A package is a directory with `techne-package.scm`, for the editor, cloud, or
+plain libraries; `(techne package)` and `(techne lock)` need no editor. A
+repository can hold several packages side by side, as `packages/` does here; a
+package's directory holds no other package.
 
 ```
 mail/
@@ -100,23 +234,14 @@ mail/
   reserved and cannot be claimed by packages. First-party packages may use
   `techne` as their owner (such as `(techne mail)`): each package owns only its
   2-part prefix `(techne pkg ...)`, so it coexists beside Techne's stdlib
-  libraries (`(techne http)`, `(techne path)`, `(techne package)`, ...), while
-  colliding with a stdlib library or another registered `(owner pkg)` package
-  is refused.
-- **Dependencies.** `(depends ((techne mail) (path "../mail")))` names the
-  packages whose libraries this one imports, each by its `(owner pkg)` identity
-  and directory relative to this one, which must hold a package of that exact
-  `(owner pkg)` name. A package's files import its own libraries and those of
-  the packages it depends on itself: an import of another package's, one a
-  dependency depends on included, is refused, saying what the manifest lacks.
-  Libraries no package provides (Techne's own stdlib) and files in no package
-  are not concerned. Cross-repository git dependencies and lockfiles are not
-  part of this version.
-- **Without the editor.** `techne run FILE` looks for the nearest manifest
-  above FILE and uses that package and what it depends on first, so a
-  package's programs and tests import its libraries and its dependencies'.
-  `(use-package-directory! DIRECTORY)` does the same from Scheme. No code is
-  loaded until something imports it.
+  libraries (`(techne http)`, `(techne path)`, `(techne package)`,
+  `(techne lock)`, ...), while colliding with a stdlib library or another
+  registered `(owner pkg)` package is refused.
+- **Direct dependency boundaries.** A package's files may import its own
+  libraries and those of the packages listed in its own `(depends ...)`:
+  importing another package's library — including a transitive dependency of a
+  dependency — is refused. Libraries no package provides (Techne's own stdlib)
+  and files in no package are not concerned.
 - **In the editor.** The options of the manifest's `editor` clause are
   declared and its commands offered, without loading the entry
   (`advertise-package!`). Installed packages and the built-in mail
@@ -128,10 +253,10 @@ mail/
 
 For a built-in without a directory of its own, `register-command-package!`
 registers the same command offers from a local path. Ibuffer, Compile and
-Markdown preview use this mechanism. Keep
-options and global bindings available early; package-private modes and hooks
-needed only after opening a view can live with its implementation. An agent,
-check-only or staged invocation cannot activate an unloaded package. A user's
-normal invocation activates before argument acquisition/validation, and then
-uses the real contract and operation. `unload-package` unloads the running
-implementation, not the installed declarations or checkout.
+Markdown preview use this mechanism. Keep options and global bindings available
+early; package-private modes and hooks needed only after opening a view can
+live with its implementation. An agent, check-only or staged invocation cannot
+activate an unloaded package. A user's normal invocation activates before
+argument acquisition/validation, and then uses the real contract and operation.
+`unload-package` unloads the running implementation, not the installed
+declarations or store entries.

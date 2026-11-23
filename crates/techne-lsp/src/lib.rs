@@ -30,18 +30,103 @@ fn package_id(form: &Syntax) -> Option<(String, String)> {
     Some((ident(&items[0])?.0, ident(&items[1])?.0))
 }
 
+/// The content-addressed package store directory, matching `(package-store-dir)`
+/// in `(techne lock)`: `$TECHNE_PACKAGE_STORE`, else `$XDG_DATA_HOME/techne/packages/store`,
+/// else `$HOME/.local/share/techne/packages/store`.
+fn package_store_dir() -> Option<PathBuf> {
+    if let Some(env) = std::env::var_os("TECHNE_PACKAGE_STORE") {
+        let p = PathBuf::from(env);
+        if p.is_absolute() {
+            return Some(p);
+        }
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        let p = PathBuf::from(xdg);
+        if p.is_absolute() {
+            return Some(p.join("techne/packages/store"));
+        }
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/techne/packages/store"))
+}
+
+/// Find the materialized directory of `(owner pkg)` from `root/techne.lock`,
+/// reading the lockfile as pure data without evaluating anything.
+fn locked_package_dir(root: &Path, owner: &str, pkg: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join("techne.lock")).ok()?;
+    let forms = techne_vm::reader::read_syntax(&text).ok()?;
+    let lock = list(forms.first()?)?;
+    if head(lock).as_deref() != Some("lock") {
+        return None;
+    }
+    for clause in lock.iter().skip(1).filter_map(list) {
+        if head(clause).as_deref() != Some("package") {
+            continue;
+        }
+        if !clause.get(1).and_then(package_id).is_some_and(|(o, p)| o == owner && p == pkg) {
+            continue;
+        }
+        let mut source_path: Option<String> = None;
+        let mut is_git_source = false;
+        let mut tree_hash: Option<String> = None;
+        for field in clause.iter().skip(3).filter_map(list) {
+            match head(field).as_deref() {
+                Some("source") => {
+                    if let Some(src) = field.get(1).and_then(list) {
+                        match head(src).as_deref() {
+                            Some("path") => source_path = src.get(1).and_then(string_lit),
+                            Some("github" | "git" | "local") => is_git_source = true,
+                            _ => {}
+                        }
+                    }
+                }
+                Some("tree-sha256") => {
+                    tree_hash = field.get(1).and_then(string_lit);
+                }
+                _ => {}
+            }
+        }
+        if let Some(rel) = source_path {
+            return Some(root.join(rel));
+        }
+        if is_git_source {
+            let hash = tree_hash?;
+            if hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return package_store_dir().map(|store| store.join(hash));
+            }
+        }
+    }
+    None
+}
+
+/// Find an entry for `(owner pkg)` inside a `(depends ...)` or `(override ...)` clause.
+fn manifest_clause_source<'a>(manifest: &'a [Syntax], clause_name: &str, owner: &str, pkg: &str) -> Option<&'a [Syntax]> {
+    manifest
+        .iter()
+        .skip(2)
+        .filter_map(list)
+        .filter(|clause| head(clause).as_deref() == Some(clause_name))
+        .flat_map(|clause| clause.iter().skip(1))
+        .filter_map(|entry| {
+            let entry = list(entry)?;
+            let matches = package_id(entry.first()?).is_some_and(|(o, p)| o == owner && p == pkg);
+            matches.then(|| list(entry.get(1)?)).flatten()
+        })
+        .next()
+}
+
 /// Where a file in `dir` finds library `parts` if a package provides it,
 /// as the runtime does once the file's package is used (`(techne
-/// package)`): the package the file is in, by the nearest manifest above,
-/// `techne-package.scm`, for the libraries of its own `(owner pkg)`, under
-/// its `lib`; or a package that manifest depends on, `(depends ((owner pkg)
-/// (path "directory")) ...)`, for those of that `(owner pkg)`, under its
-/// `lib`. Some: the library is such a package's, found there or, None
+/// package)` / `(techne lock)`): the package the file is in, by the nearest
+/// manifest above, `techne-package.scm`, for the libraries of its own
+/// `(owner pkg)`, under its `lib`; or a package that manifest depends on,
+/// resolved via root `(override ...)`, `techne.lock` + content-addressed
+/// store, or `(path "directory")`, for those of that `(owner pkg)`, under
+/// its `lib`. Some: the library is such a package's, found there or, None
 /// inside, missing: it is looked for nowhere else, whatever the library
 /// path holds. None: no package the file may import from provides it. The
-/// manifest is read as data; a file of another name under a `lib` is no
-/// library of that package's, and the packages a dependency depends on are
-/// not a file's to import.
+/// manifest and lockfile are read as data; a file of another name under a
+/// `lib` is no library of that package's, and the packages a dependency
+/// depends on are not a file's to import.
 fn package_library(parts: &[String], dir: &Path) -> Option<Option<PathBuf>> {
     let [owner, pkg, ..] = parts else { return None };
     let root = dir.ancestors().find(|d| d.join("techne-package.scm").is_file())?;
@@ -56,18 +141,25 @@ fn package_library(parts: &[String], dir: &Path) -> Option<Option<PathBuf>> {
     if package_id(manifest.get(1)?).is_some_and(|(o, p)| o == *owner && p == *pkg) {
         return Some(under(root.to_path_buf()));
     }
-    let depends = manifest.iter().skip(2).filter_map(list).filter(|clause| head(clause).as_deref() == Some("depends"));
-    depends
-        .flat_map(|clause| clause.iter().skip(1))
-        .filter_map(|dependency| {
-            let dependency = list(dependency)?;
-            let place = list(dependency.get(1)?)?;
-            let named =
-                package_id(dependency.first()?).is_some_and(|(o, p)| o == *owner && p == *pkg) && head(place).as_deref() == Some("path");
-            named.then(|| string_lit(place.get(1)?)).flatten()
-        })
-        .next()
-        .map(|directory| under(root.join(directory)))
+    let dep_source = manifest_clause_source(manifest, "depends", owner, pkg)?;
+    // Root `(override ...)` with a local `(path ...)` takes precedence even before re-locking.
+    if let Some(ov) = manifest_clause_source(manifest, "override", owner, pkg)
+        && head(ov).as_deref() == Some("path")
+        && let Some(rel) = ov.get(1).and_then(string_lit)
+    {
+        return Some(under(root.join(rel)));
+    }
+    // Locked dependency (Git in content-addressed store, or locked path).
+    if let Some(locked_dir) = locked_package_dir(root, owner, pkg) {
+        return Some(under(locked_dir));
+    }
+    // Unlocked fallback for local `(path ...)` dependencies.
+    if head(dep_source).as_deref() == Some("path")
+        && let Some(rel) = dep_source.get(1).and_then(string_lit)
+    {
+        return Some(under(root.join(rel)));
+    }
+    Some(None)
 }
 
 /// Byte offset to an LSP position (UTF-16 columns).

@@ -42,7 +42,7 @@ fn documentation_problems() {
         .unwrap();
     vm.eval_source(&format!("(load-package 'vc-runtime {:?})", root.join("lisp/editor/packages/vc/runtime.scm").display().to_string()))
         .unwrap();
-    vm.eval_source("(import (techne tools) (techne source) (techne path) (techne time) (techne format))").unwrap();
+    vm.eval_source("(import (techne tools) (techne source) (techne path) (techne time) (techne format) (techne package) (techne lock) (techne packages))").unwrap();
     let problems: Vec<String> = vm
         .eval_source(
             "(map (lambda (p) (string-append (repr (problem-module p)) \" \" (symbol->string (problem-subject p))

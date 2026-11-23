@@ -20,7 +20,8 @@ usage: techne [SUBCOMMAND] [ARGS...]
   eval [ARGS] FORM         evaluate FORM in the editor running
   daemon                   the editor with no frontend, for frontends to attach
   attach --stdio [--start] relay to the editor running here (what ssh runs)
-  run FILE [ARGS]          run a Scheme file
+  run [ARGS] FILE [ARGS]   run a Scheme file (--locked, --package DIR, --store DIR)
+  lock [DIR] [--check]     resolve or verify techne.lock for a package directory
   repl                     a Lisp REPL in this terminal
   tool ROOT [FORM [SESSION]] bounded tools for callers; tool --help to begin
   node [ARGS]              serve the node protocol, or nREPL with --nrepl PORT
@@ -28,8 +29,36 @@ usage: techne [SUBCOMMAND] [ARGS...]
   cloud dev FILE           serve a deployment locally, deploying on save
   help                     this text
 
-`techne window --help`, `techne term --help`, `techne eval --help` and
-`techne node --help` describe their arguments.";
+`techne window --help`, `techne term --help`, `techne eval --help`,
+`techne run --help`, `techne lock --help` and `techne node --help` describe
+their arguments.";
+
+const RUN_USAGE: &str = "\
+usage: techne run [--locked] [--package DIR] [--store DIR] FILE [ARGS...]
+
+Run the Scheme FILE with ARGS as its (command-line).
+
+  --locked        resolve all package dependencies strictly offline from
+                  techne.lock and the content-addressed tree-sha256 store,
+                  verifying every package's tree-sha256 before running
+  --package DIR   use DIR as the root package directory instead of searching
+                  ancestors of FILE
+  --store DIR     override the content-addressed store directory (otherwise
+                  $TECHNE_PACKAGE_STORE or $XDG_DATA_HOME/techne/packages/store)";
+
+const LOCK_USAGE: &str = "\
+usage: techne lock [DIR] [--check] [--store DIR]
+
+Resolve techne-package.scm in DIR (default .), materialize Git dependencies
+into the content-addressed tree-sha256 store, reject diamond conflicts and
+cycles, and write techne.lock beside techne-package.scm.
+
+  --check       verify strictly offline that techne.lock exists, matches
+                techne-package.scm and root overrides, and every locked
+                package's tree-sha256 matches its directory, without modifying
+                techne.lock
+  --store DIR   override the content-addressed store directory (otherwise
+                $TECHNE_PACKAGE_STORE or $XDG_DATA_HOME/techne/packages/store)";
 
 const EVAL_USAGE: &str = "\
 usage: techne eval [--detached] [--module MODULE] [--as NAME] [--timeout SECONDS] FORM
@@ -65,10 +94,8 @@ fn main() -> ExitCode {
         "eval" => eval(rest()),
         "daemon" => daemon(rest()),
         "attach" => attach(rest()),
-        "run" => match rest() {
-            file if file.is_empty() => usage(),
-            file => techne_vm::cli::main_with(file, install),
-        },
+        "run" => run_cmd(args.split_off(1)),
+        "lock" => lock_cmd(args.split_off(1)),
         "repl" => match rest() {
             none if none.is_empty() => techne_vm::cli::main_with(none, install),
             _ => usage(),
@@ -86,6 +113,127 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => editor(args),
+    }
+}
+
+fn absolutize(path: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
+    if path.is_absolute() { Ok(path.to_path_buf()) } else { Ok(std::env::current_dir()?.join(path)) }
+}
+
+/// `techne run [--locked] [--package DIR] [--store DIR] FILE [ARGS...]`
+fn run_cmd(args: Vec<String>) -> ExitCode {
+    let bad = || {
+        eprintln!("{RUN_USAGE}");
+        ExitCode::from(2)
+    };
+    let mut options = techne_vm::cli::RunOptions::default();
+    let mut it = args.into_iter();
+    let mut script_args: Vec<String> = Vec::new();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--locked" => options.locked = true,
+            "--package" => {
+                let Some(dir) = it.next().filter(|v| !v.is_empty()) else { return bad() };
+                options.package_dir = Some(std::path::PathBuf::from(dir));
+            }
+            "--store" => {
+                let Some(dir) = it.next().filter(|v| !v.is_empty()) else { return bad() };
+                options.store_dir = Some(std::path::PathBuf::from(dir));
+            }
+            "-h" | "--help" => {
+                println!("{RUN_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--" => {
+                script_args.extend(it);
+                break;
+            }
+            s if s.starts_with('-') => return bad(),
+            _ => {
+                script_args.push(arg);
+                script_args.extend(it);
+                break;
+            }
+        }
+    }
+    if script_args.is_empty() {
+        return bad();
+    }
+    techne_vm::cli::run_with(script_args, options, install)
+}
+
+/// `techne lock [DIR] [--check] [--store DIR]`
+fn lock_cmd(args: Vec<String>) -> ExitCode {
+    let bad = || {
+        eprintln!("{LOCK_USAGE}");
+        ExitCode::from(2)
+    };
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut check = false;
+    let mut store: Option<std::path::PathBuf> = None;
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--check" => check = true,
+            "--store" => {
+                let Some(path) = it.next().filter(|v| !v.is_empty()) else { return bad() };
+                store = Some(std::path::PathBuf::from(path));
+            }
+            "-h" | "--help" => {
+                println!("{LOCK_USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            s if s.starts_with('-') => return bad(),
+            _ if dir.is_none() => dir = Some(std::path::PathBuf::from(arg)),
+            _ => return bad(),
+        }
+    }
+    let raw_dir = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
+    let root = match raw_dir.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("techne lock: {}: {e}", raw_dir.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let abs_store = match store {
+        Some(s) => match absolutize(&s) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("techne lock: store {}: {e}", s.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let mut vm = techne_vm::vm::Vm::new();
+    if let Err(e) = install(&mut vm) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    let lock_sld = techne_vm::library::lisp_dir().join("techne/lock.sld");
+    if let Err(e) = vm.find_module(&lock_sld.to_string_lossy()) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    let proc_name = if check { "check-lockfile" } else { "lock-project!" };
+    let call = match abs_store {
+        Some(store_path) => format!(
+            "((eval '{proc_name} (environment '(techne lock))) {:?} #:store {:?})",
+            root.display().to_string(),
+            store_path.display().to_string()
+        ),
+        None => format!("((eval '{proc_name} (environment '(techne lock))) {:?})", root.display().to_string()),
+    };
+    let res = vm.eval_source(&call);
+    vm.flush();
+    std::mem::forget(vm);
+    match res {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

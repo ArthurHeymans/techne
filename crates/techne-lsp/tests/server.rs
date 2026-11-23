@@ -265,3 +265,103 @@ fn missing_unreadable_and_invalid_catalogs_fail_clearly() {
     failed("cannot read runtime catalog");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_package_resolves_locked_git_dependencies_and_overrides() {
+    let root = std::env::temp_dir().join(format!("techne-lsp-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = root.join("store");
+    let app = root.join("app");
+    let hash_dep = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hash_trans = "2222222222222222222222222222222222222222222222222222222222222222";
+    let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    // Materialized store entry for direct Git dependency (acme dep).
+    let dep_dir = store.join(hash_dep);
+    std::fs::create_dir_all(dep_dir.join("lib/acme/dep")).unwrap();
+    std::fs::write(dep_dir.join("techne-package.scm"), "(package (acme dep) (version \"0.1.0\"))").unwrap();
+    std::fs::write(
+        dep_dir.join("lib/acme/dep/api.sld"),
+        "(define-library (acme dep api) (export dep-fn) (import (scheme base)) (begin (define (dep-fn x) (+ x 1))))",
+    )
+    .unwrap();
+
+    // Materialized store entry for transitive dep (acme trans) — NOT in app's depends.
+    let trans_dir = store.join(hash_trans);
+    std::fs::create_dir_all(trans_dir.join("lib/acme/trans")).unwrap();
+    std::fs::write(trans_dir.join("techne-package.scm"), "(package (acme trans) (version \"0.1.0\"))").unwrap();
+    std::fs::write(
+        trans_dir.join("lib/acme/trans/secret.sld"),
+        "(define-library (acme trans secret) (export secret-fn) (import (scheme base)) (begin (define (secret-fn) 9)))",
+    )
+    .unwrap();
+
+    // Local override checkout for (acme ov).
+    let ov_dir = root.join("local-ov");
+    std::fs::create_dir_all(ov_dir.join("lib/acme/ov")).unwrap();
+    std::fs::write(ov_dir.join("techne-package.scm"), "(package (acme ov) (version \"0.1.0\"))").unwrap();
+    std::fs::write(
+        ov_dir.join("lib/acme/ov/core.sld"),
+        "(define-library (acme ov core) (export ov-fn) (import (scheme base)) (begin (define (ov-fn) 7)))",
+    )
+    .unwrap();
+
+    // Root package declaring Git deps + local path override + techne.lock.
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("techne-package.scm"),
+        "(package (acme app)
+           (version \"0.1.0\")
+           (depends
+             ((acme dep) (github \"acme/dep\" (tag \"v1\")))
+             ((acme ov) (github \"acme/ov\" (tag \"v1\"))))
+           (override
+             ((acme ov) (path \"../local-ov\"))))",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("techne.lock"),
+        format!(
+            "(lock
+               (techne \"0.4\")
+               (package (acme dep) \"0.1.0\"
+                 (source (github \"acme/dep\" (commit \"{commit}\")))
+                 (tree-sha256 \"{hash_dep}\")
+                 (depends (acme trans)))
+               (package (acme ov) \"0.1.0\"
+                 (source (path \"../local-ov\"))
+                 (tree-sha256 \"{hash_dep}\")
+                 (depends))
+               (package (acme trans) \"0.1.0\"
+                 (source (github \"acme/trans\" (commit \"{commit}\")))
+                 (tree-sha256 \"{hash_trans}\")
+                 (depends)))"
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_techne-lsp"))
+        .env("TECHNE_PACKAGE_STORE", &store)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    send(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    recv(&mut out);
+    send(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+    let main = app.join("main.scm");
+    let text = "(import (scheme base) (acme dep api) (acme ov core) (acme trans secret))\n(list (dep-fn 1) (ov-fn))";
+    let open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file://{}","languageId":"scheme","version":1,"text":{:?}}}}}}}"#,
+        main.display(),
+        text
+    );
+    send(&mut stdin, &open);
+    let messages = published(&mut out);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(messages, ["cannot find library (acme trans secret)"], "expected only undeclared transitive dep missing");
+}

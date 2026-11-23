@@ -18,9 +18,25 @@ pub fn main(args: Vec<String>) -> ExitCode {
     main_with(args, |_| Ok(()))
 }
 
+/// Options controlling how [`run_with`] resolves a script's package world.
+#[derive(Default, Clone, Debug)]
+pub struct RunOptions {
+    /// Require and verify `techne.lock` strictly offline before running.
+    pub locked: bool,
+    /// Explicit package root directory instead of searching above the script.
+    pub package_dir: Option<PathBuf>,
+    /// Override the content-addressed package store directory.
+    pub store_dir: Option<PathBuf>,
+}
+
 /// [`main`], in a world SETUP has added to: the other crates' natives,
 /// for a command that has them.
 pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>) -> ExitCode {
+    run_with(args, RunOptions::default(), setup)
+}
+
+/// [`main_with`] with explicit package resolution [`RunOptions`].
+pub fn run_with(args: Vec<String>, options: RunOptions, setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>) -> ExitCode {
     let mut vm = Vm::new();
     if let Err(e) = setup(&mut vm) {
         eprintln!("{e}");
@@ -30,7 +46,16 @@ pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), cr
     let stopped = signals(vm.interrupt_handle(), file.is_some());
     crate::stdlib::set_command_line(args);
     let result = match file {
-        Some(path) => use_package_of(&mut vm, Path::new(&path)).and_then(|()| vm.eval_file(Path::new(&path)).map(|_| ())),
+        Some(path) => {
+            let prepare = if options.locked {
+                use_locked_package_of(&mut vm, Path::new(&path), options.package_dir.as_deref(), options.store_dir.as_deref())
+            } else if let Some(pkg_dir) = options.package_dir.as_deref() {
+                use_package_dir(&mut vm, pkg_dir)
+            } else {
+                use_package_of(&mut vm, Path::new(&path))
+            };
+            prepare.and_then(|()| vm.eval_file(Path::new(&path)).map(|_| ()))
+        }
         None => {
             crate::repl::run(&mut vm);
             Ok(())
@@ -76,6 +101,14 @@ pub fn package_root(path: &Path) -> Option<PathBuf> {
     file.ancestors().skip(1).find(|dir| dir.join("techne-package.scm").is_file()).map(Path::to_path_buf)
 }
 
+/// Make the package in DIR known to VM via `(techne package)`.
+pub fn use_package_dir(vm: &mut Vm, dir: &Path) -> Result<(), crate::vm::Error> {
+    let root = dir.canonicalize().map_err(|e| crate::vm::Error::new(format!("package directory {}: {e}", dir.display())))?;
+    vm.find_module(&crate::library::lisp_dir().join("techne/package.sld").to_string_lossy())?;
+    vm.eval_source(&format!("((eval 'use-package-directory! (environment '(techne package))) {:?})", root.display().to_string()))
+        .map(|_| ())
+}
+
 /// Make the package the file at PATH is in known to VM, with those it
 /// depends on, as `(techne package)` reads its manifest: the file then
 /// imports their libraries. A file in no package changes nothing, and
@@ -87,9 +120,46 @@ pub fn package_root(path: &Path) -> Option<PathBuf> {
 /// `techne/package.sld` there says before the program asked for anything.
 pub fn use_package_of(vm: &mut Vm, path: &Path) -> Result<(), crate::vm::Error> {
     let Some(root) = package_root(path) else { return Ok(()) };
-    vm.find_module(&crate::library::lisp_dir().join("techne/package.sld").to_string_lossy())?;
-    vm.eval_source(&format!("((eval 'use-package-directory! (environment '(techne package))) {:?})", root.display().to_string()))
-        .map(|_| ())
+    use_package_dir(vm, &root)
+}
+
+/// Verify `techne.lock` strictly offline and wire all locked packages into VM.
+///
+/// Loads `(techne lock)` directly from Techne's own Lisp directory (never CWD),
+/// checks `techne.lock` against `techne-package.scm` and every locked package's
+/// `tree-sha256` without running Git or touching the network, and registers
+/// every package's library provider and direct import boundary.
+pub fn use_locked_package_of(
+    vm: &mut Vm,
+    path: &Path,
+    package_dir: Option<&Path>,
+    store_dir: Option<&Path>,
+) -> Result<(), crate::vm::Error> {
+    let root = match package_dir {
+        Some(dir) => dir.canonicalize().map_err(|e| crate::vm::Error::new(format!("package directory {}: {e}", dir.display())))?,
+        None => package_root(path)
+            .ok_or_else(|| crate::vm::Error::new(format!("techne run --locked: no techne-package.scm found for {}", path.display())))?,
+    };
+    if !root.join("techne-package.scm").is_file() {
+        return Err(crate::vm::Error::new(format!("techne run --locked: no techne-package.scm in {}", root.display())));
+    }
+    vm.find_module(&crate::library::lisp_dir().join("techne/lock.sld").to_string_lossy())?;
+    let call = match store_dir {
+        Some(store) => {
+            let abs_store = if store.is_absolute() {
+                store.to_path_buf()
+            } else {
+                std::env::current_dir().map_err(|e| crate::vm::Error::new(format!("current directory: {e}")))?.join(store)
+            };
+            format!(
+                "((eval 'use-locked-package! (environment '(techne lock))) {:?} #:store {:?})",
+                root.display().to_string(),
+                abs_store.display().to_string()
+            )
+        }
+        None => format!("((eval 'use-locked-package! (environment '(techne lock))) {:?})", root.display().to_string()),
+    };
+    vm.eval_source(&call).map(|_| ())
 }
 
 /// Watch the signals that ask this to stop, for the VM HANDLE interrupts.
