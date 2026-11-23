@@ -633,3 +633,181 @@ fn bodies_stream_through_the_worker() {
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(body, sent);
 }
+
+fn git_init_commit(dir: &std::path::Path, msg: &str) {
+    let run = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(dir).env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    if !dir.join(".git").exists() {
+        run(&["init", "--quiet"]);
+    }
+    run(&["add", "."]);
+    run(&["-c", "user.name=Test", "-c", "user.email=test@example.org", "-c", "commit.gpgSign=false", "commit", "-qm", msg]);
+}
+
+fn write_pkg_file(root: &std::path::Path, rel: &str, content: &str) {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+const PACKAGED_APP: &str = r#"(import (techne http) (acme util))
+(provide fetch)
+(define (label) "LABEL")
+(define (fetch request env ctx)
+  (let ((path (dict-ref request 'path))
+        (notes (dict-ref env 'notes #f)))
+    (cond ((equal? path "/put") (kv-put! notes "k" (format-greeting (label) (dict-ref env 'greeting))) (response "kept"))
+          ((equal? path "/get") (response (kv-get notes "k" "nothing")))
+          ((equal? path "/secret") (response (dict-ref env 'key)))
+          (else (response (format-greeting (label) (dict-ref env 'greeting)))))))
+"#;
+
+/// A packaged cloud app (directory with `techne-package.scm` + `techne.lock`)
+/// serves under `techne cloud dev` with locked dependencies, binding contract
+/// enforcement, KV storage inside the package directory, nREPL evaluation in
+/// the virtual entry module, hot-redeploy on save, and `--ops` rollback.
+#[test]
+fn packaged_cloud_dev_with_locked_deps_nrepl_and_ops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store");
+    let dep_repo = tmp.path().join("dep-util");
+    let app_dir = tmp.path().join("app");
+
+    // Dependency package also declares its own `(cloud ...)` clause — must be ignored.
+    write_pkg_file(
+        &dep_repo,
+        "techne-package.scm",
+        r#"(package (acme util)
+             (version "0.1.0")
+             (cloud "ignored.scm" (bindings (unused secret))))"#,
+    );
+    write_pkg_file(
+        &dep_repo,
+        "lib/acme/util.sld",
+        r#"(define-library (acme util)
+             (export format-greeting)
+             (import (scheme base))
+             (begin
+               (define (format-greeting label msg)
+                 (string-append label ":" msg))))"#,
+    );
+    write_pkg_file(&dep_repo, "ignored.scm", "(define (unused) #f)");
+    git_init_commit(&dep_repo, "init dep");
+
+    write_pkg_file(
+        &app_dir,
+        "techne-package.scm",
+        &format!(
+            r#"(package (demo app)
+                 (version "0.1.0")
+                 (depends
+                   ((acme util) (local {:?})))
+                 (cloud "app.scm"
+                   (bindings
+                     (notes kv)
+                     (key secret)
+                     (greeting text))))"#,
+            dep_repo.display().to_string()
+        ),
+    );
+    write_pkg_file(&app_dir, "app.scm", &PACKAGED_APP.replace("LABEL", "v1"));
+    write_pkg_file(&app_dir, "manifest.scm", r#"{bindings {notes (kv "notes") key (secret "KEY") greeting (text "hello")}}"#);
+    write_pkg_file(&app_dir, ".secrets.scm", r#"{"KEY" "dev-secret"}"#);
+
+    // Lock and hydrate into the temporary store.
+    let lock_out = Command::new(env!("CARGO_BIN_EXE_techne"))
+        .args(["lock", app_dir.to_str().unwrap()])
+        .env("TECHNE_PACKAGE_STORE", &store)
+        .output()
+        .unwrap();
+    assert!(
+        lock_out.status.success(),
+        "techne lock failed: {}{}",
+        String::from_utf8_lossy(&lock_out.stdout),
+        String::from_utf8_lossy(&lock_out.stderr)
+    );
+
+    let mut child = Killed(
+        Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["cloud", "dev", app_dir.to_str().unwrap(), "--port", "0", "--nrepl", "0", "--ops", "0"])
+            .env("TECHNE_PACKAGE_STORE", &store)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let out = lines(child.0.stdout.take().unwrap());
+    let err = lines(child.0.stderr.take().unwrap());
+    let (mut port, mut nrepl, mut ops) = (None, None, false);
+    while port.is_none() || nrepl.is_none() || !ops {
+        let line = out.recv_timeout(PATIENCE).expect("the ports");
+        if line.starts_with("Serving") {
+            port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+        } else if line.starts_with("nREPL server started on port") {
+            nrepl = line.split_whitespace().nth(5).and_then(|p| p.parse::<u16>().ok());
+        } else if line.starts_with("Operations on") {
+            ops = true;
+        }
+    }
+    let (port, nrepl) = (port.unwrap(), nrepl.unwrap());
+    assert_eq!(std::fs::read_to_string(app_dir.join(".nrepl-port")).unwrap(), nrepl.to_string());
+    assert_eq!(get(port, "/"), "v1:hello");
+    assert_eq!(get(port, "/secret"), "dev-secret");
+    assert_eq!(get(port, "/put"), "kept");
+    assert_eq!(get(port, "/get"), "v1:hello");
+    assert!(app_dir.join(".techne/kv/notes.kv").is_file());
+
+    // nREPL evaluates inside the virtual entry module (`/pkg/demo/app/app.scm`).
+    let mut c = TcpStream::connect(("127.0.0.1", nrepl)).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    nrepl_eval(&mut c, r#"(define (label) "repl")"#);
+    assert_eq!(get(port, "/"), "repl:hello");
+
+    // Save v2 -> hot-redeployed.
+    write_pkg_file(&app_dir, "app.scm", &PACKAGED_APP.replace("LABEL", "v2"));
+    until(port, "/", "v2:hello");
+    line_with(&err, "techne cloud: deployed", PATIENCE);
+
+    // Ops subcommands accept the package directory directly.
+    let (ok, listed) = cloud(&["deployments"], &app_dir, None);
+    assert!(ok, "{listed}");
+    let (ids, current) = deployments(&listed);
+    assert_eq!(ids.len(), 2, "{listed}");
+    assert_eq!(ids[0], current);
+
+    let (ok, rolled) = cloud(&["rollback"], &app_dir, None);
+    assert!(ok && rolled.contains(&ids[1]), "{rolled}");
+    assert_eq!(get(port, "/"), "v1:hello");
+}
+
+/// A packaged cloud app whose `manifest.scm` violates the root package's
+/// `(cloud ... (bindings ...))` contract is refused before serving.
+#[test]
+fn packaged_cloud_dev_rejects_binding_contract_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app_dir = tmp.path().join("bad-app");
+    write_pkg_file(
+        &app_dir,
+        "techne-package.scm",
+        r#"(package (demo bad)
+             (version "0.1.0")
+             (cloud "app.scm" (bindings (key secret))))"#,
+    );
+    write_pkg_file(&app_dir, "app.scm", &APP.replace("VERSION", "1"));
+    write_pkg_file(&app_dir, "manifest.scm", r#"{bindings {key (text "wrong-kind")}}"#);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_techne")).args(["cloud", "dev", app_dir.to_str().unwrap(), "--port", "0"]).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("key") && err.contains("secret") && err.contains("text"), "{err}");
+}

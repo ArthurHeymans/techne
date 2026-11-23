@@ -99,34 +99,35 @@ use techne_vm::{
     vm::{Error, ROOT_MODULE, Vm},
 };
 
-const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--ops PORT] [--nrepl PORT [--debug] [--auth]]
-       techne cloud deployments FILE
-       techne cloud deploy FILE
-       techne cloud rollback FILE [ID]
+const USAGE: &str = "usage: techne cloud dev TARGET [--port PORT] [--ops PORT] [--nrepl PORT [--debug] [--auth]]
+       techne cloud deployments TARGET
+       techne cloud deploy TARGET
+       techne cloud rollback TARGET [ID]
        techne cloud serve --state DIR --domain DOMAIN [--port PORT] [--ops PORT] [--nrepl PORT] [--live N] [--idle SECONDS] [--unconfined]
        techne cloud invite --state DIR TENANT
-       techne cloud deploy FILE --to URL --tenant TENANT --project PROJECT
+       techne cloud deploy TARGET --to URL --tenant TENANT --project PROJECT
        techne cloud deployments|rollback [ID]|secret NAME --to URL --tenant TENANT --project PROJECT
 
-Serve the deployment whose entry module is FILE on 127.0.0.1:PORT (8787
-by default; 0 picks one), deploying again whenever a Lisp file under
-FILE's directory changes. With --nrepl, serve it from a world kept across
-requests, with an nREPL server into it on that port. With --debug too,
-serve it as in production, and put the nREPL server in a debug instance
-beside, which serves the requests carrying the header techne-debug-route
-with the credential printed. With --auth, an nREPL client must
-authenticate first, with a token such as the one printed. With --ops,
-serve the operations on its deployments on that port, which the other
-commands ask of it: the deployments published, deploying again, and
-going back to the one before or to ID.
+Serve the deployment at TARGET (a package directory with techne-package.scm,
+or an entry module file) on 127.0.0.1:PORT (8787 by default; 0 picks one),
+deploying again whenever a Lisp file or techne.lock under its directory
+changes. With --nrepl, serve it from a world kept across requests, with an
+nREPL server into it on that port. With --debug too, serve it as in
+production, and put the nREPL server in a debug instance beside, which serves
+the requests carrying the header techne-debug-route with the credential
+printed. With --auth, an nREPL client must authenticate first, with a token
+such as the one printed. With --ops, serve the operations on its deployments
+on that port, which the other commands ask of it: the deployments published,
+deploying again, and going back to the one before or to ID.
 
 serve runs a cloud of tenants, kept in DIR: each project invited tenants
 deploy is served at PROJECT.TENANT.DOMAIN on PORT, by a worker for each
-tenant, stopped when idle. invite gives a tenant a token for its
-projects. With --to, the address of a serve's operations, the commands
-ask it, with the token in TECHNE_TOKEN: deploy uploads FILE's directory,
-secret reads the value of NAME from standard input. URL is on this
-machine: no TLS is spoken, and no token sent in the clear to another.";
+tenant, stopped when idle. invite gives a tenant a token for its projects.
+With --to, the address of a serve's operations, the commands ask it, with
+the token in TECHNE_TOKEN: deploy uploads TARGET (caching immutable package
+trees by tree-sha256 for packaged apps), secret reads the value of NAME from
+standard input. URL is on this machine: no TLS is spoken, and no token sent
+in the clear to another.";
 
 /// How long a deployment may take, loading and all.
 const DEPLOYING: Duration = Duration::from_secs(90);
@@ -369,6 +370,7 @@ fn base64(bytes: &[u8]) -> String {
 /// TLS: URL is on this machine, or it is refused, the token not sent in
 /// the clear to another (reach one through a tunnel).
 fn operate_remote(op: &str, args: &[String]) -> Result<String, String> {
+    use techne_host::package::{CloudTarget, prepare_packaged_bundle, resolve_cloud_target, validate_manifest_contract};
     let mut args = args.to_vec();
     let need = |args: &mut Vec<String>, name: &str| flag(args, name).ok_or(String::new());
     let (to, tenant, project) = (need(&mut args, "--to")?, need(&mut args, "--tenant")?, need(&mut args, "--project")?);
@@ -377,7 +379,12 @@ fn operate_remote(op: &str, args: &[String]) -> Result<String, String> {
     if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
         return Err(format!("--to {to} is not on this machine, and this speaks no TLS: the token is not sent there (use a tunnel to it)"));
     }
+    let named = |name: &str| !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !(named(&tenant) && named(&project)) {
+        return Err("not a tenant's or a project's name".into());
+    }
     let token = std::env::var("TECHNE_TOKEN").map_err(|_| "no token: set TECHNE_TOKEN")?;
+    let target_header = format!("{tenant}/{project}");
     let mut fields = vec![("tenant", json_string(&tenant)), ("project", json_string(&project))];
     match (op, &args[..]) {
         ("deployments", []) | ("rollback", []) => fields.push(("op", json_string(op))),
@@ -388,24 +395,94 @@ fn operate_remote(op: &str, args: &[String]) -> Result<String, String> {
             let value = value.strip_suffix('\n').unwrap_or(&value);
             fields.extend([("op", json_string("secret-put")), ("name", json_string(name)), ("value", json_string(value))])
         }
-        ("deploy", [file]) => {
-            let entry = Path::new(file).canonicalize().map_err(|e| format!("{file}: {e}"))?;
-            let dir = entry.parent().ok_or("an entry in no directory")?;
-            let name = entry.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            let files: Vec<String> = techne_host::supervisor::bundle(dir)?
-                .iter()
-                .map(|(p, b)| format!("{}:{}", json_string(p), json_string(&base64(b))))
-                .collect();
-            fields.extend([("op", json_string(op)), ("entry", json_string(&name)), ("files", format!("{{{}}}", files.join(",")))]);
-        }
+        ("deploy", [file]) => match resolve_cloud_target(Path::new(file))? {
+            CloudTarget::Legacy { entry } => {
+                let dir = entry.parent().ok_or("an entry in no directory")?;
+                let name = entry.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let files: Vec<String> = techne_host::supervisor::bundle(dir)?
+                    .iter()
+                    .map(|(p, b)| format!("{}:{}", json_string(p), json_string(&base64(b))))
+                    .collect();
+                fields.extend([("op", json_string(op)), ("entry", json_string(&name)), ("files", format!("{{{}}}", files.join(",")))]);
+            }
+            CloudTarget::Package { root_dir, explicit_entry } => {
+                let app = prepare_packaged_bundle(&root_dir, explicit_entry.as_deref(), None)?;
+                // Fail fast on manifest.scm contract mismatches before uploading
+                // (without requiring server-side .secrets.scm to exist locally).
+                validate_manifest_contract(&app.root_dir, &app.declared_bindings)?;
+
+                // Query which package tree-sha256s the server already caches.
+                let mut unique_trees: Vec<&str> = app.packages.iter().map(|p| p.tree_sha256.as_str()).collect();
+                unique_trees.sort();
+                unique_trees.dedup();
+                let trees_json: Vec<String> = unique_trees.iter().map(|sha| json_string(sha)).collect();
+                let check_body = format!(
+                    r#"{{"op":"has-trees","tenant":{},"project":{},"trees":[{}]}}"#,
+                    json_string(&tenant),
+                    json_string(&project),
+                    trees_json.join(",")
+                );
+                let have_reply = post(&addr, &token, Some(&target_header), &check_body)?;
+                let have = parse_have_trees(&have_reply)?;
+
+                let mut pkgs_json = Vec::with_capacity(app.packages.len());
+                for pkg in &app.packages {
+                    let deps: Vec<String> = pkg.depends.iter().map(|(o, p)| format!("[{},{}]", json_string(o), json_string(p))).collect();
+                    let mut pkg_fields = vec![
+                        format!("\"owner\":{}", json_string(&pkg.owner)),
+                        format!("\"pkg\":{}", json_string(&pkg.pkg)),
+                        format!("\"tree_sha256\":{}", json_string(&pkg.tree_sha256)),
+                        format!("\"depends\":[{}]", deps.join(",")),
+                    ];
+                    if !have.contains(&pkg.tree_sha256) {
+                        let files: Vec<String> =
+                            pkg.files.iter().map(|(p, b)| format!("{}:{}", json_string(p), json_string(&base64(b)))).collect();
+                        pkg_fields.push(format!("\"files\":{{{}}}", files.join(",")));
+                    }
+                    pkgs_json.push(format!("{{{}}}", pkg_fields.join(",")));
+                }
+                let package_json = format!(
+                    "{{\"root\":[{},{}],\"packages\":[{}]}}",
+                    json_string(&app.root_package.0),
+                    json_string(&app.root_package.1),
+                    pkgs_json.join(",")
+                );
+                fields.extend([("op", json_string(op)), ("entry", json_string(&app.entry)), ("package", package_json)]);
+            }
+        },
         _ => return Err(String::new()),
     }
     let body: Vec<String> = fields.iter().map(|(k, v)| format!("{}:{v}", json_string(k))).collect();
-    let named = |name: &str| !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if !(named(&tenant) && named(&project)) {
-        return Err("not a tenant's or a project's name".into());
-    }
-    post(&addr, &token, Some(&format!("{tenant}/{project}")), &format!("{{{}}}", body.join(",")))
+    post(&addr, &token, Some(&target_header), &format!("{{{}}}", body.join(",")))
+}
+
+/// Parse the `"have"` tree-sha256 array from a `has-trees` reply.
+fn parse_have_trees(reply: &str) -> Result<std::collections::HashSet<String>, String> {
+    let mut vm = Vm::new();
+    vm.set_memory_limit(16 << 20);
+    vm.set_locked_libraries(true);
+    let parser = vm
+        .eval_source(
+            r#"(lambda (text)
+                 (let ((arr (string->json text)))
+                   (if (and (vector? arr) (>= (vector-length arr) 1) (dict? (vector-ref arr 0)))
+                       (let ((have (dict-ref (vector-ref arr 0) "have" (vector))))
+                         (if (vector? have) (vector->list have) '()))
+                       '())))"#,
+        )
+        .map_err(|e| e.msg.clone())?;
+    let arg = vm.from_data(&Data::String(reply.into())).map_err(|e| e.msg.clone())?;
+    let res = vm.call(&parser, &[arg]).map_err(|e| e.msg.clone())?;
+    let Data::List(items) = vm.to_data(&res, 1 << 20).map_err(|e| e.msg.clone())? else {
+        return Ok(std::collections::HashSet::new());
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|d| match d {
+            Data::String(s) => Some(s),
+            _ => None,
+        })
+        .collect())
 }
 
 /// POST `body`, an operation, to the operations at `addr`, with `token`,
@@ -443,12 +520,13 @@ fn post(addr: &str, token: &str, project: Option<&str>, body: &str) -> Result<St
     }
 }
 
-/// Ask the `techne cloud dev --ops` serving `file` for operation `op`
-/// (on deployment `id`, if given), with the token in `TECHNE_TOKEN` or
-/// the one it keeps: its answer, JSON, or why there is none.
+/// Ask the `techne cloud dev --ops` serving `file` (a legacy entry file or
+/// package directory) for operation `op` (on deployment `id`, if given), with
+/// the token in `TECHNE_TOKEN` or the one it keeps: its answer, JSON, or why
+/// there is none.
 fn operate(op: &str, file: &Path, id: Option<&str>) -> Result<String, String> {
-    let entry = file.canonicalize().map_err(|e| format!("{}: {e}", file.display()))?;
-    let kept = entry.parent().unwrap_or(Path::new("/")).join(".techne");
+    let target = techne_host::package::resolve_cloud_target(file)?;
+    let kept = target.dir().join(".techne");
     let read = |name: &str| std::fs::read_to_string(kept.join(name)).map(|s| s.trim().to_string());
     let port: u16 =
         read("ops-port").ok().and_then(|p| p.parse().ok()).ok_or("no techne cloud dev --ops serves it (no .techne/ops-port)")?;
@@ -507,8 +585,9 @@ fn parse(args: &[String]) -> Option<Options> {
 /// Serve with a worker, as the module says.
 fn dev_serve(options: &Options) -> Result<(), Error> {
     use techne_host::supervisor::{Options as WorkerOptions, ResourceConfinement, Sandboxing, Supervisor};
-    let entry = options.file.canonicalize().map_err(|e| Error::new(format!("{}: {e}", options.file.display())))?;
-    let dir = entry.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let target = techne_host::package::resolve_cloud_target(&options.file).map_err(Error::new)?;
+    let target_path = target.target_path().to_path_buf();
+    let dir = target.dir().to_path_buf();
     // The files as they were loaded: a save from now on deploys again.
     let seen = lisp_files(&dir);
     let program = std::env::current_exe().map_err(|e| Error::new(e.to_string()))?;
@@ -540,7 +619,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
                (define control (make-control {NAME:?} {:?} {:?}))
                (spawn (lambda () (control-serve control)))"#,
             cloud.join("control.scm").display().to_string(),
-            entry.display().to_string(),
+            target_path.display().to_string(),
             dir.join(".techne").display().to_string(),
         ))?;
         let deploy = || Data::List(vec![Data::String("deploy".into())]);
@@ -592,13 +671,13 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
             let _ = std::fs::write(dir.join(".nrepl-port"), bound.port().to_string());
             println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
         }
-        serve_front(&mut front, port, &entry, options.debug)?;
+        serve_front(&mut front, port, &dir, &target_path, options.debug)?;
         tokio::task::spawn_local(watch_files(dir, seen, move || {
-            let (control, entry) = (control.clone(), entry.clone());
+            let (control, target_path) = (control.clone(), target_path.clone());
             async move {
-                eprintln!("techne cloud: loading {}", entry.display());
+                eprintln!("techne cloud: loading {}", target_path.display());
                 match control.ask(deploy(), DEPLOYING).await {
-                    Ok(_) => eprintln!("techne cloud: deployed {}", entry.display()),
+                    Ok(_) => eprintln!("techne cloud: deployed {}", target_path.display()),
                     Err(e) => eprintln!("techne cloud: not deployed, the last deployment keeps serving: {e}"),
                 }
             }
@@ -811,9 +890,9 @@ async fn serve_debug_sessions(
 /// deployment's debug instance (`lisp/http/debug-route.scm`). A task
 /// keeps the deployment's KV namespaces under `.techne/kv` beside its
 /// entry (`lisp/cloud/kv.scm`).
-fn serve_front(front: &mut Vm, port: u16, entry: &Path, debug: bool) -> Result<(), Error> {
+fn serve_front(front: &mut Vm, port: u16, dir: &Path, target: &Path, debug: bool) -> Result<(), Error> {
     let http = techne_vm::library::lisp_dir().join("http");
-    let kv = entry.parent().unwrap_or(Path::new("/")).join(".techne/kv");
+    let kv = dir.join(".techne/kv");
     front.eval_source(&format!(
         r#"(require {:?})
            (spawn (lambda () (kv-serve (make-kv-store {:?}))))"#,
@@ -839,7 +918,7 @@ fn serve_front(front: &mut Vm, port: u16, entry: &Path, debug: bool) -> Result<(
         http.join("server.scm").display().to_string(),
         http.join("debug-route.scm").display().to_string(),
         if debug { "#t" } else { "#f" },
-        entry.display().to_string(),
+        target.display().to_string(),
     ))?;
     Ok(())
 }
@@ -886,7 +965,10 @@ fn lisp_files(dir: &Path) -> Vec<(PathBuf, Option<u64>)> {
                         dirs.push(path);
                     }
                 }
-                Ok(_) if path.extension().is_some_and(|e| e == "scm" || e == "sld") => {
+                Ok(_)
+                    if path.extension().is_some_and(|e| e == "scm" || e == "sld")
+                        || path.file_name().is_some_and(|n| n == "techne.lock") =>
+                {
                     let hash = std::fs::read(&path).ok().map(|bytes| {
                         let mut h = std::hash::DefaultHasher::new();
                         std::hash::Hash::hash(&bytes, &mut h);

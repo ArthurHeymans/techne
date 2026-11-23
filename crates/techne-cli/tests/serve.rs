@@ -353,3 +353,274 @@ fn tenants_deploy_by_upload_and_are_served_by_host_name() {
     assert_eq!(get(port, "shop.bolt.cloud.test", "/"), (200, "bolt 1".into()));
     assert_eq!(get(port, "shop.bolt.cloud.test", "/secret"), (200, "bolts".into()));
 }
+
+fn git_init_commit(dir: &Path, msg: &str) {
+    let run = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(dir).env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    if !dir.join(".git").exists() {
+        run(&["init", "--quiet"]);
+    }
+    run(&["add", "."]);
+    run(&["-c", "user.name=Test", "-c", "user.email=test@example.org", "-c", "commit.gpgSign=false", "commit", "-qm", msg]);
+}
+
+fn write_pkg_file(root: &Path, rel: &str, content: &str) {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+fn cloud_with_store(args: &[&str], token: Option<&str>, store: &Path) -> (bool, String) {
+    let mut command = techne();
+    command.arg("cloud").args(args).env("TECHNE_PACKAGE_STORE", store).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(token) = token {
+        command.env("TECHNE_TOKEN", token);
+    }
+    let out = command.output().unwrap();
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+fn post_ops(ops_url: &str, token: &str, project_header: &str, body: &str) -> (u16, String) {
+    let addr = ops_url.strip_prefix("http://").unwrap();
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(
+        c,
+        "POST /v1/ops HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nTechne-Project: {project_header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut answer = String::new();
+    c.read_to_string(&mut answer).unwrap();
+    let status = answer.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body = answer.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    (status, body)
+}
+
+fn b64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = ((c[0] as u32) << 16) | ((*c.get(1).unwrap_or(&0) as u32) << 8) | (*c.get(2).unwrap_or(&0) as u32);
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn has_file_named(dir: &Path, target: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    for entry in entries.flatten() {
+        if entry.file_name().to_str() == Some(target) {
+            return true;
+        }
+        if entry.file_type().is_ok_and(|t| t.is_dir()) && has_file_named(&entry.path(), target) {
+            return true;
+        }
+    }
+    false
+}
+
+const PKG_SERVE_APP: &str = r#"(import (techne http) (acme util))
+(provide fetch)
+(define (fetch request env ctx)
+  (let ((path (dict-ref request 'path))
+        (notes (dict-ref env 'notes #f)))
+    (cond ((equal? path "/put") (kv-put! notes "v" (tag-value "VER" (dict-ref env 'tag))) (response "kept"))
+          ((equal? path "/get") (response (kv-get notes "v" "nothing")))
+          ((equal? path "/secret") (response (dict-ref env 'key "none")))
+          (else (response (tag-value "VER" (dict-ref env 'tag)))))))
+"#;
+
+/// Packaged cloud apps deploy to `techne cloud serve` with content-addressed
+/// `tree-sha256` caching (`has-trees` + `<state>/trees/<sha>/`), omit cached
+/// dependency trees on subsequent deploys, validate binding contracts before
+/// upload, keep `.secrets.scm` out of trees, and survive rollback and restart.
+#[test]
+fn packaged_deploy_caches_trees_and_enforces_contracts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let store = tmp.path().join("store");
+    let dep_repo = tmp.path().join("dep-util");
+    let app_dir = tmp.path().join("web");
+
+    write_pkg_file(
+        &dep_repo,
+        "techne-package.scm",
+        r#"(package (acme util)
+             (version "0.1.0")
+             (cloud "ignored.scm" (bindings (never secret))))"#,
+    );
+    write_pkg_file(
+        &dep_repo,
+        "lib/acme/util.sld",
+        r#"(define-library (acme util)
+             (export tag-value)
+             (import (scheme base))
+             (begin
+               (define (tag-value ver tag)
+                 (string-append ver "/" tag))))"#,
+    );
+    write_pkg_file(&dep_repo, "ignored.scm", "(define (unused) #f)");
+    git_init_commit(&dep_repo, "init dep");
+
+    write_pkg_file(
+        &app_dir,
+        "techne-package.scm",
+        &format!(
+            r#"(package (demo web)
+                 (version "0.1.0")
+                 (depends
+                   ((acme util) (local {:?})))
+                 (cloud "app.scm"
+                   (bindings
+                     (notes kv)
+                     (key secret)
+                     (tag text))))"#,
+            dep_repo.display().to_string()
+        ),
+    );
+    write_pkg_file(&app_dir, "app.scm", &PKG_SERVE_APP.replace("VER", "v1"));
+    write_pkg_file(&app_dir, "manifest.scm", r#"{bindings {notes (kv "notes") key (secret "KEY") tag (text "prod")}}"#);
+    // Present locally initially; must never be uploaded or hashed into trees.
+    write_pkg_file(&app_dir, ".secrets.scm", r#"{"KEY" "local-only"}"#);
+
+    let lock_out = techne().args(["lock", app_dir.to_str().unwrap()]).env("TECHNE_PACKAGE_STORE", &store).output().unwrap();
+    assert!(
+        lock_out.status.success(),
+        "techne lock failed: {}{}",
+        String::from_utf8_lossy(&lock_out.stdout),
+        String::from_utf8_lossy(&lock_out.stderr)
+    );
+
+    let (ok, token) = cloud(&["invite", "--state", state.to_str().unwrap(), "acme"], None);
+    assert!(ok, "{token}");
+    let acme = token.trim().to_string();
+    let (child, port, ops, _) = serve(&state);
+    let target = ["--to", ops.as_str(), "--tenant", "acme", "--project", "web"];
+    let host = "web.acme.cloud.test";
+
+    // Binding contract mismatch fails fast before uploading or creating the project.
+    write_pkg_file(&app_dir, "manifest.scm", r#"{bindings {notes (kv "notes") key (text "wrong-kind") tag (text "prod")}}"#);
+    let (ok, said) = cloud_with_store(&[&["deploy", app_dir.to_str().unwrap()], &target[..]].concat(), Some(&acme), &store);
+    assert!(!ok && said.contains("key") && said.contains("secret") && said.contains("text"), "{said}");
+    assert!(!state.join("tenants/acme/web").exists());
+
+    // Restore valid manifest and delete local `.secrets.scm`: remote deploy uses server secret only.
+    write_pkg_file(&app_dir, "manifest.scm", r#"{bindings {notes (kv "notes") key (secret "KEY") tag (text "prod")}}"#);
+    std::fs::remove_file(app_dir.join(".secrets.scm")).unwrap();
+    let (ok, said) = cloud_given(&[&["secret", "KEY"], &target[..]].concat(), Some(&acme), "prod-s3cret\n");
+    assert!(ok, "{said}");
+
+    // First deploy uploads both root and dep trees and caches them under `<state>/trees/<sha>/`.
+    let (ok, said) = cloud_with_store(&[&["deploy", app_dir.to_str().unwrap()], &target[..]].concat(), Some(&acme), &store);
+    assert!(ok, "{said}");
+    assert_eq!(get(port, host, "/"), (200, "v1/prod".into()));
+    assert_eq!(get(port, host, "/secret"), (200, "prod-s3cret".into()));
+    assert_eq!(get(port, host, "/put"), (200, "kept".into()));
+    assert_eq!(get(port, host, "/get"), (200, "v1/prod".into()));
+
+    let dep_files = techne_host::package::read_clean_package_tree(&dep_repo, &mut 0, 16 << 20).unwrap();
+    let dep_sha = techne_host::package::canonical_tree_sha256(&dep_files);
+    assert!(state.join("trees").join(&dep_sha).is_dir(), "expected cached dep tree {dep_sha}");
+    assert!(!has_file_named(&state.join("trees"), ".secrets.scm"), "secrets must never be stored in trees");
+
+    // Second deploy after editing root `app.scm` reuses cached dep tree and serves v2.
+    write_pkg_file(&app_dir, "app.scm", &PKG_SERVE_APP.replace("VER", "v2"));
+    let (ok, said) = cloud_with_store(&[&["deploy", app_dir.to_str().unwrap()], &target[..]].concat(), Some(&acme), &store);
+    assert!(ok, "{said}");
+    assert_eq!(get(port, host, "/"), (200, "v2/prod".into()));
+
+    // Explicitly verify `has-trees` and direct `deploy` omitting `"files"` for the cached dep.
+    let uncached_sha = "0".repeat(64);
+    let (status, body) = post_ops(
+        &ops,
+        &acme,
+        "acme/web",
+        &format!(r#"{{"op":"has-trees","tenant":"acme","project":"web","trees":[{},{}]}}"#, json_str(&dep_sha), json_str(&uncached_sha)),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(&format!("\"have\":[{}]", json_str(&dep_sha))), "{body}");
+    assert!(body.contains(&format!("\"missing\":[{}]", json_str(&uncached_sha))), "{body}");
+
+    // Build root v3 files and deploy with dep `"files"` omitted.
+    write_pkg_file(&app_dir, "app.scm", &PKG_SERVE_APP.replace("VER", "v3"));
+    let root_v3_files = techne_host::package::read_clean_package_tree(&app_dir, &mut 0, 16 << 20).unwrap();
+    let root_v3_sha = techne_host::package::canonical_tree_sha256(&root_v3_files);
+    let root_v3_json: Vec<String> = root_v3_files.iter().map(|(k, v)| format!("{}:{}", json_str(k), json_str(&b64(v)))).collect();
+    let deploy_v3 = format!(
+        r#"{{"op":"deploy","tenant":"acme","project":"web","entry":"app.scm","package":{{"root":["demo","web"],"packages":[{{"owner":"demo","pkg":"web","tree_sha256":{},"depends":[["acme","util"]],"files":{{{}}}}},{{"owner":"acme","pkg":"util","tree_sha256":{},"depends":[]}}]}}}}"#,
+        json_str(&root_v3_sha),
+        root_v3_json.join(","),
+        json_str(&dep_sha),
+    );
+    let (status, body) = post_ops(&ops, &acme, "acme/web", &deploy_v3);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(get(port, host, "/"), (200, "v3/prod".into()));
+
+    // Forged `tree_sha256` must be rejected.
+    let forged = format!(
+        r#"{{"op":"deploy","tenant":"acme","project":"web","entry":"app.scm","package":{{"root":["demo","web"],"packages":[{{"owner":"demo","pkg":"web","tree_sha256":{},"depends":[["acme","util"]],"files":{{{}}}}},{{"owner":"acme","pkg":"util","tree_sha256":{},"depends":[]}}]}}}}"#,
+        json_str(&"f".repeat(64)),
+        root_v3_json.join(","),
+        json_str(&dep_sha),
+    );
+    let (status, body) = post_ops(&ops, &acme, "acme/web", &forged);
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains("tree-sha256 mismatch"), "{body}");
+
+    // Omitting `"files"` for an uncached tree must be rejected.
+    let missing_tree = format!(
+        r#"{{"op":"deploy","tenant":"acme","project":"web","entry":"app.scm","package":{{"root":["demo","web"],"packages":[{{"owner":"demo","pkg":"web","tree_sha256":{},"depends":[["acme","util"]],"files":{{{}}}}},{{"owner":"acme","pkg":"util","tree_sha256":{},"depends":[]}}]}}}}"#,
+        json_str(&root_v3_sha),
+        root_v3_json.join(","),
+        json_str(&uncached_sha),
+    );
+    let (status, body) = post_ops(&ops, &acme, "acme/web", &missing_tree);
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains("Missing cached package tree"), "{body}");
+
+    // Rollback restores v2, and restart restores v2 with KV intact.
+    let (ok, said) = cloud(&[&["rollback"], &target[..]].concat(), Some(&acme));
+    assert!(ok, "{said}");
+    assert_eq!(get(port, host, "/"), (200, "v2/prod".into()));
+
+    drop(child);
+    let (_child, port, _, _) = serve(&state);
+    let start = Instant::now();
+    while get(port, host, "/") != (200, "v2/prod".into()) {
+        assert!(start.elapsed() < PATIENCE, "{:?}", get(port, host, "/"));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(get(port, host, "/get"), (200, "v1/prod".into()));
+    assert_eq!(get(port, host, "/secret"), (200, "prod-s3cret".into()));
+}

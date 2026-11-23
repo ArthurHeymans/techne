@@ -98,11 +98,18 @@
 (define (ensure-directory directory)
   (unless (file-exists? directory) (create-directory directory #o700)))
 
+(define (trees-directory cloud)
+  (string-append (cloud-state cloud) "/trees"))
+
+(define (tree-directory cloud sha)
+  (string-append (trees-directory cloud) "/" sha))
+
 (define (make-cloud state)
   "Return the cloud kept in the directory STATE, made if it is not there.
 Its token key is the one kept there, made if none is."
   (ensure-directory state)
   (ensure-directory (string-append state "/tenants"))
+  (ensure-directory (string-append state "/trees"))
   (let ((turn (make-channel 1)))
     (channel-send turn #t)
     (%make-cloud state (token-key-in state) (dict) (box '()) turn (box '()))))
@@ -268,6 +275,43 @@ the others go on. The targets published, `tenant/project`."
           (if (dict? kept) kept (error "The project's secrets cannot be read")))
         (dict))))
 
+;; Whether S is a canonical 64-character lowercase hexadecimal SHA-256 digest.
+(define (sha256-hex? s)
+  (and (string? s)
+       (= (string-length s) 64)
+       (let loop ((i 0))
+         (or (= i 64)
+             (let ((ch (string-ref s i)))
+               (and (or (char<=? #\0 ch #\9) (char<=? #\a ch #\f)) (loop (+ i 1))))))))
+
+;; Canonical tree-sha256 of FILES (a dict of relative path -> bytevector),
+;; matching `directory-tree-sha256` in `(techne package)` 1:1.
+(define (files-tree-sha256 files)
+  (let ((paths (sort (dict-keys files) string<?))
+        (out (open-output-bytevector)))
+    (for-each
+     (lambda (rel)
+       (let ((bytes (dict-ref files rel)))
+         (write-bytevector (string->utf8 "F ") out)
+         (write-bytevector (string->utf8 rel) out)
+         (write-u8 0 out)
+         (write-bytevector (string->utf8 (number->string (bytevector-length bytes))) out)
+         (write-u8 0 out)
+         (write-bytevector bytes out)
+         (write-u8 10 out)))
+     paths)
+    (hex-encode (sha-256 (get-output-bytevector out)))))
+
+;; Read all bytes of FILE, up to max-bytes.
+(define (read-file-bytes file)
+  (call-with-port (open-binary-input-file file)
+    (lambda (port)
+      (let loop ((chunks '()) (total 0))
+        (let ((chunk (read-bytevector 65536 port)))
+          (cond ((eof-object? chunk) (apply bytevector-append (reverse chunks)))
+                ((> (+ total (bytevector-length chunk)) max-bytes) (error "File is too large:" file))
+                (else (loop (cons chunk chunks) (+ total (bytevector-length chunk))))))))))
+
 ;; Put FILES, bytes by path, where the project in DIRECTORY is deployed
 ;; from, in place of what was there, with its secrets beside them.
 (define (stage! directory files)
@@ -281,34 +325,137 @@ the others go on. The targets published, `tenant/project`."
     (replace-file (string-append source "/.secrets.scm")
                   (call-with-output-string (lambda (port) (write (secrets-of directory) port))))))
 
-;; The files MESSAGE, a `deploy`, uploads, decoded: bytes by path.
+;; Atomically cache verified FILES under `<state>/trees/<sha>/` if not present.
+(define (cache-tree! cloud sha files)
+  (let ((dest (tree-directory cloud sha)))
+    (unless (file-exists? dest)
+      (ensure-directory (trees-directory cloud))
+      (let ((tmp (string-append (trees-directory cloud) "/.tmp-" sha "-" (hex-encode (random-bytes 8)))))
+        (guard (e (#t (when (file-exists? tmp) (delete-path tmp #t))
+                      (unless (file-exists? dest) (raise e))))
+          (create-directory tmp #o700)
+          (for-each (lambda (path)
+                      (ensure-parents tmp path)
+                      (write-bytes (string-append tmp "/" path) (dict-ref files path)))
+                    (dict-keys files))
+          (rename-file tmp dest))))))
+
+;; Stage a packaged deployment: cache any uploaded trees atomically under
+;; `<state>/trees/<sha>/`, and stage root's `manifest.scm` (if any) beside
+;; the project's server-side `.secrets.scm` in `<project>/source/`.
+(define (stage-packaged! cloud directory root-pair packages)
+  (for-each (lambda (pkg)
+              (let ((sha (caddr pkg))
+                    (files (list-ref pkg 4)))
+                (when files (cache-tree! cloud sha files))))
+            packages)
+  (let* ((root-pkg (find (lambda (p) (and (equal? (car p) (car root-pair)) (equal? (cadr p) (cadr root-pair)))) packages))
+         (root-sha (and root-pkg (caddr root-pkg)))
+         (source (string-append directory "/source")))
+    (unless root-sha (error "Root package missing from deployment packages"))
+    (when (file-exists? source) (delete-path source #t))
+    (ensure-directory source)
+    (let ((manifest (string-append (tree-directory cloud root-sha) "/manifest.scm")))
+      (when (file-exists? manifest)
+        (write-bytes (string-append source "/manifest.scm") (read-file-bytes manifest))))
+    (replace-file (string-append source "/.secrets.scm")
+                  (call-with-output-string (lambda (port) (write (secrets-of directory) port))))))
+
+;; Decode a dict of relative-path -> base64 string, updating cumulative
+;; counts (total-files . total-bytes) and enforcing bounds.
+(define (decode-files files)
+  (unless (and (dict? files) (<= 1 (dict-size files) max-files)) (error "A deployment has 1 to 1000 files"))
+  (let ((decoded (fold (lambda (path decoded)
+                         (unless (file-path? path) (error "Not a path of a deployment's file:" path))
+                         (let ((text (dict-ref files path)))
+                           (unless (string? text) (error "A file is its bytes in base64:" path))
+                           (dict-set decoded path (base64-decode text))))
+                       (dict) (dict-keys files))))
+    (when (> (fold (lambda (path total) (+ total (bytevector-length (dict-ref decoded path)))) 0 (dict-keys decoded)) max-bytes)
+      (error "A deployment's files are 16 MiB at most"))
+    decoded))
+
+;; The files MESSAGE, a legacy `deploy`, uploads, decoded: bytes by path.
 (define (uploaded message)
-  (let ((files (dict-ref message "files" #f)))
-    (unless (and (dict? files) (<= 1 (dict-size files) max-files)) (error "A deployment has 1 to 1000 files"))
-    (let ((decoded (fold (lambda (path decoded)
-                           (unless (file-path? path) (error "Not a path of a deployment's file:" path))
-                           (let ((text (dict-ref files path)))
-                             (unless (string? text) (error "A file is its bytes in base64:" path))
-                             (dict-set decoded path (base64-decode text))))
-                         (dict) (dict-keys files))))
-      (when (> (fold (lambda (path total) (+ total (bytevector-length (dict-ref decoded path)))) 0 (dict-keys decoded)) max-bytes)
-        (error "A deployment's files are 16 MiB at most"))
-      decoded)))
+  (decode-files (dict-ref message "files" #f)))
+
+(define (package-name-str? s)
+  (and (string? s) (<= 1 (string-length s) 128)))
+
+(define (parse-package-pair v)
+  (unless (and (vector? v) (= (vector-length v) 2)
+               (package-name-str? (vector-ref v 0))
+               (package-name-str? (vector-ref v 1)))
+    (error "A package name is a 2-element array [owner, pkg]"))
+  (list (vector-ref v 0) (vector-ref v 1)))
+
+(define (check-packaged-deploy cloud entry pkg-obj)
+  (unless (file-path? entry) (error "Not a path of a deployment's entry:" entry))
+  (unless (dict? pkg-obj) (error "A packaged deploy's package field is an object"))
+  (let ((root-pair (parse-package-pair (dict-ref pkg-obj "root" #f)))
+        (raw-pkgs (dict-ref pkg-obj "packages" #f))
+        (total-files 0)
+        (total-bytes 0))
+    (unless (and (vector? raw-pkgs) (<= 1 (vector-length raw-pkgs) 128))
+      (error "A packaged deployment has 1 to 128 packages"))
+    (let ((parsed
+           (map (lambda (p)
+                  (unless (dict? p) (error "Each package entry is an object"))
+                  (let ((owner (dict-ref p "owner" #f))
+                        (pkg (dict-ref p "pkg" #f))
+                        (sha (dict-ref p "tree_sha256" #f))
+                        (raw-deps (dict-ref p "depends" (vector)))
+                        (raw-files (dict-ref p "files" #f)))
+                    (unless (and (package-name-str? owner) (package-name-str? pkg))
+                      (error "A package has owner and pkg strings"))
+                    (unless (sha256-hex? sha) (error "Not a package tree_sha256:" sha))
+                    (unless (and (vector? raw-deps) (<= (vector-length raw-deps) 128))
+                      (error "A package's depends is an array"))
+                    (let ((deps (map parse-package-pair (vector->list raw-deps)))
+                          (decoded (and raw-files (decode-files raw-files))))
+                      (if decoded
+                          (begin
+                            (set! total-files (+ total-files (dict-size decoded)))
+                            (set! total-bytes (+ total-bytes
+                                                 (fold (lambda (k acc) (+ acc (bytevector-length (dict-ref decoded k))))
+                                                       0 (dict-keys decoded))))
+                            (when (> total-files max-files) (error "A deployment has 1000 files at most"))
+                            (when (> total-bytes max-bytes) (error "A deployment's files are 16 MiB at most"))
+                            (let ((actual (files-tree-sha256 decoded)))
+                              (unless (equal? actual sha)
+                                (error (string-append "Package tree-sha256 mismatch for (" owner " " pkg "): expected " sha ", got " actual)))))
+                          (unless (file-exists? (tree-directory cloud sha))
+                            (error "Missing cached package tree:" sha)))
+                      (list owner pkg sha deps decoded))))
+                (vector->list raw-pkgs))))
+      (unless (any (lambda (p) (and (equal? (car p) (car root-pair)) (equal? (cadr p) (cadr root-pair)))) parsed)
+        (error "Root package is missing from packages"))
+      (list 'packaged entry root-pair parsed))))
 
 (define (report e)
   (if (error-object? e) (condition/report-string e) "it failed"))
 
 ;; What MESSAGE, an operation OP, is to do, checked: a `deploy`'s entry
-;; and files, a `secret-put`'s name and value, each a pair; #t for
-;; another. An error for what is none.
-(define (check-operation op message)
-  (cond ((equal? op "deploy")
+;; and files (or packaged descriptor), `has-trees`'s list of digests, a
+;; `secret-put`'s name and value; #t for another. An error for what is none.
+(define (check-operation cloud op message)
+  (cond ((equal? op "has-trees")
+         (let ((trees (dict-ref message "trees" #f)))
+           (unless (and (vector? trees) (<= (vector-length trees) 128))
+             (error "trees is an array of up to 128 sha256 digests"))
+           (let ((list-trees (vector->list trees)))
+             (for-each (lambda (sha) (unless (sha256-hex? sha) (error "Not a sha256 digest:" sha))) list-trees)
+             list-trees)))
+        ((equal? op "deploy")
          (let ((entry (dict-ref message "entry" #f))
-               (files (uploaded message)))
-           (unless (and (file-path? entry) (dict-ref files entry #f)) (error "The entry is one of the files:" entry))
-           ;; Its entry at the top, as a directory deployed is.
-           (when (member #\/ (string->list entry)) (error "The entry is at the top of the files:" entry))
-           (cons entry files)))
+               (pkg-obj (dict-ref message "package" #f)))
+           (if pkg-obj
+               (check-packaged-deploy cloud entry pkg-obj)
+               (let ((files (uploaded message)))
+                 (unless (and (file-path? entry) (dict-ref files entry #f)) (error "The entry is one of the files:" entry))
+                 ;; Its entry at the top, as a directory deployed is.
+                 (when (member #\/ (string->list entry)) (error "The entry is at the top of the files:" entry))
+                 (list 'legacy entry files)))))
         ((equal? op "secret-put")
          (let ((name (dict-ref message "name" #f)) (value (dict-ref message "value" #f)))
            (unless (and (string? name) (<= 1 (string-length name) 128) (string? value) (<= (string-length value) 65536))
@@ -348,7 +495,7 @@ without is answered 503, its body unread."
              (tenant (and message (dict-ref message "tenant" #f)))
              (project (and message (dict-ref message "project" #f)))
              (scope (cond ((equal? op "deployments") "inspect")
-                          ((member op '("deploy" "rollback" "secret-put")) "deploy")
+                          ((member op '("deploy" "rollback" "secret-put" "has-trees")) "deploy")
                           (else #f))))
         (cond ((not message) (reply 400 '("error" "not-an-operation" "done")))
               ((not scope) (reply 400 '("error" "unknown-op" "done")))
@@ -363,8 +510,12 @@ without is answered 503, its body unread."
                (%fleet-tenant tenant)
                ;; Checked first: one that is no operation makes no project.
                (let ((directory (project-directory cloud tenant project))
-                     (checked (check-operation op message)))
+                     (checked (check-operation cloud op message)))
                  (cond
+                  ((equal? op "has-trees")
+                   (let ((have (filter (lambda (sha) (file-exists? (tree-directory cloud sha))) checked))
+                         (missing (filter (lambda (sha) (not (file-exists? (tree-directory cloud sha)))) checked)))
+                     (reply 200 '("done") "have" (list->vector have) "missing" (list->vector missing))))
                   ((not (project-there? cloud tenant directory (member op '("deploy" "secret-put"))))
                    (reply 404 '("error" "no-such-project" "done")))
                   ((equal? op "deployments")
@@ -380,9 +531,27 @@ without is answered 503, its body unread."
                        (replace-file (string-append directory "/secrets.scm")
                                      (call-with-output-string (lambda (port) (write (dict-set secrets name value) port)))))
                      (reply 200 '("done"))))
+                  ((eq? (car checked) 'packaged)
+                   (let* ((entry (cadr checked))
+                          (root-pair (caddr checked))
+                          (packages (cadddr checked))
+                          (specs (map (lambda (p) (list (car p) (cadr p) (caddr p) (cadddr p))) packages)))
+                     (apply reply 200 '("done")
+                            (dict->fields
+                             (control-deploy!
+                              (control-of cloud tenant project)
+                              #:stage (lambda () (stage-packaged! cloud directory root-pair packages))
+                              #:prepare (lambda ()
+                                          (%cloud-prepare-packaged
+                                           (string-append tenant "/" project)
+                                           (string-append directory "/source")
+                                           (trees-directory cloud)
+                                           entry
+                                           root-pair
+                                           specs)))))))
                   (else
-                   (let ((entry (car checked))
-                         (files (cdr checked)))
+                   (let ((entry (cadr checked))
+                         (files (caddr checked)))
                      (apply reply 200 '("done")
                             (dict->fields (control-deploy! (control-of cloud tenant project)
                                                            #:stage (lambda () (stage! directory files))

@@ -170,10 +170,12 @@ nothing was recorded; an error if its bundle is not kept, or is not it."
                (%cloud-publish (control-name c) id #t)
                id))))))
 
-(define (control-deploy! c #:stage [stage #f] #:entry [entry (control-entry c)])
+(define (control-deploy! c #:stage [stage #f] #:entry [entry (control-entry c)] #:prepare [prepare #f])
   "Deploy the project of C as its files and manifest are now.
 STAGE, if given, is called first, in this deploy's turn, to put them
-there; ENTRY is its entry module, if not the one C was made with.
+there; ENTRY is its entry module, if not the one C was made with;
+PREPARE, if given, is called instead of `%cloud-prepare-directory` and
+must return `(list id output)`.
 Prepared, its bundle kept, and published if the project is still routed
 where it was when this began: a dict of its `id`, the id `previous` to
 it (#f if none), the `output` of loading it, and whether it is
@@ -190,7 +192,7 @@ runs at a time."
       ;; that lasts.
       (let* ((name (control-name c))
              (seen (%cloud-route name))
-             (prepared (%cloud-prepare-directory name entry))
+             (prepared (if prepare (prepare) (%cloud-prepare-directory name entry)))
              (id (car prepared)))
         ;; Read before anything is published: it must be there to add
         ;; to. One published already and recorded as the last is left
