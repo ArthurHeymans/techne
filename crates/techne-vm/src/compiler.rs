@@ -424,6 +424,25 @@ impl<'v> Compiler<'v> {
         self.meter.error(self.vm).map_or(code, Err)
     }
 
+    /// Compile a top-level procedure `(define ...)` form into a closed
+    /// procedure code object without mutating global slots or running user code.
+    pub(crate) fn compile_named_procedure(mut self, form: &Sexp) -> R<u32> {
+        let items = form.list().ok_or_else(|| Error::new("patch-library: expected a (define ...) form"))?;
+        let (name, definiens) = define_parts(items)?;
+        let outer = self.new_fn("toplevel".into(), None);
+        self.fn_stack.push(outer);
+        let Expr::Lambda(f) = self.definiens(name, definiens)? else {
+            return err("patch-library: expected a pure procedure definition");
+        };
+        if !self.funcs[f].free.is_empty() {
+            return err("patch-library: patched procedure must not capture outer lexical variables");
+        }
+        self.fn_stack.pop();
+        self.optimize(f)?;
+        let code = self.generate(f);
+        self.meter.error(self.vm).map_or(code, Err)
+    }
+
     fn new_fn(&mut self, name: Rc<str>, parent: Option<FnId>) -> FnId {
         self.funcs.push(FuncInfo {
             name,

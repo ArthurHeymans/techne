@@ -601,6 +601,8 @@ pub(crate) struct Module {
     /// Structured R7RS library identity (its name components), when this module
     /// is a library. Used for collision-free lookup and ownership checks.
     pub(crate) library_parts: Option<Vec<Box<str>>>,
+    /// Retained declarations and expanded body forms for Mode 2 live patching.
+    pub(crate) library_snapshot: Option<Rc<crate::patch::LibrarySnapshot>>,
     pub path: Option<PathBuf>,
     /// Trusted loader provenance (for library ownership checks).
     pub(crate) provenance: SourceProvenance,
@@ -933,7 +935,7 @@ pub struct Vm {
     global_rooted: Vec<bool>,
     free_globals: Vec<u32>,
     global_names: Vec<u32>,
-    global_module: Vec<u32>,
+    pub(crate) global_module: Vec<u32>,
     user_defined: Vec<bool>,
     pub(crate) bindings: FxHashMap<(u32, u32), GlobalBinding>,
     /// Field counts of record types defined at top level, by the global that
@@ -1730,6 +1732,7 @@ impl Vm {
         let module = Module {
             name: name.into(),
             library_parts: None,
+            library_snapshot: None,
             path,
             provenance: SourceProvenance::Untrusted,
             caller_package: None,
@@ -3098,7 +3101,7 @@ impl Vm {
             self.bindings.retain(|&(module, _), _| module != m);
             let module = &mut self.modules[m as usize];
             (module.imports, module.exports, module.defined) = (FxHashMap::default(), None, Vec::new());
-            (module.name, module.library_parts, module.path) = ("".into(), None, None);
+            (module.name, module.library_parts, module.library_snapshot, module.path) = ("".into(), None, None, None);
             self.recharge_module(m);
             self.free_modules.push(m);
         }
@@ -3922,6 +3925,16 @@ impl Vm {
         Value::ptr(p)
     }
 
+    /// Allocate a zero-capture closure referencing compiled code index `code`.
+    pub(crate) fn alloc_closed_closure_raw(&mut self, code: u32) -> Value {
+        let p = self.alloc(2);
+        unsafe {
+            *p = header(Kind::Closure, 1, 0);
+            set_field(p, 0, Value::int_unchecked(code as i64));
+        }
+        Value::ptr(p)
+    }
+
     /// Allocate a string. Bytevectors, not strings, hold arbitrary bytes.
     pub(crate) fn make_string_raw(&mut self, text: &str) -> Value {
         let bytes = text.as_bytes();
@@ -4289,7 +4302,7 @@ impl Vm {
 
     /// Run `f`, keeping the codes it compiles and the files it adds until
     /// it returns.
-    fn pinning<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> T {
+    pub(crate) fn pinning<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> T {
         let (codes, files, modules) = (self.compiling.len(), self.pinned_files.len(), self.pinned_modules.len());
         self.pinned_modules.push(self.current_module);
         let result = f(self);

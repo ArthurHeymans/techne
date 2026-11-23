@@ -296,7 +296,7 @@ fn resolve_contained_include(dir: &Path, name: &str, root: &Path) -> R<PathBuf> 
 }
 
 /// A library name's parts: identifiers and exact integers.
-fn name_parts(name: &Sexp) -> Option<Vec<String>> {
+pub(crate) fn name_parts(name: &Sexp) -> Option<Vec<String>> {
     let list = name.list()?;
     if list.is_empty() {
         return None;
@@ -312,12 +312,12 @@ fn name_parts(name: &Sexp) -> Option<Vec<String>> {
 
 /// The identifiers a built-in library exports: an R7RS or SRFI library, or
 /// every root binding for `(techne)`.
-enum Builtin {
+pub(crate) enum Builtin {
     Standard(&'static str),
     Techne,
 }
 
-fn builtin(parts: &[String]) -> Option<Builtin> {
+pub(crate) fn builtin(parts: &[String]) -> Option<Builtin> {
     match parts {
         [t] if t == "techne" => Some(Builtin::Techne),
         [s, name] if s == "scheme" => STANDARD.iter().find(|(n, _)| n == name).map(|(_, ids)| Builtin::Standard(ids)),
@@ -330,7 +330,7 @@ pub(crate) fn module_name(parts: &[String]) -> String {
     format!("({})", parts.join(" "))
 }
 
-fn syms(items: &[Sexp], who: &str) -> R<Vec<u32>> {
+pub(crate) fn syms(items: &[Sexp], who: &str) -> R<Vec<u32>> {
     items.iter().map(|i| i.sym().map(strip).ok_or_else(|| Error::new(format!("{who}: expected identifiers")))).collect()
 }
 
@@ -578,6 +578,7 @@ impl Vm {
             let mut imports = Vec::new();
             let mut body = Vec::new();
             self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body)?;
+            self.record_library_snapshot(m, &imports, &body);
             for (form, file) in imports {
                 let dir = self.import_dir(file);
                 self.import_for(m, Some(file), &form.list().unwrap()[1..], &dir)?;
@@ -608,6 +609,7 @@ impl Vm {
             self.abort_library(m);
             return Err(e);
         }
+        self.record_library_snapshot(m, &imports, &body);
         imports.extend(body);
         Ok(self.queued_forms(m, file, imports, true))
     }

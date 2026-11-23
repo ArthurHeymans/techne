@@ -61,6 +61,7 @@ pub(crate) mod jit;
 pub(crate) mod json;
 pub mod library;
 pub(crate) mod num;
+pub mod patch;
 pub(crate) mod ports;
 pub mod reader;
 pub mod regexp;

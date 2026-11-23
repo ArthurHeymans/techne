@@ -372,6 +372,10 @@ fn empty(vm: &mut Vm, sp: Space, kind: Kind) -> Value {
     wrap(vm, sp, kind, 0, root)
 }
 
+pub(crate) fn empty_dict(vm: &mut Vm) -> Value {
+    empty(vm, Space::Young, Kind::Dict)
+}
+
 /// Where the nodes of an update of `d` at `key` go, collecting first if
 /// the nursery lacks the room; `d`, `key` and `val` again, as they may
 /// have moved.

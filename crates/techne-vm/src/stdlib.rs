@@ -1274,6 +1274,89 @@ pub fn install(vm: &mut Vm) {
                 None => Ok(Value::FALSE),
             } };
         "(%package-discard)" => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
+        /// Live-patch procedures of an already loaded library in place.
+        /// LIBRARY-NAME is a library name list such as `(alice math)` and
+        /// SOURCE-STRING is the updated `(define-library ...)` text.
+        /// OPTIONS accepts `#:check-retained` boolean (default `#t`).
+        "(patch-library! library-name source-string . options)" => |vm: &mut Vm, a, n| {
+            vm.check_loading()?;
+            let items = crate::builtins::list_values(arg(vm, a, 0))
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| Error::new("patch-library!: expected a non-empty library name list"))?;
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                if item.is_symbol() {
+                    parts.push(symbol_name(item.as_symbol()).to_string());
+                } else if is_kind(item, Kind::String) {
+                    parts.push(string(vm, item, "patch-library!")?);
+                } else if item.is_int() && item.as_int() >= 0 {
+                    parts.push(item.as_int().to_string());
+                } else {
+                    return Err(Error::new("patch-library!: library name parts must be symbols, strings, or non-negative integers"));
+                }
+            }
+            let source = string(vm, arg(vm, a, 1), "patch-library!")?;
+            let check_retained = match n {
+                2 => true,
+                3 => arg(vm, a, 2).is_truthy(),
+                4 => {
+                    let kw = arg(vm, a, 2);
+                    if !kw.is_keyword() || &*symbol_name(kw.as_keyword()) != "check-retained" {
+                        return Err(Error::new("patch-library!: expected #:check-retained option"));
+                    }
+                    arg(vm, a, 3).is_truthy()
+                }
+                _ => return Err(Error::new("patch-library!: expected optional #:check-retained boolean")),
+            };
+            let report = vm.patch_library_raw(&parts, &source, check_retained).map_err(|e| Error::new(e.to_string()))?;
+
+            // Build result dict with full GC rooting across allocations:
+            // {library ("a" "b") patched #("f") unchanged N stale-holders #({binding "f" chain #(...)}) source-sha256 "..."}
+            let lib_roots: Vec<_> = report.library.iter().map(|p| { let v = vm.make_string_raw(p); vm.root(v) }).collect();
+            let lib_vals: Vec<Value> = lib_roots.iter().map(|r| r.get()).collect();
+            let v = vm.make_list_raw(&lib_vals);
+            let lib_list = vm.root(v);
+
+            let patched_roots: Vec<_> = report.patched.iter().map(|p| { let v = vm.make_string_raw(p); vm.root(v) }).collect();
+            let patched_vals: Vec<Value> = patched_roots.iter().map(|r| r.get()).collect();
+            let v = vm.make_vector_raw(&patched_vals);
+            let patched_vec = vm.root(v);
+
+            let mut holder_roots = Vec::with_capacity(report.stale_holders.len());
+            for holder in &report.stale_holders {
+                let v = vm.make_string_raw(&holder.binding);
+                let binding_str = vm.root(v);
+                let step_roots: Vec<_> = holder.chain.iter().map(|s| { let v = vm.make_string_raw(s); vm.root(v) }).collect();
+                let step_vals: Vec<Value> = step_roots.iter().map(|r| r.get()).collect();
+                let v = vm.make_vector_raw(&step_vals);
+                let chain_vec = vm.root(v);
+                let v = crate::dict::empty_dict(vm);
+                let entry = vm.root(v);
+                let d1 = crate::dict::insert(vm, entry.get(), Value::symbol(reader::intern("binding")), binding_str.get());
+                let entry = vm.root(d1);
+                let d2 = crate::dict::insert(vm, entry.get(), Value::symbol(reader::intern("chain")), chain_vec.get());
+                holder_roots.push(vm.root(d2));
+            }
+            let holder_vals: Vec<Value> = holder_roots.iter().map(|r| r.get()).collect();
+            let v = vm.make_vector_raw(&holder_vals);
+            let holders_vec = vm.root(v);
+
+            let v = vm.make_string_raw(&report.source_sha256);
+            let sha_str = vm.root(v);
+            let v = vm.make_int_raw(report.unchanged as i64);
+            let unchanged_val = vm.root(v);
+
+            let v = crate::dict::empty_dict(vm);
+            let d = vm.root(v);
+            let v = crate::dict::insert(vm, d.get(), Value::symbol(reader::intern("library")), lib_list.get());
+            let d = vm.root(v);
+            let v = crate::dict::insert(vm, d.get(), Value::symbol(reader::intern("patched")), patched_vec.get());
+            let d = vm.root(v);
+            let v = crate::dict::insert(vm, d.get(), Value::symbol(reader::intern("unchanged")), unchanged_val.get());
+            let d = vm.root(v);
+            let v = crate::dict::insert(vm, d.get(), Value::symbol(reader::intern("stale-holders")), holders_vec.get());
+            let d = vm.root(v);
+            Ok(crate::dict::insert(vm, d.get(), Value::symbol(reader::intern("source-sha256")), sha_str.get())) };
         // The names a module sees, for completion: a list of (name kind),
         // the name a string, the kind `syntax`, `macro`, `procedure` or
         // `variable`. A module not loaded yet is not loaded (completing
