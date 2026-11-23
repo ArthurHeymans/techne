@@ -61,6 +61,7 @@ struct Index {
     empty: FxHashSet<usize>,
     unswept: FxHashSet<usize>,
     remembered: FxHashSet<usize>,
+    remembered_slots: FxHashSet<usize>,
 }
 
 impl Index {
@@ -96,6 +97,7 @@ impl Index {
             empty: heap.old.empty.iter().map(|&b| b as usize).collect(),
             unswept,
             remembered: heap.remembered.iter().map(|p| p.addr()).collect(),
+            remembered_slots: heap.remembered_slots.iter().map(|p| p.addr()).collect(),
         }
     }
 }
@@ -141,6 +143,13 @@ impl Heap {
             // SAFETY: `check` pushes only valid objects.
             let h = unsafe { *obj };
             if !is_traced(h) {
+                if header_kind(h) == Kind::Vector as u8 && h & VECTOR_FIXNUM != 0 {
+                    for i in 0..header_len(h) {
+                        if !unsafe { field(obj, i) }.is_int() {
+                            errors.push(("VECTOR_FIXNUM vector holds a non-fixnum".into(), Some(Origin::Field(obj.addr(), i))));
+                        }
+                    }
+                }
                 continue;
             }
             if header_kind(h) == Kind::Closure as u8 {
@@ -158,7 +167,8 @@ impl Heap {
             for i in 0..header_len(h) {
                 // SAFETY: a field of a traced object.
                 let v = unsafe { field(obj, i) };
-                if old && !remembered && v.is_ptr() && self.in_nursery(v.as_ptr_near(self.nursery_start)) {
+                let slot_remembered = remembered || index.remembered_slots.contains(&unsafe { obj.add(1 + i) }.addr());
+                if old && !slot_remembered && v.is_ptr() && self.in_nursery(v.as_ptr_near(self.nursery_start)) {
                     errors.push(("old object holds a nursery pointer and is not remembered".into(), Some(Origin::Field(obj.addr(), i))));
                 }
                 self.check(&index, v, Origin::Field(obj.addr(), i), &mut seen, &mut pending, &mut errors);

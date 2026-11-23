@@ -82,6 +82,8 @@ fn a_stack_grows_only_within_the_limit() {
 fn suspended_stacks_count() {
     for (name, mut vm) in vms() {
         eval(&mut vm, "(define (deep n) (if (= n 0) (begin (yield) 0) (+ 1 (deep (- n 1)))))");
+        // Warm the JIT compiler's one-time state before snapshotting baseline memory.
+        eval(&mut vm, "(deep 1)");
         let stacks = vm.held().total();
         vm.set_memory_limit(vm.held().total() + 32 * MB);
         let results =

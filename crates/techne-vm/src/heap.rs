@@ -232,8 +232,12 @@ impl Kind {
 
 const FORWARDED: u64 = 0xFF;
 const FREE: u64 = 0xFE;
-const REMEMBERED: u64 = 1 << 8;
+pub(crate) const REMEMBERED: u64 = 1 << 8;
 pub const ASCII: u64 = 1 << 9;
+/// On vectors, this kind-specific bit (sharing bit 9 with `ASCII` on strings)
+/// records that every element is a fixnum: GC skips tracing its elements and
+/// JIT `VRef` can specialize on fixnum results. Cleared on any non-fixnum write.
+pub const VECTOR_FIXNUM: u64 = 1 << 9;
 const MARKED: u64 = 1 << 10;
 /// A bignum's sign.
 pub const NEGATIVE: u64 = 1 << 11;
@@ -290,7 +294,8 @@ fn object_words(h: u64) -> usize {
 }
 #[inline(always)]
 fn is_traced(h: u64) -> bool {
-    header_kind(h) < Kind::String as u8 || h & INDIRECT != 0
+    let k = header_kind(h);
+    (k < Kind::String as u8 && !(k == Kind::Vector as u8 && h & VECTOR_FIXNUM != 0)) || h & INDIRECT != 0
 }
 
 /// A byte offset every 64 characters bounds indexing work independently
@@ -619,14 +624,21 @@ pub struct Heap {
     reserve_floor: usize,
     /// The window asked for (`set_nursery_window`), in words.
     window: usize,
-    nursery_start: *mut u64,
-    nursery_end: *mut u64,
-    top: *mut u64,
+    pub(crate) nursery_start: *mut u64,
+    pub(crate) nursery_end: *mut u64,
+    pub(crate) top: *mut u64,
     /// Allocation stops here: the end of the nursery window (see
     /// `set_nursery_window`).
     limit: *mut u64,
+    /// Allocation limit read directly by JIT inline allocation (`null` under
+    /// GC stress so the unsigned `new <= jit_limit` check fails cleanly with
+    /// zero extra branch).
+    pub(crate) jit_limit: *mut u64,
     old: OldSpace,
     remembered: Vec<*mut u64>,
+    /// Individual slots of large old objects that hold nursery pointers,
+    /// avoiding full-object scans during minor collections.
+    remembered_slots: Vec<*mut u64>,
     /// Promoted objects whose fields still need scanning (minor collection).
     scan: Vec<*mut u64>,
     /// Words promoted by the minor collection in progress. Not the growth of
@@ -652,7 +664,7 @@ pub struct Heap {
     copied: Vec<(*mut u64, usize)>,
     phase: Phase,
     /// `phase == Marking`, for the barrier's fast path.
-    marking: bool,
+    pub(crate) marking: bool,
     marked_words: usize,
     /// Words scanned by the marker in the current pause.
     slice_words: usize,
@@ -728,11 +740,13 @@ impl Heap {
         let mut nursery = try_zeroed_words(words, alloc.clone()).expect("room in a new cage for a nursery");
         let start = nursery.as_mut_ptr();
         let stress = std::env::var_os("TECHNE_GC_STRESS").is_some();
+        let end = unsafe { start.add(words) };
         Heap {
             nursery_start: start,
-            nursery_end: unsafe { start.add(words) },
+            nursery_end: end,
             top: start,
-            limit: unsafe { start.add(words) },
+            limit: end,
+            jit_limit: if stress { std::ptr::null_mut() } else { end },
             nursery,
             nursery_max,
             nursery_base,
@@ -748,6 +762,7 @@ impl Heap {
             window: usize::MAX,
             old: OldSpace::new(alloc),
             remembered: Vec::new(),
+            remembered_slots: Vec::new(),
             scan: Vec::new(),
             promoted: 0,
             gray: Vec::new(),
@@ -812,6 +827,7 @@ impl Heap {
     /// too (`Vm::collect`): for what the heap's size does not show.
     pub(crate) fn request_collection(&mut self) {
         self.limit = self.top;
+        self.sync_jit_limit();
         self.requested = true;
     }
 
@@ -833,12 +849,10 @@ impl Heap {
         self.stress || self.requested
     }
 
-    /// The addresses of the bump pointer and of the allocation limit, for
-    /// allocation inlined in JIT code, which reads both anew each time (a
-    /// collection may replace the nursery); null under GC stress, where
-    /// every allocation collects.
-    pub(crate) fn bump_pointers(&mut self) -> (*mut *mut u64, *const *mut u64) {
-        if self.stress { (std::ptr::null_mut(), std::ptr::null()) } else { (&mut self.top, &self.limit) }
+    /// Keep `jit_limit` synchronized with `limit` and `stress`.
+    #[inline(always)]
+    pub(crate) fn sync_jit_limit(&mut self) {
+        self.jit_limit = if self.stress { std::ptr::null_mut() } else { self.limit };
     }
 
     /// Bump-allocate in the nursery. Caller guarantees `has_room(words)` or has
@@ -982,6 +996,39 @@ impl Heap {
                 unsafe {
                     if *obj & REMEMBERED == 0 {
                         *obj |= REMEMBERED;
+                        self.remembered.push(obj);
+                    }
+                }
+            }
+        } else if self.marking {
+            self.shade(p);
+        }
+    }
+
+    /// Slot-precise write barrier: for large non-ephemeron old objects, record
+    /// the written slot instead of remembering the whole object so minor GC
+    /// only scans mutated slots rather than megabyte backing arrays.
+    #[inline(always)]
+    pub(crate) fn barrier_slot(&mut self, obj: *mut u64, slot: *mut u64, v: Value) {
+        if !v.is_ptr() {
+            return;
+        }
+        let p = v.as_ptr_near(self.nursery_start);
+        if self.in_nursery(p) {
+            if !self.in_nursery(obj) {
+                unsafe {
+                    let h = *obj;
+                    if h & REMEMBERED != 0 {
+                        return;
+                    }
+                    let len = header_len(h);
+                    if len > 64 && header_kind(h) != Kind::Ephemerons as u8 && self.remembered_slots.len() < (len / 4).min(1 << 18) {
+                        if self.marking {
+                            self.shade(obj);
+                        }
+                        self.remembered_slots.push(slot);
+                    } else {
+                        *obj = h | REMEMBERED;
                         self.remembered.push(obj);
                     }
                 }
@@ -1243,6 +1290,7 @@ impl Heap {
         self.top = self.nursery_start;
         // A collection asked for (`request_collection`) is done.
         self.limit = unsafe { self.nursery_start.add(self.window.min(self.nursery_capacity())) };
+        self.sync_jit_limit();
         let promoted = self.promoted;
         self.stats.max_copied_words = self.stats.max_copied_words.max(promoted);
         self.last_minor = (std::mem::take(&mut self.window_exhausted), allocated, promoted);
@@ -1349,6 +1397,7 @@ impl Heap {
     pub(crate) fn set_nursery_window(&mut self, words: usize) {
         self.window = words.max(1 << 12);
         self.limit = unsafe { self.nursery_start.add(self.window.min(self.nursery_capacity())) };
+        self.sync_jit_limit();
     }
 
     /// Bytes `resize_nursery` would newly commit: none when it shrinks or
@@ -1389,6 +1438,7 @@ impl Heap {
             self.nursery_end = start.add(words);
             self.limit = start.add(words.min(self.window));
         }
+        self.sync_jit_limit();
         self.top = start;
         self.note_nursery_stats();
     }
@@ -1479,6 +1529,9 @@ impl Heap {
                     self.shade(obj);
                 }
                 self.scan_object::<MARKING>(obj);
+            }
+            for slot in std::mem::take(&mut self.remembered_slots) {
+                self.scan_field::<MARKING>(slot);
             }
             while let Some(obj) = self.scan.pop() {
                 self.scan_object::<MARKING>(obj);
@@ -2028,6 +2081,71 @@ impl Copier {
     pub(crate) fn foreign(&mut self) -> Vec<(*mut u64, usize)> {
         std::mem::take(&mut self.foreign)
     }
+}
+
+/// Fast hash for short (`<= 8` byte) strings exploiting zero-padded final payload words.
+/// Returns `None` for strings longer than 8 bytes.
+#[inline(always)]
+pub(crate) fn fast_short_string_hash(v: Value) -> Option<u64> {
+    let p = v.as_ptr();
+    let hdr = unsafe { *p };
+    if hdr & INDIRECT == 0 {
+        let len = header_len(hdr);
+        if len <= 8 {
+            let word = if len == 0 { 0 } else { unsafe { *p.add(1) } };
+            return Some(word ^ (len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        }
+        return None;
+    }
+    let bytes = unsafe { str_bytes(p) };
+    if bytes.len() <= 8 {
+        let mut buf = [0u8; 8];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        return Some(u64::from_le_bytes(buf) ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    }
+    None
+}
+
+/// Fast string equality when both values are strings; returns `None` if either is not a string.
+#[inline(always)]
+pub(crate) fn fast_string_eq(a: Value, b: Value) -> Option<bool> {
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    let (ha, hb) = unsafe { (*pa, *pb) };
+    if (ha & 0xFF) != Kind::String as u64 || (hb & 0xFF) != Kind::String as u64 {
+        return None;
+    }
+    if (ha | hb) & INDIRECT == 0 {
+        let la = header_len(ha);
+        if la != header_len(hb) {
+            return Some(false);
+        }
+        if la <= 8 {
+            return Some(la == 0 || unsafe { *pa.add(1) == *pb.add(1) });
+        }
+    }
+    Some(unsafe { str_bytes(pa) == str_bytes(pb) })
+}
+
+#[inline(always)]
+pub(crate) fn clear_vector_fixnum(v: *mut u64) {
+    unsafe { *v &= !VECTOR_FIXNUM };
+}
+
+#[inline(always)]
+pub(crate) fn set_vector_fixnum(v: *mut u64, is_fixnum: bool) {
+    unsafe {
+        if is_fixnum {
+            *v |= VECTOR_FIXNUM;
+        } else {
+            *v &= !VECTOR_FIXNUM;
+        }
+    }
+}
+
+#[inline(always)]
+pub(crate) fn hash_string_into<H: std::hash::Hasher>(v: Value, h: &mut H) {
+    use std::hash::Hash;
+    unsafe { str_bytes(v.as_ptr()) }.hash(h);
 }
 
 #[cfg(test)]

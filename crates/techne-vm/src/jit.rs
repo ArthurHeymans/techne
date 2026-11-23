@@ -67,7 +67,7 @@ use cranelift_codegen::{
     ir::{
         self, AbiParam, Block, BlockArg, InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode,
         condcodes::{FloatCC, IntCC},
-        types::{F64, I32, I64},
+        types::{F64, I8, I32, I64},
     },
     settings::{self, Configurable},
 };
@@ -79,7 +79,7 @@ use cranelift_module::Module;
 use crate::heap::field;
 use crate::{
     code::{Code, Op, Reg},
-    heap::{Kind, header, is_kind},
+    heap::{Heap, Kind, header, is_kind},
     value::Value,
     vm::{Error, Moves, PlainFn, Vm},
 };
@@ -107,10 +107,6 @@ pub struct JitCtx {
     pub regs_end: *mut Value,
     pub fuel: *mut u32,
     pub stack_top: *mut usize,
-    /// Where the nursery's bump pointer and allocation limit are; null
-    /// when allocation must go through the VM (GC stress).
-    pub heap_top: *mut *mut u64,
-    pub heap_end: *const *mut u64,
     /// Output: the code and frame base where the interpreter continues.
     pub code: *const Code,
     pub bp: u64,
@@ -176,6 +172,10 @@ const GUARD: u32 = 11;
 /// checked (`Gen::tick`): registers stored in their tagged form, as for
 /// `GUARD`.
 const GUARD_TICK: u32 = 12;
+/// `EXIT` after `jit_call_slow`/`jit_tail_slow` where registers at `pc` were
+/// already spilled before the helper call: avoids keeping pre-call SSA values
+/// (especially floats in XMM registers) live across the C call.
+const EXIT_SPILLED: u32 = 13;
 
 /// Per-function JIT state.
 #[derive(Default)]
@@ -396,6 +396,8 @@ pub struct Job {
     /// Globals called by this code that held plain Rust natives when it was
     /// queued; calls of those natives call them directly.
     pub native_globals: HashMap<u32, KnownNative>,
+    /// Globals read by this code that held a `VECTOR_FIXNUM` vector when queued.
+    pub fixnum_vec_globals: Vec<u32>,
     /// Monomorphic indirect sites, by original pc. Code ids were resolved
     /// and their dependencies retained before this self-contained job.
     pub closure_calls: HashMap<u32, Known>,
@@ -417,6 +419,8 @@ pub struct Observed {
     pub head: usize,
     pub fixnums: Vec<Reg>,
     pub floats: Vec<Reg>,
+    pub int64s: Vec<Reg>,
+    pub fixnum_vecs: Vec<Reg>,
 }
 
 /// A function a call site runs inline (`Job::inlined`).
@@ -428,6 +432,9 @@ pub struct Inlinee {
     pub consts: Vec<u64>,
     pub consts_addr: usize,
     pub frame_size: u16,
+    /// Global holding this closure when inlined via `CallG`/`TailCallG`, so
+    /// self-tail-calls to the same global can be lowered to an inlined loop.
+    pub self_global: Option<u32>,
     /// Its calls (by pc) of small functions that run inline too, nested.
     pub inlined: HashMap<u32, Inlinee>,
 }
@@ -436,6 +443,11 @@ impl Inlinee {
     /// Its instructions and those of the functions inlined in it.
     pub fn size(&self) -> usize {
         self.ops.len() + self.inlined.values().map(Inlinee::size).sum::<usize>()
+    }
+
+    /// Whether this inlinee or any nested inlinee writes a global.
+    fn mutates_global(&self) -> bool {
+        self.ops.iter().any(|op| matches!(op, Op::SetG { .. })) || self.inlined.values().any(Inlinee::mutates_global)
     }
 }
 
@@ -464,64 +476,42 @@ pub fn inlinable(
     nparams: u16,
     rest: bool,
     n: u16,
+    self_global: Option<u32>,
     native: impl Fn(u32) -> Option<KnownNative>,
     nested: &HashMap<u32, Inlinee>,
 ) -> bool {
     use Op::*;
-    let forward = |pc: usize, op: &Op| !matches!(op, Jmp { .. }) && !is_branch(op) || jump_or_branch_target(op) > pc;
     let mut calls = 0;
-    let ok = ops.iter().enumerate().all(|(pc, op)| {
-        forward(pc, op)
-            && match *op {
-                CallG { .. } | TailCallG { .. } if nested.contains_key(&(pc as u32)) => true,
-                CallG { g, n, .. } | TailCallG { g, n, .. } => native(g)
-                    .inspect(|k| {
-                        let inline = k.inline(n);
-                        // Bounded byte loops are larger than a scalar native case.
-                        // Count them against the existing complex-native budget;
-                        // =1 restores bytecode-only admission for measurement.
-                        let heavy =
-                            switch!("TECHNE_JIT_STRING_INLINE", "1") && matches!(inline, Some(Inline::Substring | Inline::StringEq));
-                        calls += (inline.is_none() || heavy) as usize;
-                    })
-                    .is_some(),
-                Closure { .. }
-                | PushHandler { .. }
-                | PopHandler
-                | PushEscape { .. }
-                | Loop { .. }
-                | Call { .. }
-                | TailCall { .. }
-                | EnterJit => false,
-                _ => true,
-            }
+    let mut self_tail = false;
+    let mut has_loop = false;
+    let mut mutates_global = false;
+    let ok = ops.iter().enumerate().all(|(pc, op)| match *op {
+        CallG { .. } | TailCallG { .. } if nested.contains_key(&(pc as u32)) => {
+            mutates_global |= nested[&(pc as u32)].mutates_global();
+            true
+        }
+        TailCallG { g, n: argc, .. } if self_global == Some(g) && argc == nparams => {
+            self_tail = true;
+            true
+        }
+        CallG { g, n, .. } | TailCallG { g, n, .. } => native(g)
+            .inspect(|k| {
+                let inline = k.inline(n);
+                calls += inline.is_none() as usize;
+            })
+            .is_some(),
+        Loop { .. } => {
+            has_loop = true;
+            true
+        }
+        SetG { .. } => {
+            mutates_global = true;
+            true
+        }
+        Closure { .. } | PushHandler { .. } | PopHandler | PushEscape { .. } | Call { .. } | TailCall { .. } | EnterJit => false,
+        _ => true,
     });
-    ok && calls <= 1 && !rest && nparams == n && ops.len() <= INLINE_MAX
-}
-
-fn is_branch(op: &Op) -> bool {
-    use Op::*;
-    matches!(
-        op,
-        Jf { .. }
-            | Jt { .. }
-            | JNLt { .. }
-            | JNLe { .. }
-            | JNNumEq { .. }
-            | JNEq { .. }
-            | JNNull { .. }
-            | JNLtI { .. }
-            | JNGtI { .. }
-            | JNEqI { .. }
-            | JNPair { .. }
-    )
-}
-
-fn jump_or_branch_target(op: &Op) -> usize {
-    match *op {
-        Op::Jmp { t } => t as usize,
-        _ => jump_target(op),
-    }
+    ok && calls <= 1 && !rest && nparams == n && ops.len() <= INLINE_MAX && (!(self_tail || has_loop) || (calls == 0 && !mutates_global))
 }
 
 /// `op` of a function inlined with its registers `off` above the caller's
@@ -543,6 +533,7 @@ fn relocated(op: Op, off: Reg, at: &[usize]) -> Op {
         Unbox { dst, r: x } => Unbox { dst: r(dst), r: r(x) },
         SetBox { r: x, src } => SetBox { r: r(x), src: r(src) },
         Jmp { t: x } => Jmp { t: t(x) },
+        Loop { t: x } => Loop { t: t(x) },
         Jf { c, t: x } => Jf { c: r(c), t: t(x) },
         Jt { c, t: x } => Jt { c: r(c), t: t(x) },
         JNLt { a, b, t: x } => JNLt { a: r(a), b: r(b), t: t(x) },
@@ -726,8 +717,11 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>, Vec<Option<u
             Return::Move { .. } => 2,
         };
         let nested = |pc: usize| inl.inlined.contains_key(&(pc as u32));
+        let is_self_tail =
+            |pc: usize, op: &Op| !nested(pc) && matches!(*op, Op::TailCallG { g, n, .. } if inl.self_global == Some(g) && n == args);
         let size = |pc: usize, op: &Op| match op {
             Op::Ret { .. } => ret_len,
+            Op::TailCallG { n, .. } if is_self_tail(pc, op) => *n as usize + 1,
             Op::TailCallG { .. } if !nested(pc) => 1 + ret_len,
             _ => 1,
         };
@@ -750,6 +744,16 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>, Vec<Option<u
         for (pc, &op) in inl.ops.iter().enumerate() {
             match op {
                 Op::Ret { r } => give(&mut ops, &mut origin, &mut returns, r, pc),
+                Op::TailCallG { base: b, n, .. } if is_self_tail(pc, &op) => {
+                    for i in 0..n {
+                        ops.push(Op::Mov { dst: off + i, src: off + b + 1 + i });
+                        origin.push(from(pc, false));
+                        returns.push(None);
+                    }
+                    ops.push(Op::Loop { t: at[0] as u32 });
+                    origin.push(from(pc, false));
+                    returns.push(None);
+                }
                 Op::TailCallG { base: b, n, g } if !nested(pc) => {
                     ops.push(Op::CallG { base: b + off, n, g });
                     origin.push(from(pc, true));
@@ -803,7 +807,7 @@ fn redo_points(ops: &[Op], origin: &[Option<Inlined>], sites: &[Site], succs: &[
             let Some(r) = roots[pc] else { return false };
             let s = &sites[r];
             let args = s.base + 1..=s.base + s.args;
-            let call = matches!(ops[pc], CallG { .. } | TailCallG { .. });
+            let call = matches!(ops[pc], CallG { .. } | TailCallG { .. } | Loop { .. });
             call || matches!(ops[pc], SetG { .. } | SetCB { .. } | SetBox { .. } | VSet { .. } | PopHandler)
                 || uses_defs(&ops[pc], &HashMap::default()).1.iter().any(|d| args.contains(d))
         })
@@ -1427,6 +1431,14 @@ unsafe extern "C" fn jit_barrier(vm: *mut Vm, obj: *mut u64, v: Value) {
     let _ = catch_jit(vm, |vm| vm.write_barrier(obj, v));
 }
 
+unsafe extern "C" fn jit_barrier_slot(vm: *mut Vm, obj: *mut u64, slot: *mut u64, v: Value) {
+    let _ = catch_jit(vm, |vm| vm.write_barrier_slot(obj, slot, v));
+}
+
+unsafe extern "C" fn jit_box_i64(vm: *mut Vm, n: i64) -> u64 {
+    catch_jit(vm, |vm| vm.make_int_raw(n).bits()).unwrap_or(Value::FALSE.bits())
+}
+
 const TAG_INT: i64 = 0xFFF9;
 const TAG_PTR: i64 = 0xFFFA;
 const TAG_CHAR: i64 = 0xFFFB;
@@ -1463,6 +1475,9 @@ impl Regs {
     }
     fn minus(&self, o: &Regs) -> Regs {
         Regs(self.0.iter().zip(&o.0).map(|(a, b)| a & !b).collect())
+    }
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|&w| w == 0)
     }
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.0.iter().enumerate().flat_map(|(w, &bits)| {
@@ -1779,6 +1794,7 @@ fn fixnums(
     captures: &HashMap<u32, Vec<Reg>>,
     heads: &[usize],
     fixnum_call: impl Fn(usize) -> bool,
+    fix_vecs: &[Regs],
     shape: &Shape,
     assumed: &HashMap<usize, Regs>,
 ) -> Kinds {
@@ -1791,6 +1807,7 @@ fn fixnums(
             Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) && has(b))),
             Op::AddI { dst, a, .. } => Some((dst, has(a))),
             Op::Quo { dst, .. } | Op::Rem { dst, .. } | Op::Mod { dst, .. } => Some((dst, true)),
+            Op::VRef { dst, v, .. } if fix_vecs[pc].contains(v) => Some((dst, true)),
             // An inlined call returns a fixnum if each of its callee's
             // returns does (`Gen::call_op` checks the call's result).
             Op::CallG { base, .. } | Op::Call { base, .. } => {
@@ -1808,12 +1825,14 @@ fn fixnums(
 /// arithmetic with an operand known a float. Native code continues after
 /// such arithmetic only with a float: when the other operand is a float or
 /// a fixnum (converted), else it steps out (a bignum, a complex number...).
+#[allow(clippy::too_many_arguments)]
 fn flonums(
     ops: &[Op],
     n: usize,
     konst: impl Fn(usize, u32) -> Value,
     captures: &HashMap<u32, Vec<Reg>>,
     heads: &[usize],
+    inline_at: impl Fn(usize) -> Option<Inline>,
     shape: &Shape,
     assumed: &HashMap<usize, Regs>,
 ) -> Kinds {
@@ -1825,7 +1844,13 @@ fn flonums(
             Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) || has(b))),
             Op::AddI { dst, a, .. } => Some((dst, has(a))),
             Op::Call { base, .. } | Op::CallG { base, .. } => {
-                Some((base, shape.results.get(&pc).is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
+                let by_inline = match inline_at(pc) {
+                    Some(Inline::Inexact) => true,
+                    Some(Inline::FloatDiv | Inline::IntegerAdd) => has(base + 1) || has(base + 2),
+                    _ => false,
+                };
+                let by_res = shape.results.get(&pc).is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)));
+                Some((base, by_inline || by_res))
             }
             _ => None,
         }
@@ -1879,8 +1904,8 @@ fn cached_globals(ops: &[Op], succs: &[Vec<usize>], inlined: &[usize]) -> Vec<(u
 /// to the next instruction (`Gen::reload_globals`).
 fn reloads_globals(ops: &[Op], pc: usize, inline: &impl Fn(usize) -> bool) -> bool {
     match ops[pc] {
-        Op::Closure { .. } | Op::PopHandler | Op::Call { .. } => true,
-        Op::CallG { .. } => !inline(pc),
+        Op::Closure { .. } | Op::PopHandler => true,
+        Op::Call { .. } | Op::CallG { .. } => !inline(pc),
         _ => false,
     }
 }
@@ -1972,11 +1997,84 @@ fn pairs(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usize
     known_regs(ops, n, captures, heads, shape, &HashMap::default(), step, also).regs
 }
 
+/// Registers known to hold a `VECTOR_FIXNUM` vector (every element is a fixnum).
+/// Killed across any call that reloads globals (which could mutate any vector
+/// with a non-fixnum); global reads re-establish it via `reload_globals`.
+#[allow(clippy::too_many_arguments)]
+fn fixnum_vectors(
+    ops: &[Op],
+    n: usize,
+    captures: &HashMap<u32, Vec<Reg>>,
+    heads: &[usize],
+    shape: &Shape,
+    cached_fix: &[u32],
+    assumed: &HashMap<usize, Regs>,
+    inline: impl Fn(usize) -> bool,
+) -> Vec<Regs> {
+    let step = |pc: usize, known: &[Regs]| match ops[pc] {
+        Op::GetG { dst, g } => Some((dst, cached_fix.contains(&g))),
+        Op::Mov { dst, src } => Some((dst, known[pc].contains(src))),
+        _ => None,
+    };
+    let kill = |pc: usize| reloads_globals(ops, pc, &inline);
+    let res = known_regs_kill(ops, n, captures, heads, shape, assumed, step, |_| None, kill);
+    if res.missing.is_empty() {
+        res.regs
+    } else {
+        known_regs_kill(ops, n, captures, heads, shape, &HashMap::default(), step, |_| None, kill).regs
+    }
+}
+
+/// Registers known to hold a `Char` (char constants and `string-ref` results).
+fn chars(
+    ops: &[Op],
+    n: usize,
+    konst: impl Fn(usize, u32) -> Value,
+    captures: &HashMap<u32, Vec<Reg>>,
+    heads: &[usize],
+    char_call: impl Fn(usize) -> bool,
+    shape: &Shape,
+) -> Vec<Regs> {
+    let step = |pc: usize, known: &[Regs]| match ops[pc] {
+        Op::LoadK { dst, k } => Some((dst, konst(pc, k).is_char())),
+        Op::Mov { dst, src } => Some((dst, known[pc].contains(src))),
+        Op::CallG { base, .. } | Op::Call { base, .. } => {
+            let results = shape.results.get(&pc);
+            Some((base, char_call(pc) || results.is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
+        }
+        _ => None,
+    };
+    known_regs(ops, n, captures, heads, shape, &HashMap::default(), step, |_| None).regs
+}
+
+/// Registers whose flat-ASCII string length is cached in `Gen::str_lens`
+/// (0 for non-ASCII strings, causing `StringRef` to fall back cleanly).
+/// Killed across any call that could run `string-set!`.
+#[allow(clippy::too_many_arguments)]
+fn ascii_strings(
+    ops: &[Op],
+    n: usize,
+    captures: &HashMap<u32, Vec<Reg>>,
+    heads: &[usize],
+    shape: &Shape,
+    str_op: impl Fn(usize) -> Option<Reg>,
+    inline: impl Fn(usize) -> bool,
+) -> Vec<Regs> {
+    let step = |pc: usize, known: &[Regs]| match ops[pc] {
+        Op::Mov { dst, src } => Some((dst, known[pc].contains(src))),
+        _ => None,
+    };
+    let also = |pc: usize| str_op(pc);
+    let kill = |pc: usize| reloads_globals(ops, pc, &inline);
+    known_regs_kill(ops, n, captures, heads, shape, &HashMap::default(), step, also, kill).regs
+}
+
 /// The registers whose kind some instruction uses: operands of arithmetic
-/// and comparisons, and vector indices, and what is moved into them.
-fn kind_used(ops: &[Op], n: usize) -> Regs {
+/// and comparisons, vector indices, inline scalar native operands, and what
+/// is moved into them.
+fn kind_used(ops: &[Op], n: usize, inline_at: impl Fn(usize) -> Option<Inline>, for_float: bool) -> Regs {
     let mut used = Regs::empty(n);
-    for op in ops {
+    for (pc, op) in ops.iter().enumerate() {
         match *op {
             Op::Add { a, b, .. }
             | Op::Sub { a, b, .. }
@@ -1992,6 +2090,20 @@ fn kind_used(ops: &[Op], n: usize) -> Regs {
             | Op::JNNumEq { a, b, .. } => [a, b].into_iter().for_each(|r| used.insert(r)),
             Op::AddI { a, .. } | Op::JNLtI { a, .. } | Op::JNGtI { a, .. } | Op::JNEqI { a, .. } => used.insert(a),
             Op::VRef { i, .. } | Op::VSet { i, .. } => used.insert(i),
+            Op::Call { base, .. } | Op::CallG { base, .. } => match inline_at(pc) {
+                Some(Inline::IntegerAdd) if for_float => {
+                    used.insert(base + 1);
+                    used.insert(base + 2);
+                }
+                Some(Inline::FloatDiv) => {
+                    used.insert(base + 1);
+                    used.insert(base + 2);
+                }
+                Some(Inline::Inexact) => used.insert(base + 1),
+                Some(Inline::StringRef | Inline::BytevectorU8Ref) => used.insert(base + 2),
+                Some(Inline::RecordRef) => used.insert(base + 3),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -2010,6 +2122,138 @@ fn kind_used(ops: &[Op], n: usize) -> Regs {
     }
 }
 
+/// Registers whose value at `pc` may reach a use that needs a boxed `Value`
+/// (anything other than `Inline::IntegerAdd` arguments, `Op::Mov`, or `Op::Ret`).
+fn i64_bad_uses(
+    ops: &[Op],
+    n: usize,
+    captures: &HashMap<u32, Vec<Reg>>,
+    inline_at: &impl Fn(usize) -> Option<Inline>,
+    succs: &[Vec<usize>],
+) -> Vec<Regs> {
+    let mut bad = vec![Regs::empty(n); ops.len()];
+    loop {
+        let mut changed = false;
+        for pc in (0..ops.len()).rev() {
+            let mut b = Regs::empty(n);
+            for &s in &succs[pc] {
+                if s < bad.len() {
+                    b.union(&bad[s]);
+                }
+            }
+            let (uses, defs) = uses_defs(&ops[pc], captures);
+            let dst_bad = match ops[pc] {
+                Op::Mov { dst, .. } => b.contains(dst),
+                _ => false,
+            };
+            for &d in &defs {
+                b.remove(d);
+            }
+            match ops[pc] {
+                Op::Mov { src, .. } => {
+                    if dst_bad {
+                        b.insert(src);
+                    }
+                }
+                Op::Ret { .. } => {}
+                Op::Call { base, .. } if inline_at(pc) == Some(Inline::IntegerAdd) => {
+                    b.insert(base);
+                }
+                Op::CallG { .. } if inline_at(pc) == Some(Inline::IntegerAdd) => {}
+                _ => {
+                    for &u in &uses {
+                        b.insert(u);
+                    }
+                }
+            }
+            if b != bad[pc] {
+                bad[pc] = b;
+                changed = true;
+            }
+        }
+        if !changed {
+            return bad;
+        }
+    }
+}
+
+/// Registers kept as unboxed signed 64-bit exact integers (`Gen::ivals`) across
+/// `Inline::IntegerAdd` loops so 48..64-bit accumulators avoid heap BigInt
+/// allocation inside loops. Disjoint from `fix` and `flo`, and restricted to
+/// registers whose uses never require a boxed value mid-loop.
+#[allow(clippy::too_many_arguments)]
+fn int64s(
+    ops: &[Op],
+    n: usize,
+    captures: &HashMap<u32, Vec<Reg>>,
+    heads: &[usize],
+    inline_at: impl Fn(usize) -> Option<Inline>,
+    inline: impl Fn(usize) -> bool,
+    fix: &[Regs],
+    flo: &[Regs],
+    live_in: &[Regs],
+    shape: &Shape,
+    observed: Option<&Observed>,
+) -> Kinds {
+    let mut i64_ops = Regs::empty(n);
+    for (pc, op) in ops.iter().enumerate() {
+        if let Op::Call { base, .. } | Op::CallG { base, .. } = *op
+            && inline_at(pc) == Some(Inline::IntegerAdd)
+        {
+            i64_ops.insert(base + 1);
+            i64_ops.insert(base + 2);
+        }
+    }
+    if i64_ops.is_empty() {
+        return Kinds { regs: vec![Regs::empty(n); ops.len()], missing: HashMap::default() };
+    }
+    loop {
+        let before = i64_ops.clone();
+        for op in ops {
+            if let Op::Mov { dst, src } = *op
+                && i64_ops.contains(dst)
+            {
+                i64_ops.insert(src);
+            }
+        }
+        if i64_ops == before {
+            break;
+        }
+    }
+    let bad = i64_bad_uses(ops, n, captures, &inline_at, &shape.succs);
+    let ok_at = |pc: usize, r: Reg| {
+        bad.get(pc).is_some_and(|b| !b.contains(r))
+            && !shape.inlined.get(pc).copied().unwrap_or(true)
+            && fix.get(pc).is_some_and(|f| !f.contains(r))
+            && flo.get(pc).is_some_and(|f| !f.contains(r))
+    };
+    let assumed: HashMap<usize, Regs> = observed
+        .into_iter()
+        .filter(|o| heads.contains(&o.head))
+        .map(|o| {
+            let mut a = Regs::empty(n);
+            o.int64s
+                .iter()
+                .filter(|&&r| (r as usize) < n && live_in[o.head].contains(r) && i64_ops.contains(r) && ok_at(o.head, r))
+                .for_each(|&r| a.insert(r));
+            (o.head, a)
+        })
+        .collect();
+    if assumed.values().all(Regs::is_empty) {
+        return Kinds { regs: vec![Regs::empty(n); ops.len()], missing: HashMap::default() };
+    }
+    let step = |pc: usize, known: &[Regs]| match ops[pc] {
+        Op::Mov { dst, src } => Some((dst, known[pc].contains(src) && ok_at(pc + 1, dst))),
+        Op::Call { base, .. } | Op::CallG { base, .. } if inline_at(pc) == Some(Inline::IntegerAdd) => {
+            let is_flo = flo[pc].contains(base + 1) || flo[pc].contains(base + 2);
+            Some((base, !is_flo && ok_at(pc + 1, base)))
+        }
+        _ => None,
+    };
+    let kill = |pc: usize| reloads_globals(ops, pc, &inline);
+    known_regs_kill(ops, n, captures, heads, shape, &assumed, step, |_| None, kill)
+}
+
 /// What `fixnums`, `flonums` and `vectors` share: the registers of a kind
 /// on every path native code takes, given what each instruction does to
 /// the kind of the register it sets (`step`: `Some((dst, of the kind))`,
@@ -2020,7 +2264,22 @@ fn kind_used(ops: &[Op], n: usize) -> Regs {
 /// the interpreter saw there when it asked for the code), those are known
 /// too: native code checks them on its way in where they are not known
 /// (`Kinds::missing`, by edge), and the entry point's loader with the rest.
+#[allow(clippy::too_many_arguments)]
 fn known_regs(
+    ops: &[Op],
+    n: usize,
+    captures: &HashMap<u32, Vec<Reg>>,
+    heads: &[usize],
+    shape: &Shape,
+    assumed: &HashMap<usize, Regs>,
+    step: impl Fn(usize, &[Regs]) -> Option<(Reg, bool)>,
+    also: impl Fn(usize) -> Option<Reg>,
+) -> Kinds {
+    known_regs_kill(ops, n, captures, heads, shape, assumed, step, also, |_| false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn known_regs_kill(
     ops: &[Op],
     n: usize,
     _captures: &HashMap<u32, Vec<Reg>>,
@@ -2029,6 +2288,7 @@ fn known_regs(
     assumed: &HashMap<usize, Regs>,
     step: impl Fn(usize, &[Regs]) -> Option<(Reg, bool)>,
     also: impl Fn(usize) -> Option<Reg>,
+    kill_all: impl Fn(usize) -> bool,
 ) -> Kinds {
     let len = ops.len();
     // Native code runs from pc 0 and the entry points, along the edges of
@@ -2060,7 +2320,7 @@ fn known_regs(
         .collect();
     // What is known after the instruction at `pc`, on its edge to `s`.
     let out = |known: &[Regs], pc: usize, s: usize| {
-        let mut k = known[pc].clone();
+        let mut k = if shape.fresh(pc, s).is_none() && kill_all(pc) { Regs::empty(n) } else { known[pc].clone() };
         // Entering an inlinee is before the call's result exists. In
         // particular an indirect call's base still holds its closure.
         if shape.fresh(pc, s).is_none() {
@@ -2332,6 +2592,8 @@ impl Jit {
         let sigs = Sigs {
             step: helper(3, true),
             barrier: helper(3, false),
+            barrier_slot: helper(4, false),
+            box_i64: helper(2, true),
             unwind: helper(4, false),
             pop: helper(1, false),
             after: helper(5, true),
@@ -2380,12 +2642,19 @@ impl Jit {
             let pool = origin[pc].map_or(&job.consts, |o| &sites[o.site].const_bits);
             Value::from_bits(pool[k as usize])
         };
+        let inline_at = |pc: usize| match orig[pc] {
+            Op::CallG { g, n, .. } => job.native_globals.get(&g).and_then(|k| k.inline(n)),
+            Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).and_then(|k| k.inline(n)),
+            _ => None,
+        };
+        let inline = |pc: usize| inline_at(pc).is_some();
         // Assumed where the interpreter saw them (`Job::observed`), those
         // whose kind native code uses (`kind_used`): assuming others would
         // gain nothing, and leave frames to the interpreter when they
         // change (an accumulator growing into a bignum).
-        let used = kind_used(orig, n);
-        let assumed = |regs: &dyn Fn(&Observed) -> &Vec<Reg>| -> HashMap<usize, Regs> {
+        let used_fix = kind_used(orig, n, inline_at, false);
+        let used_flo = kind_used(orig, n, inline_at, true);
+        let assumed = |used: &Regs, regs: &dyn Fn(&Observed) -> &Vec<Reg>| -> HashMap<usize, Regs> {
             job.observed
                 .iter()
                 .filter(|o| heads.contains(&o.head))
@@ -2395,35 +2664,6 @@ impl Jit {
                     (o.head, a)
                 })
                 .collect()
-        };
-        let flo = flonums(orig, n, konst, &job.captures, heads, &shape, &assumed(&|o| &o.floats));
-        let fix = fixnums(
-            orig,
-            n,
-            konst,
-            &job.captures,
-            heads,
-            |pc| match orig[pc] {
-                Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
-                Op::Call { .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.fixnum),
-                _ => false,
-            },
-            &shape,
-            &assumed(&|o| &o.fixnums),
-        );
-        // The edges native code checks assumptions on.
-        let mut guards: HashMap<(usize, usize), (Regs, Regs)> = HashMap::default();
-        for (&edge, m) in &fix.missing {
-            guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).0.union(m);
-        }
-        for (&edge, m) in &flo.missing {
-            guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).1.union(m);
-        }
-        let (fix, flo) = (fix.regs, flo.regs);
-        let inline = |pc: usize| match orig[pc] {
-            Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
-            Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n).is_some()),
-            _ => false,
         };
         let mut cached_sites: Vec<_> = sites.iter().map(|s| s.call).collect();
         if switch!("TECHNE_JIT_NATIVE_CACHE") {
@@ -2436,7 +2676,16 @@ impl Jit {
                         matches!(
                             k.inline(n),
                             Some(
-                                Inline::StringRef | Inline::StringLength | Inline::CharEq | Inline::CharToInteger | Inline::BytevectorU8Ref
+                                Inline::StringRef
+                                    | Inline::StringLength
+                                    | Inline::CharEq
+                                    | Inline::CharToInteger
+                                    | Inline::BytevectorU8Ref
+                                    | Inline::IntegerAdd
+                                    | Inline::Inexact
+                                    | Inline::FloatDiv
+                                    | Inline::VectorLength
+                                    | Inline::RecordRef
                             )
                         )
                     }) && reload_free_loop(orig, &shape.succs, pc, inline) =>
@@ -2448,14 +2697,216 @@ impl Jit {
         }
         let cached = cached_globals(orig, &shape.succs, &cached_sites);
         let vec_globals: Vec<u32> = cached.iter().filter(|c| c.1).map(|c| c.0).collect();
-        let vecs = vectors(orig, n, &job.captures, heads, &shape, &vec_globals);
-        let pairs = if std::env::var("TECHNE_JIT_PAIRS").as_deref() == Ok("0") {
+        let fix_vec_globals: Vec<u32> = vec_globals.iter().copied().filter(|g| job.fixnum_vec_globals.contains(g)).collect();
+        let mut vec_used = Regs::empty(n);
+        for op in orig {
+            if let Op::VRef { v, .. } = *op {
+                vec_used.insert(v);
+            }
+        }
+        let assumed_fix_vecs: HashMap<usize, Regs> = job
+            .observed
+            .iter()
+            .filter(|o| heads.contains(&o.head))
+            .map(|o| {
+                let mut a = Regs::empty(n);
+                o.fixnum_vecs.iter().filter(|&&r| (r as usize) < n && vec_used.contains(r)).for_each(|&r| a.insert(r));
+                (o.head, a)
+            })
+            .collect();
+        let fix_vecs = if fix_vec_globals.is_empty() && assumed_fix_vecs.values().all(Regs::is_empty) {
+            vec![Regs::empty(n); orig.len()]
+        } else {
+            fixnum_vectors(orig, n, &job.captures, heads, &shape, &fix_vec_globals, &assumed_fix_vecs, inline)
+        };
+        let mut vecs = vectors(orig, n, &job.captures, heads, &shape, &vec_globals);
+        for (v, f) in vecs.iter_mut().zip(&fix_vecs) {
+            v.union(f);
+        }
+        let flo = flonums(orig, n, konst, &job.captures, heads, inline_at, &shape, &assumed(&used_flo, &|o| &o.floats));
+        let fix = fixnums(
+            orig,
+            n,
+            konst,
+            &job.captures,
+            heads,
+            |pc| match orig[pc] {
+                Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
+                Op::Call { .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.fixnum),
+                _ => false,
+            },
+            &fix_vecs,
+            &shape,
+            &assumed(&used_fix, &|o| &o.fixnums),
+        );
+        let flow = analyze(
+            orig,
+            n,
+            &job.captures,
+            self_jump,
+            &fix.regs,
+            |pc| match orig[pc] {
+                Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
+                Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).map(|k| k.inline(n).is_some()),
+                _ => None,
+            },
+            &shape,
+        );
+        let native_inline = |pc: usize| match orig[pc] {
+            Op::CallG { g, n, .. } | Op::TailCallG { g, n, .. } => job.native_globals.get(&g).and_then(|k| k.inline(n)),
+            Op::Call { n, .. } | Op::TailCall { n, .. } => job.native_calls.get(&(pc as u32)).and_then(|k| k.inline(n)),
+            _ => None,
+        };
+        let has_i64_ops = sites.is_empty() && (0..orig.len()).any(|pc| native_inline(pc) == Some(Inline::IntegerAdd));
+        let i64_res = if has_i64_ops {
+            int64s(orig, n, &job.captures, heads, inline_at, inline, &fix.regs, &flo.regs, &flow.live_in, &shape, job.observed.as_ref())
+        } else {
+            Kinds { regs: vec![Regs::empty(n); orig.len()], missing: HashMap::default() }
+        };
+        // The edges native code checks assumptions on.
+        let mut guards: HashMap<(usize, usize), (Regs, Regs, Regs)> = HashMap::default();
+        for (&edge, m) in &fix.missing {
+            guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n), Regs::empty(n))).0.union(m);
+        }
+        for (&edge, m) in &flo.missing {
+            guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n), Regs::empty(n))).1.union(m);
+        }
+        let i64s = if !sites.is_empty()
+            || guards
+                .iter()
+                .filter(|&(&(_, to), (fx, fl, _))| !fx.and(&flow.live_in[to]).is_empty() || !fl.and(&flow.live_in[to]).is_empty())
+                .map(|(&e, _)| e)
+                .chain(i64_res.missing.iter().filter(|&(&(_, to), m)| !m.and(&flow.live_in[to]).is_empty()).map(|(&e, _)| e))
+                .any(|(from, _)| !i64_res.regs[from].is_empty())
+        {
+            vec![Regs::empty(n); orig.len()]
+        } else {
+            for (&edge, m) in &i64_res.missing {
+                guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n), Regs::empty(n))).2.union(m);
+            }
+            i64_res.regs
+        };
+        let (fix, flo) = (fix.regs, flo.regs);
+        let has_char_ops = (0..orig.len()).any(|pc| matches!(native_inline(pc), Some(Inline::CharToInteger | Inline::CharEq)));
+        let chars = if has_char_ops {
+            chars(
+                orig,
+                n,
+                konst,
+                &job.captures,
+                heads,
+                |pc| match orig[pc] {
+                    Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n) == Some(Inline::StringRef)),
+                    Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n) == Some(Inline::StringRef)),
+                    _ => false,
+                },
+                &shape,
+            )
+        } else {
+            vec![Regs::empty(n); orig.len()]
+        };
+        let has_str_ops = (0..orig.len()).any(|pc| matches!(native_inline(pc), Some(Inline::StringLength | Inline::StringRef)));
+        let ascii_strs = if has_str_ops {
+            ascii_strings(
+                orig,
+                n,
+                &job.captures,
+                heads,
+                &shape,
+                |pc| match orig[pc] {
+                    Op::CallG { base, g, n }
+                        if job
+                            .native_globals
+                            .get(&g)
+                            .is_some_and(|k| matches!(k.inline(n), Some(Inline::StringLength | Inline::StringRef))) =>
+                    {
+                        Some(base + 1)
+                    }
+                    Op::Call { base, n }
+                        if job
+                            .native_calls
+                            .get(&(pc as u32))
+                            .is_some_and(|k| matches!(k.inline(n), Some(Inline::StringLength | Inline::StringRef))) =>
+                    {
+                        Some(base + 1)
+                    }
+                    _ => None,
+                },
+                inline,
+            )
+        } else {
+            vec![Regs::empty(n); orig.len()]
+        };
+        let pairs = if std::env::var("TECHNE_JIT_PAIRS").as_deref() == Ok("0")
+            || !orig.iter().any(|op| matches!(op, Op::Car { .. } | Op::Cdr { .. }))
+        {
             vec![Regs::empty(n); orig.len()]
         } else {
             pairs(orig, n, &job.captures, heads, &shape)
         };
         let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline, heads.contains(&0));
         let bound = bound_globals(&ops, &shape.succs, heads);
+        let has_reload_free_loop = loops
+            && orig.iter().enumerate().any(|(pc, op)| {
+                (matches!(op, Op::Loop { .. }) || (self_jump && pc == 0)) && reload_free_loop(orig, &shape.succs, pc, inline)
+            });
+        let defer_fuel = loops && (!sites.is_empty() || has_reload_free_loop) && std::env::var("TECHNE_JIT_FUEL").as_deref() != Ok("0");
+        let leaf = heads.contains(&0)
+            && kernel.is_none()
+            && !job.rest
+            && frame > job.nparams as usize
+            && orig.iter().enumerate().all(|(pc, op)| match *op {
+                Op::LoadI { .. }
+                | Op::LoadK { .. }
+                | Op::Mov { .. }
+                | Op::GetG { .. }
+                | Op::SetG { .. }
+                | Op::GetC { .. }
+                | Op::GetCB { .. }
+                | Op::SetCB { .. }
+                | Op::Unbox { .. }
+                | Op::SetBox { .. }
+                | Op::Add { .. }
+                | Op::AddI { .. }
+                | Op::Sub { .. }
+                | Op::Mul { .. }
+                | Op::Quo { .. }
+                | Op::Rem { .. }
+                | Op::Mod { .. }
+                | Op::Lt { .. }
+                | Op::Le { .. }
+                | Op::NumEq { .. }
+                | Op::Car { .. }
+                | Op::Cdr { .. }
+                | Op::NullP { .. }
+                | Op::PairP { .. }
+                | Op::Not { .. }
+                | Op::EqP { .. }
+                | Op::VRef { .. }
+                | Op::VSet { .. }
+                | Op::Jmp { .. }
+                | Op::Loop { .. }
+                | Op::Jf { .. }
+                | Op::Jt { .. }
+                | Op::JNLt { .. }
+                | Op::JNLe { .. }
+                | Op::JNNumEq { .. }
+                | Op::JNEq { .. }
+                | Op::JNNull { .. }
+                | Op::JNLtI { .. }
+                | Op::JNGtI { .. }
+                | Op::JNEqI { .. }
+                | Op::JNPair { .. }
+                | Op::Ret { .. }
+                | Op::EnterJit => true,
+                Op::TailCallG { g, n, .. } => {
+                    site_at.contains_key(&pc) || (n == job.nparams && job.closure_globals.get(&g).is_some_and(|k| k.code == job.code))
+                }
+                Op::CallG { .. } => {
+                    site_at.contains_key(&pc) || inline_at(pc).is_some_and(|i| !matches!(i, Inline::Substring | Inline::IntegerAdd))
+                }
+                _ => false,
+            });
         let mut g = Gen {
             bound,
             vm: p[0],
@@ -2467,36 +2918,44 @@ impl Jit {
             fuel,
             fuel_var,
             loops,
-            // Multiple polls per iteration pay for boundary publication.
-            // Pure loops retain the smaller old live ranges/counter path.
-            defer_fuel: loops && !sites.is_empty() && std::env::var("TECHNE_JIT_FUEL").as_deref() != Ok("0"),
+            // Keep the fuel counter in an SSA register across loops with inlined
+            // sites or reload-free loops, publishing only at foreign/native/exit boundaries.
+            defer_fuel,
+            leaf,
+            leaf_first: job.nparams as usize + job.rest as usize,
+            leaf_frame: frame,
             regs_end,
             cage,
             code_table,
             code_ptr: job.code as i64,
             entry0: heads.contains(&0),
-            flow: analyze(
-                orig,
-                n,
-                &job.captures,
-                self_jump,
-                &fix,
-                |pc| match orig[pc] {
-                    Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
-                    Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).map(|k| k.inline(n).is_some()),
-                    _ => None,
-                },
-                &shape,
-            ),
+            vec_ptrs: if orig.iter().any(|op| matches!(op, Op::VRef { .. } | Op::VSet { .. })) || vecs.iter().any(|r| !r.is_empty()) {
+                (0..n).map(|_| b.declare_var(I64)).collect()
+            } else {
+                Vec::new()
+            },
+            ivals: if i64s.iter().any(|r| !r.is_empty()) { (0..n).map(|_| b.declare_var(I64)).collect() } else { Vec::new() },
+            flow,
             fix,
             flo,
+            i64s,
             vecs,
+            fix_vecs,
+            chars,
+            ascii_strs,
             pairs,
             ant,
             lens: (0..n).map(|_| (b.declare_var(I64), b.declare_var(I64))).collect(),
+            str_lens: if has_str_ops { (0..n).map(|_| b.declare_var(I64)).collect() } else { Vec::new() },
             cached: cached
                 .iter()
-                .map(|&(g, lens)| Cached { g, value: b.declare_var(I64), lens: lens.then(|| (b.declare_var(I64), b.declare_var(I64))) })
+                .map(|&(g, lens)| Cached {
+                    g,
+                    value: b.declare_var(I64),
+                    lens: lens.then(|| (b.declare_var(I64), b.declare_var(I64))),
+                    ptr: lens.then(|| b.declare_var(I64)),
+                    fix: lens && fix_vec_globals.contains(&g),
+                })
                 .collect(),
             native_same: cached
                 .iter()
@@ -2545,12 +3004,13 @@ impl Jit {
         }
         // Dead registers start as 0; each entry point loads its live ones.
         let zero = b.ins().iconst(I64, 0);
-        g.vars.iter().chain(&g.shifts).for_each(|v| b.def_var(*v, zero));
+        g.vars.iter().chain(&g.shifts).chain(&g.ivals).for_each(|v| b.def_var(*v, zero));
         // (A length of 0 lets no access through.)
         g.lens.iter().chain(g.cached.iter().filter_map(|c| c.lens.as_ref())).for_each(|&(l, w)| {
             b.def_var(l, zero);
             b.def_var(w, zero);
         });
+        g.str_lens.iter().chain(&g.vec_ptrs).chain(g.cached.iter().filter_map(|c| c.ptr.as_ref())).for_each(|&v| b.def_var(v, zero));
         g.cached
             .iter()
             .map(|c| c.value)
@@ -2577,7 +3037,7 @@ impl Jit {
         b.ins().trap(TrapCode::unwrap_user(1));
         for (&h, &block) in &loaders {
             b.switch_to_block(block);
-            if h == 0 {
+            if h == 0 && !g.leaf {
                 // Prologue: callers only place the arguments. Clear the rest
                 // of the frame (stale values above the GC's root window may
                 // dangle) and include it in that window.
@@ -2601,8 +3061,15 @@ impl Jit {
             g.reload_globals(&mut b, h);
             for r in g.vecs[h].and(&g.flow.live_in[h]).iter() {
                 let x = g.get(&mut b, r as Reg);
-                let lens = g.lens_of(&mut b, x);
+                let lens = if g.fix_vecs[h].contains(r as Reg) { g.lens_of_fix(&mut b, x) } else { g.lens_of(&mut b, x) };
                 g.set_lens(&mut b, r as Reg, lens);
+                let p = g.ptr(&mut b, x);
+                b.def_var(g.vec_ptrs[r], p);
+            }
+            for r in g.ascii_strs[h].and(&g.flow.live_in[h]).iter() {
+                let x = g.get(&mut b, r as Reg);
+                let len = g.ascii_str_len_of(&mut b, x);
+                b.def_var(g.str_lens[r], len);
             }
             // Pair facts hold on compiled paths, not necessarily on an
             // interpreter/OSR entry (an earlier access may have raised).
@@ -2610,6 +3077,18 @@ impl Jit {
                 let x = g.get(&mut b, r as Reg);
                 let interpret = g.exit(&mut b, h, INTERPRET);
                 g.check_kind(&mut b, x, Kind::Pair, interpret);
+            }
+            for r in g.chars[h].and(&g.flow.live_in[h]).iter() {
+                let x = g.get(&mut b, r as Reg);
+                let interpret = g.exit(&mut b, h, INTERPRET);
+                let ok = Gen::is_char(&mut b, x);
+                Gen::guard(&mut b, ok, interpret);
+            }
+            for r in g.i64s[h].and(&g.flow.live_in[h]).iter() {
+                let x = g.get(&mut b, r as Reg);
+                let interpret = g.exit(&mut b, h, INTERPRET);
+                let n = g.unbox_i64(&mut b, x, interpret);
+                b.def_var(g.ivals[r], n);
             }
             // The interpreter may have stored something else where native
             // code knows fixnums or floats.
@@ -2658,11 +3137,26 @@ impl Jit {
         let guard_blocks: Vec<_> = g.guard_blocks.iter().map(|(&edge, &block)| (edge, block)).collect();
         for ((from, to), block) in guard_blocks {
             b.switch_to_block(block);
-            let (fx, fl) = &g.guards[&(from, to)];
+            let (fx, fl, i64g) = g.guards[&(from, to)].clone();
             let live = g.flow.live_in[to].clone();
-            let bad = g.check_kinds(&mut b, &fx.and(&live), &fl.and(&live));
             let fail = g.exit(&mut b, to, GUARD);
-            b.ins().brif(bad, fail, &[], g.blocks[to].unwrap(), &[]);
+            let (fx, fl, i64g) = (fx.and(&live), fl.and(&live), i64g.and(&live));
+            for r in i64g.iter() {
+                let n = if g.fix[from].contains(r as Reg) {
+                    let s = b.use_var(g.shifts[r]);
+                    b.ins().sshr_imm_s(s, 16)
+                } else {
+                    let x = g.get(&mut b, r as Reg);
+                    g.unbox_i64(&mut b, x, fail)
+                };
+                b.def_var(g.ivals[r], n);
+            }
+            if !fx.is_empty() || !fl.is_empty() {
+                let bad = g.check_kinds(&mut b, &fx, &fl);
+                b.ins().brif(bad, fail, &[], g.blocks[to].unwrap(), &[]);
+            } else {
+                b.ins().jump(g.blocks[to].unwrap(), &[]);
+            }
         }
         let exits: Vec<_> = g.exits.iter().map(|(k, v)| (*k, *v)).collect();
         for ((pc, status), block) in exits {
@@ -2673,13 +3167,14 @@ impl Jit {
             }
             if matches!(status, EXIT | TICK | STEP | REDO) {
                 g.spill_at(&mut b, pc);
-            }
-            if matches!(status, GUARD | GUARD_TICK) {
+            } else if matches!(status, GUARD | GUARD_TICK) {
                 g.clear_dead(&mut b, pc);
                 for i in g.flow.dirty_in[pc].and(&g.flow.live_in[pc]).iter() {
                     let x = b.use_var(g.vars[i]);
                     b.ins().store(flags(), x, g.r, (i * 8) as i32);
                 }
+            } else if status != EXIT_SPILLED {
+                g.init_leaf_frame(&mut b, pc);
             }
             // Publish before REDO's refund; publishing after it would
             // overwrite the increment the interpreter is owed.
@@ -2688,6 +3183,7 @@ impl Jit {
             let status = match status {
                 GUARD => INTERPRET,
                 GUARD_TICK => TICK,
+                EXIT_SPILLED => EXIT,
                 REDO => {
                     // Native code counted the call: the interpreter counts it.
                     let f = b.ins().load(I32, flags(), g.fuel, 0);
@@ -2742,6 +3238,8 @@ impl Jit {
 struct Sigs {
     step: ir::SigRef,
     barrier: ir::SigRef,
+    barrier_slot: ir::SigRef,
+    box_i64: ir::SigRef,
     unwind: ir::SigRef,
     pop: ir::SigRef,
     after: ir::SigRef,
@@ -2777,6 +3275,11 @@ struct Gen {
     /// Count at every original poll, but publish only at foreign/native
     /// boundaries. Inlined work shares this function's SSA counter.
     defer_fuel: bool,
+    /// GC-free leaf function: defer frame zeroing and `stack_top` publication
+    /// to cold exit/fallback paths so hot calls skip them completely.
+    leaf: bool,
+    leaf_first: usize,
+    leaf_frame: usize,
     regs_end: ir::Value,
     /// `JitCtx::cage`: values name addresses in it (`Gen::ptr`).
     cage: ir::Value,
@@ -2788,8 +3291,16 @@ struct Gen {
     fix: Vec<Regs>,
     /// Registers known to hold floats, by pc (`flonums`).
     flo: Vec<Regs>,
+    /// Registers kept as unboxed signed 64-bit exact integers, by pc (`int64s`).
+    i64s: Vec<Regs>,
     /// Registers whose `lens` are kept, by pc (`vectors`).
     vecs: Vec<Regs>,
+    /// Registers known to hold `VECTOR_FIXNUM` vectors, by pc (`fixnum_vectors`).
+    fix_vecs: Vec<Regs>,
+    /// Registers known to hold `Char`s, by pc (`chars`).
+    chars: Vec<Regs>,
+    /// Registers whose flat-ASCII string length is cached in `str_lens`, by pc (`ascii_strings`).
+    ascii_strs: Vec<Regs>,
     /// Registers known pairs on compiled paths (`pairs`).
     pairs: Vec<Regs>,
     /// The globals kept native code may read, by pc (`anticipated`).
@@ -2797,6 +3308,10 @@ struct Gen {
     /// By register: the length of the vector it holds if it is one, and
     /// if it can be changed, else 0 (`Gen::lens_of`), where `vecs` has it.
     lens: Vec<(Variable, Variable)>,
+    /// By register: cached raw pointer `cage + (v & CAGE_MASK)` for vectors in `vecs`.
+    vec_ptrs: Vec<Variable>,
+    /// By register: flat-ASCII string length if it is one, else 0.
+    str_lens: Vec<Variable>,
     /// The globals native code keeps (`cached_globals`): read at entry
     /// points and after anything that may have changed them or moved what
     /// they hold, where native code may read them before it reads them
@@ -2810,9 +3325,9 @@ struct Gen {
     /// By indirect inline site: its immutable argument source and a cached
     /// code-identity guard. Actual closures/environments are never cached.
     cached_calls: Vec<(usize, Reg, Variable)>,
-    /// The fixnums and floats native code checks on an edge (from, to)
-    /// into an entry point that assumes them (`known_regs`).
-    guards: HashMap<(usize, usize), (Regs, Regs)>,
+    /// The fixnums, floats, and unboxed i64s native code checks on an edge
+    /// (from, to) into an entry point that assumes them (`known_regs`).
+    guards: HashMap<(usize, usize), (Regs, Regs, Regs)>,
     /// Blocks checking them, filled after the instructions.
     guard_blocks: HashMap<(usize, usize), Block>,
     /// The instruction being compiled, whose edges `target` makes.
@@ -2826,6 +3341,8 @@ struct Gen {
     /// The registers known to hold floats (`flo`) as `f64`s, kept from
     /// where they become known (`set_float`).
     fvals: Vec<Variable>,
+    /// The registers kept as unboxed signed 64-bit exact integers (`i64s`).
+    ivals: Vec<Variable>,
     ops: Vec<Op>,
     /// Native instruction blocks by pc.
     blocks: Vec<Option<Block>>,
@@ -2860,6 +3377,8 @@ struct Cached {
     g: u32,
     value: Variable,
     lens: Option<(Variable, Variable)>,
+    ptr: Option<Variable>,
+    fix: bool,
 }
 
 /// A register's value, and its shifted form (`Gen::shifted`) if it is
@@ -2905,7 +3424,28 @@ impl Gen {
     /// heap pointer. Clear those slots before GC can see them. Clean slots
     /// still agree with the interpreter; avoid redundant stores to them.
     fn clear_dead(&self, b: &mut FunctionBuilder, pc: usize) {
-        self.clear_regs(b, self.flow.dirty_in[pc].iter().filter(|&i| !self.flow.live_in[pc].contains(i as Reg)));
+        if self.leaf {
+            self.clear_regs(
+                b,
+                self.flow.dirty_in[pc].iter().filter(|&i| !self.flow.live_in[pc].contains(i as Reg)).chain(
+                    (self.leaf_first..self.leaf_frame)
+                        .filter(|&i| !self.flow.live_in[pc].contains(i as Reg) && !self.flow.dirty_in[pc].contains(i as Reg)),
+                ),
+            );
+            let top = b.ins().iadd_imm_s(self.bp, self.leaf_frame as i64);
+            self.raise_stack_top(b, top);
+        } else {
+            self.clear_regs(b, self.flow.dirty_in[pc].iter().filter(|&i| !self.flow.live_in[pc].contains(i as Reg)));
+        }
+    }
+
+    fn init_leaf_frame(&self, b: &mut FunctionBuilder, pc: usize) {
+        if !self.leaf {
+            return;
+        }
+        self.clear_regs(b, (self.leaf_first..self.leaf_frame).filter(|&i| !self.flow.live_in[pc].contains(i as Reg)));
+        let top = b.ins().iadd_imm_s(self.bp, self.leaf_frame as i64);
+        self.raise_stack_top(b, top);
     }
 
     fn clear_regs(&self, b: &mut FunctionBuilder, regs: impl Iterator<Item = usize>) {
@@ -2922,13 +3462,30 @@ impl Gen {
 
     /// `spill` to the frame's registers at `r`.
     fn spill_to(&self, b: &mut FunctionBuilder, pc: usize, regs: &Regs, r: ir::Value) {
+        let zero = b.ins().iconst(I64, 0);
+        let mut need_box = Vec::new();
         for i in regs.iter() {
+            if self.i64s[pc].contains(i as Reg) {
+                // Zero first so all slots in the frame are valid GC roots if
+                // boxing an i64 triggers collection.
+                b.ins().store(flags(), zero, r, (i * 8) as i32);
+                need_box.push(i);
+                continue;
+            }
             let x = if self.fix[pc].contains(i as Reg) {
                 let s = b.use_var(self.shifts[i]);
                 Self::tag_shifted(b, s)
+            } else if self.flo[pc].contains(i as Reg) {
+                let f = b.use_var(self.fvals[i]);
+                Self::from_f(b, f)
             } else {
                 b.use_var(self.vars[i])
             };
+            b.ins().store(flags(), x, r, (i * 8) as i32);
+        }
+        for i in need_box {
+            let n = b.use_var(self.ivals[i]);
+            let x = self.box_i64_call(b, n);
             b.ins().store(flags(), x, r, (i * 8) as i32);
         }
     }
@@ -2961,6 +3518,13 @@ impl Gen {
             let s = Self::shifted(b, x);
             b.def_var(self.shifts[r], s);
         }
+        if let Some(vs) = self.vecs.get(pc + 1) {
+            for r in vs.and(live).iter() {
+                let x = b.use_var(self.vars[r]);
+                let p = self.ptr(b, x);
+                b.def_var(self.vec_ptrs[r], p);
+            }
+        }
         self.reload_globals(b, pc + 1);
     }
 
@@ -2976,6 +3540,13 @@ impl Gen {
         uses_defs(&self.ops[pc], &HashMap::default()).1.iter().for_each(|&d| known.remove(d));
         known.iter().for_each(|r| live.remove(r as Reg));
         self.reload(b, &live);
+        if let Some(vs) = self.vecs.get(pc + 1) {
+            for r in vs.and(&live).iter() {
+                let x = b.use_var(self.vars[r]);
+                let p = self.ptr(b, x);
+                b.def_var(self.vec_ptrs[r], p);
+            }
+        }
         self.reload_globals(b, pc + 1);
     }
 
@@ -2988,9 +3559,13 @@ impl Gen {
             let x = b.ins().load(I64, flags(), self.globals, (c.g * 8) as i32);
             b.def_var(c.value, x);
             if let Some(lens) = c.lens {
-                let (l, w) = self.lens_of(b, x);
+                let (l, w) = if c.fix { self.lens_of_fix(b, x) } else { self.lens_of(b, x) };
                 b.def_var(lens.0, l);
                 b.def_var(lens.1, w);
+                if let Some(pv) = c.ptr {
+                    let p = self.ptr(b, x);
+                    b.def_var(pv, p);
+                }
             }
         }
         for &(g, expected, var) in &self.native_same {
@@ -3064,6 +3639,45 @@ impl Gen {
         (b.block_params(done)[0], b.block_params(done)[1])
     }
 
+    /// The length of `x` if it is a `VECTOR_FIXNUM` vector (and if mutable); else 0.
+    fn lens_of_fix(&self, b: &mut FunctionBuilder, x: ir::Value) -> (ir::Value, ir::Value) {
+        let (object, done) = (b.create_block(), b.create_block());
+        b.append_block_param(done, I64);
+        b.append_block_param(done, I64);
+        let zero = b.ins().iconst(I64, 0);
+        let ptr = Self::is_ptr(b, x);
+        b.ins().brif(ptr, object, &[], done, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+        b.switch_to_block(object);
+        let p = self.ptr(b, x);
+        let h = b.ins().load(I64, flags(), p, 0);
+        let (l, w) = Self::header_lens_fix(b, x, h);
+        b.ins().jump(done, &[BlockArg::Value(l), BlockArg::Value(w)]);
+        b.switch_to_block(done);
+        (b.block_params(done)[0], b.block_params(done)[1])
+    }
+
+    /// Flat-ASCII string length of `x`, or 0 if `x` is not a flat ASCII string.
+    fn ascii_str_len_of(&self, b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
+        use crate::heap::{ASCII, INDIRECT};
+        let (object, done) = (b.create_block(), b.create_block());
+        b.append_block_param(done, I64);
+        let zero = b.ins().iconst(I64, 0);
+        let ptr = Self::is_ptr(b, x);
+        b.ins().brif(ptr, object, &[], done, &[BlockArg::Value(zero)]);
+        b.switch_to_block(object);
+        let p = self.ptr(b, x);
+        let h = b.ins().load(I64, flags(), p, 0);
+        let mask = 0xFF | ASCII as i64 | INDIRECT as i64;
+        let bits = Kind::String as i64 | ASCII as i64;
+        let k = b.ins().band_imm_s(h, mask);
+        let ok = b.ins().icmp_imm_s(IntCC::Equal, k, bits);
+        let len = Self::header_len(b, h);
+        let res = b.ins().select(ok, len, zero);
+        b.ins().jump(done, &[BlockArg::Value(res)]);
+        b.switch_to_block(done);
+        b.block_params(done)[0]
+    }
+
     /// The length in header `h`, bounded as `heap::header_len` bounds it;
     /// an index below it is taken with its offset wrapping (`wrap`).
     fn header_len(b: &mut FunctionBuilder, h: ir::Value) -> ir::Value {
@@ -3095,6 +3709,20 @@ impl Gen {
         let l = b.ins().select(vector, len, zero);
         let bits = b.ins().band_imm_s(h, 0xFF | crate::heap::IMMUTABLE as i64);
         let changeable = b.ins().icmp_imm_s(IntCC::Equal, bits, Kind::Vector as i64);
+        let w = b.ins().select(changeable, len, zero);
+        (l, w)
+    }
+
+    /// `lens_of_fix` vector `x`, its header `h` (requiring `VECTOR_FIXNUM`).
+    fn header_lens_fix(b: &mut FunctionBuilder, x: ir::Value, h: ir::Value) -> (ir::Value, ir::Value) {
+        let zero = b.ins().iconst(I64, 0);
+        let len = Self::vector_len(b, x, h);
+        let want = Kind::Vector as i64 | crate::heap::VECTOR_FIXNUM as i64;
+        let kind = b.ins().band_imm_s(h, 0xFF | crate::heap::VECTOR_FIXNUM as i64);
+        let vector = b.ins().icmp_imm_s(IntCC::Equal, kind, want);
+        let l = b.ins().select(vector, len, zero);
+        let bits = b.ins().band_imm_s(h, 0xFF | crate::heap::IMMUTABLE as i64 | crate::heap::VECTOR_FIXNUM as i64);
+        let changeable = b.ins().icmp_imm_s(IntCC::Equal, bits, want);
         let w = b.ins().select(changeable, len, zero);
         (l, w)
     }
@@ -3168,6 +3796,9 @@ impl Gen {
             } else if self.fix[pc].contains(i as Reg) {
                 let s = b.use_var(self.shifts[i]);
                 Self::tag_shifted(b, s)
+            } else if self.flo[pc].contains(i as Reg) {
+                let f = b.use_var(self.fvals[i]);
+                Self::from_f(b, f)
             } else {
                 b.use_var(self.vars[i])
             };
@@ -3209,6 +3840,10 @@ impl Gen {
                     let s = b.use_var(self.shifts[i]);
                     let x = Self::tag_shifted(b, s);
                     b.def_var(self.vars[i], x);
+                } else if self.flo[pc].contains(i as Reg) {
+                    let f = b.use_var(self.fvals[i]);
+                    let x = Self::from_f(b, f);
+                    b.def_var(self.vars[i], x);
                 }
             }
         }
@@ -3234,6 +3869,7 @@ impl Gen {
                 let (_, span, below) = self.span(site);
                 if below {
                     let s = &self.sites[root(&self.sites, site)];
+                    self.init_leaf_frame(b, s.call);
                     let mut caller = self.flow.dirty_in[s.call].and(&self.flow.live_out[s.call]);
                     span.clone().for_each(|r| caller.remove(r as Reg));
                     caller.remove(s.base);
@@ -3328,9 +3964,9 @@ impl Gen {
     /// assumptions there (`guards`): until it has, what is known at `pc`
     /// does not hold.
     fn guarded(&self, pc: usize) -> bool {
-        self.guards.get(&(self.at, pc)).is_some_and(|(fx, fl)| {
+        self.guards.get(&(self.at, pc)).is_some_and(|(fx, fl, i64g)| {
             let live = &self.flow.live_in[pc];
-            fx.and(live).iter().chain(fl.and(live).iter()).next().is_some()
+            fx.and(live).iter().chain(fl.and(live).iter()).chain(i64g.and(live).iter()).next().is_some()
         })
     }
 
@@ -3515,16 +4151,14 @@ impl Gen {
     /// A bounded, word-aligned byte size, including the header. Callers
     /// prove that bound before reserving and initialize before any boundary.
     fn alloc_bytes(&self, b: &mut FunctionBuilder, bytes: ir::Value, slow: Block) -> ir::Value {
-        let top_ptr = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_top) as i32);
-        let inline = b.ins().icmp_imm_s(IntCC::NotEqual, top_ptr, 0);
-        Self::guard(b, inline, slow);
-        let top = b.ins().load(I64, flags(), top_ptr, 0);
-        let end = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_end) as i32);
-        let end = b.ins().load(I64, flags(), end, 0);
+        let top_off = (offset_of!(Vm, heap) + offset_of!(Heap, top)) as i32;
+        let end_off = (offset_of!(Vm, heap) + offset_of!(Heap, jit_limit)) as i32;
+        let top = b.ins().load(I64, flags(), self.vm, top_off);
+        let end = b.ins().load(I64, flags(), self.vm, end_off);
         let new = b.ins().iadd(top, bytes);
         let room = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new, end);
         Self::guard(b, room, slow);
-        b.ins().store(flags(), new, top_ptr, 0);
+        b.ins().store(flags(), new, self.vm, top_off);
         top
     }
 
@@ -3548,6 +4182,11 @@ impl Gen {
     fn is_ptr(b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
         let tag = b.ins().ushr_imm_s(x, 48);
         b.ins().icmp_imm_s(IntCC::Equal, tag, TAG_PTR)
+    }
+
+    fn is_char(b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
+        let tag = b.ins().ushr_imm_s(x, 48);
+        b.ins().icmp_imm_s(IntCC::Equal, tag, TAG_CHAR)
     }
 
     /// Sign-extend the 48-bit payload.
@@ -3683,16 +4322,63 @@ impl Gen {
         (p, h)
     }
 
-    fn barrier(&self, b: &mut FunctionBuilder, obj: ir::Value, v: ir::Value) {
+    fn barrier_inline(&self, b: &mut FunctionBuilder, obj: ir::Value, v: ir::Value, emit_call: impl FnOnce(&Self, &mut FunctionBuilder)) {
+        let check = b.create_block();
+        let young_check = b.create_block();
+        let val_check = b.create_block();
+        let rem_check = b.create_block();
         let call = b.create_block();
         let done = b.create_block();
         let ptr = Self::is_ptr(b, v);
-        b.ins().brif(ptr, call, &[], done, &[]);
+        b.ins().brif(ptr, check, &[], done, &[]);
+        b.set_cold_block(check);
+        b.set_cold_block(young_check);
+        b.set_cold_block(val_check);
+        b.set_cold_block(rem_check);
         b.set_cold_block(call);
+
+        b.switch_to_block(check);
+        let mark_off = (offset_of!(Vm, heap) + offset_of!(Heap, marking)) as i32;
+        let marking = b.ins().load(I8, flags(), self.vm, mark_off);
+        b.ins().brif(marking, call, &[], young_check, &[]);
+
+        b.switch_to_block(young_check);
+        let ns_off = (offset_of!(Vm, heap) + offset_of!(Heap, nursery_start)) as i32;
+        let ne_off = (offset_of!(Vm, heap) + offset_of!(Heap, nursery_end)) as i32;
+        let ns = b.ins().load(I64, flags(), self.vm, ns_off);
+        let ne = b.ins().load(I64, flags(), self.vm, ne_off);
+        let nlen = b.ins().isub(ne, ns);
+        let obj_off = b.ins().isub(obj, ns);
+        let obj_young = b.ins().icmp(IntCC::UnsignedLessThan, obj_off, nlen);
+        b.ins().brif(obj_young, done, &[], val_check, &[]);
+
+        b.switch_to_block(val_check);
+        let p = self.ptr(b, v);
+        let p_off = b.ins().isub(p, ns);
+        let p_young = b.ins().icmp(IntCC::UnsignedLessThan, p_off, nlen);
+        b.ins().brif(p_young, rem_check, &[], done, &[]);
+
+        b.switch_to_block(rem_check);
+        let h = b.ins().load(I64, flags(), obj, 0);
+        let rem = b.ins().band_imm_s(h, crate::heap::REMEMBERED as i64);
+        b.ins().brif(rem, done, &[], call, &[]);
+
         b.switch_to_block(call);
-        self.call(b, self.sigs.barrier, jit_barrier as *const (), &[self.vm, obj, v]);
+        emit_call(self, b);
         b.ins().jump(done, &[]);
         b.switch_to_block(done);
+    }
+
+    fn barrier(&self, b: &mut FunctionBuilder, obj: ir::Value, v: ir::Value) {
+        self.barrier_inline(b, obj, v, |g, b| {
+            g.call(b, g.sigs.barrier, jit_barrier as *const (), &[g.vm, obj, v]);
+        });
+    }
+
+    fn barrier_slot(&self, b: &mut FunctionBuilder, obj: ir::Value, slot: ir::Value, v: ir::Value) {
+        self.barrier_inline(b, obj, v, |g, b| {
+            g.call(b, g.sigs.barrier_slot, jit_barrier_slot as *const (), &[g.vm, obj, slot, v]);
+        });
     }
 
     /// Register `r` at `pc`, with its shifted form if a known fixnum.
@@ -3796,6 +4482,7 @@ impl Gen {
         let (x, y) = (xn.0, yn.0);
         let float = Self::both_int(b, xn, yn).map(|both| {
             let (int, float) = (b.create_block(), b.create_block());
+            b.set_cold_block(float);
             b.ins().brif(both, int, &[], float, &[]);
             b.switch_to_block(int);
             float
@@ -3860,6 +4547,7 @@ impl Gen {
         let (x, y) = (xn.0, yn.0);
         let float = Self::both_int(b, xn, yn).map(|both| {
             let (int, float) = (b.create_block(), b.create_block());
+            b.set_cold_block(float);
             b.ins().brif(both, int, &[], float, &[]);
             b.switch_to_block(int);
             float
@@ -3912,8 +4600,10 @@ impl Gen {
         let slow = b.create_block();
         let done = b.create_block();
         let bail = b.create_block();
+        b.set_cold_block(bail);
         b.append_block_param(bail, I64);
         let returned = b.create_block();
+        b.set_cold_block(returned);
         b.append_block_param(returned, I64);
         // Globals and observed monomorphic indirect calls share the paths.
         let known = global.map_or_else(|| self.closure_calls.get(&(pc as u32)), |g| self.closure_globals.get(&g)).copied();
@@ -3923,9 +4613,19 @@ impl Gen {
         // the call took.
         let checked = self.fix.get(next).is_some_and(|f| f.contains(base));
         let checked_float = self.flo.get(next).is_some_and(|f| f.contains(base));
+        let checked_char = self.chars.get(next).is_some_and(|f| f.contains(base));
+        let checked_i64 = self.i64s.get(next).is_some_and(|s| s.contains(base));
         if let Some(k) = native {
+            if k.inline(n).is_some() {
+                b.set_cold_block(slow);
+                b.set_cold_block(returned);
+                b.set_cold_block(done);
+                b.set_cold_block(bail);
+            }
             self.known_native(b, pc, base, n, f, k, slow, returned, false, |g, b, v| {
-                if fixnum {
+                if checked_i64 {
+                    // `integer_add` already wrote `ivals[base]`.
+                } else if fixnum {
                     let s = Self::shifted(b, v);
                     g.set_fixnum(b, base, s);
                 } else {
@@ -3947,6 +4647,14 @@ impl Gen {
         // Rust natives, rest arguments: see `jit_call_slow`.
         b.switch_to_block(slow);
         self.spill_at(b, pc);
+        let f = if !self.i64s[pc].is_empty() {
+            match global {
+                Some(g) => self.global(b, g),
+                None => b.ins().load(I64, flags(), self.r, (base as i32) * 8),
+            }
+        } else {
+            f
+        };
         let (base_v, n_v) = (b.ins().iconst(I64, base as i64), b.ins().iconst(I64, n as i64));
         let k = self
             .call(b, self.sigs.call_slow, jit_call_slow as *const (), &[self.vm, self.ctx, self.bp, base_v, n_v, self.depth, f])
@@ -3956,9 +4664,17 @@ impl Gen {
         b.switch_to_block(returned);
         let k = b.block_params(returned)[0];
         let handed_over = b.create_block();
-        let calls =
-            [done, self.exit(b, pc, EXIT), self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, RESUME), handed_over]
-                .map(|blk| b.func.dfg.block_call(blk, &[]));
+        b.set_cold_block(handed_over);
+        let slow_exit = if native.is_some() || global.is_none() { EXIT_SPILLED } else { EXIT };
+        let calls = [
+            done,
+            self.exit(b, pc, slow_exit),
+            self.exit(b, next, ERROR),
+            self.exit(b, next, WAIT),
+            self.exit(b, next, RESUME),
+            handed_over,
+        ]
+        .map(|blk| b.func.dfg.block_call(blk, &[]));
         let k = b.ins().ireduce(I32, k);
         let jt = b.create_jump_table(JumpTableData::new(calls[5], &calls[..5]));
         b.ins().br_table(k, jt);
@@ -3977,6 +4693,22 @@ impl Gen {
 
         b.switch_to_block(done);
         self.reload_after(b, pc);
+        if let Some(strs) = self.ascii_strs.get(next) {
+            let live = strs.and(&self.flow.live_out[pc]);
+            if !live.is_empty() {
+                let zero = b.ins().iconst(I64, 0);
+                for r in live.iter() {
+                    b.def_var(self.str_lens[r], zero);
+                }
+            }
+        }
+        if let (Some(fv), Some(vs)) = (self.fix_vecs.get(next), self.vecs.get(next)) {
+            for r in fv.and(vs).and(&self.flow.live_out[pc]).iter() {
+                let x = self.get(b, r as Reg);
+                let lens = self.lens_of_fix(b, x);
+                self.set_lens(b, r as Reg, lens);
+            }
+        }
         if checked {
             // Another procedure than the native (a redefinition), or a call
             // of a function inlined elsewhere, returned what native code
@@ -3995,6 +4727,16 @@ impl Gen {
             Self::guard(b, float, other);
             let f = b.ins().bitcast(F64, MemFlagsData::new(), x);
             b.def_var(self.fvals[base as usize], f);
+        } else if checked_char {
+            let x = self.get(b, base);
+            let ch = Self::is_char(b, x);
+            let other = self.exit(b, next, RESUME);
+            Self::guard(b, ch, other);
+        } else if checked_i64 {
+            let x = self.get(b, base);
+            let other = self.exit(b, next, RESUME);
+            let n = self.unbox_i64(b, x, other);
+            b.def_var(self.ivals[base as usize], n);
         }
         self.jump(b, next);
     }
@@ -4104,7 +4846,8 @@ impl Gen {
         self.tick(b, pc);
         self.spill_at(b, pc);
         // Through a global, the closure is not in the base register yet.
-        if matches!(self.ops[pc], Op::CallG { .. }) {
+        if let Op::CallG { g, .. } = self.ops[pc] {
+            let f = if !self.i64s[pc].is_empty() { self.global(b, g) } else { f };
             b.ins().store(flags(), f, self.r, (base as i32) * 8);
         }
         let callee_bp = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
@@ -4122,6 +4865,7 @@ impl Gen {
         let status = b.ins().ushr_imm_s(res, 32);
         let returned = b.ins().icmp_imm_s(IntCC::Equal, status, RETURNED as i64);
         let after = b.create_block();
+        b.set_cold_block(after);
         b.ins().brif(returned, done, &[], after, &[]);
         // A tail call in the callee, or a hand-over to the interpreter.
         b.switch_to_block(after);
@@ -4147,6 +4891,7 @@ impl Gen {
         };
         let slow = b.create_block();
         let returned = b.create_block();
+        b.set_cold_block(returned);
         b.append_block_param(returned, I64);
         let known = global.map_or_else(|| self.closure_calls.get(&(pc as u32)), |g| self.closure_globals.get(&g)).copied();
         let native = global.map_or_else(|| self.native_calls.get(&(pc as u32)), |g| self.native_globals.get(&g)).copied();
@@ -4205,11 +4950,22 @@ impl Gen {
         };
         Self::guard(b, same, slow);
         if let Some(i) = k.inline(n) {
+            if i == Inline::IntegerAdd && !tail && self.i64s.get(pc + 1).is_some_and(|s| s.contains(base)) {
+                let args: Vec<_> = (1..=n).map(|a| self.get(b, base + a)).collect();
+                let v = self.inline_native(b, pc, base, i, &args, slow);
+                done(self, b, v);
+                return;
+            }
             let call = b.create_block();
+            b.set_cold_block(call);
             let args: Vec<_> = (1..=n).map(|a| self.get(b, base + a)).collect();
             let v = self.inline_native(b, pc, base, i, &args, call);
             done(self, b, v);
             b.switch_to_block(call);
+            if matches!(i, Inline::StringLength | Inline::StringRef) {
+                let zero = b.ins().iconst(I64, 0);
+                b.def_var(self.str_lens[(base + 1) as usize], zero);
+            }
         }
         // Known fixnums need not be in memory while the native runs (the GC
         // does not move them, and the native does not read them): they are
@@ -4230,6 +4986,7 @@ impl Gen {
                 deferred
             }
         };
+        let inlined_native = k.inline(n).is_some();
         let args = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
         let n = b.ins().iconst(I64, n as i64);
         let f = b.ins().iconst(I64, k.f as usize as i64);
@@ -4247,6 +5004,10 @@ impl Gen {
         let unusual = b.ins().bor(moved, error);
         let next = b.create_block();
         let other = b.create_block();
+        if inlined_native {
+            b.set_cold_block(next);
+        }
+        b.set_cold_block(other);
         b.ins().brif(unusual, other, &[], next, &[]);
         b.switch_to_block(other);
         let base_v = b.ins().iconst(I64, base as i64);
@@ -4264,6 +5025,10 @@ impl Gen {
         b.switch_to_block(next);
         if !tail {
             self.reload_except(b, pc, Some(base));
+            if self.flo.get(pc + 1).is_some_and(|f| f.contains(base)) {
+                let fv = b.ins().bitcast(F64, MemFlagsData::new(), v);
+                b.def_var(self.fvals[base as usize], fv);
+            }
         }
         done(self, b, v);
     }
@@ -4306,8 +5071,28 @@ impl Gen {
             self.reload_calls(b, 0);
             // What the start assumes of the arguments (`Job::observed`),
             // checked as on edges into other entry points (`Gen::target`).
-            let live = &self.flow.live_in[0];
-            let (fx, fl) = (self.fix[0].and(live), self.flo[0].and(live));
+            let live = self.flow.live_in[0].clone();
+            for r in self.vecs[0].and(&live).iter() {
+                let x = self.get(b, r as Reg);
+                let lens = if self.fix_vecs[0].contains(r as Reg) { self.lens_of_fix(b, x) } else { self.lens_of(b, x) };
+                self.set_lens(b, r as Reg, lens);
+                let p = self.ptr(b, x);
+                b.def_var(self.vec_ptrs[r], p);
+            }
+            for r in self.ascii_strs[0].and(&live).iter() {
+                let x = self.get(b, r as Reg);
+                let len = self.ascii_str_len_of(b, x);
+                b.def_var(self.str_lens[r], len);
+            }
+            let (fx, fl, i64g) = (self.fix[0].and(&live), self.flo[0].and(&live), self.i64s[0].and(&live));
+            if !i64g.is_empty() {
+                let fail = self.exit(b, 0, GUARD);
+                for r in i64g.iter() {
+                    let x = self.get(b, r as Reg);
+                    let n = self.unbox_i64(b, x, fail);
+                    b.def_var(self.ivals[r], n);
+                }
+            }
             if fx.iter().chain(fl.iter()).next().is_some() {
                 let bad = self.check_kinds(b, &fx, &fl);
                 let fail = self.exit(b, 0, GUARD);
@@ -4367,18 +5152,15 @@ impl Gen {
             b.ins().uload8(I64, flags(), addr, 8)
         };
         let tag = |b: &mut FunctionBuilder, v: ir::Value, tag: i64| b.ins().bor_imm_s(v, tag << 48);
-        let is_char = |b: &mut FunctionBuilder, v: ir::Value| {
-            let t = b.ins().ushr_imm_s(v, 48);
-            b.ins().icmp_imm_s(IntCC::Equal, t, TAG_CHAR)
-        };
         match i {
-            Inline::IntegerAdd => self.integer_add(b, args[0], args[1], call),
-            Inline::Substring => self.substring(b, args, call),
+            Inline::IntegerAdd => self.integer_add(b, pc, base, args[0], args[1], call),
+            Inline::Substring => self.substring(b, pc, base, args, call),
             Inline::StringEq => self.string_eq(b, args, call),
-            Inline::Inexact => self.inexact(b, args[0], call),
-            Inline::FloatDiv => self.float_div(b, args[0], args[1], call),
+            Inline::Inexact => self.inexact(b, pc, base, args[0], call),
+            Inline::FloatDiv => self.float_div(b, pc, base, args[0], args[1], call),
             Inline::StringLength => {
                 let (_, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
+                b.def_var(self.str_lens[(base + 1) as usize], len);
                 tag(b, len, TAG_INT)
             }
             Inline::VectorLength => {
@@ -4386,7 +5168,13 @@ impl Gen {
                 tag(b, len, TAG_INT)
             }
             Inline::StringRef => {
-                let (_, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
+                let len = if self.ascii_strs[pc].contains(base + 1) {
+                    b.use_var(self.str_lens[(base + 1) as usize])
+                } else {
+                    let (_, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
+                    b.def_var(self.str_lens[(base + 1) as usize], len);
+                    len
+                };
                 let c = byte(b, len);
                 tag(b, c, TAG_CHAR)
             }
@@ -4396,8 +5184,10 @@ impl Gen {
                 tag(b, c, TAG_INT)
             }
             Inline::CharToInteger => {
-                let ok = is_char(b, x);
-                Self::guard(b, ok, call);
+                if !self.chars[pc].contains(base + 1) {
+                    let ok = Self::is_char(b, x);
+                    Self::guard(b, ok, call);
+                }
                 let c = b.ins().band_imm_s(x, PAYLOAD);
                 tag(b, c, TAG_INT)
             }
@@ -4424,9 +5214,24 @@ impl Gen {
                 b.ins().load(I64, flags(), addr, 16)
             }
             Inline::CharEq => {
-                let (a, c) = (is_char(b, x), is_char(b, args[1]));
-                let ok = b.ins().band(a, c);
-                Self::guard(b, ok, call);
+                let c0 = self.chars[pc].contains(base + 1);
+                let c1 = self.chars[pc].contains(base + 2);
+                match (c0, c1) {
+                    (true, true) => {}
+                    (true, false) => {
+                        let ok = Self::is_char(b, args[1]);
+                        Self::guard(b, ok, call);
+                    }
+                    (false, true) => {
+                        let ok = Self::is_char(b, x);
+                        Self::guard(b, ok, call);
+                    }
+                    (false, false) => {
+                        let (a, c) = (Self::is_char(b, x), Self::is_char(b, args[1]));
+                        let ok = b.ins().band(a, c);
+                        Self::guard(b, ok, call);
+                    }
+                }
                 let eq = b.ins().icmp(IntCC::Equal, x, args[1]);
                 Self::bool(b, eq)
             }
@@ -4441,14 +5246,23 @@ impl Gen {
         let next = pc + 1;
         b.switch_to_block(slow);
         self.spill_at(b, pc);
+        let f = if !self.i64s[pc].is_empty() {
+            match self.ops[pc] {
+                Op::TailCallG { g, .. } => self.global(b, g),
+                _ => b.ins().load(I64, flags(), self.r, (base as i32) * 8),
+            }
+        } else {
+            f
+        };
         let (base_v, n_v) = (b.ins().iconst(I64, base as i64), b.ins().iconst(I64, n as i64));
         let k = self.call(b, self.sigs.tail_slow, jit_tail_slow as *const (), &[self.vm, self.bp, base_v, n_v, f]).unwrap();
         b.ins().jump(done, &[BlockArg::Value(k)]);
         b.switch_to_block(done);
         let k = b.block_params(done)[0];
         let returned = b.create_block();
-        let calls = [returned, self.exit(b, pc, EXIT), self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, RET_MOVED)]
-            .map(|blk| b.func.dfg.block_call(blk, &[]));
+        let calls =
+            [returned, self.exit(b, pc, EXIT_SPILLED), self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, RET_MOVED)]
+                .map(|blk| b.func.dfg.block_call(blk, &[]));
         let k = b.ins().ireduce(I32, k);
         let jt = b.create_jump_table(JumpTableData::new(calls[4], &calls[..4]));
         b.ins().br_table(k, jt);
@@ -4491,14 +5305,25 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::Mov { dst, src } => {
-                match (self.num(b, pc, src), self.fval(b, pc, src)) {
-                    ((_, Some(s)), _) => self.set_fixnum(b, dst, s),
-                    (_, Some(f)) => self.set_float(b, dst, f),
-                    ((v, None), None) => self.set(b, dst, v),
+                if self.i64s[pc].contains(src) {
+                    let n = b.use_var(self.ivals[src as usize]);
+                    b.def_var(self.ivals[dst as usize], n);
+                } else {
+                    match (self.num(b, pc, src), self.fval(b, pc, src)) {
+                        ((_, Some(s)), _) => self.set_fixnum(b, dst, s),
+                        (_, Some(f)) => self.set_float(b, dst, f),
+                        ((v, None), None) => self.set(b, dst, v),
+                    }
                 }
                 if self.vecs[pc].contains(src) {
                     let lens = self.use_lens(b, self.lens[src as usize]);
                     self.set_lens(b, dst, lens);
+                    let p = b.use_var(self.vec_ptrs[src as usize]);
+                    b.def_var(self.vec_ptrs[dst as usize], p);
+                }
+                if self.ascii_strs[pc].contains(src) {
+                    let len = b.use_var(self.str_lens[src as usize]);
+                    b.def_var(self.str_lens[dst as usize], len);
                 }
                 self.jump(b, next);
             }
@@ -4510,9 +5335,15 @@ impl Gen {
                     Self::guard(b, bound, slow);
                 }
                 self.set(b, dst, v);
-                if let Some(lens) = self.cached.iter().find(|c| c.g == g).and_then(|c| c.lens) {
+                if let Some(c) = self.cached.iter().find(|c| c.g == g)
+                    && let Some(lens) = c.lens
+                {
                     let lens = self.use_lens(b, lens);
                     self.set_lens(b, dst, lens);
+                    if let Some(pv) = c.ptr {
+                        let p = b.use_var(pv);
+                        b.def_var(self.vec_ptrs[dst as usize], p);
+                    }
                 }
                 self.jump(b, next);
             }
@@ -4590,7 +5421,12 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::Ret { r } => {
-                let v = self.get(b, r);
+                let v = if self.i64s[pc].contains(r) {
+                    let n = b.use_var(self.ivals[r as usize]);
+                    self.box_i64_call(b, n)
+                } else {
+                    self.get(b, r)
+                };
                 b.ins().store(flags(), v, self.r, -8);
                 let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
                 self.publish_fuel(b);
@@ -4773,19 +5609,30 @@ impl Gen {
                 let slow = self.step(b, pc);
                 let (vec, k) = (self.get(b, v), self.get(b, i));
                 let set = matches!(op, Op::VSet { .. });
+                let fix_vec = self.fix_vecs[pc].contains(v);
                 // Its length where kept (`vecs`), else from its header,
                 // kept from now on.
                 let (p, len) = if self.vecs[pc].contains(v) {
                     let (l, w) = self.use_lens(b, self.lens[v as usize]);
-                    (self.ptr(b, vec), if set { w } else { l })
+                    (b.use_var(self.vec_ptrs[v as usize]), if set { w } else { l })
                 } else {
                     // To change it, literals go to `slow` too, at no extra
                     // cost (the same test, with the immutable flag).
-                    let mask = if set { 0xFF | crate::heap::IMMUTABLE as i64 } else { 0xFF };
-                    let (p, h) = self.check_bits(b, vec, mask, Kind::Vector as i64, slow);
-                    let lens = Self::header_lens(b, vec, h);
+                    let mut mask = if set { 0xFF | crate::heap::IMMUTABLE as i64 } else { 0xFF };
+                    let mut bits = Kind::Vector as i64;
+                    if fix_vec {
+                        mask |= crate::heap::VECTOR_FIXNUM as i64;
+                        bits |= crate::heap::VECTOR_FIXNUM as i64;
+                    }
+                    let (p, h) = self.check_bits(b, vec, mask, bits, slow);
+                    let lens = if fix_vec || self.fix_vecs[next].contains(v) {
+                        Self::header_lens_fix(b, vec, h)
+                    } else {
+                        Self::header_lens(b, vec, h)
+                    };
                     if !matches!(*op, Op::VRef { dst, .. } if dst == v) {
                         self.set_lens(b, v, lens);
+                        b.def_var(self.vec_ptrs[v as usize], p);
                     }
                     (p, Self::vector_len(b, vec, h))
                 };
@@ -4809,11 +5656,50 @@ impl Gen {
                     Op::VRef { dst, .. } => {
                         let x = b.ins().load(I64, flags(), addr, 8);
                         self.set(b, dst, x);
+                        if self.fix[next].contains(dst) {
+                            let s = Self::shifted(b, x);
+                            b.def_var(self.shifts[dst as usize], s);
+                        }
                     }
                     Op::VSet { x, .. } => {
                         let val = self.get(b, x);
-                        b.ins().store(flags(), val, addr, 8);
-                        self.barrier(b, p, val);
+                        if self.fix[pc].contains(x) {
+                            // Known fixnum: preserves VECTOR_FIXNUM and needs no write barrier.
+                            b.ins().store(flags(), val, addr, 8);
+                        } else {
+                            let int = Self::is_int(b, val);
+                            let not_int = b.create_block();
+                            let store = b.create_block();
+                            b.set_cold_block(not_int);
+                            b.ins().brif(int, store, &[], not_int, &[]);
+
+                            b.switch_to_block(not_int);
+                            let h = b.ins().load(I64, flags(), p, 0);
+                            let was_fix = b.ins().band_imm_s(h, crate::heap::VECTOR_FIXNUM as i64);
+                            let has_fix_vecs = !self.fix_vecs[next].is_empty() || self.cached.iter().any(|c| c.fix);
+                            let do_store = b.create_block();
+                            b.set_cold_block(do_store);
+                            if has_fix_vecs {
+                                // Clearing VECTOR_FIXNUM could invalidate a cached fixnum-vector assumption.
+                                b.ins().brif(was_fix, slow, &[], do_store, &[]);
+                            } else {
+                                let clear_fix = b.create_block();
+                                b.set_cold_block(clear_fix);
+                                b.ins().brif(was_fix, clear_fix, &[], do_store, &[]);
+                                b.switch_to_block(clear_fix);
+                                let cleared = b.ins().band_imm_s(h, !(crate::heap::VECTOR_FIXNUM as i64));
+                                b.ins().store(flags(), cleared, p, 0);
+                                b.ins().jump(do_store, &[]);
+                            }
+                            b.switch_to_block(do_store);
+                            b.ins().store(flags(), val, addr, 8);
+                            let slot = b.ins().iadd_imm_s(addr, 8);
+                            self.barrier_slot(b, p, slot, val);
+                            self.jump(b, next);
+
+                            b.switch_to_block(store);
+                            b.ins().store(flags(), val, addr, 8);
+                        }
                     }
                     _ => unreachable!(),
                 }
@@ -5135,8 +6021,6 @@ mod tests {
             regs_end: std::ptr::null_mut(),
             fuel: std::ptr::null_mut(),
             stack_top: std::ptr::null_mut(),
-            heap_top: std::ptr::null_mut(),
-            heap_end: std::ptr::null(),
             code: std::ptr::null(),
             bp: 1,
             tail: first as *const () as usize,

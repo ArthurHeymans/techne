@@ -96,6 +96,7 @@ impl Vm {
     pub fn set_gc_stress(&mut self, stress: bool, full: bool) {
         self.heap.stress = stress;
         self.heap.stress_full = stress && full;
+        self.heap.sync_jit_limit();
     }
 
     /// Values held for conversions in progress: none at rest.
