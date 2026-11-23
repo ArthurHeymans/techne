@@ -8,7 +8,11 @@
 ;;;     (version "0.1.0")
 ;;;     (techne "0.4")
 ;;;     (description "Native Scheme mail client.")
-;;;     (depends ((alice authinfo) (path "../authinfo")))
+;;;     (depends
+;;;       ((alice authinfo) (path "../authinfo"))
+;;;       ((bob util) (github "bob/util" (tag "v1.0"))))
+;;;     (override
+;;;       ((bob util) (path "../local-util")))
 ;;;     (editor "editor.scm"
 ;;;       (commands (mail "Open the mail dashboard."))
 ;;;       (options (mail-prefer-html #t boolean "Whether to show HTML.")))
@@ -19,26 +23,31 @@
 ;;; `(owner pkg)`: `(techne mail)` is `lib/techne/mail.sld` and `(techne
 ;;; mail imap)` is `lib/techne/mail/imap.sld` in its directory and nowhere
 ;;; else. They are the world's, one instance whoever imports them.
-;;; `depends` names the packages whose libraries this one imports, each by
-;;; the directory it is in, relative to this one. `editor` is what the
-;;; editor loads on first use (doc/packages.md): the entry file, the
-;;; commands advertised before that and the options declared early, as
+;;; `depends` names the packages whose libraries this one imports, by
+;;; local relative path or by Git repository (`github`, `git`, `local`).
+;;; `override` is a root-only clause that replaces the source of any
+;;; direct or transitive dependency. `editor` is what the editor loads on
+;;; first use (doc/packages.md): the entry file, the commands advertised
+;;; before that and the options declared early, as
 ;;; (name default schema documentation). `cloud` declares a cloud worker
 ;;; entry file and its binding interface (name and kind: kv, secret, text).
 
 (define-library (techne package)
-  (export package-manifest-file package-name? read-package-manifest package-manifest?
+  (export package-manifest-file package-name? package-name<? package-source-datum?
+          read-package-manifest package-manifest?
           manifest-name manifest-directory manifest-version manifest-techne manifest-description
-          manifest-dependencies manifest-editor manifest-cloud
-          use-package-directory! package-closure package-directories)
-  (import (techne) (techne path) (techne schema))
+          manifest-dependencies manifest-dependency-sources manifest-overrides
+          manifest-editor manifest-cloud
+          directory-tree-sha256 package-tree-sha256
+          register-package-world! use-package-directory! package-closure package-directories)
+  (import (techne) (techne crypto) (techne path) (techne schema))
   (begin
 
     (define package-manifest-file "techne-package.scm"
       "The name of the file in a package's directory holding its manifest.")
 
     (define-record-type manifest
-      (%manifest name directory version techne description dependencies editor cloud)
+      (%manifest name directory version techne description dependencies dependency-sources overrides editor cloud)
       package-manifest?
       (name manifest-name)
       (directory manifest-directory)
@@ -46,6 +55,8 @@
       (techne manifest-techne)
       (description manifest-description)
       (dependencies manifest-dependencies)
+      (dependency-sources manifest-dependency-sources)
+      (overrides manifest-overrides)
       (editor manifest-editor)
       (cloud manifest-cloud))
 
@@ -68,6 +79,14 @@
       "Return whether X is a canonical `(owner pkg)` package identity."
       (and (list? x) (= 2 (length x)) (package-part? (car x)) (package-part? (cadr x))))
 
+    (define (package-name<? a b)
+      "Return whether package identity A sorts lexicographically before B."
+      (let ((oa (symbol->string (car a)))
+            (ob (symbol->string (car b))))
+        (or (string<? oa ob)
+            (and (string=? oa ob)
+                 (string<? (symbol->string (cadr a)) (symbol->string (cadr b)))))))
+
     (define (reserved-namespace? name)
       (memq (car name) '(scheme srfi)))
 
@@ -76,6 +95,55 @@
            (char-numeric? (string-ref s 0))
            (every (lambda (c) (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\. #\- #\+))))
                   (string->list s))))
+
+    (define (oid? s)
+      (and (string? s) (memv (string-length s) '(40 64))
+           (every (lambda (c) (and (string-index "0123456789abcdef" c) #t)) (string->list s))))
+
+    (define (https-url? s)
+      (and (string? s) (string-prefix? "https://" s) (> (string-length s) 8)
+           (not (any (lambda (c) (or (char-whitespace? c) (< (char->integer c) 32))) (string->list s)))))
+
+    (define (git-ref-clause? x)
+      (and (list? x) (= 2 (length x)) (string? (cadr x)) (positive? (string-length (cadr x)))
+           (case (car x)
+             ((branch tag) (every component? (string-split (cadr x) "/")))
+             ((commit) (oid? (cadr x)))
+             (else #f))))
+
+    (define (package-selector-clause? x)
+      (and (list? x) (= 2 (length x)) (eq? (car x) 'package)
+           (package-name? (cadr x)) (not (reserved-namespace? (cadr x)))))
+
+    (define (git-source-valid? src)
+      (and (list? src) (memv (length src) '(2 3 4)) (string? (cadr src))
+           (case (car src)
+             ((github) (let ((parts (string-split (cadr src) "/")))
+                         (and (= 2 (length parts)) (every component? parts))))
+             ((git) (https-url? (cadr src)))
+             ((local) (and (positive? (string-length (cadr src))) (path-absolute? (cadr src))))
+             (else #f))
+           (let* ((rest (cddr src))
+                  (pkgs (filter (lambda (e) (and (pair? e) (eq? (car e) 'package))) rest))
+                  (refs (remove (lambda (e) (and (pair? e) (eq? (car e) 'package))) rest)))
+             (and (<= (length pkgs) 1)
+                  (<= (length refs) 1)
+                  (every package-selector-clause? pkgs)
+                  (every git-ref-clause? refs)))))
+
+    (define (path-source-valid? src)
+      (and (list? src) (= 2 (length src)) (eq? 'path (car src))
+           (string? (cadr src)) (positive? (string-length (cadr src)))
+           (not (path-absolute? (cadr src)))))
+
+    (define (package-source-datum? src)
+      "Return whether SRC is a valid dependency or override source datum."
+      (or (path-source-valid? src) (git-source-valid? src)))
+
+    (define (source-selected-package src)
+      (and (pair? src) (not (eq? (car src) 'path))
+           (let ((found (assq 'package (cddr src))))
+             (and found (cadr found)))))
 
     (define (relative? path)
       (and (string? path) (every component? (string-split path "/"))))
@@ -111,17 +179,31 @@
         (bad "expected (description \"...\")" clause))
       (car clause))
 
-    (define (dependencies root name clause)
-      (map (lambda (d)
-             (unless (and (list? d) (= 2 (length d)) (package-name? (car d))
-                          (not (reserved-namespace? (car d)))
-                          (list? (cadr d)) (= 2 (length (cadr d))) (eq? 'path (car (cadr d)))
-                          (string? (cadr (cadr d))) (positive? (string-length (cadr (cadr d))))
-                          (not (path-absolute? (cadr (cadr d)))))
-               (bad "expected a dependency ((owner pkg) (path \"relative/directory\"))" d))
-             (when (equal? (car d) name) (bad "a package cannot depend on itself" name))
-             (cons (car d) (path-join root (cadr (cadr d)))))
-           clause))
+    (define (source-entries what name clause)
+      (let ((entries
+             (map (lambda (d)
+                    (unless (and (list? d) (= 2 (length d)) (package-name? (car d))
+                                 (not (reserved-namespace? (car d)))
+                                 (package-source-datum? (cadr d)))
+                      (bad (string-append "expected a " what " ((owner pkg) <source>)") d))
+                    (when (equal? (car d) name)
+                      (bad (string-append "a package cannot " what " itself") name))
+                    (let ((selected (source-selected-package (cadr d))))
+                      (when (and selected (not (equal? selected (car d))))
+                        (bad (string-append what " source selects another package than named") (car d) selected)))
+                    (cons (car d) (cadr d)))
+                  clause)))
+        (distinct! (string-append what " declared twice") (map car entries))
+        entries))
+
+    (define (dependencies-from-sources root sources)
+      (map (lambda (entry)
+             (let ((dep (car entry))
+                   (src (cdr entry)))
+               (if (eq? 'path (car src))
+                   (cons dep (path-join root (cadr src)))
+                   (cons dep src))))
+           sources))
 
     (define (editor root clause)
       (unless (and (pair? clause) (string? (car clause))) (bad "expected (editor \"entry.scm\" (commands ...) [(options ...)])"))
@@ -184,23 +266,132 @@ an error if the manifest is missing or is not one."
                             (cddr d)))
                (clause (lambda (head)
                          (let ((found (assq head clauses))) (and found (cdr found))))))
-          (unless (every (lambda (c) (and (pair? c) (list? c) (memq (car c) '(version techne description depends editor cloud)))) clauses)
+          (unless (every (lambda (c) (and (pair? c) (list? c) (memq (car c) '(version techne description depends override editor cloud)))) clauses)
             (bad "unknown manifest clause" (map (lambda (c) (if (pair? c) (car c) c)) clauses)))
           (distinct! "clause given twice" (map car clauses))
-          (let ((depends (dependencies root name (or (clause 'depends) '()))))
-            (distinct! "dependency declared twice" (map car depends))
+          (let* ((dep-sources (source-entries "dependency" name (or (clause 'depends) '())))
+                 (deps (dependencies-from-sources root dep-sources))
+                 (overrides (source-entries "override" name (or (clause 'override) '()))))
             (%manifest name root
                        (and (clause 'version) (version-clause "version" (clause 'version)))
                        (and (clause 'techne) (version-clause "techne" (clause 'techne)))
                        (and (clause 'description) (description-clause (clause 'description)))
-                       depends
+                       deps
+                       dep-sources
+                       overrides
                        (and (clause 'editor) (editor root (clause 'editor)))
                        (and (clause 'cloud) (cloud root (clause 'cloud))))))))
+
+    ;; Read the raw bytes of PATH into a single bytevector.
+    (define (read-file-bytes path)
+      (let ((port (open-binary-input-file path)))
+        (dynamic-wind
+          (lambda () #f)
+          (lambda ()
+            (let ((out (open-output-bytevector)))
+              (let loop ()
+                (let ((chunk (read-bytevector 65536 port)))
+                  (unless (eof-object? chunk)
+                    (write-bytevector chunk out)
+                    (loop))))
+              (get-output-bytevector out)))
+          (lambda () (close-input-port port)))))
+
+    (define (directory-tree-sha256 directory)
+      "Return the canonical 64-hex SHA-256 tree digest of DIRECTORY.
+Regular files are walked recursively in sorted UTF-8 relative POSIX path
+order, excluding hidden files and directories whose path component begins
+with `.` (including `.git`, `.jj`, `.secrets.scm`, and `.DS_Store`).
+Symlinks and non-regular files are rejected. Each regular file is hashed
+as \"F <relpath>\\0<byte-len>\\0<file-bytes>\\n\"."
+      (let* ((root (file-truename directory))
+             (attrs (file-attributes root)))
+        (unless (and attrs (eq? 'directory (car attrs)))
+          (error "Not a directory" directory))
+        (let ((files '()))
+          (let walk ((dir root) (prefix ""))
+            (for-each
+              (lambda (raw)
+                (let ((name (if (string-suffix? "/" raw)
+                                (substring raw 0 (- (string-length raw) 1))
+                                raw)))
+                  (unless (string-prefix? "." name)
+                    (let* ((rel (if (string=? prefix "") name (string-append prefix "/" name)))
+                           (full (path-join dir name))
+                           (a (file-attributes full))
+                           (kind (and a (car a))))
+                      (cond ((eq? kind 'symlink)
+                             (error "Symlink not allowed in package tree" rel))
+                            ((eq? kind 'directory)
+                             (walk full rel))
+                            ((eq? kind 'file)
+                             (set! files (cons (cons rel full) files)))
+                            (else
+                             (error "Unsupported file type in package tree" rel)))))))
+              (directory-list dir)))
+          (let ((sorted (sort files (lambda (a b) (string<? (car a) (car b)))))
+                (out (open-output-bytevector)))
+            (for-each
+              (lambda (entry)
+                (let* ((rel (car entry))
+                       (bytes (read-file-bytes (cdr entry))))
+                  (write-bytevector (string->utf8 "F ") out)
+                  (write-bytevector (string->utf8 rel) out)
+                  (write-u8 0 out)
+                  (write-bytevector (string->utf8 (number->string (bytevector-length bytes))) out)
+                  (write-u8 0 out)
+                  (write-bytevector bytes out)
+                  (write-u8 10 out)))
+              sorted)
+            (hex-encode (sha-256 (get-output-bytevector out)))))))
+
+    (define (package-tree-sha256 directory)
+      "Return the canonical `tree-sha256` digest of the package in DIRECTORY.
+This is an alias for `directory-tree-sha256`."
+      (directory-tree-sha256 directory))
 
     ;; The manifest of each directory used.
     (define used (make-hash-table equal?))
     ;; The directory each package name was used from.
     (define names (make-hash-table equal?))
+
+    ;; Where the libraries of the package of manifest M are, or would be.
+    (define (library-directory m)
+      (let ((lib (path-join (manifest-directory m) "lib")))
+        (or (%loadable-path lib) lib)))
+
+    (define (register-package-world! manifests)
+      "Register MANIFESTS (a list of resolved package manifests) atomically.
+All conflicts are checked before anything changes: reserved namespaces,
+duplicate package identities pointing to different directories, and VM
+library provider collisions. Each manifest's libraries and declared
+direct imports are then wired into the VM."
+      (let ((batch (make-hash-table equal?)))
+        (for-each
+          (lambda (m)
+            (let* ((name (manifest-name m))
+                   (dir (manifest-directory m))
+                   (existing (or (hash-table-ref/default names name #f)
+                                 (hash-table-ref/default batch name #f)))
+                   (conflict (%library-conflict name (library-directory m))))
+              (when (reserved-namespace? name)
+                (error "A package cannot take a reserved library namespace" name))
+              (when (and existing (not (equal? existing dir)))
+                (error "Another directory holds a package of this name" name existing dir))
+              (when conflict
+                (error (string-append "A package's libraries cannot be found in its directory: " conflict) name dir))
+              (hash-table-set! batch name dir)))
+          manifests)
+        (for-each
+          (lambda (m)
+            (let ((dir (manifest-directory m))
+                  (name (manifest-name m)))
+              (%provide-libraries! name (library-directory m))
+              (%package-imports! dir name (cons name (map car (manifest-dependency-sources m))))
+              (hash-table-set! names name dir)
+              (hash-table-set! used dir m)))
+          manifests)
+        manifests))
 
     ;; The manifests of the package in ROOT and of those it depends on
     ;; that are not used yet, each after the ones it depends on. Everything
@@ -245,14 +436,18 @@ an error if the manifest is missing or is not one."
           (let ((known (hash-table-ref/default used root #f)))
             (when (and known within (not (hash-table-ref/default walked root #f)))
               (for-each (lambda (dependency)
-                          (let ((dir (%loadable-path (cdr dependency))))
-                            (when dir (visit dir (cons (cons root (manifest-name known)) above)))))
+                          (when (string? (cdr dependency))
+                            (let ((dir (%loadable-path (cdr dependency))))
+                              (when dir (visit dir (cons (cons root (manifest-name known)) above))))))
                         (manifest-dependencies known))
               (hash-table-set! walked root #t)))
           (or (manifest-at root)
               (let ((m (read-package-manifest root)))
                 (check-name! m above)
                 (for-each (lambda (dependency)
+                            (unless (string? (cdr dependency))
+                              (error "Git dependency requires techne.lock (run `techne lock` and `techne run --locked`)"
+                                     (car dependency) (cdr dependency)))
                             (unless (%loadable-path (path-join (cdr dependency) package-manifest-file))
                               (error "No package where a dependency says" (car dependency) (cdr dependency)))
                             (let ((name (manifest-name (visit (%loadable-path (cdr dependency))
@@ -264,11 +459,6 @@ an error if the manifest is missing or is not one."
                 m)))
         (visit root '())
         (reverse (map cdr found))))
-
-    ;; Where the libraries of the package of manifest M are, or would be.
-    (define (library-directory m)
-      (let ((lib (path-join (manifest-directory m) "lib")))
-        (or (%loadable-path lib) lib)))
 
     (define (resolved directory)
       (or (%loadable-path directory) (error "No package directory at" directory)))
@@ -300,14 +490,7 @@ beside it)."
       (let ((root (resolved directory)))
         ;; Nothing to make known of a package known already, which is
         ;; held to WITHIN all the same.
-        (for-each (lambda (m)
-                    (let ((dir (manifest-directory m))
-                          (name (manifest-name m)))
-                      (%provide-libraries! name (library-directory m))
-                      (%package-imports! dir name (cons name (map car (manifest-dependencies m))))
-                      (hash-table-set! names name dir)
-                      (hash-table-set! used dir m)))
-                  (package-closure root #:within within))
+        (register-package-world! (package-closure root #:within within))
         (hash-table-ref/default used root #f)))
 
     (define (package-directories root)

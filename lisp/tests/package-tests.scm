@@ -1,6 +1,6 @@
 ;;; Package directories: manifests read as data, the libraries a package
 ;;; provides and those of the packages it depends on, without the editor.
-(import (techne) (techne package) (techne path) (techne uuid))
+(import (techne) (techne crypto) (techne package) (techne path) (techne uuid))
 (require "../test.scm")
 
 (define root (string-append (or (get-environment-variable "TMPDIR") "/tmp") "/techne-package-" (uuid-v4)))
@@ -267,6 +267,94 @@
   (check "side by side" #t (and (member "alpha" found) (member "beta" found) #t))
   (check "below a directory that is none" #t (and (member "copy/alpha" found) #t))
   (check "not a package's own files" #f (and (member "alpha/lib" found) #t)))
+
+;; Cross-repo git dependencies (`github`, `git`, `local`) and root `override`.
+(let ((oid "0123456789abcdef0123456789abcdef01234567"))
+  (package! '(acme remote-app)
+            '(version "0.2.0")
+            `(depends
+               ((acme alpha) (path "../alpha"))
+               ((bob util) (github "bob/util" (tag "v1.0")))
+               ((carol mono) (github "carol/mono" (package (carol mono)) (branch "main")))
+               ((dave lib) (git "https://example.org/dave/lib.git" (commit ,oid)))
+               ((erin local-lib) (local "/tmp/erin-repo" (tag "release/v2") (package (erin local-lib)))))
+            '(override
+               ((bob util) (path "../alpha"))
+               ((dave lib) (local "/tmp/dave-fork" (branch "fix")))))
+  (let ((m (read-package-manifest (at "remote-app"))))
+    (check "manifest-dependency-sources preserves all sources"
+           `(((acme alpha) . (path "../alpha"))
+             ((bob util) . (github "bob/util" (tag "v1.0")))
+             ((carol mono) . (github "carol/mono" (package (carol mono)) (branch "main")))
+             ((dave lib) . (git "https://example.org/dave/lib.git" (commit ,oid)))
+             ((erin local-lib) . (local "/tmp/erin-repo" (tag "release/v2") (package (erin local-lib)))))
+           (manifest-dependency-sources m))
+    (check "manifest-overrides returns override alist"
+           '(((bob util) . (path "../alpha"))
+             ((dave lib) . (local "/tmp/dave-fork" (branch "fix"))))
+           (manifest-overrides m))
+    (check "use-package-directory! refuses unlocked git dep cleanly" #t
+           (and (string-contains (or (why (lambda () (use-package-directory! (at "remote-app")))) "") "techne.lock") #t))))
+
+(for-each
+ (lambda (case)
+   (write-file! (at "broken" "techne-package.scm") (cdr case))
+   (check (car case) #t (failed? (lambda () (read-package-manifest (at "broken"))))))
+ '(("unknown dependency source" . (package (acme broken) (depends ((bob x) (http "https://example.org/x")))))
+   ("github bad owner/repo" . (package (acme broken) (depends ((bob x) (github "only-one")))))
+   ("github traversal" . (package (acme broken) (depends ((bob x) (github "../x")))))
+   ("git non-https" . (package (acme broken) (depends ((bob x) (git "http://example.org/x.git")))))
+   ("local relative path" . (package (acme broken) (depends ((bob x) (local "../repo")))))
+   ("path extra clause" . (package (acme broken) (depends ((bob x) (path "../x" (tag "v1"))))))
+   ("two ref selectors" . (package (acme broken) (depends ((bob x) (github "bob/x" (tag "v1") (branch "main"))))))
+   ("empty tag selector" . (package (acme broken) (depends ((bob x) (github "bob/x" (tag ""))))))
+   ("short commit sha" . (package (acme broken) (depends ((bob x) (github "bob/x" (commit "deadbeef"))))))
+   ("unknown ref clause" . (package (acme broken) (depends ((bob x) (github "bob/x" (rev "v1"))))))
+   ("mismatched package selector" . (package (acme broken) (depends ((bob x) (github "bob/mono" (package (bob y)))))))
+   ("two package selectors" . (package (acme broken) (depends ((bob x) (github "bob/mono" (package (bob x)) (package (bob x)))))))
+   ("override twice" . (package (acme broken) (override) (override)))
+   ("override self" . (package (acme broken) (override ((acme broken) (path "../other")))))
+   ("duplicate override" . (package (acme broken) (override ((bob x) (path "../a")) ((bob x) (path "../b")))))
+   ("invalid override source" . (package (acme broken) (override ((bob x) (git "file:///tmp/repo")))))))
+
+;; Canonical `directory-tree-sha256` / `package-tree-sha256`.
+(make-directory (at "hash-empty"))
+(check "empty tree hash is sha-256 of empty stream"
+       (hex-encode (sha-256 ""))
+       (package-tree-sha256 (at "hash-empty")))
+
+(make-directory (at "hash-tree" "sub"))
+(make-directory (at "hash-tree" ".git"))
+(make-directory (at "hash-tree" ".jj"))
+(call-with-output-file (at "hash-tree" "a.txt") (lambda (p) (display "abc" p)))
+(let ((p (open-binary-output-file (at "hash-tree" "sub" "b.bin"))))
+  (write-bytevector #u8(0 1 255 2) p)
+  (close-output-port p))
+;; Hidden files and directories are excluded.
+(call-with-output-file (at "hash-tree" ".DS_Store") (lambda (p) (display "junk" p)))
+(call-with-output-file (at "hash-tree" ".secrets.scm") (lambda (p) (display "secret" p)))
+(call-with-output-file (at "hash-tree" ".git" "HEAD") (lambda (p) (display "ref: refs/heads/main\n" p)))
+(call-with-output-file (at "hash-tree" ".jj" "repo") (lambda (p) (display "jj" p)))
+(call-with-output-file (at "hash-tree" "sub" ".hidden") (lambda (p) (display "hidden" p)))
+(let ((expected-stream (open-output-bytevector)))
+  (write-bytevector (string->utf8 "F a.txt") expected-stream)
+  (write-u8 0 expected-stream)
+  (write-bytevector (string->utf8 "3") expected-stream)
+  (write-u8 0 expected-stream)
+  (write-bytevector (string->utf8 "abc") expected-stream)
+  (write-u8 10 expected-stream)
+  (write-bytevector (string->utf8 "F sub/b.bin") expected-stream)
+  (write-u8 0 expected-stream)
+  (write-bytevector (string->utf8 "4") expected-stream)
+  (write-u8 0 expected-stream)
+  (write-bytevector #u8(0 1 255 2) expected-stream)
+  (write-u8 10 expected-stream)
+  (let ((expected (hex-encode (sha-256 (get-output-bytevector expected-stream))))
+        (got (package-tree-sha256 (at "hash-tree"))))
+    (check "canonical tree-sha256 exact match" expected got)
+    (check "64 lowercase hex chars" 64 (string-length got))
+    (check "directory-tree-sha256 agrees" got (directory-tree-sha256 (at "hash-tree")))))
+(check "non-directory rejected" #t (failed? (lambda () (package-tree-sha256 (at "hash-tree" "a.txt")))))
 
 (delete-path root #t)
 (test-summary)
