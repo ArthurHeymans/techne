@@ -125,6 +125,22 @@ pub(super) fn plan(job: &Job) -> Option<Plan> {
     });
     let fix = if ret_fix { fix_try } else { fixnums(ops, n, konst, &job.captures, &[0], |_| false, &[], &shape, &assumed).regs };
     let flow = analyze(ops, n, &job.captures, false, &fix, |_| None, &shape);
+    // Reject if any control-flow edge changes a live register's stored
+    // representation (shifted fixnum vs tagged Value) without redefining it.
+    for (pc, op) in ops.iter().enumerate() {
+        let (_, defs) = uses_defs(op, &HashMap::default());
+        for &s in &shape.succs[pc] {
+            for r in flow.live_in[s].iter() {
+                let r = r as Reg;
+                if s == pc + 1 && defs.contains(&r) {
+                    continue;
+                }
+                if fix[pc].contains(r) != fix[s].contains(r) {
+                    return None;
+                }
+            }
+        }
+    }
     let pairs = if uses_heap { pairs(ops, n, &job.captures, &[0], &shape) } else { vec![Regs::empty(n); ops.len()] };
     // Every numeric op and every fixnum self-call parameter must have known
     // fixnum operands; overflow and type-check failures exit cleanly.

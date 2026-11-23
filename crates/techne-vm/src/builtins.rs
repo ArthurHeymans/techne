@@ -2628,7 +2628,7 @@ pub(crate) fn install(vm: &mut Vm) {
         "(hash-by-identity obj [bound])" => |vm: &mut Vm, a, n| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Eq); bounded_hash(vm, a, n, h, "hash-by-identity") };
         /// Return a hash of OBJ by contents, as `equal?` compares.
         /// With BOUND, the hash is below it.
-        "(hash obj [bound])" => |vm: &mut Vm, a, n| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Equal); bounded_hash(vm, a, n, h, "hash") };
+        "(hash obj [bound])" => |vm: &mut Vm, a, n| { let h = equal_hash(vm, arg(vm, a, 0)); bounded_hash(vm, a, n, h, "hash") };
         /// Return a hash of STRING, as `string=?` compares.
         /// With BOUND, the hash is below it.
         "(string-hash string [bound])" => |vm: &mut Vm, a, n| { let h = string_hash(str_arg(vm, arg(vm, a, 0), "string-hash")?); bounded_hash(vm, a, n, h, "string-hash") };
@@ -2639,7 +2639,12 @@ pub(crate) fn install(vm: &mut Vm) {
         "(%hash-table-slots table)" => |vm: &mut Vm, a, _| table_proc(vm, a, 1, "hash-table");
         "(%hash-table-version table)" => |vm: &mut Vm, a, _| table_proc(vm, a, 6, "hash-table");
         "(%hash-key-state key)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(match arg(vm, a, 0) { Value::EMPTY => 0, Value::UNDEFINED => 1, _ => 2 }));
-        "(%hash-code value)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked((hash_key(vm, arg(vm, a, 0), Equiv::Eqv) & ((1 << 47) - 1)) as i64));
+        "(%hash-code value)" => |vm: &mut Vm, a, _| {
+            let v = arg(vm, a, 0);
+            let mut h = FxHasher::default();
+            if !v.is_ptr() { v.bits().hash(&mut h); } else { hash_into(vm, v, Equiv::Eqv, &mut h, &mut 32); }
+            Ok(Value::int_unchecked((h.finish() & ((1 << 47) - 1)) as i64))
+        };
         "(%hash-table-needs-growth? table)" => table_needs_growth;
         "(%hash-table-grow! table snapshot hashes)" => custom_grow;
         "(%hash-table-finish table key operation value slots index expected version)" => custom_finish;

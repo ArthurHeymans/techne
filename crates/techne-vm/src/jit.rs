@@ -2611,7 +2611,6 @@ impl Jit {
         let vars: Vec<Variable> = (0..n).map(|_| b.declare_var(I64)).collect();
         let shifts: Vec<Variable> = (0..n).map(|_| b.declare_var(I64)).collect();
         let fvals: Vec<Variable> = (0..n).map(|_| b.declare_var(F64)).collect();
-        let ivals: Vec<Variable> = (0..n).map(|_| b.declare_var(I64)).collect();
         let load_ctx = |b: &mut FunctionBuilder, off: usize| b.ins().load(I64, flags(), p[1], off as i32);
         let globals = load_ctx(&mut b, offset_of!(JitCtx, globals));
         let fuel = load_ctx(&mut b, offset_of!(JitCtx, fuel));
@@ -2702,7 +2701,11 @@ impl Jit {
                 (o.head, a)
             })
             .collect();
-        let fix_vecs = fixnum_vectors(orig, n, &job.captures, heads, &shape, &fix_vec_globals, &assumed_fix_vecs, inline);
+        let fix_vecs = if fix_vec_globals.is_empty() && assumed_fix_vecs.values().all(Regs::is_empty) {
+            vec![Regs::empty(n); orig.len()]
+        } else {
+            fixnum_vectors(orig, n, &job.captures, heads, &shape, &fix_vec_globals, &assumed_fix_vecs, inline)
+        };
         let mut vecs = vectors(orig, n, &job.captures, heads, &shape, &vec_globals);
         for (v, f) in vecs.iter_mut().zip(&fix_vecs) {
             v.union(f);
@@ -2736,8 +2739,17 @@ impl Jit {
             },
             &shape,
         );
-        let i64_res =
-            int64s(orig, n, &job.captures, heads, inline_at, inline, &fix.regs, &flo.regs, &flow.live_in, &shape, job.observed.as_ref());
+        let native_inline = |pc: usize| match orig[pc] {
+            Op::CallG { g, n, .. } | Op::TailCallG { g, n, .. } => job.native_globals.get(&g).and_then(|k| k.inline(n)),
+            Op::Call { n, .. } | Op::TailCall { n, .. } => job.native_calls.get(&(pc as u32)).and_then(|k| k.inline(n)),
+            _ => None,
+        };
+        let has_i64_ops = sites.is_empty() && (0..orig.len()).any(|pc| native_inline(pc) == Some(Inline::IntegerAdd));
+        let i64_res = if has_i64_ops {
+            int64s(orig, n, &job.captures, heads, inline_at, inline, &fix.regs, &flo.regs, &flow.live_in, &shape, job.observed.as_ref())
+        } else {
+            Kinds { regs: vec![Regs::empty(n); orig.len()], missing: HashMap::default() }
+        };
         // The edges native code checks assumptions on.
         let mut guards: HashMap<(usize, usize), (Regs, Regs, Regs)> = HashMap::default();
         for (&edge, m) in &fix.missing {
@@ -2746,12 +2758,13 @@ impl Jit {
         for (&edge, m) in &flo.missing {
             guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n), Regs::empty(n))).1.union(m);
         }
-        let i64s = if guards
-            .iter()
-            .filter(|&(&(_, to), (fx, fl, _))| !fx.and(&flow.live_in[to]).is_empty() || !fl.and(&flow.live_in[to]).is_empty())
-            .map(|(&e, _)| e)
-            .chain(i64_res.missing.iter().filter(|&(&(_, to), m)| !m.and(&flow.live_in[to]).is_empty()).map(|(&e, _)| e))
-            .any(|(from, _)| !i64_res.regs[from].is_empty())
+        let i64s = if !sites.is_empty()
+            || guards
+                .iter()
+                .filter(|&(&(_, to), (fx, fl, _))| !fx.and(&flow.live_in[to]).is_empty() || !fl.and(&flow.live_in[to]).is_empty())
+                .map(|(&e, _)| e)
+                .chain(i64_res.missing.iter().filter(|&(&(_, to), m)| !m.and(&flow.live_in[to]).is_empty()).map(|(&e, _)| e))
+                .any(|(from, _)| !i64_res.regs[from].is_empty())
         {
             vec![Regs::empty(n); orig.len()]
         } else {
@@ -2761,47 +2774,59 @@ impl Jit {
             i64_res.regs
         };
         let (fix, flo) = (fix.regs, flo.regs);
-        let chars = chars(
-            orig,
-            n,
-            konst,
-            &job.captures,
-            heads,
-            |pc| match orig[pc] {
-                Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n) == Some(Inline::StringRef)),
-                Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n) == Some(Inline::StringRef)),
-                _ => false,
-            },
-            &shape,
-        );
-        let ascii_strs = ascii_strings(
-            orig,
-            n,
-            &job.captures,
-            heads,
-            &shape,
-            |pc| match orig[pc] {
-                Op::CallG { base, g, n }
-                    if job
-                        .native_globals
-                        .get(&g)
-                        .is_some_and(|k| matches!(k.inline(n), Some(Inline::StringLength | Inline::StringRef))) =>
-                {
-                    Some(base + 1)
-                }
-                Op::Call { base, n }
-                    if job
-                        .native_calls
-                        .get(&(pc as u32))
-                        .is_some_and(|k| matches!(k.inline(n), Some(Inline::StringLength | Inline::StringRef))) =>
-                {
-                    Some(base + 1)
-                }
-                _ => None,
-            },
-            inline,
-        );
-        let pairs = if std::env::var("TECHNE_JIT_PAIRS").as_deref() == Ok("0") {
+        let has_char_ops = (0..orig.len()).any(|pc| matches!(native_inline(pc), Some(Inline::CharToInteger | Inline::CharEq)));
+        let chars = if has_char_ops {
+            chars(
+                orig,
+                n,
+                konst,
+                &job.captures,
+                heads,
+                |pc| match orig[pc] {
+                    Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n) == Some(Inline::StringRef)),
+                    Op::Call { n, .. } => job.native_calls.get(&(pc as u32)).is_some_and(|k| k.inline(n) == Some(Inline::StringRef)),
+                    _ => false,
+                },
+                &shape,
+            )
+        } else {
+            vec![Regs::empty(n); orig.len()]
+        };
+        let has_str_ops = (0..orig.len()).any(|pc| matches!(native_inline(pc), Some(Inline::StringLength | Inline::StringRef)));
+        let ascii_strs = if has_str_ops {
+            ascii_strings(
+                orig,
+                n,
+                &job.captures,
+                heads,
+                &shape,
+                |pc| match orig[pc] {
+                    Op::CallG { base, g, n }
+                        if job
+                            .native_globals
+                            .get(&g)
+                            .is_some_and(|k| matches!(k.inline(n), Some(Inline::StringLength | Inline::StringRef))) =>
+                    {
+                        Some(base + 1)
+                    }
+                    Op::Call { base, n }
+                        if job
+                            .native_calls
+                            .get(&(pc as u32))
+                            .is_some_and(|k| matches!(k.inline(n), Some(Inline::StringLength | Inline::StringRef))) =>
+                    {
+                        Some(base + 1)
+                    }
+                    _ => None,
+                },
+                inline,
+            )
+        } else {
+            vec![Regs::empty(n); orig.len()]
+        };
+        let pairs = if std::env::var("TECHNE_JIT_PAIRS").as_deref() == Ok("0")
+            || !orig.iter().any(|op| matches!(op, Op::Car { .. } | Op::Cdr { .. }))
+        {
             vec![Regs::empty(n); orig.len()]
         } else {
             pairs(orig, n, &job.captures, heads, &shape)
@@ -2891,6 +2916,12 @@ impl Jit {
             code_table,
             code_ptr: job.code as i64,
             entry0: heads.contains(&0),
+            vec_ptrs: if orig.iter().any(|op| matches!(op, Op::VRef { .. } | Op::VSet { .. })) || vecs.iter().any(|r| !r.is_empty()) {
+                (0..n).map(|_| b.declare_var(I64)).collect()
+            } else {
+                Vec::new()
+            },
+            ivals: if i64s.iter().any(|r| !r.is_empty()) { (0..n).map(|_| b.declare_var(I64)).collect() } else { Vec::new() },
             flow,
             fix,
             flo,
@@ -2902,8 +2933,7 @@ impl Jit {
             pairs,
             ant,
             lens: (0..n).map(|_| (b.declare_var(I64), b.declare_var(I64))).collect(),
-            vec_ptrs: (0..n).map(|_| b.declare_var(I64)).collect(),
-            str_lens: (0..n).map(|_| b.declare_var(I64)).collect(),
+            str_lens: if has_str_ops { (0..n).map(|_| b.declare_var(I64)).collect() } else { Vec::new() },
             cached: cached
                 .iter()
                 .map(|&(g, lens)| Cached {
@@ -2936,7 +2966,6 @@ impl Jit {
             vars,
             shifts,
             fvals,
-            ivals,
             ops: orig.to_vec(),
             blocks: orig.iter().map(|op| compiled(op).then(|| b.create_block())).collect(),
             exits: HashMap::default(),
@@ -4605,6 +4634,14 @@ impl Gen {
         // Rust natives, rest arguments: see `jit_call_slow`.
         b.switch_to_block(slow);
         self.spill_at(b, pc);
+        let f = if !self.i64s[pc].is_empty() {
+            match global {
+                Some(g) => self.global(b, g),
+                None => b.ins().load(I64, flags(), self.r, (base as i32) * 8),
+            }
+        } else {
+            f
+        };
         let (base_v, n_v) = (b.ins().iconst(I64, base as i64), b.ins().iconst(I64, n as i64));
         let k = self
             .call(b, self.sigs.call_slow, jit_call_slow as *const (), &[self.vm, self.ctx, self.bp, base_v, n_v, self.depth, f])
@@ -4796,7 +4833,8 @@ impl Gen {
         self.tick(b, pc);
         self.spill_at(b, pc);
         // Through a global, the closure is not in the base register yet.
-        if matches!(self.ops[pc], Op::CallG { .. }) {
+        if let Op::CallG { g, .. } = self.ops[pc] {
+            let f = if !self.i64s[pc].is_empty() { self.global(b, g) } else { f };
             b.ins().store(flags(), f, self.r, (base as i32) * 8);
         }
         let callee_bp = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
@@ -5021,6 +5059,18 @@ impl Gen {
             // What the start assumes of the arguments (`Job::observed`),
             // checked as on edges into other entry points (`Gen::target`).
             let live = self.flow.live_in[0].clone();
+            for r in self.vecs[0].and(&live).iter() {
+                let x = self.get(b, r as Reg);
+                let lens = if self.fix_vecs[0].contains(r as Reg) { self.lens_of_fix(b, x) } else { self.lens_of(b, x) };
+                self.set_lens(b, r as Reg, lens);
+                let p = self.ptr(b, x);
+                b.def_var(self.vec_ptrs[r], p);
+            }
+            for r in self.ascii_strs[0].and(&live).iter() {
+                let x = self.get(b, r as Reg);
+                let len = self.ascii_str_len_of(b, x);
+                b.def_var(self.str_lens[r], len);
+            }
             let (fx, fl, i64g) = (self.fix[0].and(&live), self.flo[0].and(&live), self.i64s[0].and(&live));
             if !i64g.is_empty() {
                 let fail = self.exit(b, 0, GUARD);
@@ -5183,6 +5233,14 @@ impl Gen {
         let next = pc + 1;
         b.switch_to_block(slow);
         self.spill_at(b, pc);
+        let f = if !self.i64s[pc].is_empty() {
+            match self.ops[pc] {
+                Op::TailCallG { g, .. } => self.global(b, g),
+                _ => b.ins().load(I64, flags(), self.r, (base as i32) * 8),
+            }
+        } else {
+            f
+        };
         let (base_v, n_v) = (b.ins().iconst(I64, base as i64), b.ins().iconst(I64, n as i64));
         let k = self.call(b, self.sigs.tail_slow, jit_tail_slow as *const (), &[self.vm, self.bp, base_v, n_v, f]).unwrap();
         b.ins().jump(done, &[BlockArg::Value(k)]);

@@ -3015,9 +3015,9 @@ impl Vm {
     pub(crate) fn alloc_fast(&mut self, words: usize) -> *mut u64 {
         unsafe {
             let top = self.heap.top;
-            let next = top.add(words);
-            if next <= self.heap.jit_limit {
-                self.heap.top = next;
+            let room = self.heap.jit_limit.addr().checked_sub(top.addr()).map(|bytes| bytes / 8);
+            if room.is_some_and(|left| words <= left) {
+                self.heap.top = top.add(words);
                 return top;
             }
         }
@@ -3048,9 +3048,9 @@ impl Vm {
         let words = 3 * len;
         unsafe {
             let top = self.heap.top;
-            let next = top.add(words);
-            if next <= self.heap.jit_limit {
-                self.heap.top = next;
+            let room = self.heap.jit_limit.addr().checked_sub(top.addr()).map(|bytes| bytes / 8);
+            if room.is_some_and(|left| words <= left) {
+                self.heap.top = top.add(words);
                 let mut acc = tail;
                 let mut dst = top;
                 let h = header(Kind::Pair, 2, 0);
@@ -6056,8 +6056,28 @@ impl Vm {
                     let name = if matches!(op, Op::Car { .. }) { "car" } else { "cdr" };
                     return Err(crate::builtins::type_error(name, "pair", reg!(a)));
                 }
-                Op::VRef { v, i, .. } => return Err(crate::builtins::index_error("vector-ref", reg!(v), reg!(i))),
-                Op::VSet { v, i, .. } => return Err(crate::builtins::vector_set_error(reg!(v), reg!(i))),
+                Op::VRef { dst, v, i } => {
+                    let (x, k) = (reg!(v), reg!(i));
+                    if !is_kind(x, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(x.as_ptr()) as u64 {
+                        return Err(crate::builtins::index_error("vector-ref", x, k));
+                    }
+                    reg!(dst) = field(x.as_ptr(), k.as_int() as usize);
+                }
+                Op::VSet { v, i, x } => {
+                    let (vec, k, val) = (reg!(v), reg!(i), reg!(x));
+                    if !heap::is_changeable(vec, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64 {
+                        return Err(crate::builtins::vector_set_error(vec, k));
+                    }
+                    let idx = k.as_int() as usize;
+                    let vp = vec.as_ptr();
+                    if !val.is_int() {
+                        *vp &= !heap::VECTOR_FIXNUM;
+                        set_field(vp, idx, val);
+                        self.write_barrier_slot(vp, vp.add(1 + idx), val);
+                    } else {
+                        set_field(vp, idx, val);
+                    }
+                }
                 Op::PopHandler => {
                     self.handlers.pop();
                 }

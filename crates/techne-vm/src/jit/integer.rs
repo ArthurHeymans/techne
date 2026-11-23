@@ -112,8 +112,9 @@ impl Gen {
         }
 
         let want_i64 = self.i64s.get(pc + 1).is_some_and(|s| s.contains(base));
+        let any_i64 = want_i64 || self.i64s[pc].contains(base + 1) || self.i64s[pc].contains(base + 2);
         let raw = (a, c);
-        let floating = if want_i64 {
+        let floating = if any_i64 {
             slow
         } else {
             let blk = b.create_block();
