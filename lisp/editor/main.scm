@@ -41,8 +41,13 @@
 (require "help.scm")
 (require "server.scm")
 (require "capture.scm")
+(require "operations.scm")
+(require "requests.scm")
+(require "remote.scm")
 
-(provide start-session editor-detach! editor-select! editor-open! %attach-file-document editor-take-done! editor-forget! editor-eval! editor-eval-ended! editor-press editor-viewport! editor-pointer! editor-focus-event! editor-click editor-message! session-quit?
+(provide start-session editor-detach! editor-select! editor-open! %attach-file-document %attach-file-visit!
+         editor-take-opened! editor-take-failed! editor-take-done! editor-forget! editor-eval! editor-eval-ended!
+         editor-press editor-viewport! editor-pointer! editor-focus-event! editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers pane-inlays pane-projections face-table face-generation cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations! keep-histories!
@@ -77,6 +82,7 @@ Return the session, now the current one."
   "End the session S of a frontend detaching.
 The buffers it showed stay, with their unsaved edits; the minibuffer
 histories are written where they are kept (`keep-histories!`)."
+  (cancel-file-visit! s)
   (set! %last-shown (view-document (pane-view s)))
   (let ((private (sget s 'private-key))) (when private ((cdr private))))
   (detach-session! s)
@@ -86,11 +92,52 @@ histories are written where they are kept (`keep-histories!`)."
   "Make S, whose frontend's input comes next, the current session."
   (set-current-session! s))
 
+(define (%attach-file-visit! s path journal-path [alias #f])
+  "Internal helper used by live attach to open codec files asynchronously."
+  (file-visit! s path #:journal-path journal-path #:alias alias #:pinned #t))
+
 (define-command (save-buffer s n)
   "Write the document to its file."
-  (let ((d (doc s)))
-    (save-document! d)
-    (message! s (string-append "Wrote " (document-path d)))))
+  (save-document-in-session! s (doc s) 'save-buffer))
+
+(define (finish-save-and-quit! s d b accepted-waits if-clean)
+  (let ((attached-at-start? (and (memq s (attached-sessions)) #t))
+        (was-waited? (pair? accepted-waits)))
+    (save-document-in-session!
+     s d 'save-buffer
+     #:if-clean if-clean
+     #:after (lambda ()
+               (let ((valid? (or (not attached-at-start?) (and (memq s (attached-sessions)) #t))))
+                 (cond
+                   ((document-dirty? d)
+                    (when valid?
+                      (message! s "Wrote earlier revision; newer edits remain")))
+                   ((or was-waited? (waited? d))
+                    (if was-waited?
+                        (finish-waited-ids! accepted-waits)
+                        (finish-waited! d))
+                    (when (and (memq b (buffer-list)) (not (waited? d)))
+                      (if (memq s (attached-sessions))
+                          (drop-buffer! s b)
+                          (forget-buffer! b))))
+                   ((not valid?) #f)
+                   ((not (document=? (doc s) d))
+                    (message! s (string-append "Wrote " (abbreviate-path (document-path d))
+                                               "; active buffer changed, not quitting")))
+                   (else
+                    (sset! s 'quit #t))))))))
+
+(define-command (save-and-quit s n)
+  "Write the document to its file, then end the session or waited buffer."
+  (let ((d (doc s))
+        (b (current-buffer s)))
+    (finish-save-and-quit! s d b (waited-ids d) 'write)))
+
+(define-command (save-if-modified-and-quit s n)
+  "Write the document if modified, then end the session or waited buffer."
+  (let ((d (doc s))
+        (b (current-buffer s)))
+    (finish-save-and-quit! s d b (waited-ids d) 'skip)))
 
 (define-command (quit s n)
   "End the session. Unsaved edits stay in the journal for the next start.

@@ -265,6 +265,8 @@ pub struct Runtime {
     /// The frontend whose session Lisp is called for.
     serving: Client,
     next_id: u64,
+    /// Programs whose async open (`Msg::Open`) is still in flight: `(wait, reply)`.
+    opening: HashMap<usize, (bool, mpsc::Sender<Reply>)>,
     /// The programs waiting until a file they opened is done with, by the
     /// id of their request, which Lisp knows them by (`Msg::Open`).
     waiting: HashMap<usize, mpsc::Sender<Reply>>,
@@ -531,7 +533,7 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 44] = [
+const PROCS: [&str; 47] = [
     "editor-pointer!",
     "editor-focus-event!",
     "editor-cancel-capture!",
@@ -542,7 +544,10 @@ const PROCS: [&str; 44] = [
     "editor-take-captures!",
     "editor-captured!",
     "editor-open!",
+    "%attach-file-visit!",
     "keep-histories!",
+    "editor-take-opened!",
+    "editor-take-failed!",
     "editor-take-done!",
     "editor-forget!",
     "editor-detach!",
@@ -639,6 +644,7 @@ impl Runtime {
             clients: BTreeMap::new(),
             serving: Client::FIRST,
             next_id: 0,
+            opening: HashMap::new(),
             waiting: HashMap::new(),
             captures: HashMap::new(),
             outstanding_frames: HashSet::new(),
@@ -754,6 +760,31 @@ impl Runtime {
             self.message(&format!("Recovered {transactions} unsaved edits from the journal")).map_err(|e| e.to_string())?;
         }
         Ok(recovery)
+    }
+
+    /// Attach a frontend inside `serve` (`Msg::Attach`): fast non-codec files
+    /// attach synchronously as `attach` does, while codec-backed files start
+    /// the session immediately and return `(canonical, journal_arg, alias_arg)`
+    /// to launch asynchronously via `%attach-file-visit!` without blocking the
+    /// daemon or re-resolving the classified path.
+    fn attach_live(&mut self, client: Client, file: Option<&File>, profile: &str) -> Result<Option<(String, Arg, Arg)>, String> {
+        if let Some(f) = file {
+            let (_canonical, canon_str, abs_str, has_codec, is_private) = self.inspect_attach_file(f)?;
+            if has_codec {
+                let alias_arg = if abs_str != canon_str { Arg::Str(abs_str) } else { Arg::Bool(false) };
+                let journal_arg = if !is_private && !f.journal.as_os_str().is_empty() {
+                    let journal_str =
+                        f.journal.to_str().ok_or_else(|| format!("{}: journal path is not valid UTF-8", f.journal.display()))?;
+                    Arg::Str(journal_str.to_string())
+                } else {
+                    Arg::Bool(false)
+                };
+                self.start_session(client, None, profile).map_err(|e| e.to_string())?;
+                return Ok(Some((canon_str, journal_arg, alias_arg)));
+            }
+        }
+        self.attach(client, file, profile)?;
+        Ok(None)
     }
 
     fn start_session(&mut self, client: Client, view: Option<View>, profile: &str) -> Result<(), Error> {
@@ -1008,12 +1039,21 @@ impl Runtime {
                     Msg::CaptureCancelled => {}
                     Msg::Wake => woken.store(false, Ordering::Release),
                     Msg::Stop => return,
-                    Msg::Attach { client, file, profile, state, interrupts } => match self.attach(client, file.as_ref(), &profile) {
-                        Ok(_) => {
+                    Msg::Attach { client, file, profile, state, interrupts } => match self.attach_live(client, file.as_ref(), &profile) {
+                        Ok(pending_open) => {
                             interrupts.0.lock().expect("the gate").stop = Some(stop.clone());
                             self.set_interrupts(client, interrupts);
                             if let Some(e) = state.and_then(|s| self.restore(&s).err()) {
                                 let _ = self.message(&format!("The session could not be restored: {e}"));
+                            }
+                            if let Some((canon_str, journal_arg, alias_arg)) = pending_open
+                                && let Err(e) = self.call_within(
+                                    "%attach-file-visit!",
+                                    &[Arg::Session, Arg::Str(canon_str), journal_arg, alias_arg],
+                                    OPEN_DEADLINE,
+                                )
+                            {
+                                let _ = self.message(&e.to_string());
                             }
                             greet.push(client);
                         }
@@ -1084,7 +1124,9 @@ impl Runtime {
                         }
                     }
                     Msg::Gone(id) => {
-                        if self.waiting.remove(&id).is_some() {
+                        let was_opening = self.opening.remove(&id).is_some();
+                        let was_waiting = self.waiting.remove(&id).is_some();
+                        if was_opening || was_waiting {
                             let _ = self.call("editor-forget!", &[Arg::Int(id)]);
                         }
                     }
@@ -1153,13 +1195,17 @@ impl Runtime {
             let _ = reply.send(Reply::Failed("path is not valid UTF-8".into()));
             return;
         };
-        let id = wait.then_some(id);
-        let args = [Arg::Str(path_str.to_string()), id.map_or(Arg::Bool(false), Arg::Int)];
+        let args = [Arg::Str(path_str.to_string()), Arg::Int(id), Arg::Bool(wait)];
         match self.call_within("editor-open!", &args, OPEN_DEADLINE) {
-            Ok(_) => {
-                let _ = reply.send(Reply::Opened);
-                if let Some(id) = id {
-                    self.waiting.insert(id, reply);
+            Ok(v) => {
+                let pending = self.vm.get::<String>(&v).is_ok_and(|s| s == "pending");
+                if pending {
+                    self.opening.insert(id, (wait, reply));
+                } else {
+                    let _ = reply.send(Reply::Opened);
+                    if wait {
+                        self.waiting.insert(id, reply);
+                    }
                 }
             }
             Err(e) => {
@@ -1203,6 +1249,26 @@ impl Runtime {
     /// since, with the bindings too; detach those whose session quit. Tell
     /// the programs waiting for files done with since.
     fn answer(&mut self, greet: &mut Vec<Client>, send: &impl Fn(Client, Output)) {
+        let opened = self.call("editor-take-opened!", &[]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
+        for id in opened {
+            if let Some((wait, reply)) = self.opening.remove(&id) {
+                let _ = reply.send(Reply::Opened);
+                if wait {
+                    self.waiting.insert(id, reply);
+                }
+            }
+        }
+        let failed = self.call("editor-take-failed!", &[]).and_then(|v| self.vm.get::<Vec<Vec<String>>>(&v)).unwrap_or_default();
+        for pair in failed {
+            if let Some(id) = pair.first().and_then(|s| s.parse::<usize>().ok()) {
+                let msg = pair.get(1).cloned().unwrap_or_else(|| "open failed".into());
+                if let Some((_, reply)) = self.opening.remove(&id) {
+                    let _ = reply.send(Reply::Failed(msg));
+                } else if let Some(reply) = self.waiting.remove(&id) {
+                    let _ = reply.send(Reply::Failed(msg));
+                }
+            }
+        }
         let done = self.call("editor-take-done!", &[]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
         for id in done {
             if let Some(reply) = self.waiting.remove(&id) {

@@ -21,42 +21,136 @@
 (require "help.scm")
 (require "emacs.scm")
 (require "operations.scm")
+(require "requests.scm")
+(require "remote.scm")
 (require "shell.scm")
 
-(provide editor-open! editor-take-done! editor-forget! waited? server-edit editor-eval! editor-eval-ended! server-eval-max-chars)
+(provide editor-open! editor-take-opened! editor-take-failed! editor-take-done! editor-forget!
+         waited? waited-ids finish-waited! finish-waited-ids! server-edit editor-eval! editor-eval-ended! server-eval-max-chars)
 
-;; The programs waiting, (id . document), and those done waiting, by id,
-;; for the runtime to tell them.
+;; The programs waiting, (id . document); in-flight async opens, id -> cancel-thunk;
+;; and settlement queues for the runtime to deliver to clients.
 (define %waiting '())
+(define %pending-opens (make-hash-table))
+(define %opened '())
+(define %failed '())
 (define %done '())
 
-(define (editor-open! path id)
+(define (editor-open! path id [wait? #t])
   "Show the file at PATH in the current session, for a program.
-With ID, the program waits until the file is done with, and ID is
-among those `editor-take-done!` returns then. A document of the file
-without unsaved edits is read again: the program may have written the
-file since it was last shown, as Git writes COMMIT_EDITMSG."
+ID identifies the request; with WAIT? true (the default when ID is given),
+the program waits until the file is done with, and ID is among those
+`editor-take-done!` returns then. A document of the file without unsaved
+edits is read again: the program may have written the file since it was
+last shown, as Git writes COMMIT_EDITMSG.
+Returns \"opened\" when completed synchronously or \"pending\" when an
+asynchronous open is in flight (settled via `editor-take-opened!` or
+`editor-take-failed!`)."
   (let* ((s (or (current-session) (error "No frontend is attached")))
-         (d (file-document path)))
-    (unless (document-dirty? d) (reload-document! d))
-    (show-document! s d)
-    (when id (set! %waiting (cons (cons id d) %waiting)))
-    (message! s (cond ((not id) (string-append "Opened " (absolute-path path)))
-                      ((eq? (profile-name (sget s 'profile)) 'modal) "When done with the file, type :wq")
-                      (else (substitute-command-keys s "When done with the file, type \\[server-edit]"))))))
+         (wait-for? (and id wait? #t))
+         (went-async? #f)
+         (settled? #f))
+    (define (record-failed! msg)
+      (when (and id (not settled?))
+        (set! settled? #t)
+        (hash-table-delete! %pending-opens id)
+        (set! %failed (append %failed (list (list (number->string id) msg))))))
+    (file-visit!
+     s path
+     #:reload-clean #t
+     #:interactive #f
+     #:on-pending
+     (lambda (cancel!)
+       (set! went-async? #t)
+       (when id (hash-table-set! %pending-opens id cancel!)))
+     #:on-ready
+     (lambda (sess d)
+       (when (or (not id) (not went-async?) (hash-table-ref/default %pending-opens id #f))
+         (when id (hash-table-delete! %pending-opens id))
+         (let ((target (cond ((memq sess (attached-sessions)) sess)
+                             ((current-session) => (lambda (cs) cs))
+                             (else #f))))
+           (if (not target)
+               (record-failed! "the frontend detached before the file opened")
+               (let ((in-mini? (and (sget target 'minibuffer) #t)))
+                 (if in-mini?
+                     (add-buffer! d)
+                     (show-document! target d))
+                 (when wait-for?
+                   (set! %waiting (cons (cons id d) %waiting)))
+                 (when (and id went-async? (not settled?))
+                   (set! settled? #t)
+                   (set! %opened (append %opened (list id))))
+                 (message! target
+                           (cond ((not wait-for?)
+                                  (string-append "Opened " (absolute-path path)
+                                                 (if in-mini? " in background" "")))
+                                 (in-mini?
+                                  (string-append "Opened " (abbreviate-path (absolute-path path))
+                                                 " in background for waiting program"))
+                                 ((eq? (profile-name (sget target 'profile)) 'modal)
+                                  "When done with the file, type :wq")
+                                 (else
+                                  (substitute-command-keys target "When done with the file, type \\[server-edit]")))))))))
+     #:on-fail
+     (lambda (sess e)
+       (record-failed! (error-text e))
+       (when (memq sess (attached-sessions))
+         (failed! sess 'editor-open! e)))
+     #:on-cancel
+     (lambda (sess)
+       (record-failed! "open cancelled")))
+    (if went-async? "pending" "opened")))
 
 (define (waited? d)
   "Return #t if a program waits until the document D is done with."
   (any (lambda (w) (document=? (cdr w) d)) %waiting))
+
+(define (waited-ids d)
+  "Return the list of wait IDs currently waiting on document D."
+  (map car (filter (lambda (w) (document=? (cdr w) d)) %waiting)))
 
 (define (done! d)
   (let ((waiting (filter (lambda (w) (document=? (cdr w) d)) %waiting)))
     (set! %waiting (remove (lambda (w) (memq w waiting)) %waiting))
     (set! %done (append %done (map car waiting)))))
 
+(define (done-ids! ids)
+  (when (pair? ids)
+    (let ((waiting (filter (lambda (w) (memv (car w) ids)) %waiting)))
+      (set! %waiting (remove (lambda (w) (memq w waiting)) %waiting))
+      (set! %done (append %done (map car waiting))))))
+
+(define (finish-waited! d)
+  "Signal any waiting programs that document D is done."
+  (done! d))
+
+(define (finish-waited-ids! ids)
+  "Signal only the waiting programs in IDS that their document is done."
+  (done-ids! ids))
+
 (define (editor-forget! id)
-  "Forget the program ID waiting: it stopped waiting."
-  (set! %waiting (remove (lambda (w) (eqv? (car w) id)) %waiting)))
+  "Forget the program ID waiting or opening: it stopped waiting."
+  (let ((cancel! (hash-table-ref/default %pending-opens id #f)))
+    (hash-table-delete! %pending-opens id)
+    (when cancel! (guard (e (#t #f)) (cancel!))))
+  (let ((id-str (number->string id)))
+    (set! %opened (remove (lambda (x) (eqv? x id)) %opened))
+    (set! %failed (remove (lambda (x) (equal? (car x) id-str)) %failed))
+    (set! %waiting (remove (lambda (w) (eqv? (car w) id)) %waiting))))
+
+(define (editor-take-opened!)
+  "Return the ids of async server opens that succeeded since last asked."
+  (let ((ids %opened))
+    (set! %opened '())
+    ids))
+
+(define (editor-take-failed!)
+  "Return failed async server opens since last asked.
+Each entry is an `(id-string message)` pair."
+  (let ((xs %failed))
+    (set! %failed '())
+    xs))
 
 (define (editor-take-done!)
   "Return the ids of the programs done waiting since last asked."
@@ -66,11 +160,27 @@ file since it was last shown, as Git writes COMMIT_EDITMSG."
 
 (define-command (server-edit s n)
   "Be done with the file a program waits for: save it and kill its buffer."
-  (let ((d (doc s)))
-    (unless (waited? d) (error "No program waits for this buffer"))
-    (when (document-dirty? d) (save-document! d))
-    (done! d)
-    (drop-buffer! s (current-buffer s))))
+  (let* ((d (doc s))
+         (b (current-buffer s))
+         (accepted (waited-ids d)))
+    (unless (pair? accepted) (error "No program waits for this buffer"))
+    (if (document-dirty? d)
+        (save-document-in-session!
+         s d 'server-edit
+         #:after (lambda ()
+                   (if (document-dirty? d)
+                       (when (memq s (attached-sessions))
+                         (message! s "Wrote earlier revision; newer edits remain — run C-x # again to finish"))
+                       (begin
+                         (done-ids! accepted)
+                         (when (and (memq b (buffer-list)) (not (waited? d)))
+                           (if (memq s (attached-sessions))
+                               (drop-buffer! s b)
+                               (forget-buffer! b)))))))
+        (begin
+          (done-ids! accepted)
+          (when (and (memq b (buffer-list)) (not (waited? d)))
+            (drop-buffer! s b))))))
 
 (add-hook! 'buffer-killed 'server (lambda (s b) (done! (buffer-document b))))
 

@@ -112,9 +112,11 @@ ones. \\[ibuffer-cycle-sort] sorts, \\[ibuffer-filter-by-name] and
              ("/ /" ibuffer-filter-clear) ("*" "mark") ("/" "filter")))
 
 (define (redisplay! s b)
-  (let ((k (listing-key-at b (point s))))
+  (let* ((focused? (eq? (current-buffer s) b))
+         (k (and focused? (listing-key-at b (point s)))))
     (listing-redisplay! b)
-    (when k (listing-goto! s b k))))
+    (when (and k (eq? (current-buffer s) b))
+      (listing-goto! s b k))))
 
 (define-command (ibuffer s n)
   "Show the buffers, grouped by project, to act on.
@@ -158,10 +160,61 @@ Their files' unsaved edits stay in their journals."
 (define-command (ibuffer-do-save s n)
   "Save the marked buffers' files, or the one at point's."
   (let* ((b (current s))
-         (files (filter (lambda (x) (document-path (buffer-document x))) (buffers s #\*))))
-    (for-each (lambda (x) (save-document! (buffer-document x))) files)
-    (redisplay! s b)
-    (message! s (string-append "Saved " (number->string (length files)) " buffers"))))
+         (files (filter (lambda (x) (document-path (buffer-document x))) (buffers s #\*)))
+         (saved 0)
+         (failed 0)
+         (cancelled 0)
+         (remaining (length files))
+         (in-loop? #f)
+         (dirty-listing? #f))
+    (define (summary-message)
+      (string-append "Saved " (number->string saved) " buffers"
+                     (if (> failed 0) (string-append ", " (number->string failed) " failed") "")
+                     (if (> cancelled 0) (string-append ", " (number->string cancelled) " cancelled") "")))
+    (define (make-child-settler)
+      (let ((settled? #f))
+        (lambda (kind)
+          (unless settled?
+            (set! settled? #t)
+            (case kind
+              ((saved) (set! saved (+ saved 1)))
+              ((failed) (set! failed (+ failed 1)))
+              ((cancelled) (set! cancelled (+ cancelled 1))))
+            (set! remaining (- remaining 1))
+            (if in-loop?
+                (set! dirty-listing? #t)
+                (when (memq b (buffer-list)) (redisplay! s b)))
+            (when (and (not in-loop?) (= remaining 0))
+              (message! s (summary-message)))))))
+    (if (= remaining 0)
+        (begin
+          (redisplay! s b)
+          (message! s (summary-message)))
+        (begin
+          (set! in-loop? #t)
+          (dynamic-wind
+           (lambda () #f)
+           (lambda ()
+             (for-each
+              (lambda (x)
+                (let ((settle! (make-child-settler))
+                      (d (buffer-document x)))
+                  (guard (e ((cancelled-condition? e)
+                             (settle! 'cancelled))
+                            (#t
+                             (settle! 'failed)))
+                    (save-document-in-session!
+                     s d 'ibuffer-do-save
+                     #:after (lambda () (settle! 'saved))
+                     #:on-fail (lambda (_e) (settle! 'failed))
+                     #:on-cancel (lambda () (settle! 'cancelled))))))
+              files))
+           (lambda ()
+             (set! in-loop? #f)))
+          (when (and dirty-listing? (memq b (buffer-list)))
+            (redisplay! s b))
+          (when (= remaining 0)
+            (message! s (summary-message)))))))
 
 (define (mark-where! s keep?)
   (let ((b (current s)))

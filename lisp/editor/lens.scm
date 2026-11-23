@@ -15,6 +15,7 @@
 (require "commands.scm")
 (require "targets.scm")
 (require "files.scm")
+(require "remote.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "views.scm")
@@ -48,9 +49,56 @@ MODE, with STATE, and replaces a buffer of that name."
 
 (define-command (lens-save s n)
   "Write the files edited through this lens."
-  (let ((dirty (filter (lambda (d) (and (document-dirty? d) (document-path d))) (presentation-sources (lens-of s)))))
-    (for-each save-document! dirty)
-    (message! s (if (null? dirty) "No changes to write" (string-append "Wrote " (string-join (map document-path dirty) ", "))))))
+  (let* ((dirty (filter (lambda (d) (and (document-dirty? d) (document-path d))) (presentation-sources (lens-of s))))
+         (async-docs (filter (lambda (d) (or (document-codec d) (remote-path? (document-path d)))) dirty))
+         (sync-docs (filter (lambda (d) (not (memq d async-docs))) dirty)))
+    (cond
+      ((null? dirty) (message! s "No changes to write"))
+      ((null? async-docs)
+       (for-each save-document! sync-docs)
+       (message! s (string-append "Wrote " (string-join (map document-path dirty) ", "))))
+      (else
+       (for-each save-document! sync-docs)
+       (let ((remaining (length async-docs))
+             (failed '())
+             (cancelled '()))
+         (define (finish-lens-batch!)
+           (cond
+             ((and (null? failed) (null? cancelled))
+              (message! s (string-append "Wrote " (string-join (map document-path dirty) ", "))))
+             (else
+              (let* ((wrote-count (- (length dirty) (length failed) (length cancelled)))
+                     (parts (append (if (> wrote-count 0)
+                                        (list (string-append "Wrote " (number->string wrote-count)))
+                                        '())
+                                    (if (pair? failed)
+                                        (list (string-append "failed: " (string-join (reverse failed) ", ")))
+                                        '())
+                                    (if (pair? cancelled)
+                                        (list (string-append "cancelled: " (string-join (reverse cancelled) ", ")))
+                                        '()))))
+                (message! s (string-join parts "; "))))))
+         (for-each
+          (lambda (d)
+            (let ((settled? #f)
+                  (p (document-path d)))
+              (define (settle! kind)
+                (unless settled?
+                  (set! settled? #t)
+                  (case kind
+                    ((failed) (set! failed (cons p failed)))
+                    ((cancelled) (set! cancelled (cons p cancelled))))
+                  (set! remaining (- remaining 1))
+                  (when (= remaining 0)
+                    (finish-lens-batch!))))
+              (guard (e ((cancelled-condition? e) (settle! 'cancelled))
+                        (#t (settle! 'failed)))
+                (save-document-in-session!
+                 s d 'lens-save
+                 #:after (lambda () (settle! 'saved))
+                 #:on-fail (lambda (_e) (settle! 'failed))
+                 #:on-cancel (lambda () (settle! 'cancelled))))))
+          async-docs))))))
 
 ;;; Lenses of lines
 

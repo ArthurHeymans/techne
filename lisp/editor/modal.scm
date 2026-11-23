@@ -165,7 +165,10 @@ The leader key, SPC, is bound in main.scm.")
   (sset! s 'insert-extend #t))
 
 (define (insert-key s key)
-  (cond ((member key '("ESC" "C-g")) (sset! s 'mode-pending '()) (leave-insert! s))
+  (cond ((member key '("ESC" "C-g"))
+         (sset! s 'mode-pending '())
+         (leave-insert! s)
+         (when (string=? key "C-g") (run-hook! s 'keyboard-quit-hook)))
         ((bound-key! s (active-keymaps s 'chord) key))
         (else
          (unless (sget s 'replaying) (sset! s 'insert-keys (cons key (sget s 'insert-keys))))
@@ -312,7 +315,13 @@ The leader key, SPC, is bound in main.scm.")
   (let ((op (sget s 'op)) (prefix (sget s 'prefix)) (visual (eq? (state s) 'visual)))
     (cond
      ((member key '("ESC" "C-g"))
-      (if (or op prefix (sget s 'count)) (reset-pending! s) (when visual (leave-visual! s))))
+      (cond ((or op prefix (sget s 'count))
+             (reset-pending! s)
+             (when (string=? key "C-g") (run-hook! s 'keyboard-quit-hook)))
+            (visual
+             (leave-visual! s)
+             (when (string=? key "C-g") (run-hook! s 'keyboard-quit-hook)))
+            (else (run-hook! s 'keyboard-quit-hook))))
      ;; Text objects after an operator: iw, aw.
      ((member prefix '("i" "a"))
       (let ((around (string=? prefix "a")) (n (total-count s)))
@@ -400,7 +409,7 @@ Nothing typed searches for the last string again; n goes to the next."
 ;; Ex commands: the few a file needs. They run the named commands, which
 ;; the application defines (main.scm), each only when the one before it
 ;; succeeded: :wq does not quit when the file could not be written.
-(define ex-commands '(("w" save-buffer) ("q" quit) ("wq" save-buffer quit) ("x" save-buffer quit)))
+(define ex-commands '(("w" save-buffer) ("q" quit) ("wq" save-and-quit) ("x" save-if-modified-and-quit)))
 
 ;; Whether INPUT names what : can run.
 (define (ex-command? input)
