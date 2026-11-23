@@ -410,6 +410,10 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     dev.closed(&host, cid);
                 }
             }
+            ToWorker::PatchLibrary { id, name, library, code, check_retained } => {
+                let result = host.patch_library(&name, &library, &code, check_retained);
+                let _ = tx.send(FromWorker::PatchedLibrary { id, result });
+            }
         }
     }
     host_task.abort();

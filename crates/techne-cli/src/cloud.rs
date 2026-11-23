@@ -103,9 +103,11 @@ const USAGE: &str = "usage: techne cloud dev TARGET [--port PORT] [--ops PORT] [
        techne cloud deployments TARGET
        techne cloud deploy TARGET
        techne cloud rollback TARGET [ID]
+       techne cloud patch-library TARGET LIBRARY (SOURCE_FILE | --code CODE) [--no-check-retained]
        techne cloud serve --state DIR --domain DOMAIN [--port PORT] [--ops PORT] [--nrepl PORT] [--live N] [--idle SECONDS] [--unconfined]
        techne cloud invite --state DIR TENANT
        techne cloud deploy TARGET --to URL --tenant TENANT --project PROJECT
+       techne cloud patch-library LIBRARY (SOURCE_FILE | --code CODE) [--no-check-retained] --to URL --tenant TENANT --project PROJECT
        techne cloud deployments|rollback [ID]|secret NAME --to URL --tenant TENANT --project PROJECT
 
 Serve the deployment at TARGET (a package directory with techne-package.scm,
@@ -118,7 +120,8 @@ the requests carrying the header techne-debug-route with the credential
 printed. With --auth, an nREPL client must authenticate first, with a token
 such as the one printed. With --ops, serve the operations on its deployments
 on that port, which the other commands ask of it: the deployments published,
-deploying again, and going back to the one before or to ID.
+deploying again, going back to the one before or to ID, and Mode 2 live
+library patching (patch-library) in a dev world or attached debug instance.
 
 serve runs a cloud of tenants, kept in DIR: each project invited tenants
 deploy is served at PROJECT.TENANT.DOMAIN on PORT, by a worker for each
@@ -176,6 +179,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         Some((serve, rest)) if serve == "serve" => done(serve_fleet(rest).map(|()| String::new())),
         Some((invite, rest)) if invite == "invite" => done(invite_tenant(rest)),
         Some((op, rest)) if rest.iter().any(|a| a == "--to") => done(operate_remote(op, rest)),
+        Some((op, rest)) if op == "patch-library" => done(operate_patch_library(rest)),
         Some((op, rest)) if matches!(op.as_str(), "deployments" | "deploy" | "rollback") => {
             let id = rest.get(1).filter(|_| op == "rollback");
             match rest.first() {
@@ -453,6 +457,16 @@ fn operate_remote(op: &str, args: &[String]) -> Result<String, String> {
                 fields.extend([("op", json_string(op)), ("entry", json_string(&app.entry)), ("package", package_json)]);
             }
         },
+        ("patch-library", rest) => {
+            let (_, library, code, check_retained) = parse_patch_args(rest, false)?;
+            let lib_json: Vec<String> = library.iter().map(|p| json_string(p)).collect();
+            fields.extend([
+                ("op", json_string("patch-library")),
+                ("library", format!("[{}]", lib_json.join(","))),
+                ("code", json_string(&code)),
+                ("check-retained", if check_retained { "true" } else { "false" }.to_string()),
+            ]);
+        }
         _ => return Err(String::new()),
     }
     let body: Vec<String> = fields.iter().map(|(k, v)| format!("{}:{v}", json_string(k))).collect();
@@ -559,6 +573,62 @@ fn operate(op: &str, file: &Path, id: Option<&str>) -> Result<String, String> {
         None => format!(r#"{{"op":{}}}"#, json_string(op)),
     };
     post(&format!("127.0.0.1:{port}"), &token, None, &body)
+}
+
+/// Ask the `techne cloud dev --ops` serving `TARGET` to live-patch `LIBRARY`
+/// from `SOURCE_FILE` or `--code CODE` (Mode 2).
+fn operate_patch_library(args: &[String]) -> Result<String, String> {
+    let (target_file, library, code, check_retained) = parse_patch_args(args, true)?;
+    let target_file = target_file.ok_or_else(String::new)?;
+    let target = techne_host::package::resolve_cloud_target(&target_file)?;
+    let kept = target.dir().join(".techne");
+    let read = |name: &str| std::fs::read_to_string(kept.join(name)).map(|s| s.trim().to_string());
+    let port: u16 =
+        read("ops-port").ok().and_then(|p| p.parse().ok()).ok_or("no techne cloud dev --ops serves it (no .techne/ops-port)")?;
+    let token = std::env::var("TECHNE_TOKEN").or_else(|_| read("token")).map_err(|_| "no token: set TECHNE_TOKEN")?;
+    let lib_json: Vec<String> = library.iter().map(|p| json_string(p)).collect();
+    let body = format!(
+        r#"{{"op":"patch-library","library":[{}],"code":{},"check-retained":{}}}"#,
+        lib_json.join(","),
+        json_string(&code),
+        if check_retained { "true" } else { "false" }
+    );
+    post(&format!("127.0.0.1:{port}"), &token, None, &body)
+}
+
+/// Parse arguments for `techne cloud patch-library`.
+///
+/// When `expect_target` is true (local `techne cloud dev`), expects:
+/// `TARGET LIBRARY (SOURCE_FILE | --code CODE) [--no-check-retained]`.
+/// When `expect_target` is false (remote `--to`), expects:
+/// `LIBRARY (SOURCE_FILE | --code CODE) [--no-check-retained]`.
+fn parse_patch_args(args: &[String], expect_target: bool) -> Result<(Option<PathBuf>, Vec<String>, String, bool), String> {
+    let mut rest = args.to_vec();
+    let check_retained = match rest.iter().position(|a| a == "--no-check-retained") {
+        Some(at) => {
+            rest.remove(at);
+            false
+        }
+        None => true,
+    };
+    let inline_code = if rest.iter().any(|a| a == "--code") { Some(flag(&mut rest, "--code").ok_or_else(String::new)?) } else { None };
+    if rest.iter().any(|a| a.starts_with("--")) {
+        return Err(String::new());
+    }
+    let (target, lib_str, source_file) = match (expect_target, inline_code.is_some(), rest.as_slice()) {
+        (true, true, [target, lib]) => (Some(PathBuf::from(target)), lib.as_str(), None),
+        (true, false, [target, lib, file]) => (Some(PathBuf::from(target)), lib.as_str(), Some(Path::new(file))),
+        (false, true, [lib]) => (None, lib.as_str(), None),
+        (false, false, [lib, file]) => (None, lib.as_str(), Some(Path::new(file))),
+        _ => return Err(String::new()),
+    };
+    let library = techne_vm::patch::parse_library_name(lib_str)?;
+    let code = match (inline_code, source_file) {
+        (Some(code), None) => code,
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?,
+        _ => return Err(String::new()),
+    };
+    Ok((target, library, code, check_retained))
 }
 
 fn usage() -> ExitCode {

@@ -277,26 +277,41 @@ prepare, keep the bundle (files or packages and bindings, by id, the latest
 ten), publish if nothing overtook it, and record it; to roll back is to
 prepare an earlier one again from its bundle and publish it the same way.
 The record and the bundles are files, which outlive the supervisor.
-`techne cloud dev --ops PORT` serves the operations `deployments`, `deploy`
-and `rollback` as JSON over HTTP (`POST /v1/ops`, a bearer token allowing
-`inspect` or `deploy` on the project), and `techne cloud deployments`,
-`deploy` and `rollback` ask them. Against `techne cloud serve`, packaged
-deploys query `has-trees` first and omit `"files"` for dependency trees
-already cached by canonical `tree-sha256` under `<state>/trees/<sha>/`;
-uploaded trees are verified against their declared `tree-sha256` and
-cached atomically before staging. Not yet: `dry-run`, idempotency keys,
-the other operations and the audit log.
+`techne cloud dev --ops PORT` serves the operations `deployments`, `deploy`,
+`rollback`, and `patch-library` as JSON over HTTP (`POST /v1/ops`, a bearer
+token allowing `inspect` or `deploy` on the project), and `techne cloud
+deployments`, `deploy`, `rollback`, and `patch-library` ask them. Against
+`techne cloud serve`, packaged deploys query `has-trees` first and omit
+`"files"` for dependency trees already cached by canonical `tree-sha256` under
+`<state>/trees/<sha>/`; uploaded trees are verified against their declared
+`tree-sha256` and cached atomically before staging. Not yet: `dry-run`,
+idempotency keys, the other operations and the audit log.
 
 Rollback publishes an earlier deployment that is still Ready or can be
 again. **It rolls back code only**: storage, schema changes and external
 effects stay. Storage changes must stay compatible with the previous
 deployment, or be undone by the developer.
 
-Libraries are packages pinned by hash; updating one is a new deployment of
-each project that uses it. The aim is a second from `C-c C-k` to serving:
-compiling a thousand lines takes a few milliseconds (about 18 K
-instructions a line today); a snapshot of the loaded deployment takes
-half a millisecond for the Org library, more for larger projects
+Libraries are packages pinned by hash; updating one for production traffic
+is a new immutable deployment (Mode 1). In a dev world or an attached debug
+instance, a single loaded library's procedures can also be live-patched in
+place without resetting state or record types (**Mode 2**): via nREPL op
+`techne-patch-library`, `POST /v1/ops` (`op: "patch-library"`), or `techne
+cloud patch-library`. Mode 2 never mutates production serving instances or
+snapshots (refusing with `no-mutable-world` when no dev world or debug
+instance is active), refuses structural changes (`record-layout-changed`,
+`macro-changed`, `state-initializer-changed`, `imports-changed`,
+`export-rebound`, `binding-removed`, `binding-added`) atomically, reports
+retained callbacks in `stale-holders`, and tracks active patch deltas
+(`dirty: true`) that clear automatically on redeploy, rollback, or debug
+detach. When a request pauses in the debugger on an error inside an imported
+library, patching that library via `techne-patch-library` and invoking the
+`retry` restart re-runs the request against the patched procedure immediately.
+See [packages.md](packages.md#hot-reload-mode-1-vs-mode-2) for the full
+Mode 1 / Mode 2 contract. The aim for Mode 1 redeploys is a second from
+`C-c C-k` to serving: compiling a thousand lines takes a few milliseconds
+(about 18 K instructions a line today); a snapshot of the loaded deployment
+takes half a millisecond for the Org library, more for larger projects
 (runtime work 1).
 
 ## The REPL

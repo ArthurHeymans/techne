@@ -248,6 +248,10 @@ and read by `(techne lock)` without evaluation:
     omits `"files"` for package trees already cached by canonical `tree-sha256`
     under `<state>/trees/<sha>/`; uploaded trees are verified against their
     declared `tree-sha256` and written atomically before staging.
+  - **`techne cloud patch-library TARGET LIBRARY (SOURCE_FILE | --code CODE) [--no-check-retained]`**
+    (and remote `--to URL --tenant TENANT --project PROJECT`) sends a Mode 2
+    live library patch to a deployment's dev world or attached debug instance
+    over `POST /v1/ops`.
 - **`techne lsp`**
   - Resolves a package's own `(owner pkg ...)` libraries from `lib/` and its
     direct `(depends ...)` via the consuming workspace/project root's
@@ -255,6 +259,71 @@ and read by `(techne lock)` without evaluation:
     `$TECHNE_PACKAGE_STORE`), or unlocked `(path ...)`, reading manifests and
     lockfiles strictly as pure data while preserving direct-dependency
     boundaries and ignoring overrides inside non-root dependency manifests.
+
+## Hot Reload: Mode 1 vs. Mode 2
+
+Techne separates hot reload into two distinct modes so that production
+deployments stay immutable and reproducible while interactive worlds stay fast
+and stateful:
+
+- **Mode 1 — Atomic Snapshot / Generation Swap (always safe):**
+  - Used for all production deploys (`techne cloud deploy`, `techne cloud rollback`,
+    file-save redeploys in `techne cloud dev`) and full editor package reloads.
+  - Builds a fresh world from the immutable bundle or package closure, swaps
+    routes atomically to the new snapshot, and drains old instances.
+  - Required whenever exports, imports, macros (`define-syntax`), record
+    layouts (`define-record-type`), or top-level state initializers change.
+- **Mode 2 — Live In-World Library Patching (procedure-only, dev & debug worlds):**
+  - Patches a single already-loaded R7RS `(define-library ...)` library in
+    place without resetting top-level state, without replacing
+    `define-record-type` descriptors (existing records keep their type
+    identity), and without re-evaluating unchanged forms.
+  - Available in three surfaces:
+    1. **Scheme:** `(patch-library! '(owner pkg sub) source-string [#:check-retained #t])`
+       (requires `Capability::Loading` when called from Scheme; returns a dict
+       with `library`, `patched`, `unchanged`, `stale-holders`, and `source-sha256`).
+    2. **nREPL:** op `techne-patch-library` with `library` (list of parts or
+       Scheme string like `"(owner pkg)"`), `code`, and optional `check-retained`
+       (runs at the scheduler boundary between task slices, works even while
+       paused in a debugger waiting on `retry`, and requires no `Capability::Loading`).
+    3. **Cloud ops & CLI:** `POST /v1/ops` with `op: "patch-library"` and
+       `techne cloud patch-library` (targets only a deployment's dev world or
+       attached debug instance; never mutates production serving instances or
+       snapshots, and tracks active patch deltas cleared on redeploy, rollback,
+       or debug detach).
+  - **Strict safety invariants & typed refusals:** Before mutating any global
+    slot, the VM parses the source, diffs declarations and top-level forms
+    structurally (span-insensitively), compiles and stages *every* changed
+    procedure closure, and commits all global slot updates atomically in one
+    pass (so both interpreted and JIT callers immediately invoke the new
+    procedures, and any compile error leaves the world completely unchanged).
+    Any structural change is refused cleanly with a typed kebab-case `reason`
+    (instructing the caller to fall back to Mode 1):
+    - `not-loaded` — target library is not a loaded `define-library` module.
+    - `syntax-error` — patch source is not a single valid `define-library` form.
+    - `library-name-mismatch` — `define-library` name does not match target.
+    - `include-not-supported` / `unsupported-declaration` — `include`,
+      `include-ci`, `include-library-declarations`, or unknown declarations are
+      forbidden in Mode 2 (never reopens filesystem loading).
+    - `imports-changed` — `import` declarations changed.
+    - `export-rebound` — `export` declarations changed, or attempted to patch a
+      re-exported/imported slot owned by another library.
+    - `binding-removed` / `binding-added` — an existing export or binding was
+      removed, or a new binding was added.
+    - `record-layout-changed` — any `define-record-type` form changed, added, or
+      removed (protects positional `match` compilation and RTD identity).
+    - `macro-changed` — any `define-syntax` form changed, added, or removed
+      (protects already-expanded importers).
+    - `state-initializer-changed` — any non-procedure top-level `define` or
+      expression changed, added, or removed.
+    - `compile-error` — compiling a changed procedure failed (atomic: zero
+      slots mutated).
+    - `no-mutable-world` — (cloud host/supervisor) deployment has no dev world
+      or attached debug instance.
+  - **Stale-holder diagnostics:** When `check-retained` is enabled (the
+    default), the VM checks whether any live heap reference still retains a
+    replaced closure (for example, a callback stored in a hook table) and
+    reports its retention chain under `stale-holders` (`{binding, chain}`).
 
 ## Package directories
 

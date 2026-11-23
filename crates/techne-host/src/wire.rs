@@ -27,6 +27,15 @@ pub const REPL_CHUNK: usize = 64 << 10;
 /// The most bytes of a deployment's files: they go in a frame.
 pub const BUNDLE_BYTES: usize = 24 << 20;
 
+/// The most bytes of a single Mode 2 library source patch.
+pub const MAX_PATCH_BYTES: usize = 4 << 20;
+
+/// The most parts in a library name over IPC.
+const MAX_LIBRARY_PARTS: usize = 32;
+
+/// The most stale-holder diagnostics returned in a single patch report.
+const MAX_STALE_HOLDERS: usize = 256;
+
 /// Chunks of a body sent before any is credited.
 pub const WINDOW: usize = 4;
 
@@ -130,6 +139,15 @@ pub enum ToWorker {
     ReplClose {
         cid: u64,
     },
+    /// Live-patch a single library in the dev world or attached debug
+    /// instance of the deployment published as `name` (Mode 2).
+    PatchLibrary {
+        id: u64,
+        name: String,
+        library: Vec<String>,
+        code: String,
+        check_retained: bool,
+    },
 }
 
 /// What the worker says.
@@ -194,6 +212,11 @@ pub enum FromWorker {
     },
     ReplClose {
         cid: u64,
+    },
+    /// Result of Mode 2 `PatchLibrary` `id`.
+    PatchedLibrary {
+        id: u64,
+        result: Result<crate::PatchReport, crate::HostPatchError>,
     },
 }
 
@@ -336,6 +359,14 @@ impl ToWorker {
             }
             ToWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
             ToWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
+            ToWorker::PatchLibrary { id, name, library, code, check_retained } => Data::List(vec![
+                sym("patch-library"),
+                int(*id),
+                Data::String(name.clone()),
+                Data::List(library.iter().cloned().map(Data::String).collect()),
+                Data::String(code.clone()),
+                Data::Bool(*check_retained),
+            ]),
         }
     }
 
@@ -389,6 +420,17 @@ impl ToWorker {
             "repl-open" => ToWorker::ReplOpen { cid: p.uint()?, principal: p.failure()?, target: p.failure()? },
             "repl-data" => ToWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => ToWorker::ReplClose { cid: p.uint()? },
+            "patch-library" => {
+                let id = p.uint()?;
+                let name = p.string()?;
+                let library = decode_string_list(p.list()?, MAX_LIBRARY_PARTS, true)?;
+                let code = p.string()?;
+                if code.len() > MAX_PATCH_BYTES {
+                    return Err(bad("patch source too large"));
+                }
+                let check_retained = p.flag()?;
+                ToWorker::PatchLibrary { id, name, library, code, check_retained }
+            }
             other => return Err(bad(&format!("no message {other}"))),
         };
         if p.has_more() {
@@ -430,6 +472,37 @@ impl FromWorker {
             }
             FromWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
             FromWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
+            FromWorker::PatchedLibrary { id, result } => match result {
+                Ok(report) => Data::List(vec![
+                    sym("patched-library"),
+                    int(*id),
+                    Data::Bool(true),
+                    Data::List(report.library.iter().cloned().map(Data::String).collect()),
+                    Data::List(report.patched.iter().cloned().map(Data::String).collect()),
+                    int(report.unchanged as u64),
+                    Data::List(
+                        report
+                            .stale_holders
+                            .iter()
+                            .map(|h| {
+                                Data::List(vec![
+                                    Data::String(h.binding.clone()),
+                                    Data::List(h.chain.iter().cloned().map(Data::String).collect()),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                    Data::String(report.source_sha256.clone()),
+                ]),
+                Err(err) => Data::List(vec![
+                    sym("patched-library"),
+                    int(*id),
+                    Data::Bool(false),
+                    Data::String(err.reason.clone()),
+                    Data::String(err.message.clone()),
+                    failure(&err.binding),
+                ]),
+            },
         }
     }
 
@@ -452,6 +525,41 @@ impl FromWorker {
             "fetch" => FromWorker::Fetch { rid: p.uint()?, fid: p.uint()?, service: p.string()?, request: p.any()? },
             "repl-data" => FromWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => FromWorker::ReplClose { cid: p.uint()? },
+            "patched-library" => {
+                let id = p.uint()?;
+                let result = match p.flag()? {
+                    true => {
+                        let library = decode_string_list(p.list()?, MAX_LIBRARY_PARTS, true)?;
+                        let patched = decode_string_list(p.list()?, MAX_PARTS, false)?;
+                        let unchanged = usize::try_from(p.uint()?).map_err(|_| bad("unchanged count"))?;
+                        let raw_holders = p.list()?;
+                        if raw_holders.len() > MAX_STALE_HOLDERS {
+                            return Err(bad("too many stale holders"));
+                        }
+                        let stale_holders = raw_holders
+                            .into_iter()
+                            .map(|h| {
+                                let mut hp = Parts::of(h)?;
+                                let binding = hp.string()?;
+                                let chain = decode_string_list(hp.list()?, MAX_DEPTH, false)?;
+                                if hp.has_more() {
+                                    return Err(bad("trailing parts in stale holder"));
+                                }
+                                Ok(crate::StaleHolder { binding, chain })
+                            })
+                            .collect::<io::Result<Vec<_>>>()?;
+                        let source_sha256 = p.string()?;
+                        Ok(crate::PatchReport { library, patched, unchanged, stale_holders, source_sha256 })
+                    }
+                    false => {
+                        let reason = p.string()?;
+                        let message = p.string()?;
+                        let binding = p.failure()?;
+                        Err(crate::HostPatchError { reason, message, binding })
+                    }
+                };
+                FromWorker::PatchedLibrary { id, result }
+            }
             other => return Err(bad(&format!("no message {other}"))),
         };
         if p.has_more() {
@@ -459,6 +567,22 @@ impl FromWorker {
         }
         Ok(msg)
     }
+}
+
+fn decode_string_list(items: Vec<Data>, max_len: usize, require_non_empty: bool) -> io::Result<Vec<String>> {
+    if require_non_empty && items.is_empty() {
+        return Err(bad("an empty list"));
+    }
+    if items.len() > max_len {
+        return Err(bad("list too long"));
+    }
+    items
+        .into_iter()
+        .map(|item| match item {
+            Data::String(s) if !require_non_empty || !s.is_empty() => Ok(s),
+            _ => Err(bad("a string")),
+        })
+        .collect()
 }
 
 /// A message's parts, taken in order; all of them, or it is malformed.

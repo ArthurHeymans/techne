@@ -88,6 +88,7 @@ pub mod worker;
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
+    fmt,
     path::Path,
     rc::Rc,
     sync::Arc,
@@ -96,6 +97,7 @@ use std::{
 
 pub use body::Response;
 use body::{Exchange, Reader};
+pub use techne_vm::patch::{PatchError, PatchRefusal, PatchReport, StaleHolder};
 use techne_vm::{
     api::Value,
     bundle::BundleVfs,
@@ -104,6 +106,38 @@ use techne_vm::{
     vm::{Capability, Error, Grants, Output, ROOT_MODULE, Snapshot, Vm},
 };
 use tokio::sync::{Notify, oneshot};
+
+/// Why a Mode 2 live library patch was refused by a [`Host`] or
+/// [`supervisor::Supervisor`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostPatchError {
+    /// Kebab-case refusal code (e.g. `"no-mutable-world"`, `"record-layout-changed"`).
+    pub reason: String,
+    /// Human-readable diagnostic message.
+    pub message: String,
+    /// Binding name involved in the refusal, if any.
+    pub binding: Option<String>,
+}
+
+impl HostPatchError {
+    /// Construct a `"no-mutable-world"` refusal.
+    pub fn no_mutable_world(message: impl Into<String>) -> Self {
+        Self { reason: "no-mutable-world".into(), message: message.into(), binding: None }
+    }
+
+    /// Convert a VM [`PatchError`] into a [`HostPatchError`].
+    pub fn from_vm(error: PatchError) -> Self {
+        Self { reason: error.reason.code().into(), message: error.message, binding: error.binding }
+    }
+}
+
+impl fmt::Display for HostPatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.reason, self.message)
+    }
+}
+
+impl std::error::Error for HostPatchError {}
 
 /// How much longer than its deployment's wall time a request routed to a
 /// debug instance may take, waiting in a debugger.
@@ -303,6 +337,10 @@ struct Published {
     idle: Vec<Instance>,
     dev: bool,
     debug: Option<Debug>,
+    /// Active Mode 2 library patch deltas on this deployment's mutable world
+    /// (dev world or attached debug instance): library name parts -> `source_sha256`.
+    /// Never applies to production serving instances or snapshots.
+    patches: HashMap<Vec<String>, String>,
 }
 
 /// A request the front world asked for.
@@ -437,7 +475,10 @@ impl Host {
         let generation = s.generation();
         // The debug instance of the one before goes with it.
         s.retire_debug(name);
-        s.published.insert(name.to_string(), Published { deployment, generation, idle: Vec::new(), dev: false, debug: None });
+        s.published.insert(
+            name.to_string(),
+            Published { deployment, generation, idle: Vec::new(), dev: false, debug: None, patches: HashMap::new() },
+        );
         drop(s);
         self.wake.notify_one();
     }
@@ -536,10 +577,79 @@ impl Host {
         world.serve = Some(install_dev(&mut world.vm)?);
         world.attached = Some(attach(&mut world.vm)?);
         s.retire_debug(name);
-        s.published.insert(name.to_string(), Published { deployment, generation, idle: vec![world], dev: true, debug: None });
+        s.published.insert(
+            name.to_string(),
+            Published { deployment, generation, idle: vec![world], dev: true, debug: None, patches: HashMap::new() },
+        );
         drop(s);
         self.wake.notify_one();
         Ok(())
+    }
+
+    /// Live-patch a single already-loaded library in `deployment`'s mutable
+    /// world (its dev world when published for development, or its attached
+    /// debug instance when serving in production) using Mode 2 procedure-only
+    /// patching ([`Vm::patch_library`]).
+    ///
+    /// Production serving instances and the deployment's immutable snapshot
+    /// are NEVER mutated. If `deployment` is a production deployment without
+    /// an attached debug instance, or does not exist, refuses with
+    /// `"no-mutable-world"`.
+    pub fn patch_library(
+        &self,
+        deployment: &str,
+        parts: &[String],
+        source: &str,
+        check_retained: bool,
+    ) -> Result<PatchReport, HostPatchError> {
+        let mut s = self.state.borrow_mut();
+        let State { published, running, .. } = &mut *s;
+        let Some(p) = published.get_mut(deployment) else {
+            return Err(HostPatchError::no_mutable_world(format!("no deployment named {deployment}")));
+        };
+        let vm = if p.dev {
+            if let Some(world) = p.idle.first_mut() {
+                &mut world.vm
+            } else if let Some(r) = running
+                .iter_mut()
+                .find(|r| r.deployment == deployment && r.instance.generation == p.generation && r.instance.debug.is_none())
+            {
+                &mut r.instance.vm
+            } else {
+                return Err(HostPatchError::no_mutable_world("the dev world is gone; deploy again"));
+            }
+        } else if let Some(debug) = &mut p.debug {
+            let debug_id = debug.id;
+            if let Some(world) = debug.idle.as_mut() {
+                &mut world.vm
+            } else if let Some(r) =
+                running.iter_mut().find(|r| r.deployment == deployment && r.instance.debug == Some(debug_id) && !r.retired)
+            {
+                &mut r.instance.vm
+            } else {
+                return Err(HostPatchError::no_mutable_world("the debug instance is no longer active"));
+            }
+        } else {
+            return Err(HostPatchError::no_mutable_world(
+                "production deployment has no dev world or attached debug instance; attach a debug instance or deploy a new immutable snapshot",
+            ));
+        };
+        let report = vm.patch_library(parts, source, check_retained).map_err(HostPatchError::from_vm)?;
+        p.patches.insert(report.library.clone(), report.source_sha256.clone());
+        Ok(report)
+    }
+
+    /// Active Mode 2 library patch deltas (`library -> source_sha256`) on
+    /// `deployment`'s mutable world. Empty for clean or production-only
+    /// deployments, and cleared on redeploy, rollback, or debug detach.
+    pub fn patch_deltas(&self, deployment: &str) -> HashMap<Vec<String>, String> {
+        self.state.borrow().published.get(deployment).map(|p| p.patches.clone()).unwrap_or_default()
+    }
+
+    /// Whether `deployment`'s mutable world carries any active Mode 2 library
+    /// patch deltas (i.e. has diverged from its deployed snapshot).
+    pub fn is_dirty(&self, deployment: &str) -> bool {
+        self.state.borrow().published.get(deployment).is_some_and(|p| !p.patches.is_empty())
     }
 
     /// Have `broker` fetch what requests ask for (`fetch-url`); without
@@ -808,6 +918,9 @@ impl Host {
                         && p.debug.as_ref().is_some_and(|d| d.id == id)
                     {
                         p.debug = None;
+                        if !p.dev {
+                            p.patches.clear();
+                        }
                     }
                     s.keep(&job.deployment, kept);
                     s.fail(job.deployment, id, &job.exchange, 500, e.msg.clone())
@@ -829,6 +942,7 @@ impl Host {
         let mut s = self.state.borrow_mut();
         for p in s.published.values_mut() {
             if p.dev {
+                let before = p.idle.len();
                 p.idle.retain_mut(|world| match slice(world) {
                     Ok(more) => {
                         busy |= more;
@@ -836,6 +950,9 @@ impl Host {
                     }
                     Err(_) => false,
                 });
+                if before > 0 && p.idle.is_empty() {
+                    p.patches.clear();
+                }
             }
             let gone = match p.debug.as_mut().and_then(|d| d.idle.as_mut()).map(slice) {
                 Some(Ok(more)) => {
@@ -847,6 +964,9 @@ impl Host {
             };
             if gone {
                 p.debug = None;
+                if !p.dev {
+                    p.patches.clear();
+                }
             }
         }
         busy
@@ -954,10 +1074,19 @@ impl State {
                     && p.debug.as_ref().is_some_and(|d| d.id == id)
                 {
                     p.debug = None;
+                    if !p.dev {
+                        p.patches.clear();
+                    }
                 }
             }
             Some(_) => {}
             None => {
+                if instance.is_none()
+                    && let Some(p) = self.published.get_mut(deployment)
+                    && p.dev
+                {
+                    p.patches.clear();
+                }
                 if let Some(n) = self.busy.get_mut(deployment) {
                     *n = n.saturating_sub(1);
                     // Names come and go with deployments: none is kept
@@ -1012,7 +1141,11 @@ impl State {
     /// `deployment` has its debug instance no longer: the request running
     /// on it ends.
     fn retire_debug(&mut self, deployment: &str) {
-        let Some(d) = self.published.get_mut(deployment).and_then(|p| p.debug.take()) else { return };
+        let Some(p) = self.published.get_mut(deployment) else { return };
+        let Some(d) = p.debug.take() else { return };
+        if !p.dev {
+            p.patches.clear();
+        }
         for r in self.running.iter_mut().filter(|r| r.deployment == deployment && r.instance.debug == Some(d.id)) {
             r.retired = true;
         }

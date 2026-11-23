@@ -28,7 +28,7 @@
 (require "../http/http.scm")
 
 (provide make-control control? control-name control-deploy! control-rollback! control-restore! control-deployments
-         control-serve control-ops-handler)
+         control-patch-library! control-serve control-ops-handler)
 
 ;; How many deployments' bundles are kept, and events recorded; the most
 ;; bytes a bundle kept may be (a deployment's files, and their encoding).
@@ -242,6 +242,31 @@ is `kept`, to roll back to."
                         "kept" (file-exists? (bundle-file c id))))
                 (distinct-ids events))))))
 
+(define (control-patch-library! c library code #:check-retained [check-retained #t])
+  "Live-patch LIBRARY with CODE in the mutable world of C.
+LIBRARY is a non-empty list or vector of library name parts (or a Scheme
+library name string); CODE is the updated `define-library` source string.
+When CHECK-RETAINED is true, stale closure holders are reported. Return a
+dict whose `ok` field is `#t` on success or `#f` on typed refusal."
+  (%cloud-patch-library (control-name c) library code (if check-retained #t #f)))
+
+;; Extract and validate (library code check-retained) from a patch-library op MESSAGE.
+(define (patch-library-args message)
+  (let ((library (dict-ref message "library" #f))
+        (code (dict-ref message "code" #f))
+        (check-retained (dict-ref message "check-retained" #t)))
+    (unless (or (and (string? library) (> (string-length library) 0))
+                (and (vector? library)
+                     (> (vector-length library) 0)
+                     (<= (vector-length library) 32)
+                     (every (lambda (p) (and (string? p) (> (string-length p) 0))) (vector->list library))))
+      (error "library must be a non-empty array of strings or a Scheme library name string"))
+    (unless (and (string? code) (<= (string-length code) (* 4 1024 1024)))
+      (error "code must be a string within the patch size limit"))
+    (unless (boolean? check-retained)
+      (error "check-retained must be a boolean"))
+    (list library code check-retained)))
+
 (define (report e)
   (if (error-object? e) (condition/report-string e) "it failed"))
 
@@ -266,10 +291,11 @@ with why it was not deployed."
 (define (control-ops-handler c key #:revoked? [revoked? (lambda (id) #f)])
   "Return an HTTP handler answering the operations on the project of C.
 `POST /v1/ops` with a JSON object of its `op`: `deployments`; `deploy`;
-`rollback`, with the `id` to go back to if not the one before. Answered
-with a JSON array of one reply, its `status` done, or error and what
-kind, with a `message`. The request's bearer token must hold under KEY
-(and REVOKED?, as `verify-token` has them) and allow the operation on
+`rollback`, with the `id` to go back to if not the one before; or
+`patch-library`, with `library`, `code`, and optional `check-retained`.
+Answered with a JSON array of one reply, its `status` done, or error and
+what kind, with a `message`. The request's bearer token must hold under
+KEY (and REVOKED?, as `verify-token` has them) and allow the operation on
 the project: `inspect` to list, `deploy` for the others."
   (define (reply status statuses . fields)
     (json-response (vector (apply dict "status" (list->vector statuses) fields)) #:status status))
@@ -282,7 +308,7 @@ the project: `inspect` to list, `deploy` for the others."
                            (guard (e (#t #f)) (request-json request))))
              (op (and (dict? message) (dict-ref message "op" #f)))
              (scope (cond ((equal? op "deployments") "inspect")
-                          ((member op '("deploy" "rollback")) "deploy")
+                          ((member op '("deploy" "rollback" "patch-library")) "deploy")
                           (else #f))))
         (cond ((not claims) (reply 401 '("error" "unauthenticated" "done")))
               ((not message) (reply 400 '("error" "not-an-operation" "done")))
@@ -290,6 +316,12 @@ the project: `inspect` to list, `deploy` for the others."
               ((not (token-allows? claims (control-name c) scope)) (reply 403 '("error" "refused" "done")))
               ((equal? op "deployments") (apply reply 200 '("done") (dict->fields (control-deployments c))))
               ((equal? op "deploy") (apply reply 200 '("done") (dict->fields (control-deploy! c))))
+              ((equal? op "patch-library")
+               (let* ((args (patch-library-args message))
+                      (res (control-patch-library! c (car args) (cadr args) #:check-retained (caddr args))))
+                 (if (dict-ref res "ok" #f)
+                     (apply reply 200 '("done") (dict->fields (dict-delete res "ok")))
+                     (apply reply 422 '("error" "patch-refused" "done") (dict->fields (dict-delete res "ok"))))))
               (else
                (let ((id (dict-ref message "id" #f)))
                  (unless (or (not id) (string? id)) (error "An id is a string:" id))

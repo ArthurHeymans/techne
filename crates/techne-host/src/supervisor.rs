@@ -82,7 +82,7 @@ use tokio::{
 };
 
 use crate::{
-    Failure, Printed, Response,
+    Failure, HostPatchError, PatchReport, Printed, Response,
     ask::Asker,
     body::{self, DataValue, Piece, Reader},
     outbound::Service,
@@ -91,8 +91,8 @@ use crate::{
         load_verified_packaged_trees_staged, prepare_packaged_bundle, resolve_cloud_target,
     },
     wire::{
-        BUNDLE_BYTES, BundledPackage, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, decode_packages, decode_root_package, encode,
-        encode_packages, encode_root_package, read_frame, write_encoded,
+        BUNDLE_BYTES, BundledPackage, FromWorker, MAX_FRAME, MAX_PATCH_BYTES, REPL_CHUNK, ToWorker, WINDOW, decode_packages,
+        decode_root_package, encode, encode_packages, encode_root_package, read_frame, write_encoded,
     },
     worker,
 };
@@ -106,6 +106,9 @@ const RESTARTS: usize = 5;
 
 /// How long a worker may take to be ready.
 const START: Duration = Duration::from_secs(10);
+
+/// How long a Mode 2 live library patch may wait for the worker to answer.
+const PATCHING: Duration = Duration::from_secs(30);
 
 /// Whether workers are sandboxed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -583,6 +586,8 @@ struct State {
     pending: HashMap<u64, Pending>,
     next_deploy: u64,
     deploys: HashMap<u64, (Bundle, oneshot::Sender<Result<String, String>>)>,
+    next_patch: u64,
+    patches: HashMap<u64, oneshot::Sender<Result<PatchReport, HostPatchError>>>,
     /// The deployments the worker has loaded, by the names it serves
     /// them under.
     ready: HashMap<String, Ready>,
@@ -898,9 +903,90 @@ pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
     front.register_fn("%cloud-route", move |name: String| -> DataValue {
         DataValue(of(&name).ok().and_then(|(me, name)| me.route(&name)).map_or(Data::Bool(false), Data::String))
     });
+    let of = resolve.clone();
     front.register_fn("%cloud-bundle", move |name: String, id: String| -> DataValue {
-        DataValue(resolve(&name).ok().and_then(|(me, name)| me.bundle_of(&name, &id)).map_or(Data::Bool(false), Data::Bytes))
+        DataValue(of(&name).ok().and_then(|(me, name)| me.bundle_of(&name, &id)).map_or(Data::Bool(false), Data::Bytes))
     });
+    front.register_async("%cloud-patch-library", 4, move |vm, args| {
+        let asked = (|| {
+            let name = args.get::<String>(vm, 0)?;
+            let lib_val = args.value(vm, 1)?;
+            let lib_data = vm.to_data(&lib_val, 4096)?;
+            let library = parse_library_arg(&lib_data).map_err(Error::new)?;
+            let code = args.get::<String>(vm, 2)?;
+            if code.len() > MAX_PATCH_BYTES {
+                return Err(Error::new("patch source exceeds maximum size"));
+            }
+            let check_retained = args.get::<bool>(vm, 3)?;
+            let (me, name) = resolve(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, library, code, check_retained))
+        })();
+        async move {
+            let (me, name, library, code, check_retained) = asked?;
+            let result = me.patch_library(&name, library, code, check_retained).await;
+            Ok::<_, Error>(DataValue(patch_result_to_data(result)))
+        }
+    });
+}
+
+fn parse_library_arg(data: &Data) -> Result<Vec<String>, String> {
+    match data {
+        Data::String(s) => techne_vm::patch::parse_library_name(s),
+        Data::List(items) | Data::Vector(items) => {
+            if items.is_empty() {
+                return Err("library name must not be empty".into());
+            }
+            items
+                .iter()
+                .map(|item| match item {
+                    Data::String(s) if !s.is_empty() => Ok(s.clone()),
+                    Data::Symbol(s) if !s.is_empty() => Ok(s.clone()),
+                    Data::Int(n) if *n >= 0 => Ok(n.to_string()),
+                    _ => Err("library name parts must be non-empty strings, symbols, or non-negative integers".into()),
+                })
+                .collect()
+        }
+        _ => Err("library must be a list/vector of name parts or a Scheme library name string".into()),
+    }
+}
+
+fn patch_result_to_data(result: Result<PatchReport, HostPatchError>) -> Data {
+    match result {
+        Ok(report) => Data::Dict(vec![
+            (Data::String("ok".into()), Data::Bool(true)),
+            (Data::String("library".into()), Data::Vector(report.library.into_iter().map(Data::String).collect())),
+            (Data::String("patched".into()), Data::Vector(report.patched.into_iter().map(Data::String).collect())),
+            (Data::String("unchanged".into()), Data::Int(report.unchanged as i64)),
+            (
+                Data::String("stale-holders".into()),
+                Data::Vector(
+                    report
+                        .stale_holders
+                        .into_iter()
+                        .map(|h| {
+                            Data::Dict(vec![
+                                (Data::String("binding".into()), Data::String(h.binding)),
+                                (Data::String("chain".into()), Data::Vector(h.chain.into_iter().map(Data::String).collect())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (Data::String("source-sha256".into()), Data::String(report.source_sha256)),
+            (Data::String("dirty".into()), Data::Bool(true)),
+        ]),
+        Err(err) => {
+            let mut entries = vec![
+                (Data::String("ok".into()), Data::Bool(false)),
+                (Data::String("reason".into()), Data::String(err.reason)),
+                (Data::String("message".into()), Data::String(err.message)),
+            ];
+            if let Some(binding) = err.binding {
+                entries.push((Data::String("binding".into()), Data::String(binding)));
+            }
+            Data::Dict(entries)
+        }
+    }
 }
 
 fn parse_pair(data: &Data) -> Result<(String, String), String> {
@@ -1012,6 +1098,8 @@ impl Supervisor {
                 pending: HashMap::new(),
                 next_deploy: 0,
                 deploys: HashMap::new(),
+                next_patch: 0,
+                patches: HashMap::new(),
                 ready: HashMap::new(),
                 joining: HashMap::new(),
                 routes: HashMap::new(),
@@ -1477,6 +1565,13 @@ impl Supervisor {
                 s.repls.remove(&cid);
                 None
             }
+            FromWorker::PatchedLibrary { id, result } => match s.patches.remove(&id) {
+                Some(reply) => {
+                    let _ = reply.send(result);
+                    None
+                }
+                None => Some(format!("a library patch it was not given ({id})")),
+            },
             FromWorker::Ready => Some("ready again".into()),
         }
     }
@@ -1484,7 +1579,7 @@ impl Supervisor {
     /// Worker `generation` is done for, for `why`: kill it, answer for its
     /// requests, and start another with the last deployment.
     fn end_worker(&self, generation: u64, why: &str) {
-        let (requests, deploys) = {
+        let (requests, deploys, patches) = {
             let mut s = self.state.borrow_mut();
             let Some(w) = s.worker.take_if(|w| w.generation == generation) else { return };
             kill(&w);
@@ -1500,7 +1595,7 @@ impl Supervisor {
                     let _ = waiter.send(Err(why.into()));
                 }
             }
-            (std::mem::take(&mut s.pending), std::mem::take(&mut s.deploys))
+            (std::mem::take(&mut s.pending), std::mem::take(&mut s.deploys), std::mem::take(&mut s.patches))
         };
         // Their responses' bodies streaming are cut short.
         for (_, mut p) in requests {
@@ -1511,6 +1606,9 @@ impl Supervisor {
         }
         for (_, (_, reply)) in deploys {
             let _ = reply.send(Err(why.into()));
+        }
+        for (_, reply) in patches {
+            let _ = reply.send(Err(HostPatchError::no_mutable_world(why)));
         }
         let me = self.clone();
         tokio::task::spawn_local(async move {
@@ -2009,6 +2107,46 @@ impl Supervisor {
             self.state.borrow().ready.values().filter(|r| r.bundle.name == name).map(|r| r.bundle.id.clone()).collect();
         ids.sort();
         ids
+    }
+
+    /// Live-patch `library` with `code` in the mutable world (dev world or
+    /// attached debug instance) of the deployment `name` is currently routed
+    /// to (Mode 2). Never mutates production serving instances or snapshots,
+    /// and never wakes a sleeping worker (which has no mutable world).
+    pub async fn patch_library(
+        &self,
+        name: &str,
+        library: Vec<String>,
+        code: String,
+        check_retained: bool,
+    ) -> Result<PatchReport, HostPatchError> {
+        let (tx, rx) = oneshot::channel();
+        let pid = {
+            let mut s = self.state.borrow_mut();
+            let Some(id) = s.routes.get(name).cloned() else {
+                return Err(HostPatchError::no_mutable_world(format!("{name} has no published deployment")));
+            };
+            let served = served(name, &id);
+            if !s.ready.get(&served).is_some_and(|r| r.loaded) {
+                return Err(HostPatchError::no_mutable_world(format!("{name} is not loaded in a live worker")));
+            }
+            let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else {
+                return Err(HostPatchError::no_mutable_world("no live worker for deployment"));
+            };
+            s.next_patch += 1;
+            let pid = s.next_patch;
+            s.patches.insert(pid, tx);
+            let _ = send.send(ToWorker::PatchLibrary { id: pid, name: served, library, code, check_retained });
+            pid
+        };
+        match tokio::time::timeout(PATCHING, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(HostPatchError::no_mutable_world("the worker is gone")),
+            Err(_) => {
+                self.state.borrow_mut().patches.remove(&pid);
+                Err(HostPatchError::no_mutable_world("the worker did not answer the library patch in time"))
+            }
+        }
     }
 
     /// Have a task of `front` keep what requests keep in their KV
