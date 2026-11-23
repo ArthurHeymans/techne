@@ -66,7 +66,7 @@
          doc ranges point move! check-editable! edit! insert-text! search! region-text replace-region! search-all goto-next!
          set-indent! indent-lines! line-starts indentation lisp-indent
          kill-ring kill-save! yank-text current-prefix
-         file-document show-document! show-buffer! visit! buffer-list add-buffer! eval-region!
+         file-document show-document! show-buffer! visit! file-visit! cancel-file-visit! file-visit-pending? save-document-in-session! buffer-list add-buffer! eval-region!
          completing-read async-source candidate candidate-text candidate-annotation candidate-target take-target candidate-table minibuffer-history
          target target? target-kind target-value target-at define-action actions-for act-on!
          location file-location location? location-document location-position line-candidate
@@ -98,13 +98,17 @@
          make-listing-buffer! listing-redisplay! listing-row listing-mark listing-marked listing-targets
          listing-key-at listing-goto! listing-get listing-set! listing?
          save-document! reload-document! directory-entries path-exists?
-         document-codec document-codec-envelope document-private? document-logical-path
+         document-codec document-codec-envelope document-private? document-logical-path document-save-description
          codec? codec-name codec-doc codec-private? codec-priority
          codec-result? make-codec-result codec-result-text codec-result-envelope
          register-codec! define-codec find-codec codec-names
          codec-for-path codecs-for-path path-private-by-codec? codec-logical-path codec-init-envelope
-         codec-decode codec-encode
+         codec-decode codec-encode codec-save-description
          default-codec-max-bytes default-codec-timeout default-gzip-program
+         default-gpg-program default-gpg-homedir default-gpg-recipients default-gpg-id-roots
+         default-gpg-trust-file-recipients default-gpg-armor default-gpg-batch default-gpg-timeout
+         default-age-program default-age-identities default-age-recipients default-age-recipients-file
+         default-age-recipient-roots default-age-armor default-age-timeout
          remote-path? location-route location-path location-prefix location-at define-method method-names
          hop? hop-method hop-user hop-host hop-port
          location-endpoint remote-endpoints call-with-process-at

@@ -299,7 +299,7 @@ In dirvish, a file is opened where the panes were before."
   (let ((t (target-here s)))
     (if (eq? (target-kind t) 'directory)
         (go-to-directory! s (target-value t) #f)
-        (begin (dirvish-quit! s) (show-document! s (file-document (target-value t)))))))
+        (begin (dirvish-quit! s) (file-visit! s (target-value t))))))
 
 (define-command (dired-find-file-other-pane s n)
   "Open the entry at point in a new pane below."
@@ -307,7 +307,7 @@ In dirvish, a file is opened where the panes were before."
     (dirvish-quit! s)
     (if (eq? (target-kind t) 'directory)
         (begin (show-in-other-pane! s (doc s)) (dired! s (target-value t)))
-        (show-in-other-pane! s (file-document (target-value t))))))
+        (file-visit! s (target-value t) #:other-pane #t))))
 
 ;; Show DIR in the listing of the focused pane, moved there; in dirvish,
 ;; in the middle pane.

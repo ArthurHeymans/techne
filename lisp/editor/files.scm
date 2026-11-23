@@ -11,18 +11,25 @@
 (require "operations.scm")
 
 (provide file-document absolute-path directory-of file-name working-directory normal-directory abbreviate-path state-file
-         open-file-documents open-document-at cached-open-document-at
+         open-file-documents open-document-at cached-open-document-at visit-needs-async?
          file-document-moved! save-document! reload-document! revert-document! directory-entries
          changed-on-disk? file-text
          path-exists?
          document-codec document-codec-envelope document-unretained? document-private? mark-document-private! document-logical-path private-path?
+         document-save-description
          %attach-file-document
          codec? codec-name codec-doc codec-private? codec-priority
          codec-result? make-codec-result codec-result-text codec-result-envelope
          register-codec! define-codec find-codec codec-names
          codecs-for-path codec-for-path path-private-by-codec? codec-logical-path codec-init-envelope
-         codec-decode codec-encode
-         default-gzip-program default-codec-max-bytes default-codec-timeout)
+         codec-decode codec-encode codec-save-description
+         default-gzip-program default-codec-max-bytes default-codec-timeout
+         default-gpg-program default-gpg-homedir default-gpg-recipients
+         default-gpg-id-roots default-gpg-trust-file-recipients
+         default-gpg-armor default-gpg-batch default-gpg-timeout
+         default-age-program default-age-identities default-age-recipients
+         default-age-recipients-file default-age-recipient-roots
+         default-age-armor default-age-timeout)
 
 ;;; Lazy bridge to `(techne codec)`.
 ;;; Loaded on first codec call or built-in codec filename match.
@@ -39,7 +46,10 @@
   (eval name (ensure-codec!)))
 
 (define (maybe-builtin-codec-path? path)
-  (and (string? path) (string-suffix? ".gz" path)))
+  (and (string? path)
+       (or (string-suffix? ".gz" path)
+           (string-suffix? ".gpg" path)
+           (string-suffix? ".age" path))))
 
 (define (codec-bridge-active?)
   (or %codec-env (codec-registry-loaded?)))
@@ -150,9 +160,13 @@ The remaining arguments are keywords as `register-codec!` takes them."
   "Encode TEXT for PATH with ENVELOPE using codec C into a bytevector."
   ((codec-ref 'codec-encode) c path text envelope))
 
+(define (codec-save-description c path envelope)
+  "Return a short save description for PATH with ENVELOPE under codec C."
+  ((codec-ref 'codec-save-description) c path envelope))
+
 ;;; User-scope codec options bridging editor configuration to `(techne codec)` parameters.
 ;;; All codec options are `#:user-only #t` and read with `(option #f ...)` so untrusted
-;;; project, buffer, or mode settings can never hijack helpers.
+;;; project, buffer, or mode settings can never hijack crypto helpers or recipients.
 
 (define-option gzip-program "gzip"
   "Executable name or absolute path used by the built-in `gzip` codec.
@@ -168,6 +182,97 @@ User-scope only."
 
 (define-option codec-timeout 30000
   "Default subprocess timeout in milliseconds for built-in codecs.
+User-scope only."
+  #:type '(natural #:min 1)
+  #:user-only #t)
+
+(define-option gpg-program "gpg"
+  "Executable name or absolute path used by the built-in `gpg` codec.
+User-scope only; resolved on the clean host PATH."
+  #:type '(string #:min 1)
+  #:user-only #t)
+
+(define-option gpg-homedir #f
+  "Optional explicit GNUPGHOME directory for the built-in `gpg` codec.
+User-scope only; `#f` uses GnuPG's default home directory."
+  #:type '(or (one-of #f) (string #:min 1))
+  #:user-only #t)
+
+(define-option gpg-recipients '()
+  "List of GPG recipient key IDs or emails for encrypting `.gpg` files.
+User-scope only; takes precedence over `.gpg-id` and file metadata."
+  #:type '(list-of (string #:min 1))
+  #:user-only #t)
+
+(define-option gpg-id-roots '()
+  "Trusted local roots (or `#t`) allowing `.gpg-id` recipient discovery.
+User-scope only; empty by default so untrusted repositories are ignored."
+  #:type '(or boolean (list-of (string #:min 1)))
+  #:user-only #t)
+
+(define-option gpg-trust-file-recipients #f
+  "Whether saving a `.gpg` file may reuse unauthenticated `ENC_TO` IDs.
+Applies when no explicit `gpg-recipients` or trusted `.gpg-id` policy
+is configured. Off by default; user-scope only."
+  #:type 'boolean
+  #:user-only #t)
+
+(define-option gpg-armor #f
+  "Whether newly created `.gpg` files use ASCII armor (`--armor`).
+Existing files always preserve their own armor format. User-scope only."
+  #:type 'boolean
+  #:user-only #t)
+
+(define-option gpg-batch #f
+  "Whether to pass `--batch` to `gpg` on decrypt (disables pinentry).
+User-scope only."
+  #:type 'boolean
+  #:user-only #t)
+
+(define-option gpg-timeout 120000
+  "Subprocess timeout in milliseconds for the built-in `gpg` codec.
+User-scope only."
+  #:type '(natural #:min 1)
+  #:user-only #t)
+
+(define-option age-program "age"
+  "Executable name or absolute path used by the built-in `age` codec.
+User-scope only; resolved on the clean host PATH."
+  #:type '(string #:min 1)
+  #:user-only #t)
+
+(define-option age-identities '()
+  "List of identity file paths for decrypting `.age` files.
+User-scope only; empty falls back to `~/.config/age/keys.txt`."
+  #:type '(list-of (string #:min 1))
+  #:user-only #t)
+
+(define-option age-recipients '()
+  "List of age recipient public keys for encrypting `.age` files.
+User-scope only."
+  #:type '(list-of (string #:min 1))
+  #:user-only #t)
+
+(define-option age-recipients-file #f
+  "Optional path to a trusted age recipients file.
+User-scope only."
+  #:type '(or (one-of #f) (string #:min 1))
+  #:user-only #t)
+
+(define-option age-recipient-roots '()
+  "Trusted local roots (or `#t`) allowing `.age-recipients` discovery.
+User-scope only; empty by default so untrusted repositories are ignored."
+  #:type '(or boolean (list-of (string #:min 1)))
+  #:user-only #t)
+
+(define-option age-armor #f
+  "Whether newly created `.age` files use ASCII armor (`-a`).
+Existing files always preserve their own armor format. User-scope only."
+  #:type 'boolean
+  #:user-only #t)
+
+(define-option age-timeout 60000
+  "Subprocess timeout in milliseconds for the built-in `age` codec.
 User-scope only."
   #:type '(natural #:min 1)
   #:user-only #t)
@@ -353,13 +458,28 @@ Used for mode and syntax detection; for codec-backed documents, applies
       abs
       (guard (e (#t abs)) (%canonical-file-path abs))))
 
+(define (document-save-description d)
+  "Return a short save description for codec-backed document D, or #f."
+  (let ((codec (document-codec d))
+        (path (document-path d)))
+    (and codec path
+         (guard (e (#t #f))
+           (with-editor-codec-options
+            (lambda ()
+              (codec-save-description codec path (document-codec-envelope d))))))))
+
+(define (document-matches-canonical? existing canon)
+  (let ((ep (document-path existing)))
+    (and (string? ep) (string=? ep canon))))
+
 (define (path-compatible-with-document? abs canon existing)
   (let* ((canon-codec (codec-for-path canon))
          (abs-codec (if (string=? canon abs) canon-codec (codec-for-path abs)))
          (need-private? (or (and canon-codec (codec-private? canon-codec) #t)
                             (path-private-by-codec? canon)
                             (and (not (string=? canon abs)) (path-private-by-codec? abs)))))
-    (and (not (and abs-codec (not (eq? abs-codec canon-codec))))
+    (and (document-matches-canonical? existing canon)
+         (not (and abs-codec (not (eq? abs-codec canon-codec))))
          (not (and need-private? (not (document-unretained? existing))))
          (not (and canon-codec (not (document-decoded? existing))))
          (not (and (not canon-codec) (document-decoded? existing)))
@@ -378,14 +498,14 @@ Used for mode and syntax detection; for codec-backed documents, applies
 
 (define (cached-open-document-at path)
   "Return the already-open document for PATH without remote I/O, or #f.
-Only returns a cached document when PATH and its canonical target are
-compatible with the document's codec and privacy profile."
+Only returns a cached document when PATH and its canonical target match
+the open document's canonical path, codec, and privacy profile."
   (and (string? path)
        (let ((abs (absolute-path path)))
          (if (remote-path? abs)
              (let ((existing (hash-table-ref/default %documents abs #f)))
                (and existing
-                    (path-compatible-with-document? abs (or (document-path existing) abs) existing)
+                    (path-compatible-with-document? abs abs existing)
                     existing))
              (let ((canon (guard (e (#t #f)) (%canonical-file-path abs))))
                (and canon
@@ -398,8 +518,28 @@ compatible with the document's codec and privacy profile."
   "Return the open document for PATH or its canonical target, or #f."
   (and (string? path)
        (let* ((abs (absolute-path path))
-              (canon (canonical-path-or-self abs)))
-         (hash-table-ref/default %documents canon #f))))
+              (canon (canonical-path-or-self abs))
+              (existing (hash-table-ref/default %documents canon #f)))
+         (and existing
+              (or (document-matches-canonical? existing canon)
+                  (not (document-path existing)))
+              existing))))
+
+(define (visit-needs-async? path)
+  "Return #t if opening PATH should run in a background task.
+Already-open documents do not need async; remote paths and local paths
+matching a registered codec do."
+  (and (string? path)
+       (let ((abs (absolute-path path)))
+         (cond
+           ((cached-open-document-at abs) #f)
+           ((remote-path? abs) #t)
+           (else
+            (let ((canon (local-canonical-or-self abs)))
+              (and (or (codec-for-path canon)
+                       (and (not (string=? canon abs))
+                            (codec-for-path abs)))
+                   #t)))))))
 
 (define (resolve-file-codec path codec-arg)
   (cond ((eq? codec-arg 'auto) (codec-for-path path))
@@ -410,12 +550,12 @@ compatible with the document's codec and privacy profile."
              (error "file-document: unknown codec" codec-arg)))
         (else (error "file-document: invalid #:codec argument" codec-arg))))
 
-(define (register-open-document! path canon d)
+(define (register-open-document! canon d)
   ;; Key strictly by canonical target path (never by a mutable symlink alias)
   ;; so retargeting a symlink never reuses the previous target's open document.
   (hash-table-set! %documents canon d)
   (let ((actual (document-path d)))
-    (when (and actual (not (string=? actual canon)) (not (string=? actual path)))
+    (when (and actual (not (string=? actual canon)))
       (hash-table-set! %documents actual d)))
   d)
 
@@ -474,7 +614,11 @@ a different target on disk."
                             (and codec (codec-private? codec) #t)
                             (path-private-by-codec? canon)
                             (and effective-alias (path-private-by-codec? effective-alias))))
-         (existing (hash-table-ref/default %documents canon #f)))
+         (existing (let ((cand (hash-table-ref/default %documents canon #f)))
+                     (and cand
+                          (or (document-matches-canonical? cand canon)
+                              (not (document-path cand)))
+                          cand))))
     (when (and abs-codec (not (eq? abs-codec codec)))
       (error (string-append (abbreviate-path effective-alias)
                             ": symlink codec mismatch with target "
@@ -491,7 +635,7 @@ a different target on disk."
          (error (string-append (abbreviate-path canon) ": already open with a different codec")))
        (when (and (not (eq? codec-arg 'auto)) (not (eq? (document-codec existing) codec)))
          (error (string-append (abbreviate-path canon) ": already open with a different codec")))
-       (register-open-document! abs canon existing))
+       (register-open-document! canon existing))
       (d
        (when (and need-private? (not (document-unretained? d)))
          (error (string-append (abbreviate-path canon) ": document is not private")))
@@ -504,7 +648,7 @@ a different target on disk."
                           (%make-doc-meta codec
                                           (and codec (with-editor-codec-options (lambda () (codec-init-envelope codec canon))))
                                           need-private?)))
-       (register-open-document! abs canon d))
+       (register-open-document! canon d))
       (codec
        (let-values (((doc env)
                      (if remote?
@@ -524,7 +668,7 @@ a different target on disk."
                   (hash-table-set! %doc-meta (document-id doc) (%make-doc-meta codec env need-private?)))
                  ((not (eq? (%doc-meta-codec m) codec))
                   (error (string-append (abbreviate-path canon) ": already open with a different codec")))))
-         (register-open-document! abs canon doc)))
+         (register-open-document! canon doc)))
       (need-private?
        (let ((doc (if remote?
                       (let* ((gen (%remote-open-prepare canon))
@@ -535,12 +679,12 @@ a different target on disk."
            (error (string-append (abbreviate-path canon) ": already open with a journal")))
          (unless (doc-meta-of doc)
            (hash-table-set! %doc-meta (document-id doc) (%make-doc-meta #f #f #t)))
-         (register-open-document! abs canon doc)))
+         (register-open-document! canon doc)))
       (else
        (let ((doc (if remote?
                       (%open-remote-file (location-endpoint canon) (location-path canon) canon)
                       (%open-file-pinned canon (and (string? journal-path) journal-path) effective-alias))))
-         (register-open-document! abs canon doc))))))
+         (register-open-document! canon doc))))))
 
 (define (%attach-file-document path journal-path [alias #f])
   "Internal helper for `Runtime::attach` preserving journal and alias."
@@ -557,14 +701,17 @@ Refused, the error offers recovery choices (doc/operations.md,
 \"Recovery\"): to overwrite the file, to revert the buffer to it, to
 compare the two; each expects D as it is now, and is refused once D has
 changed since."
-  (let ((path (document-path d))
-        (codec (document-codec d)))
+  (let* ((path (document-path d))
+         (codec (document-codec d)))
     (when (and (document-decoded? d) (not codec))
       (error "a decoded document cannot be saved without its codec"))
     (when (and codec (hash-table-ref/default %saving-docs (document-id d) #f))
       (error "a save of this document is under way"))
     (guard (e ((changed-on-disk? e)
-               (error-with-choices (save-choices d) (string-append (abbreviate-path path) " changed on disk since it was read"))))
+               (let ((cur-path (or (document-path d) path)))
+                 (error-with-choices (save-choices d)
+                                     (string-append (if cur-path (abbreviate-path cur-path) "document")
+                                                    " changed on disk since it was read")))))
       (cond
         (codec
          (let ((id (document-id d)))
@@ -574,13 +721,19 @@ changed since."
            (dynamic-wind
              (lambda () #f)
              (lambda ()
-               (let* ((rev (document-revision d))
+               ;; Sample path, codec, revision, location-generation, text, and
+               ;; envelope together without yielding so recipient/path lookup
+               ;; cannot split across a concurrent or pre-save move.
+               (let* ((cur-path (document-path d))
+                      (cur-codec (document-codec d))
+                      (rev (document-revision d))
                       (loc-gen (document-location-generation d))
                       (text (document-string d))
                       (env (document-codec-envelope d))
-                      (encoded (with-editor-codec-options (lambda () (codec-encode codec path text env)))))
-                 (if (and path (remote-path? path))
-                     (%document-save-remote-encoded! d (location-endpoint path) (location-path path) rev encoded overwrite loc-gen)
+                      (encoded (with-editor-codec-options
+                                (lambda () (codec-encode cur-codec cur-path text env)))))
+                 (if (and cur-path (remote-path? cur-path))
+                     (%document-save-remote-encoded! d (location-endpoint cur-path) (location-path cur-path) rev encoded overwrite loc-gen)
                      (%document-save-encoded! d rev encoded overwrite loc-gen))))
              (lambda ()
                (hash-table-delete! %saving-docs id)))))

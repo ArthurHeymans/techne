@@ -158,10 +158,46 @@ Their files' unsaved edits stay in their journals."
 (define-command (ibuffer-do-save s n)
   "Save the marked buffers' files, or the one at point's."
   (let* ((b (current s))
-         (files (filter (lambda (x) (document-path (buffer-document x))) (buffers s #\*))))
-    (for-each (lambda (x) (save-document! (buffer-document x))) files)
-    (redisplay! s b)
-    (message! s (string-append "Saved " (number->string (length files)) " buffers"))))
+         (files (filter (lambda (x) (document-path (buffer-document x))) (buffers s #\*)))
+         (saved 0)
+         (failed 0)
+         (cancelled 0)
+         (remaining (length files)))
+    (define (summary-message)
+      (string-append "Saved " (number->string saved) " buffers"
+                     (if (> failed 0) (string-append ", " (number->string failed) " failed") "")
+                     (if (> cancelled 0) (string-append ", " (number->string cancelled) " cancelled") "")))
+    (define (make-child-settler)
+      (let ((settled? #f))
+        (lambda (kind)
+          (unless settled?
+            (set! settled? #t)
+            (case kind
+              ((saved) (set! saved (+ saved 1)))
+              ((failed) (set! failed (+ failed 1)))
+              ((cancelled) (set! cancelled (+ cancelled 1))))
+            (set! remaining (- remaining 1))
+            (when (memq b (buffer-list)) (redisplay! s b))
+            (when (= remaining 0)
+              (message! s (summary-message)))))))
+    (if (= remaining 0)
+        (begin
+          (redisplay! s b)
+          (message! s (summary-message)))
+        (for-each
+         (lambda (x)
+           (let ((settle! (make-child-settler))
+                 (d (buffer-document x)))
+             (guard (e ((cancelled-condition? e)
+                        (settle! 'cancelled))
+                       (#t
+                        (settle! 'failed)))
+               (save-document-in-session!
+                s d 'ibuffer-do-save
+                #:after (lambda () (settle! 'saved))
+                #:on-fail (lambda (_e) (settle! 'failed))
+                #:on-cancel (lambda () (settle! 'cancelled))))))
+         files))))
 
 (define (mark-where! s keep?)
   (let ((b (current s)))

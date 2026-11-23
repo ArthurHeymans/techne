@@ -13,9 +13,14 @@
 (require "commands.scm")
 (require "targets.scm")
 (require "files.scm")
+(require "remote.scm")
 (require "minibuffer.scm")
+(require "requests.scm")
+(require "operations.scm")
 
-(provide add-buffer! show-document! show-buffer! visit! default-directory drop-buffer!
+(provide add-buffer! show-document! show-buffer! visit! file-visit! cancel-file-visit! file-visit-pending?
+         save-document-in-session! save-progress-message
+         default-directory drop-buffer!
          show-in-other-pane! display-buffer! document-module read-file-name read-directory-name file-name-map find-file switch-to-buffer kill-buffer line-candidate
          search-lines search-all-buffers make-generated-buffer! buffer-named move-path! delete-path-and-buffers!)
 
@@ -180,17 +185,412 @@ preview) the buffer list's order stays."
           (set-pane-view! s v)
           v))))
 
+;; Dedicated persistent scope owning shared background decode tasks so shutting
+;; a transient waiter scope cancels only that waiter unless it is the last waiter,
+;; without granting root authority to decode workers.
+(define %visit-scope (make-scope 'visit-workers))
+(define %spawn-in-visit-scope
+  (with-scope %visit-scope
+    (scope-procedure (lambda (thunk) (spawn thunk)))))
+;; Map (abs journal-path reload-cached?) -> %visit-job for in-flight async opens.
+(define %in-flight-visits (make-hash-table))
+
+(define-record-type %visit-job
+  (%make-visit-job key task waiters settled?)
+  %visit-job?
+  (key %visit-job-key)
+  (task %visit-job-task %set-visit-job-task!)
+  (waiters %visit-job-waiters %set-visit-job-waiters!)
+  (settled? %visit-job-settled? %set-visit-job-settled?!))
+
+(define-record-type %visit-waiter
+  (%make-visit-waiter job session interactive? on-deliver on-fail on-cancel release owned disown done?)
+  %visit-waiter?
+  (job %visit-waiter-job)
+  (session %visit-waiter-session)
+  (interactive? %visit-waiter-interactive?)
+  (on-deliver %visit-waiter-on-deliver)
+  (on-fail %visit-waiter-on-fail)
+  (on-cancel %visit-waiter-on-cancel)
+  (release %visit-waiter-release %set-visit-waiter-release!)
+  (owned %visit-waiter-owned)
+  (disown %visit-waiter-disown)
+  (done? %visit-waiter-done? %set-visit-waiter-done?!))
+
+(define (clear-interactive-waiter! w)
+  (let ((s (%visit-waiter-session w)))
+    (when (and (%visit-waiter-interactive? w)
+               (eq? (sget s 'visit-waiter) w))
+      (sset! s 'visit-waiter #f)
+      (sset! s 'visit-path #f)
+      (sset! s 'visit-key #f))))
+
+(define (settle-waiter-deliver! w d)
+  (unless (%visit-waiter-done? w)
+    (%set-visit-waiter-done?! w #t)
+    (clear-interactive-waiter! w)
+    (guard (e (#t #f)) ((%visit-waiter-disown w)))
+    (let ((rel (%visit-waiter-release w)))
+      (guard (e (#t
+                 (when rel (rel #f e))
+                 (let ((fail (%visit-waiter-on-fail w)))
+                   (when fail (guard (e2 (#t #f)) (fail e))))))
+        ((%visit-waiter-on-deliver w) d)
+        (when rel (rel #f #f))))))
+
+(define (settle-waiter-fail! w e)
+  (unless (%visit-waiter-done? w)
+    (%set-visit-waiter-done?! w #t)
+    (clear-interactive-waiter! w)
+    (guard (e2 (#t #f)) ((%visit-waiter-disown w)))
+    (let ((rel (%visit-waiter-release w)))
+      (when rel (rel #f e)))
+    (let ((fail (%visit-waiter-on-fail w)))
+      (when fail (guard (e2 (#t #f)) (fail e))))))
+
+(define (cancel-visit-waiter! w #:shut [shut? #f])
+  (unless (%visit-waiter-done? w)
+    (%set-visit-waiter-done?! w #t)
+    (clear-interactive-waiter! w)
+    (unless shut?
+      (guard (e (#t #f)) ((%visit-waiter-disown w))))
+    (let ((job (%visit-waiter-job w)))
+      (%set-visit-job-waiters! job (remove (lambda (x) (eq? x w)) (%visit-job-waiters job)))
+      (when (and (null? (%visit-job-waiters job))
+                 (not (%visit-job-settled? job)))
+        (%set-visit-job-settled?! job #t)
+        (when (eq? (hash-table-ref/default %in-flight-visits (%visit-job-key job) #f) job)
+          (hash-table-delete! %in-flight-visits (%visit-job-key job)))
+        (let ((t (%visit-job-task job)))
+          (when (and t (not (task-done? t)))
+            (guard (e (#t #f)) (task-cancel t))))))
+    (let ((rel (%visit-waiter-release w)))
+      (when rel (rel #t #f)))
+    (let ((cb (%visit-waiter-on-cancel w)))
+      (when cb (guard (e (#t #f)) (cb))))))
+
+(define (wrap-waiter-callback proc op)
+  (and proc
+       (let ((scoped (scope-procedure proc)))
+         (if op
+             (lambda args (call-in-operation op (lambda () (apply scoped args)) #:fail #f))
+             (lambda args (without-operation (lambda () (apply scoped args))))))))
+
+(define (start-or-join-visit-job! key target alias pinned-local? journal-path reload-clean?)
+  (or (let ((existing (hash-table-ref/default %in-flight-visits key #f)))
+        (and existing (not (%visit-job-settled? existing)) existing))
+      (let ((job (%make-visit-job key #f '() #f)))
+        (hash-table-set! %in-flight-visits key job)
+        (let ((t (without-operation
+                  (lambda ()
+                    (%spawn-in-visit-scope
+                     (lambda ()
+                       (let ((outcome #f))
+                         (dynamic-wind
+                          (lambda () #f)
+                          (lambda ()
+                            (set! outcome
+                                  (guard (e ((not (cancelled-condition? e)) (cons 'failed e)))
+                                    (when (and pinned-local?
+                                               (not (string=? (%canonical-file-path target) target)))
+                                      (error (string-append (abbreviate-path target)
+                                                            ": file target changed while opening")))
+                                    (let* ((was-open (and (cached-open-document-at target) #t))
+                                           (d (file-document target
+                                                             #:journal-path journal-path
+                                                             #:alias alias
+                                                             #:pinned pinned-local?)))
+                                      (when (and pinned-local?
+                                                 (not (equal? (document-path d) target)))
+                                        (error (string-append (abbreviate-path target)
+                                                              ": file target changed while opening")))
+                                      (when (and reload-clean? was-open (not (document-dirty? d)))
+                                        (reload-document! d))
+                                      (cons 'done d)))))
+                          (lambda ()
+                            (unless (%visit-job-settled? job)
+                              (%set-visit-job-settled?! job #t)
+                              (when (eq? (hash-table-ref/default %in-flight-visits key #f) job)
+                                (hash-table-delete! %in-flight-visits key))
+                              (let ((ws (reverse (%visit-job-waiters job))))
+                                (%set-visit-job-waiters! job '())
+                                (cond
+                                  ((and (pair? outcome) (eq? (car outcome) 'done))
+                                   (for-each (lambda (w) (settle-waiter-deliver! w (cdr outcome))) ws))
+                                  ((and (pair? outcome) (eq? (car outcome) 'failed))
+                                   (for-each (lambda (w) (settle-waiter-fail! w (cdr outcome))) ws))
+                                  (else
+                                   (for-each (lambda (w) (cancel-visit-waiter! w)) ws))))))))))))))
+          (unless t
+            (%set-visit-job-settled?! job #t)
+            (when (eq? (hash-table-ref/default %in-flight-visits key #f) job)
+              (hash-table-delete! %in-flight-visits key))
+            (error "file-visit!: visit worker scope is closed"))
+          (%set-visit-job-task! job t)
+          job))))
+
+(define (file-visit-pending? s)
+  "Return #t if session S has an interactive async file visit in flight."
+  (let ((w (sget s 'visit-waiter)))
+    (and w (not (%visit-waiter-done? w)) #t)))
+
+(define (cancel-file-visit! s)
+  "Cancel any pending interactive asynchronous file visit in session S."
+  (let ((w (sget s 'visit-waiter)))
+    (sset! s 'visit-waiter #f)
+    (sset! s 'visit-path #f)
+    (sset! s 'visit-key #f)
+    (when w (cancel-visit-waiter! w))))
+
+(add-hook! 'keyboard-quit-hook 'cancel-file-visit
+           (lambda (s)
+             (when (file-visit-pending? s)
+               (cancel-file-visit! s))))
+
+(define (visit-status-verb abs)
+  (cond
+    ((remote-path? abs) "Opening ")
+    ((private-path? abs) "Decrypting ")
+    ((visit-needs-async? abs) "Decoding ")
+    (else "Opening ")))
+
+(define (visit-position! d v line column)
+  (when line
+    (let ((p (line-down d 0 (max 0 (- line 1)) (max 0 (- (or column 1) 1)))))
+      (view-set-ranges! v (list (list p p)) 0)
+      (view-set-scroll! v (line-start d p)))))
+
+(define (file-visit! s path
+                     #:other-pane [other-pane? #f]
+                     #:line [line #f]
+                     #:column [column #f]
+                     #:async [force-async? #f]
+                     #:reload-clean [reload-clean? #f]
+                     #:journal-path [journal-path #f]
+                     #:alias [alias #f]
+                     #:pinned [pinned? #f]
+                     #:interactive [interactive? #t]
+                     #:on-pending [on-pending #f]
+                     #:on-shown [on-shown #f]
+                     #:on-ready [on-ready #f]
+                     #:on-fail [on-fail #f]
+                     #:on-cancel [on-cancel #f])
+  "Open PATH in session S, running slow or remote opens asynchronously.
+Already-open documents and fast local non-codec files open immediately.
+Remote files and codec-backed files (or when FORCE-ASYNC? is true) share a
+deduplicated background decode task per path. When INTERACTIVE? is true (the
+default), opens supersede a prior interactive open in S and avoid hijacking
+focus if S moved panes or opened a minibuffer while waiting; non-interactive
+opens (such as server `--wait` requests) run with independent waiters that are
+not cancelled by interactive navigation or `C-g`.
+OTHER-PANE? displays the buffer in another pane; LINE and COLUMN move point
+once opened; RELOAD-CLEAN? reloads an unmodified open document; JOURNAL-PATH
+overrides the journal file for a non-private local file; ALIAS records the
+original symlink pathname when PATH is already canonical; PINNED? suppresses
+re-canonicalization for a previously pinned local path; ON-PENDING, when an
+open goes asynchronous, is called with a zero-argument cancellation thunk;
+ON-SHOWN is called with (session document view) when displayed in S; ON-READY,
+ON-FAIL, and ON-CANCEL override completion, failure, and cancellation handling."
+  (let* ((abs (absolute-path path))
+         (cached (if (or pinned? alias)
+                     #f
+                     (cached-open-document-at abs)))
+         (cached-needs-async-reload?
+          (and cached reload-clean? (not (document-dirty? cached))
+               (or (document-codec cached) (remote-path? abs))))
+         (origin-view (pane-view s))
+         (origin-focus (session-focus s))
+         (attached-at-start? (and (memq s (attached-sessions)) #t)))
+    (define (session-still-valid?)
+      (or (not attached-at-start?) (and (memq s (attached-sessions)) #t)))
+    (define (focus-unchanged?)
+      (and (session-still-valid?)
+           (equal? (session-focus s) origin-focus)
+           (view=? (pane-view s) origin-view)
+           (not (sget s 'minibuffer))))
+    (define (finish! d async?)
+      (let ((b (or (document-buffer d) (add-buffer! d))))
+        (cond
+          (on-ready
+           (on-ready s d))
+          ((or (not async?) (focus-unchanged?))
+           (let ((v (if other-pane? (show-in-other-pane! s d) (show-document! s d))))
+             (visit-position! d v line column)
+             (when on-shown (on-shown s d v))
+             (when async?
+               (message! s (string-append (if (document-private? d) "Decrypted " "Opened ")
+                                          (abbreviate-path abs))))
+             v))
+          ((session-still-valid?)
+           (when line
+             (let ((v (or (buffer-view b)
+                          (let ((nv (new-view b)))
+                            (set-buffer-view! b nv)
+                            nv))))
+               (visit-position! d v line column)))
+           (message! s (string-append "Opened " (abbreviate-path abs) " in background"))
+           #f)
+          (else #f))))
+    (cond
+      ((and cached (not force-async?) (not cached-needs-async-reload?))
+       (when interactive? (cancel-file-visit! s))
+       (when (and reload-clean? (not (document-dirty? cached)))
+         (reload-document! cached))
+       (finish! cached #f)
+       cached)
+      ((or force-async? cached-needs-async-reload? (visit-needs-async? abs))
+       (let* ((remote? (remote-path? abs))
+              (local-target (if remote?
+                                abs
+                                (if pinned? abs (%canonical-file-path abs))))
+              (pinned-local? (not remote?))
+              (alias-path (cond ((string? alias)
+                                 (let ((a (absolute-path alias)))
+                                   (and (not (string=? a local-target)) a)))
+                                ((not (string=? local-target abs)) abs)
+                                (else #f)))
+              (verb (visit-status-verb abs))
+              (key (list local-target (or alias-path abs) journal-path (and cached reload-clean? #t))))
+         (if (and interactive?
+                  (file-visit-pending? s)
+                  (equal? (sget s 'visit-key) key)
+                  (not reload-clean?)
+                  (not journal-path)
+                  (not on-pending)
+                  (not on-shown)
+                  (not on-ready)
+                  (not on-fail)
+                  (not on-cancel)
+                  (not line)
+                  (not other-pane?))
+             (begin
+               (message! s (string-append verb (abbreviate-path abs) "..."))
+               #f)
+             (let* ((prev-waiter (and interactive? (sget s 'visit-waiter)))
+                    (job (start-or-join-visit-job! key local-target alias-path pinned-local? journal-path reload-clean?))
+                    (op (current-operation))
+                    (owned (list 'file-visit))
+                    (disown (scope-procedure (lambda () (scope-disown! owned))))
+                    (w (%make-visit-waiter
+                        job
+                        s
+                        interactive?
+                        (wrap-waiter-callback (lambda (d) (finish! d #t)) op)
+                        (wrap-waiter-callback
+                         (lambda (e)
+                           (if on-fail
+                               (on-fail s e)
+                               (when (session-still-valid?)
+                                 (failed! s 'find-file e))))
+                         op)
+                        (and on-cancel (wrap-waiter-callback (lambda () (on-cancel s)) op))
+                        #f
+                        owned
+                        disown
+                        #f)))
+               (when op
+                 (let* ((released? #f)
+                        (hold (operation-hold! op #:cancel (lambda () (cancel-visit-waiter! w)))))
+                   (%set-visit-waiter-release!
+                    w
+                    (lambda (cancelled? err)
+                      (unless released?
+                        (set! released? #t)
+                        (when err (operation-failed! op err))
+                        (operation-release! op hold #:cancelled cancelled?))))))
+               (scope-own! owned (lambda (r) (cancel-visit-waiter! w #:shut #t)))
+               (%set-visit-job-waiters! job (cons w (%visit-job-waiters job)))
+               (when interactive?
+                 (sset! s 'visit-waiter w)
+                 (sset! s 'visit-path abs)
+                 (sset! s 'visit-key key)
+                 (when (and prev-waiter (not (eq? prev-waiter w)))
+                   (cancel-visit-waiter! prev-waiter)))
+               (when (session-still-valid?)
+                 (message! s (string-append verb (abbreviate-path abs) "...")))
+               (when on-pending
+                 (on-pending (lambda () (cancel-visit-waiter! w))))
+               #f))))
+      (else
+       (when interactive? (cancel-file-visit! s))
+       (let ((d (file-document abs
+                               #:journal-path journal-path
+                               #:alias alias
+                               #:pinned pinned?)))
+         (finish! d #f)
+         d)))))
+
 (define (visit! s path line column)
   "Show line LINE, column COLUMN, of the file PATH in S's focused pane.
 Lines and columns count from 1. Where the pane was is remembered for
-\\[xref-go-back]."
-  (let ((v (pane-view s)))
-    (sset! s 'visited (cons (cons v (location (view-document v) (view-point v))) (or (sget s 'visited) '()))))
-  (let* ((d (file-document path))
-         (v (show-document! s d))
-         (p (line-down d 0 (- line 1) (- column 1))))
-    (view-set-ranges! v (list (list p p)) 0)
-    (view-set-scroll! v (line-start d p))))
+\\[xref-go-back] once navigation succeeds."
+  (let* ((v (pane-view s))
+         (entry (cons v (location (view-document v) (view-point v)))))
+    (file-visit! s path
+                 #:line line
+                 #:column column
+                 #:on-shown (lambda (sess d shown-v)
+                              (sset! sess 'visited (cons entry (or (sget sess 'visited) '())))))))
+
+(define (save-progress-message d)
+  "Return a progress message for an asynchronous save of document D."
+  (let* ((path (document-path d))
+         (verb (if (document-private? d) "Encrypting " "Saving "))
+         (detail (document-save-description d)))
+    (if detail
+        (string-append verb (abbreviate-path path) " (" detail ")...")
+        (string-append verb (abbreviate-path path) "..."))))
+
+(define (save-document-in-session! s d who #:after [after #f] #:on-fail [on-fail #f] #:on-cancel [on-cancel #f]
+                                   #:overwrite [overwrite #f] #:if-clean [if-clean 'write])
+  "Save document D for session S, running codec or remote writes async.
+WHO names the command for error reporting. AFTER, when given, runs once
+the save succeeds; ON-FAIL runs with the error condition if the save
+fails; ON-CANCEL runs if an asynchronous save is cancelled. OVERWRITE
+bypasses the external-change check. When IF-CLEAN is `'skip`, an
+already-saved unmodified document is not rewritten and AFTER runs
+immediately."
+  (let* ((path (document-path d))
+         (attached-at-start? (and (memq s (attached-sessions)) #t))
+         (session-valid? (lambda () (or (not attached-at-start?) (and (memq s (attached-sessions)) #t))))
+         (skip? (and (eq? if-clean 'skip)
+                     path
+                     (not (document-dirty? d))
+                     (document-disk-hash d)))
+         (async? (and (not skip?) path (or (document-codec d) (remote-path? path)))))
+    (cond
+      (skip?
+       (when (session-valid?) (message! s "(No changes need to be saved)"))
+       (when after (after)))
+      ((not async?)
+       (let ((ok? #f))
+         (guard (e (#t
+                    (when on-fail (guard (e2 (#t #f)) (on-fail e)))
+                    (raise e)))
+           (save-document! d #:overwrite overwrite)
+           (set! ok? #t))
+         (when ok?
+           (when (session-valid?) (message! s (string-append "Wrote " (document-path d))))
+           (when after (after)))))
+      (else
+       (let ((op (current-operation)))
+         (when (session-valid?) (message! s (save-progress-message d)))
+         (spawn-held
+          (lambda ()
+            (let ((ok? #f))
+              (guard (e ((cancelled-condition? e)
+                         (when (session-valid?) (message! s "Save cancelled"))
+                         (when on-cancel (guard (e2 (#t #f)) (on-cancel)))
+                         (raise e))
+                        (#t
+                         (when op (operation-failed! op e))
+                         (when (session-valid?) (failed! s who e))
+                         (when on-fail (guard (e2 (#t #f)) (on-fail e)))))
+                (save-document! d #:overwrite overwrite)
+                (set! ok? #t))
+              (when ok?
+                (when (session-valid?) (message! s (string-append "Wrote " (document-path d))))
+                (when after (after)))))))))))
 
 ;;; Commands
 
@@ -400,7 +800,7 @@ with ~ for the home directory, as Emacs abbreviates it."
   #:arguments '((file file #:doc "The file's path. A directory is shown by the default action on it."))
   #:read '((file file #:prompt "Find file: "))
   (let ((path (absolute-path file)))
-    (cond ((not (directory-name? path)) (show-document! s (file-document path)))
+    (cond ((not (directory-name? path)) (file-visit! s path))
           ((null? (actions-for 'directory)) (error "Is a directory" path))
           (else (act-default! s (target 'directory path))))))
 
@@ -515,13 +915,15 @@ its target the line's location."
 
 ;;; Actions on files, buffers and locations; the first is the default.
 
-(define-action file (visit-file s path) "Open the file." (show-document! s (file-document path)))
-(define-action file (visit-file-other-pane s path) "Open the file in a new pane below." (show-in-other-pane! s (file-document path)))
+(define-action file (visit-file s path) "Open the file." (file-visit! s path))
+(define-action file (visit-file-other-pane s path) "Open the file in a new pane below." (file-visit! s path #:other-pane #t))
 (define-action file (copy-file-name s path) "Save the file's name as a kill." (kill-save! s path #f #f))
 
 (define-action buffer (show-buffer s b) "Show the buffer." (show-buffer! s b))
 (define-action buffer (show-buffer-other-pane s b) "Show the buffer in a new pane below." (show-in-other-pane! s (buffer-document b)))
-(define-action buffer (save-buffer-document s b) "Write the buffer to its file." (save-document! (buffer-document b)))
+(define-action buffer (save-buffer-document s b)
+  "Write the buffer to its file."
+  (save-document-in-session! s (buffer-document b) 'save-buffer-document))
 (define-action buffer (kill-buffer-target s b) "Take the buffer off the buffer list." (drop-buffer! s b))
 
 ;; The focused pane shows the location's document with the caret there.

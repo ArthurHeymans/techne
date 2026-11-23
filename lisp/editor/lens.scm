@@ -15,6 +15,7 @@
 (require "commands.scm")
 (require "targets.scm")
 (require "files.scm")
+(require "remote.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "views.scm")
@@ -48,9 +49,25 @@ MODE, with STATE, and replaces a buffer of that name."
 
 (define-command (lens-save s n)
   "Write the files edited through this lens."
-  (let ((dirty (filter (lambda (d) (and (document-dirty? d) (document-path d))) (presentation-sources (lens-of s)))))
-    (for-each save-document! dirty)
-    (message! s (if (null? dirty) "No changes to write" (string-append "Wrote " (string-join (map document-path dirty) ", "))))))
+  (let* ((dirty (filter (lambda (d) (and (document-dirty? d) (document-path d))) (presentation-sources (lens-of s))))
+         (async-docs (filter (lambda (d) (or (document-codec d) (remote-path? (document-path d)))) dirty))
+         (sync-docs (filter (lambda (d) (not (memq d async-docs))) dirty)))
+    (cond
+      ((null? dirty) (message! s "No changes to write"))
+      ((null? async-docs)
+       (for-each save-document! sync-docs)
+       (message! s (string-append "Wrote " (string-join (map document-path dirty) ", "))))
+      (else
+       (for-each save-document! sync-docs)
+       (let ((remaining (length async-docs)))
+         (for-each (lambda (d)
+                     (save-document-in-session!
+                      s d 'lens-save
+                      #:after (lambda ()
+                                (set! remaining (- remaining 1))
+                                (when (= remaining 0)
+                                  (message! s (string-append "Wrote " (string-join (map document-path dirty) ", ")))))))
+                   async-docs))))))
 
 ;;; Lenses of lines
 

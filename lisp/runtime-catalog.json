@@ -1,11 +1,11 @@
 {
   "bindings": {
     "abbreviate-path": {
-      "description": "(abbreviate-path path)  procedure, @lisp@/editor/files.scm:235\n\nReturn PATH with ~ for the home directory when it is inside it.\nA home directory that is the root is left, as Emacs leaves it.",
+      "description": "(abbreviate-path path)  procedure, @lisp@/editor/files.scm:340\n\nReturn PATH with ~ for the home directory when it is inside it.\nA home directory that is the root is left, as Emacs leaves it.",
       "is_macro": false
     },
     "absolute-path": {
-      "description": "(absolute-path path)  procedure, @lisp@/editor/files.scm:212\n\nReturn PATH as an absolute path, with ~ for the home directory.\nPATH may be a location on another machine (doc/remote.md): its path\nthere is made absolute, ~ standing for the home directory there.",
+      "description": "(absolute-path path)  procedure, @lisp@/editor/files.scm:317\n\nReturn PATH as an absolute path, with ~ for the home directory.\nPATH may be a location on another machine (doc/remote.md): its path\nthere is made absolute, ~ standing for the home directory there.",
       "is_macro": false
     },
     "accept-operation-proposals!": {
@@ -21,7 +21,7 @@
       "is_macro": false
     },
     "add-buffer!": {
-      "description": "(add-buffer! d)  procedure, @lisp@/editor/buffers.scm:33\n\nReturn the buffer of D, made if it has none, first in the list.\nA file's is named by the file, with its directory's name after it when\nthat name is taken. A file's new buffer runs `file-buffer-added`.",
+      "description": "(add-buffer! d)  procedure, @lisp@/editor/buffers.scm:38\n\nReturn the buffer of D, made if it has none, first in the list.\nA file's is named by the file, with its directory's name after it when\nthat name is taken. A file's new buffer runs `file-buffer-added`.",
       "is_macro": false
     },
     "add-hook!": {
@@ -65,7 +65,7 @@
       "is_macro": false
     },
     "buffer-named": {
-      "description": "(buffer-named name)  procedure, @lisp@/editor/buffers.scm:24\n\nReturn the buffer called NAME, or #f.",
+      "description": "(buffer-named name)  procedure, @lisp@/editor/buffers.scm:29\n\nReturn the buffer called NAME, or #f.",
       "is_macro": false
     },
     "buffer-projections": {
@@ -112,6 +112,10 @@
       "description": "(call-with-tcp-connection host port f)  procedure, <techne-net>:51\n\nCall F with a connection to PORT on HOST, closed when F is done.\nIt is closed when F returns, fails or is cancelled, as `call-with-socket`\ndoes; return what F returns.",
       "is_macro": false
     },
+    "cancel-file-visit!": {
+      "description": "(cancel-file-visit! s)  procedure, @lisp@/editor/buffers.scm:337\n\nCancel any pending interactive asynchronous file visit in session S.",
+      "is_macro": false
+    },
     "cancel-request!": {
       "description": "(cancel-request! slot)  procedure, @lisp@/editor/requests.scm:45\n\nCancel the request in flight in SLOT, if any.\nIts result is never delivered.",
       "is_macro": false
@@ -141,7 +145,7 @@
       "is_macro": false
     },
     "changed-on-disk?": {
-      "description": "(changed-on-disk? e)  procedure, @lisp@/editor/files.scm:593\n\nReturn #t if E is the error of a save refused: the file changed since.",
+      "description": "(changed-on-disk? e)  procedure, @lisp@/editor/files.scm:746\n\nReturn #t if E is the error of a save refused: the file changed since.",
       "is_macro": false
     },
     "char-start": {
@@ -153,7 +157,7 @@
       "is_macro": false
     },
     "choice-applicable": {
-      "description": "(choice-applicable s r c)  procedure, @lisp@/editor/recovery.scm:47\n\nReturn #t if the choice C of R's failure can be chosen in session S.\nElse why not: R is settled, or invoking C's command with its arguments\nwould be refused now (what it expects changed since).",
+      "description": "(choice-applicable s r c)  procedure, @lisp@/editor/recovery.scm:49\n\nReturn #t if the choice C of R's failure can be chosen in session S.\nElse why not: R is settled, or invoking C's command with its arguments\nwould be refused now (what it expects changed since).",
       "is_macro": false
     },
     "choice-arguments": {
@@ -177,7 +181,7 @@
       "is_macro": false
     },
     "choose-recovery!": {
-      "description": "(choose-recovery! s r c)  procedure, @lisp@/editor/recovery.scm:66\n\nChoose C, a recovery choice of R's failure, in session S.\nIts command is invoked with its arguments, as a child of R's operation,\nrun for the current principal, who must be the user or the principal R\nran for. A choice that settles R does so once: it takes R before its\ninvocation is checked, which may wait, so that another chosen meanwhile,\nor the same again, is refused; if it is refused or fails, R is open\nagain. Return what the command returns.",
+      "description": "(choose-recovery! s r c)  procedure, @lisp@/editor/recovery.scm:68\n\nChoose C, a recovery choice of R's failure, in session S.\nIts command is invoked with its arguments, as a child of R's operation,\nrun for the current principal, who must be the user or the principal R\nran for. A choice that settles R does so once: it takes R before its\ninvocation is checked, which may wait, so that another chosen meanwhile,\nor the same again, is refused; if it is refused or fails, R is open\nagain. Return what the command returns.",
       "is_macro": false
     },
     "code-id": {
@@ -185,63 +189,67 @@
       "is_macro": false
     },
     "codec-decode": {
-      "description": "(codec-decode c path raw-bytes)  procedure, @lisp@/editor/files.scm:145\n\nDecode RAW-BYTES for PATH using codec C into a `codec-result`.",
+      "description": "(codec-decode c path raw-bytes)  procedure, @lisp@/editor/files.scm:155\n\nDecode RAW-BYTES for PATH using codec C into a `codec-result`.",
       "is_macro": false
     },
     "codec-doc": {
-      "description": "(codec-doc c)  procedure, @lisp@/editor/files.scm:55\n\nReturn the documentation string of codec C.",
+      "description": "(codec-doc c)  procedure, @lisp@/editor/files.scm:65\n\nReturn the documentation string of codec C.",
       "is_macro": false
     },
     "codec-encode": {
-      "description": "(codec-encode c path text envelope)  procedure, @lisp@/editor/files.scm:149\n\nEncode TEXT for PATH with ENVELOPE using codec C into a bytevector.",
+      "description": "(codec-encode c path text envelope)  procedure, @lisp@/editor/files.scm:159\n\nEncode TEXT for PATH with ENVELOPE using codec C into a bytevector.",
       "is_macro": false
     },
     "codec-for-path": {
-      "description": "(codec-for-path path)  procedure, @lisp@/editor/files.scm:127\n\nReturn the highest-priority codec matching PATH, or #f.",
+      "description": "(codec-for-path path)  procedure, @lisp@/editor/files.scm:137\n\nReturn the highest-priority codec matching PATH, or #f.",
       "is_macro": false
     },
     "codec-init-envelope": {
-      "description": "(codec-init-envelope c path)  procedure, @lisp@/editor/files.scm:141\n\nReturn the initial envelope for a new file at PATH under codec C.",
+      "description": "(codec-init-envelope c path)  procedure, @lisp@/editor/files.scm:151\n\nReturn the initial envelope for a new file at PATH under codec C.",
       "is_macro": false
     },
     "codec-logical-path": {
-      "description": "(codec-logical-path c path)  procedure, @lisp@/editor/files.scm:137\n\nReturn the logical path for PATH under codec C.",
+      "description": "(codec-logical-path c path)  procedure, @lisp@/editor/files.scm:147\n\nReturn the logical path for PATH under codec C.",
       "is_macro": false
     },
     "codec-name": {
-      "description": "(codec-name c)  procedure, @lisp@/editor/files.scm:51\n\nReturn the symbol name of codec C.",
+      "description": "(codec-name c)  procedure, @lisp@/editor/files.scm:61\n\nReturn the symbol name of codec C.",
       "is_macro": false
     },
     "codec-names": {
-      "description": "(codec-names)  procedure, @lisp@/editor/files.scm:117\n\nReturn the names of all registered codecs.",
+      "description": "(codec-names)  procedure, @lisp@/editor/files.scm:127\n\nReturn the names of all registered codecs.",
       "is_macro": false
     },
     "codec-priority": {
-      "description": "(codec-priority c)  procedure, @lisp@/editor/files.scm:63\n\nReturn the numeric matching priority of codec C.",
+      "description": "(codec-priority c)  procedure, @lisp@/editor/files.scm:73\n\nReturn the numeric matching priority of codec C.",
       "is_macro": false
     },
     "codec-private?": {
-      "description": "(codec-private? c)  procedure, @lisp@/editor/files.scm:59\n\nReturn #t if codec C requires the private profile.",
+      "description": "(codec-private? c)  procedure, @lisp@/editor/files.scm:69\n\nReturn #t if codec C requires the private profile.",
       "is_macro": false
     },
     "codec-result-envelope": {
-      "description": "(codec-result-envelope r)  procedure, @lisp@/editor/files.scm:79\n\nReturn the envelope metadata of codec result R, or #f.",
+      "description": "(codec-result-envelope r)  procedure, @lisp@/editor/files.scm:89\n\nReturn the envelope metadata of codec result R, or #f.",
       "is_macro": false
     },
     "codec-result-text": {
-      "description": "(codec-result-text r)  procedure, @lisp@/editor/files.scm:75\n\nReturn the decoded text string of codec result R.",
+      "description": "(codec-result-text r)  procedure, @lisp@/editor/files.scm:85\n\nReturn the decoded text string of codec result R.",
       "is_macro": false
     },
     "codec-result?": {
-      "description": "(codec-result? x)  procedure, @lisp@/editor/files.scm:67\n\nReturn #t if X is a codec decode result.",
+      "description": "(codec-result? x)  procedure, @lisp@/editor/files.scm:77\n\nReturn #t if X is a codec decode result.",
+      "is_macro": false
+    },
+    "codec-save-description": {
+      "description": "(codec-save-description c path envelope)  procedure, @lisp@/editor/files.scm:163\n\nReturn a short save description for PATH with ENVELOPE under codec C.",
       "is_macro": false
     },
     "codec?": {
-      "description": "(codec? x)  procedure, @lisp@/editor/files.scm:47\n\nReturn #t if X is a codec.",
+      "description": "(codec? x)  procedure, @lisp@/editor/files.scm:57\n\nReturn #t if X is a codec.",
       "is_macro": false
     },
     "codecs-for-path": {
-      "description": "(codecs-for-path path)  procedure, @lisp@/editor/files.scm:121\n\nReturn all codecs matching PATH ordered by priority.",
+      "description": "(codecs-for-path path)  procedure, @lisp@/editor/files.scm:131\n\nReturn all codecs matching PATH ordered by priority.",
       "is_macro": false
     },
     "column": {
@@ -324,6 +332,34 @@
       "description": "(current-session)  procedure, @lisp@/editor/session.scm:199\n\nReturn the session whose input is handled, or was last.\nThat is the one evaluated code acts on; #f with no frontend attached.",
       "is_macro": false
     },
+    "default-age-armor": {
+      "description": "(default-age-armor)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nWhen true, newly created `.age` files use ASCII armor (`-a`).\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-age-identities": {
+      "description": "(default-age-identities)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nList of identity file paths for decrypting `.age` files.\nSupports identity-based decryption only; passphrase-encrypted `.age`\nfiles are not supported. Root authority only.",
+      "is_macro": false
+    },
+    "default-age-program": {
+      "description": "(default-age-program)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nExecutable name or absolute path used by the built-in `age` codec.\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-age-recipient-roots": {
+      "description": "(default-age-recipient-roots)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nTrusted local roots (or `#t`) allowing `.age-recipients` discovery.\nOpting in delegates recipient selection to whoever can write `.age-recipients`\nfiles inside those roots; `#t` trusts every local directory. Root\nauthority only.",
+      "is_macro": false
+    },
+    "default-age-recipients": {
+      "description": "(default-age-recipients)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nList of age recipient public keys for encrypting `.age` files.\nNote: `.age` ciphertexts do not carry recipient metadata, so saving\nre-encrypts to the configured or discovered recipients. Root authority\nonly.",
+      "is_macro": false
+    },
+    "default-age-recipients-file": {
+      "description": "(default-age-recipients-file)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nOptional path to a trusted age recipients file.\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-age-timeout": {
+      "description": "(default-age-timeout)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nSubprocess timeout in milliseconds for the built-in `age` codec.\nRoot authority only.",
+      "is_macro": false
+    },
     "default-codec-max-bytes": {
       "description": "(default-codec-max-bytes)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nMaximum decoded or encoded byte count accepted by built-in codecs.\nRoot authority only.",
       "is_macro": false
@@ -333,7 +369,39 @@
       "is_macro": false
     },
     "default-directory": {
-      "description": "(default-directory s)  procedure, @lisp@/editor/buffers.scm:349\n\nReturn the directory of the focused pane's file in S, with a slash.\nWithout a file, it is the directory its buffer's mode says (a\ndirectory's listing is in that directory), else the working directory.",
+      "description": "(default-directory s)  procedure, @lisp@/editor/buffers.scm:749\n\nReturn the directory of the focused pane's file in S, with a slash.\nWithout a file, it is the directory its buffer's mode says (a\ndirectory's listing is in that directory), else the working directory.",
+      "is_macro": false
+    },
+    "default-gpg-armor": {
+      "description": "(default-gpg-armor)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nWhen true, newly created `.gpg` files use ASCII armor (`--armor`).\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-gpg-batch": {
+      "description": "(default-gpg-batch)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nWhen true, pass `--batch --pinentry-mode error` to `gpg` on decrypt.\nDisables interactive pinentry; otherwise a GUI pinentry configured in\n`gpg-agent` is required because helpers run without a controlling tty.\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-gpg-homedir": {
+      "description": "(default-gpg-homedir)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nOptional explicit GNUPGHOME directory for the built-in `gpg` codec.\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-gpg-id-roots": {
+      "description": "(default-gpg-id-roots)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nTrusted local root directories (or `#t`) allowing `.gpg-id` discovery.\nOpting in delegates recipient selection to whoever can write `.gpg-id`\nfiles inside those roots; `#t` trusts every local directory. Root\nauthority only.",
+      "is_macro": false
+    },
+    "default-gpg-program": {
+      "description": "(default-gpg-program)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nExecutable name or absolute path used by the built-in `gpg` codec.\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-gpg-recipients": {
+      "description": "(default-gpg-recipients)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nTrusted GPG recipients (fingerprints, key IDs, or emails) for `.gpg`.\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-gpg-timeout": {
+      "description": "(default-gpg-timeout)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nSubprocess timeout in milliseconds for the built-in `gpg` codec.\nRoot authority only.",
+      "is_macro": false
+    },
+    "default-gpg-trust-file-recipients": {
+      "description": "(default-gpg-trust-file-recipients)  procedure, @source@/crates/techne-vm/src/prelude.scm:291\n\nAllow reusing unauthenticated `ENC_TO` recipients on `.gpg` save.\nWhen true, saving an existing visible-recipient `.gpg` file may reuse\nthe ciphertext's `ENC_TO` key IDs when no trusted recipient policy\n(`default-gpg-recipients` or `.gpg-id`) is configured. Defaults to `#f`\nso untrusted ciphertext metadata cannot choose recipients. Root\nauthority only.",
       "is_macro": false
     },
     "default-gzip-program": {
@@ -345,7 +413,7 @@
       "is_macro": true
     },
     "define-codec": {
-      "description": "define-codec: macro, @lisp@/editor/files.scm:107\n\nDefine and register a scope-owned codec NAME documented by DOC.\nThe remaining arguments are keywords as `register-codec!` takes them.",
+      "description": "define-codec: macro, @lisp@/editor/files.scm:117\n\nDefine and register a scope-owned codec NAME documented by DOC.\nThe remaining arguments are keywords as `register-codec!` takes them.",
       "is_macro": true
     },
     "define-command": {
@@ -397,7 +465,7 @@
       "is_macro": true
     },
     "delete-path-and-buffers!": {
-      "description": "(delete-path-and-buffers! s path)  procedure, @lisp@/editor/buffers.scm:128\n\nDelete the file or directory PATH, with all it holds, in session S.\nThe buffers of the open files deleted are killed. It is an error, and\nnothing is deleted, when one of them has unsaved edits: they would be\nleft with no file to be recovered against.",
+      "description": "(delete-path-and-buffers! s path)  procedure, @lisp@/editor/buffers.scm:133\n\nDelete the file or directory PATH, with all it holds, in session S.\nThe buffers of the open files deleted are killed. It is an error, and\nnothing is deleted, when one of them has unsaved edits: they would be\nleft with no file to be recovered against.",
       "is_macro": false
     },
     "derived-mode?": {
@@ -405,15 +473,15 @@
       "is_macro": false
     },
     "directory-entries": {
-      "description": "(directory-entries dir)  procedure, @lisp@/editor/files.scm:688\n\nReturn the entries of the directory DIR, sorted.\nA directory's has a slash after its name. DIR may be a location on\nanother machine.",
+      "description": "(directory-entries dir)  procedure, @lisp@/editor/files.scm:841\n\nReturn the entries of the directory DIR, sorted.\nA directory's has a slash after its name. DIR may be a location on\nanother machine.",
       "is_macro": false
     },
     "dismiss-decision!": {
-      "description": "(dismiss-decision! r)  procedure, @lisp@/editor/recovery.scm:94\n\nLeave R's failure undecided for good: it is no longer pending.",
+      "description": "(dismiss-decision! r)  procedure, @lisp@/editor/recovery.scm:96\n\nLeave R's failure undecided for good: it is no longer pending.",
       "is_macro": false
     },
     "display-buffer!": {
-      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:463\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
+      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:863\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
       "is_macro": false
     },
     "doc": {
@@ -437,11 +505,11 @@
       "is_macro": false
     },
     "document-codec": {
-      "description": "(document-codec d)  procedure, @lisp@/editor/files.scm:296\n\nReturn the codec associated with document D, or #f.",
+      "description": "(document-codec d)  procedure, @lisp@/editor/files.scm:401\n\nReturn the codec associated with document D, or #f.",
       "is_macro": false
     },
     "document-codec-envelope": {
-      "description": "(document-codec-envelope d)  procedure, @lisp@/editor/files.scm:301\n\nReturn the codec envelope stored for document D, or #f.",
+      "description": "(document-codec-envelope d)  procedure, @lisp@/editor/files.scm:406\n\nReturn the codec envelope stored for document D, or #f.",
       "is_macro": false
     },
     "document-datum-before": {
@@ -493,7 +561,7 @@
       "is_macro": false
     },
     "document-logical-path": {
-      "description": "(document-logical-path d)  procedure, @lisp@/editor/files.scm:333\n\nReturn the logical path of document D, or #f.\nUsed for mode and syntax detection; for codec-backed documents, applies\n`codec-logical-path` to `document-path`.",
+      "description": "(document-logical-path d)  procedure, @lisp@/editor/files.scm:438\n\nReturn the logical path of document D, or #f.\nUsed for mode and syntax detection; for codec-backed documents, applies\n`codec-logical-path` to `document-path`.",
       "is_macro": false
     },
     "document-lsp-changes": {
@@ -525,7 +593,7 @@
       "is_macro": false
     },
     "document-private?": {
-      "description": "(document-private? d)  procedure, @lisp@/editor/files.scm:310\n\nReturn #t if document D uses the private profile.\nPrivate documents keep no journal, refuse LSP attachment, and are\nexcluded from session persistence.",
+      "description": "(document-private? d)  procedure, @lisp@/editor/files.scm:415\n\nReturn #t if document D uses the private profile.\nPrivate documents keep no journal, refuse LSP attachment, and are\nexcluded from session persistence.",
       "is_macro": false
     },
     "document-reload!": {
@@ -550,6 +618,10 @@
     },
     "document-save!": {
       "description": "(document-save! document)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:975\n\nWrite DOCUMENT to its file, refusing an external change.",
+      "is_macro": false
+    },
+    "document-save-description": {
+      "description": "(document-save-description d)  procedure, @lisp@/editor/files.scm:461\n\nReturn a short save description for codec-backed document D, or #f.",
       "is_macro": false
     },
     "document-save-overwriting!": {
@@ -577,7 +649,7 @@
       "is_macro": false
     },
     "drop-buffer!": {
-      "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:423\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
+      "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:823\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
       "is_macro": false
     },
     "edit!": {
@@ -693,7 +765,7 @@
       "is_macro": false
     },
     "file-document": {
-      "description": "(file-document path #:document (d #f) #:private (private? #f) #:codec (codec-arg (quote auto)) #:journal-path (journal-path #f) #:alias (alias #f) #:pinned (pinned? #f))  procedure, @lisp@/editor/files.scm:442\n\nReturn the document of the file at PATH.\nIt is opened once; D, a document already open, is registered as the file's.\nCodec and privacy matching follow symlinks via the canonical file path (both\nlocally and on remote nodes, failing closed if canonicalization fails or if\na symlink's own name matches a different codec than its canonical target), and\nany matching private codec forces the private profile even if a higher-priority\nnon-private codec also matches. When PRIVATE? is true or the path is private,\nthe document uses `Retention::None` (no journal or lock file) and fails closed\nif the file is already open with a journal or has an existing journal on disk.\nCODEC-ARG defaults to `'auto` (match via `codec-for-path`), may be `#f` to open\nraw bytes without a codec, or a codec name/object. JOURNAL-PATH, when given for\na non-private local file, overrides the default state-directory journal path.\nALIAS records the original symlink pathname when PATH is already canonical, and\nPINNED? suppresses re-canonicalization so a previously pinned path cannot adopt\na different target on disk.",
+      "description": "(file-document path #:document (d #f) #:private (private? #f) #:codec (codec-arg (quote auto)) #:journal-path (journal-path #f) #:alias (alias #f) #:pinned (pinned? #f))  procedure, @lisp@/editor/files.scm:582\n\nReturn the document of the file at PATH.\nIt is opened once; D, a document already open, is registered as the file's.\nCodec and privacy matching follow symlinks via the canonical file path (both\nlocally and on remote nodes, failing closed if canonicalization fails or if\na symlink's own name matches a different codec than its canonical target), and\nany matching private codec forces the private profile even if a higher-priority\nnon-private codec also matches. When PRIVATE? is true or the path is private,\nthe document uses `Retention::None` (no journal or lock file) and fails closed\nif the file is already open with a journal or has an existing journal on disk.\nCODEC-ARG defaults to `'auto` (match via `codec-for-path`), may be `#f` to open\nraw bytes without a codec, or a codec name/object. JOURNAL-PATH, when given for\na non-private local file, overrides the default state-directory journal path.\nALIAS records the original symlink pathname when PATH is already canonical, and\nPINNED? suppresses re-canonicalization so a previously pinned path cannot adopt\na different target on disk.",
       "is_macro": false
     },
     "file-location": {
@@ -701,7 +773,7 @@
       "is_macro": false
     },
     "file-name": {
-      "description": "(file-name path)  procedure, @lisp@/editor/files.scm:192\n\nReturn the part of PATH after its directory.",
+      "description": "(file-name path)  procedure, @lisp@/editor/files.scm:297\n\nReturn the part of PATH after its directory.",
       "is_macro": false
     },
     "file-name-map": {
@@ -709,11 +781,19 @@
       "is_macro": false
     },
     "file-text": {
-      "description": "(file-text d)  procedure, @lisp@/editor/files.scm:665\n\nReturn the text of the file of the document D now, \"\" if it has none.\nA file on another machine is read through its endpoint; a codec-backed\ndocument's stored bytes are decoded through its codec.",
+      "description": "(file-text d)  procedure, @lisp@/editor/files.scm:818\n\nReturn the text of the file of the document D now, \"\" if it has none.\nA file on another machine is read through its endpoint; a codec-backed\ndocument's stored bytes are decoded through its codec.",
+      "is_macro": false
+    },
+    "file-visit!": {
+      "description": "(file-visit! s path #:other-pane (other-pane? #f) #:line (line #f) #:column (column #f) #:async (force-async? #f) #:reload-clean (reload-clean? #f) #:journal-path (journal-path #f) #:alias (alias #f) #:pinned (pinned? #f) #:interactive (interactive? #t) #:on-pending (on-pending #f) #:on-shown (on-shown #f) #:on-ready (on-ready #f) #:on-fail (on-fail #f) #:on-cancel (on-cancel #f))  procedure, @lisp@/editor/buffers.scm:363\n\nOpen PATH in session S, running slow or remote opens asynchronously.\nAlready-open documents and fast local non-codec files open immediately.\nRemote files and codec-backed files (or when FORCE-ASYNC? is true) share a\ndeduplicated background decode task per path. When INTERACTIVE? is true (the\ndefault), opens supersede a prior interactive open in S and avoid hijacking\nfocus if S moved panes or opened a minibuffer while waiting; non-interactive\nopens (such as server `--wait` requests) run with independent waiters that are\nnot cancelled by interactive navigation or `C-g`.\nOTHER-PANE? displays the buffer in another pane; LINE and COLUMN move point\nonce opened; RELOAD-CLEAN? reloads an unmodified open document; JOURNAL-PATH\noverrides the journal file for a non-private local file; ALIAS records the\noriginal symlink pathname when PATH is already canonical; PINNED? suppresses\nre-canonicalization for a previously pinned local path; ON-PENDING, when an\nopen goes asynchronous, is called with a zero-argument cancellation thunk;\nON-SHOWN is called with (session document view) when displayed in S; ON-READY,\nON-FAIL, and ON-CANCEL override completion, failure, and cancellation handling.",
+      "is_macro": false
+    },
+    "file-visit-pending?": {
+      "description": "(file-visit-pending? s)  procedure, @lisp@/editor/buffers.scm:332\n\nReturn #t if session S has an interactive async file visit in flight.",
       "is_macro": false
     },
     "find-codec": {
-      "description": "(find-codec name)  procedure, @lisp@/editor/files.scm:113\n\nReturn the registered codec named NAME (a symbol), or #f.",
+      "description": "(find-codec name)  procedure, @lisp@/editor/files.scm:123\n\nReturn the registered codec named NAME (a symbol), or #f.",
       "is_macro": false
     },
     "find-face": {
@@ -873,7 +953,7 @@
       "is_macro": false
     },
     "line-candidate": {
-      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:473\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
+      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:873\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
       "is_macro": false
     },
     "line-diff": {
@@ -1033,7 +1113,7 @@
       "is_macro": false
     },
     "make-codec-result": {
-      "description": "(make-codec-result text #:envelope (envelope #f))  procedure, @lisp@/editor/files.scm:71\n\nConstruct a codec decode result with TEXT and optional ENVELOPE.",
+      "description": "(make-codec-result text #:envelope (envelope #f))  procedure, @lisp@/editor/files.scm:81\n\nConstruct a codec decode result with TEXT and optional ENVELOPE.",
       "is_macro": false
     },
     "make-contract": {
@@ -1049,7 +1129,7 @@
       "is_macro": false
     },
     "make-generated-buffer!": {
-      "description": "(make-generated-buffer! name d mode #:state (state #f))  procedure, @lisp@/editor/buffers.scm:145\n\nReturn a new buffer NAME of the document D in MODE, with STATE.\nLENS is the lens whose document D is, if any. A buffer of that name is\nreplaced.",
+      "description": "(make-generated-buffer! name d mode #:state (state #f))  procedure, @lisp@/editor/buffers.scm:150\n\nReturn a new buffer NAME of the document D in MODE, with STATE.\nLENS is the lens whose document D is, if any. A buffer of that name is\nreplaced.",
       "is_macro": false
     },
     "make-indent-specs": {
@@ -1189,7 +1269,7 @@
       "is_macro": false
     },
     "move-path!": {
-      "description": "(move-path! from to)  procedure, @lisp@/editor/buffers.scm:83\n\nMove the file or directory FROM to TO, which must not exist.\nThe open files moved with it follow: their unsaved edits stay, saving\nwrites where they are now, and their buffers are named anew. Nothing\nmoves when the journal of one of them cannot move with it. Return what\nkept a journal where it was, a list of texts.",
+      "description": "(move-path! from to)  procedure, @lisp@/editor/buffers.scm:88\n\nMove the file or directory FROM to TO, which must not exist.\nThe open files moved with it follow: their unsaved edits stay, saving\nwrites where they are now, and their buffers are named anew. Nothing\nmoves when the journal of one of them cannot move with it. Return what\nkept a journal where it was, a list of texts.",
       "is_macro": false
     },
     "name-prefix!": {
@@ -1309,7 +1389,7 @@
       "is_macro": false
     },
     "normal-directory": {
-      "description": "(normal-directory path)  procedure, @lisp@/editor/files.scm:221\n\nReturn the directory PATH, absolute, without its . and .. parts.\nThey are taken away as written, a symbolic link not followed. The\nresult ends with a slash. On another machine, it is its path there that\nis made normal.",
+      "description": "(normal-directory path)  procedure, @lisp@/editor/files.scm:326\n\nReturn the directory PATH, absolute, without its . and .. parts.\nThey are taken away as written, a symbolic link not followed. The\nresult ends with a slash. On another machine, it is its path there that\nis made normal.",
       "is_macro": false
     },
     "note-effect!": {
@@ -1453,7 +1533,7 @@
       "is_macro": false
     },
     "path-exists?": {
-      "description": "(path-exists? path)  procedure, @lisp@/editor/files.scm:696\n\nReturn #t if something is at PATH, here or on another machine.",
+      "description": "(path-exists? path)  procedure, @lisp@/editor/files.scm:849\n\nReturn #t if something is at PATH, here or on another machine.",
       "is_macro": false
     },
     "path-language": {
@@ -1461,11 +1541,11 @@
       "is_macro": false
     },
     "path-private-by-codec?": {
-      "description": "(path-private-by-codec? path)  procedure, @lisp@/editor/files.scm:132\n\nReturn #t if any codec matching PATH requires the private profile.",
+      "description": "(path-private-by-codec? path)  procedure, @lisp@/editor/files.scm:142\n\nReturn #t if any codec matching PATH requires the private profile.",
       "is_macro": false
     },
     "pending-decisions": {
-      "description": "(pending-decisions s)  procedure, @lisp@/editor/recovery.scm:56\n\nReturn the records of the operations whose failure is undecided.\nNewest first: those that failed offering choices that settle them, not\nsettled or dismissed, of which one at least applies in session S now.",
+      "description": "(pending-decisions s)  procedure, @lisp@/editor/recovery.scm:58\n\nReturn the records of the operations whose failure is undecided.\nNewest first: those that failed offering choices that settle them, not\nsettled or dismissed, of which one at least applies in session S now.",
       "is_macro": false
     },
     "pending-operation-records": {
@@ -1641,11 +1721,11 @@
       "is_macro": false
     },
     "read-directory-name": {
-      "description": "(read-directory-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:359\n\nRead a directory's name in the minibuffer of S with PROMPT and INITIAL.\nIt is completed a directory at a time, as `read-file-name` completes:\nthe candidates are ./, the directory of the input itself, then ../ and\nthe subdirectories. Taking ./ calls (ACCEPT session directory) with its\nabsolute name, with a slash; taking another goes into it. The input\nnaming a directory that exists is selected first, so that RET takes\nit, whatever subdirectory was taken before and is listed first.\n\\[minibuffer-accept-input] takes the input as it is, also a directory\nthat does not exist yet.",
+      "description": "(read-directory-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:759\n\nRead a directory's name in the minibuffer of S with PROMPT and INITIAL.\nIt is completed a directory at a time, as `read-file-name` completes:\nthe candidates are ./, the directory of the input itself, then ../ and\nthe subdirectories. Taking ./ calls (ACCEPT session directory) with its\nabsolute name, with a slash; taking another goes into it. The input\nnaming a directory that exists is selected first, so that RET takes\nit, whatever subdirectory was taken before and is listed first.\n\\[minibuffer-accept-input] takes the input as it is, also a directory\nthat does not exist yet.",
       "is_macro": false
     },
     "read-file-name": {
-      "description": "(read-file-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:314\n\nRead a file name in the minibuffer of S with PROMPT and INITIAL.\nThe name is completed a directory at a time: the candidates are the\nentries of the input's directory. Taking a directory goes into it;\n(ACCEPT session path) gets a file's absolute path, also one that does\nnot exist yet. The input naming a directory that exists is selected\nfirst, as vertico selects it: taking it as it is gives ACCEPT the\ndirectory's path, with its slash.",
+      "description": "(read-file-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:714\n\nRead a file name in the minibuffer of S with PROMPT and INITIAL.\nThe name is completed a directory at a time: the candidates are the\nentries of the input's directory. Taking a directory goes into it;\n(ACCEPT session path) gets a file's absolute path, also one that does\nnot exist yet. The input naming a directory that exists is selected\nfirst, as vertico selects it: taking it as it is gives ACCEPT the\ndirectory's path, with its slash.",
       "is_macro": false
     },
     "record-arguments": {
@@ -1733,7 +1813,7 @@
       "is_macro": false
     },
     "register-codec!": {
-      "description": "(register-codec! name doc #:match match-proc #:decode decode-proc #:encode encode-proc #:logical-path (logical-path-proc #f) #:init-envelope (init-envelope-proc #f) #:private (private? #f) #:priority (priority 0) #:override-builtin-private? (override-builtin-private? #f))  procedure, @lisp@/editor/files.scm:83\n\nRegister scope-owned codec NAME documented by DOC.\nMATCH-PROC matches paths, DECODE-PROC decodes bytes, ENCODE-PROC encodes\ntext; optional LOGICAL-PATH-PROC, INIT-ENVELOPE-PROC, PRIVATE?, PRIORITY,\nOVERRIDE-BUILTIN-PRIVATE?.",
+      "description": "(register-codec! name doc #:match match-proc #:decode decode-proc #:encode encode-proc #:logical-path (logical-path-proc #f) #:init-envelope (init-envelope-proc #f) #:private (private? #f) #:priority (priority 0) #:override-builtin-private? (override-builtin-private? #f))  procedure, @lisp@/editor/files.scm:93\n\nRegister scope-owned codec NAME documented by DOC.\nMATCH-PROC matches paths, DECODE-PROC decodes bytes, ENCODE-PROC encodes\ntext; optional LOGICAL-PATH-PROC, INIT-ENVELOPE-PROC, PRIVATE?, PRIORITY,\nOVERRIDE-BUILTIN-PRIVATE?.",
       "is_macro": false
     },
     "register-command!": {
@@ -1773,7 +1853,7 @@
       "is_macro": false
     },
     "reload-document!": {
-      "description": "(reload-document! d)  procedure, @lisp@/editor/files.scm:640\n\nRead the file of the document D again if it changed since it was read.\nIt is refused while D has unsaved edits. Return #t if the text changed.",
+      "description": "(reload-document! d)  procedure, @lisp@/editor/files.scm:793\n\nRead the file of the document D again if it changed since it was read.\nIt is refused while D has unsaved edits. Return #t if the text changed.",
       "is_macro": false
     },
     "relocation-cancel!": {
@@ -1817,7 +1897,7 @@
       "is_macro": false
     },
     "revert-document!": {
-      "description": "(revert-document! d)  procedure, @lisp@/editor/files.scm:652\n\nRead the file of the document D again, its unsaved edits replaced.\nThe text becomes the file's as one edit by the current principal, which\nundo takes back. Return #t if the text changed.",
+      "description": "(revert-document! d)  procedure, @lisp@/editor/files.scm:805\n\nRead the file of the document D again, its unsaved edits replaced.\nThe text becomes the file's as one edit by the current principal, which\nundo takes back. Return #t if the text changed.",
       "is_macro": false
     },
     "review-operation-proposals": {
@@ -1921,7 +2001,11 @@
       "is_macro": false
     },
     "save-document!": {
-      "description": "(save-document! d #:overwrite (overwrite #f))  procedure, @lisp@/editor/files.scm:549\n\nWrite the document D to its file, refusing an external change.\nWith OVERWRITE, an external change is replaced. A codec-backed document\nencodes a snapshot of D's text asynchronously and commits via a checked\nsave at that revision, preserving any edits made while encoding. A file\non another machine is written through its endpoint, only if it still has\nthe stored bytes D was read or last saved with. Then `document-saved` runs.\nRefused, the error offers recovery choices (doc/operations.md,\n\"Recovery\"): to overwrite the file, to revert the buffer to it, to\ncompare the two; each expects D as it is now, and is refused once D has\nchanged since.",
+      "description": "(save-document! d #:overwrite (overwrite #f))  procedure, @lisp@/editor/files.scm:693\n\nWrite the document D to its file, refusing an external change.\nWith OVERWRITE, an external change is replaced. A codec-backed document\nencodes a snapshot of D's text asynchronously and commits via a checked\nsave at that revision, preserving any edits made while encoding. A file\non another machine is written through its endpoint, only if it still has\nthe stored bytes D was read or last saved with. Then `document-saved` runs.\nRefused, the error offers recovery choices (doc/operations.md,\n\"Recovery\"): to overwrite the file, to revert the buffer to it, to\ncompare the two; each expects D as it is now, and is refused once D has\nchanged since.",
+      "is_macro": false
+    },
+    "save-document-in-session!": {
+      "description": "(save-document-in-session! s d who #:after (after #f) #:on-fail (on-fail #f) #:on-cancel (on-cancel #f) #:overwrite (overwrite #f) #:if-clean (if-clean (quote write)))  procedure, @lisp@/editor/buffers.scm:544\n\nSave document D for session S, running codec or remote writes async.\nWHO names the command for error reporting. AFTER, when given, runs once\nthe save succeeds; ON-FAIL runs with the error condition if the save\nfails; ON-CANCEL runs if an asynchronous save is cancelled. OVERWRITE\nbypasses the external-change check. When IF-CLEAN is `'skip`, an\nalready-saved unmodified document is not rewritten and AFTER runs\nimmediately.",
       "is_macro": false
     },
     "screenshot!": {
@@ -2057,19 +2141,19 @@
       "is_macro": false
     },
     "show-buffer!": {
-      "description": "(show-buffer! s b #:remember (remember #t))  procedure, @lisp@/editor/buffers.scm:164\n\nShow the buffer B in the focused pane of S.\nIt is shown in the view it was last shown in, unless another pane, of\nS or of another attached session, shows that one. With REMEMBER #f (a\npreview) the buffer list's order stays.",
+      "description": "(show-buffer! s b #:remember (remember #t))  procedure, @lisp@/editor/buffers.scm:169\n\nShow the buffer B in the focused pane of S.\nIt is shown in the view it was last shown in, unless another pane, of\nS or of another attached session, shows that one. With REMEMBER #f (a\npreview) the buffer list's order stays.",
       "is_macro": false
     },
     "show-document!": {
-      "description": "(show-document! s d #:remember (remember #t))  procedure, @lisp@/editor/buffers.scm:159\n\nShow the document D in the focused pane of S, as `show-buffer!` does.\nREMEMBER is as `show-buffer!` takes it.",
+      "description": "(show-document! s d #:remember (remember #t))  procedure, @lisp@/editor/buffers.scm:164\n\nShow the document D in the focused pane of S, as `show-buffer!` does.\nREMEMBER is as `show-buffer!` takes it.",
       "is_macro": false
     },
     "show-in-other-pane!": {
-      "description": "(show-in-other-pane! s d)  procedure, @lisp@/editor/buffers.scm:449\n\nShow the document D in a new pane of S below the focused one.\nThe new pane is focused.",
+      "description": "(show-in-other-pane! s d)  procedure, @lisp@/editor/buffers.scm:849\n\nShow the document D in a new pane of S below the focused one.\nThe new pane is focused.",
       "is_macro": false
     },
     "show-lens!": {
-      "description": "(show-lens! s name rows #:mode (mode (quote lens-mode)) #:state (state #f))  procedure, @lisp@/editor/lens.scm:33\n\nShow a lens of ROWS in S's focused pane as the buffer NAME.\nReturn its view. ROWS are a view's, with excerpts. The buffer is in\nMODE, with STATE, and replaces a buffer of that name.",
+      "description": "(show-lens! s name rows #:mode (mode (quote lens-mode)) #:state (state #f))  procedure, @lisp@/editor/lens.scm:34\n\nShow a lens of ROWS in S's focused pane as the buffer NAME.\nReturn its view. ROWS are a view's, with excerpts. The buffer is in\nMODE, with STATE, and replaces a buffer of that name.",
       "is_macro": false
     },
     "show-view!": {
@@ -2393,7 +2477,7 @@
       "is_macro": false
     },
     "visit!": {
-      "description": "(visit! s path line column)  procedure, @lisp@/editor/buffers.scm:183\n\nShow line LINE, column COLUMN, of the file PATH in S's focused pane.\nLines and columns count from 1. Where the pane was is remembered for\n\\[xref-go-back].",
+      "description": "(visit! s path line column)  procedure, @lisp@/editor/buffers.scm:523\n\nShow line LINE, column COLUMN, of the file PATH in S's focused pane.\nLines and columns count from 1. Where the pane was is remembered for\n\\[xref-go-back] once navigation succeeds.",
       "is_macro": false
     },
     "with-choices": {
