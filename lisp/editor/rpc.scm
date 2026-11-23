@@ -174,11 +174,14 @@ telling MethodNotFound (-32601) from other failures."
                                        (list 'error (dict-ref failure "message" "an error") (dict-ref failure "code" 0))
                                        (list 'result (dict-ref message "result" 'null))))))))))))))
 
-(define (rpc-connect program args #:directory [directory #f] #:on-note [on-note (lambda (m p) #f)]
+(define (rpc-connect program args #:directory [directory #f] #:environment [environment '()]
+                     #:node [node #f] #:on-note [on-note (lambda (m p) #f)]
                      #:on-ask [on-ask (lambda (m p) rpc-unsupported)] #:on-dead [on-dead (lambda () #f)]
                      #:on-event [on-event #f])
   "Start PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.
-Return the connection. A task reads it, in the scope calling:
+Return the connection. ENVIRONMENT is an optional list of
+`(NAME . VALUE-OR-#f)` entries and NODE an optional remote endpoint, as
+`process-spawn` takes them. A task reads it, in the scope calling:
 notifications go to ON-NOTE (method params), requests of the peer's to
 ON-ASK (method params), which answers with a JSON value or
 `rpc-unsupported`, and answers wake `rpc-request!`'s. The process's
@@ -191,7 +194,8 @@ given, is told (direction text) of each message as it is written
 (`out`) and read (`in`), the JSON as it went, and of what the peer
 writes to stderr (`err`): a log's. It must not wait, and its failure is
 its own."
-  (let* ((process (begin (note-effect! 'external) (process-spawn program args #:directory directory)))
+  (let* ((process (begin (note-effect! 'external)
+                         (process-spawn program args #:directory directory #:environment environment #:node node)))
          (conn (%make-rpc process (make-rpc-framer) (make-hash-table) (make-channel 1000000) (make-channel 1000000) #f
                           on-note on-ask on-dead on-event))
          ;; Closed when stderr has been read to its end.

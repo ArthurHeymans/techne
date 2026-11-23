@@ -21,16 +21,7 @@
 That is the nearest directory up from DIR with a .jj or .git in it,
 else DIR itself; with a slash, as DIR has. DIR may be on another
 machine: its endpoint looks, in one request."
-  (if (remote-path? dir)
-      (let ((found (node-find-up (location-endpoint dir) (location-path dir) '(".jj" ".git"))))
-        (if found (location-at dir (if (string-suffix? "/" found) found (string-append found "/"))) dir))
-      (local-project-root dir)))
-
-(define (local-project-root dir)
-  (let up ((d dir))
-    (cond ((or (file-exists? (string-append d ".jj")) (file-exists? (string-append d ".git"))) d)
-          ((string=? d "/") dir)
-          (else (up (directory-of (substring d 0 (- (string-length d) 1))))))))
+  (endpoint-project-root dir))
 
 ;; This file, which the service's is found beside.
 (define %here (current-module))

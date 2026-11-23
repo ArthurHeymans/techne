@@ -1444,9 +1444,11 @@ pub fn install(vm: &mut Vm) {
 /// moving, copying and deleting entries, for worlds with files.
 #[cfg(unix)]
 fn files(vm: &mut Vm) {
+    use std::cell::RefCell;
     use std::path::Path;
 
-    use crate::files;
+    use crate::{api::Foreign, files};
+    vm.foreign_type_names.insert(std::any::type_name::<RefCell<files::PinnedDir>>(), reader::intern("pinned-dir"));
     techne_vm::procedures! { vm;
         /// Return the entries of DIRECTORY, sorted.
         /// Subdirectories have a slash after their name.
@@ -1497,5 +1499,85 @@ fn files(vm: &mut Vm) {
         /// What is not UTF-8 is replaced; a character cut at the end is
         /// left out.
         "(file-head path bytes)" => |path: String, bytes: usize| files::head(Path::new(&path), bytes).map_err(|e| format!("{path}: {e}"));
+        /// Read at most MAX-BYTES raw bytes from regular file LEAF in ROOT.
+        /// Returns a bytevector, or #f if ROOT or LEAF does not exist; refuses
+        /// symlinks, parent components, and non-regular files.
+        "(read-confined-bytes-nofollow root leaf max-bytes)" => |root: String, leaf: String, max_bytes: usize| {
+            files::read_confined_bytes_nofollow(Path::new(&root), Path::new(&leaf), max_bytes)
+                .map(|o| o.map(crate::api::Bytes))
+                .map_err(|e| format!("{root}/{leaf}: {e}"))
+        };
+        /// Atomically write BYTES to private regular file LEAF in ROOT.
+        /// Creates missing directories when CREATE-DIRS is true. Writes with
+        /// mode 0600 and refuses symlinks and parent components.
+        "(write-confined-file-private-nofollow! root leaf bytes create-dirs)" => |root: String, leaf: String, bytes: crate::api::Bytes, create_dirs: bool| {
+            files::write_confined_file_private_nofollow(Path::new(&root), Path::new(&leaf), &bytes.0, create_dirs)
+                .map_err(|e| format!("{root}/{leaf}: {e}"))
+        };
+        /// Delete regular file LEAF in ROOT without following symlinks.
+        /// Returns #t if LEAF was removed, #f if ROOT or LEAF did not exist.
+        "(delete-confined-file-nofollow! root leaf)" => |root: String, leaf: String| {
+            files::delete_confined_file_nofollow(Path::new(&root), Path::new(&leaf))
+                .map_err(|e| format!("{root}/{leaf}: {e}"))
+        };
+        /// Open directory ROOT without following symlinks and return a handle.
+        /// When CREATE-DIRS is true, creates missing directories with mode 0700;
+        /// when false, returns #f if ROOT does not exist.
+        "(open-pinned-dir root create-dirs)" => |root: String, create_dirs: bool| {
+            files::PinnedDir::open(Path::new(&root), create_dirs)
+                .map(|o| o.map(|d| Foreign::new(RefCell::new(d))))
+                .map_err(|e| format!("{root}: {e}"))
+        };
+        /// Close the pinned directory handle DIR.
+        "(pinned-dir-close! dir)" => |dir: Foreign<RefCell<files::PinnedDir>>| {
+            dir.borrow_mut().close();
+        };
+        /// Read at most MAX-BYTES raw bytes from regular file LEAF in DIR.
+        /// Returns a bytevector, or #f if LEAF does not exist; refuses symlinks
+        /// and non-regular files.
+        "(pinned-dir-read-bytes dir leaf max-bytes)" => |dir: Foreign<RefCell<files::PinnedDir>>, leaf: String, max_bytes: usize| {
+            dir.borrow()
+                .read_bytes(Path::new(&leaf), max_bytes)
+                .map(|o| o.map(crate::api::Bytes))
+                .map_err(|e| format!("{leaf}: {e}"))
+        };
+        /// Atomically publish BYTES to private LEAF in DIR without dir fsync.
+        /// Writes with mode 0600, syncs the file before rename, and refuses
+        /// symlinks.
+        "(pinned-dir-publish-private! dir leaf bytes)" => |dir: Foreign<RefCell<files::PinnedDir>>, leaf: String, bytes: crate::api::Bytes| {
+            dir.borrow()
+                .publish_private(Path::new(&leaf), &bytes.0)
+                .map_err(|e| format!("{leaf}: {e}"))
+        };
+        /// Atomically write BYTES to private regular file LEAF in DIR.
+        /// Writes with mode 0600, syncs the file and DIR, and refuses symlinks.
+        "(pinned-dir-write-private! dir leaf bytes)" => |dir: Foreign<RefCell<files::PinnedDir>>, leaf: String, bytes: crate::api::Bytes| {
+            dir.borrow()
+                .write_private(Path::new(&leaf), &bytes.0)
+                .map_err(|e| format!("{leaf}: {e}"))
+        };
+        /// Unlink regular file LEAF in DIR without syncing DIR.
+        /// Returns #t if LEAF was removed, #f if absent; refuses symlinks.
+        "(pinned-dir-unlink! dir leaf)" => |dir: Foreign<RefCell<files::PinnedDir>>, leaf: String| {
+            dir.borrow()
+                .unlink(Path::new(&leaf))
+                .map_err(|e| format!("{leaf}: {e}"))
+        };
+        /// Delete regular file LEAF in DIR and sync DIR when removed.
+        /// Returns #t if LEAF was removed, #f if absent; refuses symlinks.
+        "(pinned-dir-delete! dir leaf)" => |dir: Foreign<RefCell<files::PinnedDir>>, leaf: String| {
+            dir.borrow()
+                .delete(Path::new(&leaf))
+                .map_err(|e| format!("{leaf}: {e}"))
+        };
+        /// Fsync the pinned directory descriptor DIR.
+        "(pinned-dir-sync! dir)" => |dir: Foreign<RefCell<files::PinnedDir>>| {
+            dir.borrow().sync().map_err(|e| e.to_string())
+        };
+        /// Try to acquire an exclusive non-blocking lock on pinned directory DIR.
+        /// Returns #t if acquired, #f if another open handle holds the lock.
+        "(pinned-dir-try-lock! dir)" => |dir: Foreign<RefCell<files::PinnedDir>>| {
+            dir.borrow().try_lock().map_err(|e| e.to_string())
+        };
     }
 }

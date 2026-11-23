@@ -31,3 +31,5 @@ pn = "pn"
 wrk = "wrk"
 # The ASCII prefix of café in MIME wire-format and charset fixtures.
 caf = "caf"
+# POSIX open(2) write-only flag (rustix::fs::OFlags::WRONLY).
+WRONLY = "WRONLY"

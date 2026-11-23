@@ -25,6 +25,7 @@
 (require "staging.scm")
 (require "recovery.scm")
 (require "shell.scm")
+(require "direnv.scm")
 (require "repl.scm")
 (require "which-key.scm")
 (require "options.scm")
