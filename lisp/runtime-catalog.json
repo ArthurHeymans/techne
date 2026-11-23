@@ -25,11 +25,11 @@
       "is_macro": false
     },
     "add-hook!": {
-      "description": "(add-hook! hook name proc)  procedure, @lisp@/editor/dispatch.scm:78\n\nRun (PROC session args ...) at each HOOK, as NAME.",
+      "description": "(add-hook! hook name proc)  procedure, @lisp@/editor/dispatch.scm:79\n\nRun (PROC session args ...) at each HOOK, as NAME.",
       "is_macro": false
     },
     "advertise-package!": {
-      "description": "(advertise-package! name entry commands options)  procedure, @lisp@/editor/modes.scm:303\n\nAdvertise the package NAME without loading the file ENTRY; return NAME.\nWhat a package's manifest declares for the editor (doc/packages.md) is\nthere from now on: OPTIONS, each (name default schema documentation),\nare declared, and COMMANDS, each (name documentation), offered, the\nfirst use of one loading ENTRY as the package\n(`register-command-package!`). A scope of the package's name owns the\ndeclarations: if one of them fails, none is left.",
+      "description": "(advertise-package! name entry commands options)  procedure, @lisp@/editor/modes.scm:306\n\nAdvertise the package NAME without loading the file ENTRY; return NAME.\nWhat a package's manifest declares for the editor (doc/packages.md) is\nthere from now on: OPTIONS, each (name default schema documentation),\nare declared, and COMMANDS, each (name documentation), offered, the\nfirst use of one loading ENTRY as the package\n(`register-command-package!`). A scope of the package's name owns the\ndeclarations: if one of them fails, none is left.",
       "is_macro": false
     },
     "append-bounded-output!": {
@@ -69,7 +69,7 @@
       "is_macro": false
     },
     "buffer-projections": {
-      "description": "(buffer-projections doc from to)  procedure, @lisp@/editor/modes.scm:543\n\nReturn how the modes of DOC's buffer lay out its text from FROM to TO.\nEach is (hang LINE AT), the line starting at LINE wrapping under the\ncharacter at AT, its wrapped lines starting where that character does\n(a list item's under its text, not its bullet); or (block AT IMAGE),\nIMAGE (`image-load') shown as a block of its own above the line AT is\non, fitted to the pane's width. A frontend that cannot draw one\nignores it: a terminal shows no images.",
+      "description": "(buffer-projections doc from to)  procedure, @lisp@/editor/modes.scm:562\n\nReturn how the modes of DOC's buffer lay out its text from FROM to TO.\nEach is (hang LINE AT), the line starting at LINE wrapping under the\ncharacter at AT, its wrapped lines starting where that character does\n(a list item's under its text, not its bullet); or (block AT IMAGE),\nIMAGE (`image-load') shown as a block of its own above the line AT is\non, fitted to the pane's width. A frontend that cannot draw one\nignores it: a terminal shows no images.",
       "is_macro": false
     },
     "buffer-state": {
@@ -85,7 +85,7 @@
       "is_macro": false
     },
     "call-with-process": {
-      "description": "(call-with-process program args f #:pty (pty #f) #:node (node #f) #:persist (persist #f) #:directory (directory #f) #:environment (environment (quote ())) #:stdin (stdin #f) #:stdout (stdout #f) #:stderr (stderr #f))  procedure, <techne-process>:54\n\nCall F with a new process, killed when F returns, fails or is cancelled.\nPROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY, ENVIRONMENT, STDIN, STDOUT\nand STDERR are as `process-spawn` takes them.",
+      "description": "(call-with-process program args f #:pty (pty #f) #:node (node #f) #:persist (persist #f) #:directory (directory #f) #:environment (environment (quote ())) #:stdin (stdin #f) #:stdout (stdout #f) #:stderr (stderr #f) #:detach-tty (detach-tty #f))  procedure, <techne-process>:58\n\nCall F with a new process, killed when F returns, fails or is cancelled.\nPROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY, ENVIRONMENT, STDIN, STDOUT,\nSTDERR and DETACH-TTY are as `process-spawn` takes them.",
       "is_macro": false
     },
     "call-with-process-at": {
@@ -185,7 +185,7 @@
       "is_macro": false
     },
     "command": {
-      "description": "(command name)  procedure, @lisp@/editor/dispatch.scm:232\n\nReturn the procedure of the command NAME; it is an error if none.",
+      "description": "(command name)  procedure, @lisp@/editor/dispatch.scm:241\n\nReturn the procedure of the command NAME; it is an error if none.",
       "is_macro": false
     },
     "command-available": {
@@ -193,15 +193,15 @@
       "is_macro": false
     },
     "command-contract": {
-      "description": "(command-contract name)  procedure, @lisp@/editor/dispatch.scm:226\n\nReturn the contract of the command NAME, or #f: run by a count only.",
+      "description": "(command-contract name)  procedure, @lisp@/editor/dispatch.scm:235\n\nReturn the contract of the command NAME, or #f: run by a count only.",
       "is_macro": false
     },
     "command-joins!": {
-      "description": "(command-joins! name join)  procedure, @lisp@/editor/dispatch.scm:660\n\nLet runs of the command NAME join one operation when JOIN says so.\nJOIN is #t, or a procedure (session record) saying whether this run\njoins the last, whose record is RECORD.",
+      "description": "(command-joins! name join)  procedure, @lisp@/editor/dispatch.scm:669\n\nLet runs of the command NAME join one operation when JOIN says so.\nJOIN is #t, or a procedure (session record) saying whether this run\njoins the last, whose record is RECORD.",
       "is_macro": false
     },
     "command-names": {
-      "description": "(command-names)  procedure, @lisp@/editor/dispatch.scm:237\n\nReturn the names of the commands defined.",
+      "description": "(command-names)  procedure, @lisp@/editor/dispatch.scm:246\n\nReturn the names of the commands defined.",
       "is_macro": false
     },
     "command-schema": {
@@ -217,27 +217,27 @@
       "is_macro": false
     },
     "contract-effects": {
-      "description": "(contract-effects record)  procedure, @lisp@/editor/dispatch.scm:305\n\nReturn the `effects` field of RECORD, a `contract` record.",
+      "description": "(contract-effects record)  procedure, @lisp@/editor/dispatch.scm:314\n\nReturn the `effects` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract-entries": {
-      "description": "(contract-entries record)  procedure, @lisp@/editor/dispatch.scm:300\n\nReturn the `entries` field of RECORD, a `contract` record.",
+      "description": "(contract-entries record)  procedure, @lisp@/editor/dispatch.scm:309\n\nReturn the `entries` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract-expose": {
-      "description": "(contract-expose record)  procedure, @lisp@/editor/dispatch.scm:307\n\nReturn the `expose` field of RECORD, a `contract` record.",
+      "description": "(contract-expose record)  procedure, @lisp@/editor/dispatch.scm:316\n\nReturn the `expose` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract-params": {
-      "description": "(contract-params record)  procedure, @lisp@/editor/dispatch.scm:296\n\nReturn the `params` field of RECORD, a `contract` record.",
+      "description": "(contract-params record)  procedure, @lisp@/editor/dispatch.scm:305\n\nReturn the `params` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract-stageable": {
-      "description": "(contract-stageable record)  procedure, @lisp@/editor/dispatch.scm:313\n\nReturn the `stageable` field of RECORD, a `contract` record.",
+      "description": "(contract-stageable record)  procedure, @lisp@/editor/dispatch.scm:322\n\nReturn the `stageable` field of RECORD, a `contract` record.",
       "is_macro": false
     },
     "contract?": {
-      "description": "(contract? obj)  procedure, @lisp@/editor/dispatch.scm:293\n\nReturn #t if OBJ is a `contract` record.",
+      "description": "(contract? obj)  procedure, @lisp@/editor/dispatch.scm:302\n\nReturn #t if OBJ is a `contract` record.",
       "is_macro": false
     },
     "current-buffer": {
@@ -269,7 +269,7 @@
       "is_macro": true
     },
     "define-command": {
-      "description": "define-command: macro, @lisp@/editor/dispatch.scm:254\n\nDefine the command NAME, a procedure of the session S and the count N.\nDOC documents both the procedure and the command; BODY runs when it is\ninvoked. With #:arguments after DOC, it is a command with a contract,\na procedure of the session and its arguments, in order: (define-command\n(name s arg ...) doc #:arguments '((arg schema option ...) ...) ...\nbody ...), with #:read, #:effects, #:expose, #:available, #:stageable\nand #:result after #:arguments as `make-contract` takes them.",
+      "description": "define-command: macro, @lisp@/editor/dispatch.scm:263\n\nDefine the command NAME, a procedure of the session S and the count N.\nDOC documents both the procedure and the command; BODY runs when it is\ninvoked. With #:arguments after DOC, it is a command with a contract,\na procedure of the session and its arguments, in order: (define-command\n(name s arg ...) doc #:arguments '((arg schema option ...) ...) ...\nbody ...), with #:read, #:effects, #:expose, #:available, #:stageable\nand #:result after #:arguments as `make-contract` takes them.",
       "is_macro": true
     },
     "define-face": {
@@ -277,7 +277,7 @@
       "is_macro": true
     },
     "define-hook": {
-      "description": "define-hook: macro, @lisp@/editor/dispatch.scm:66\n\nDeclare the hook NAME, documented by DOC.\nDOC says when it runs and what its procedures are called with.",
+      "description": "define-hook: macro, @lisp@/editor/dispatch.scm:67\n\nDeclare the hook NAME, documented by DOC.\nDOC says when it runs and what its procedures are called with.",
       "is_macro": true
     },
     "define-key!": {
@@ -305,7 +305,7 @@
       "is_macro": true
     },
     "define-option": {
-      "description": "define-option: macro, @lisp@/editor/modes.scm:298\n\nDeclare the option NAME, its DEFAULT and documentation DOC.\nThe other arguments are keywords, as `register-option!` takes them.",
+      "description": "define-option: macro, @lisp@/editor/modes.scm:301\n\nDeclare the option NAME, its DEFAULT and documentation DOC.\nThe other arguments are keywords, as `register-option!` takes them.",
       "is_macro": true
     },
     "define-reader!": {
@@ -477,7 +477,7 @@
       "is_macro": false
     },
     "error-text": {
-      "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:601\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
+      "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:610\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
       "is_macro": false
     },
     "error-with-choices": {
@@ -509,11 +509,11 @@
       "is_macro": false
     },
     "explain-key": {
-      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:485\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
+      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:504\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
       "is_macro": false
     },
     "explain-option": {
-      "description": "(explain-option b name)  procedure, @lisp@/editor/modes.scm:343\n\nReturn the settings of the option NAME that apply in buffer B.\nB #f means no buffer. Each is (cell value by), the one that wins first:\nCELL is `buffer`, a mode's name, `global` or `default`; BY is who made\nit (a package, `root` for the editor's own code and what is evaluated\nin it, a mode for its own options).",
+      "description": "(explain-option b name)  procedure, @lisp@/editor/modes.scm:358\n\nReturn the settings of the option NAME that apply in buffer B.\nB #f means no buffer. Each is (cell value by), the one that wins first:\nCELL is `buffer`, a mode's name, `global` or `default`; BY is who made\nit (a package, `root` for the editor's own code and what is evaluated\nin it, a mode for its own options).",
       "is_macro": false
     },
     "exposed-command-schemas": {
@@ -569,7 +569,7 @@
       "is_macro": false
     },
     "find-option": {
-      "description": "(find-option name)  procedure, @lisp@/editor/modes.scm:282\n\nReturn the declaration of the option NAME, or #f.",
+      "description": "(find-option name)  procedure, @lisp@/editor/modes.scm:283\n\nReturn the declaration of the option NAME, or #f.",
       "is_macro": false
     },
     "forget-operation!": {
@@ -673,7 +673,7 @@
       "is_macro": false
     },
     "invoke": {
-      "description": "(invoke s name args #:principal (principal \"user\") #:mode (mode (quote apply)) #:parent (parent #f) #:started (started #f))  procedure, @lisp@/editor/dispatch.scm:484\n\nRun the command NAME in session S with ARGS, a dict of its arguments.\nKeys are the arguments' names, symbols or strings (JSON's). The command\nmust have a contract; it checks that PRINCIPAL (\"user\", or an agent's\nname) may invoke it, that it is available, and conforms and validates\nARGS, refusing with what is wrong, values of sensitive arguments left\nout. It runs as an operation, a child of the current one, recording the\narguments as data. MODE `check` stops there and returns #t; `apply`\nruns it and returns what it returns. `stage` runs reads and queries,\nbut edits become revision-checked proposals; settings and external\neffects are refused, as are edits through presentations and undo, and\nthe `edit` effect of a command that does not declare #:stageable.\nErrors are raised to the caller, sensitive irritants redacted.\nThe operation is a child of PARENT when given (the failed one a recovery\nchoice is of), and\nSTARTED, if given, is called with its record before the command runs.",
+      "description": "(invoke s name args #:principal (principal \"user\") #:mode (mode (quote apply)) #:parent (parent #f) #:started (started #f))  procedure, @lisp@/editor/dispatch.scm:493\n\nRun the command NAME in session S with ARGS, a dict of its arguments.\nKeys are the arguments' names, symbols or strings (JSON's). The command\nmust have a contract; it checks that PRINCIPAL (\"user\", or an agent's\nname) may invoke it, that it is available, and conforms and validates\nARGS, refusing with what is wrong, values of sensitive arguments left\nout. It runs as an operation, a child of the current one, recording the\narguments as data. MODE `check` stops there and returns #t; `apply`\nruns it and returns what it returns. `stage` runs reads and queries,\nbut edits become revision-checked proposals; settings and external\neffects are refused, as are edits through presentations and undo, and\nthe `edit` effect of a command that does not declare #:stageable.\nErrors are raised to the caller, sensitive irritants redacted.\nThe operation is a child of PARENT when given (the failed one a recovery\nchoice is of), and\nSTARTED, if given, is called with its record before the command runs.",
       "is_macro": false
     },
     "kbd": {
@@ -689,7 +689,7 @@
       "is_macro": false
     },
     "keymap-sources": {
-      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:467\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
+      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:486\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
       "is_macro": false
     },
     "kill-ring": {
@@ -869,7 +869,7 @@
       "is_macro": false
     },
     "make-contract": {
-      "description": "(make-contract entries #:read (read (quote ())) #:effects (effects (quote ())) #:expose (expose (quote ())) #:available (available #f) #:stageable (stageable #f) #:result (result #f))  procedure, @lisp@/editor/dispatch.scm:318\n\nReturn the contract of a command taking the arguments ENTRIES.\nENTRIES are (name schema option ...), as a dict schema's, SCHEMA a\nprocedure of the arguments before when it depends on them; options\n#:doc, #:default, #:optional and #:sensitive (redacted wherever it would\nbe recorded or written). READ says how to ask the user for each: (name\nhow option ...). EFFECTS is what it may do, a list of `read`, `query`,\n`edit`, `settings`, `external`, or a procedure of the arguments giving\nit. EXPOSE lists who else may invoke it (`agents`). AVAILABLE is a\nprocedure of the session giving #t or why not. STAGEABLE, #t, says the\nbody does not read its own edits back nor assume another effect of its\nlanded, so its `edit` effect may run in `stage` mode. RESULT is the\nschema of what it returns.",
+      "description": "(make-contract entries #:read (read (quote ())) #:effects (effects (quote ())) #:expose (expose (quote ())) #:available (available #f) #:stageable (stageable #f) #:result (result #f))  procedure, @lisp@/editor/dispatch.scm:327\n\nReturn the contract of a command taking the arguments ENTRIES.\nENTRIES are (name schema option ...), as a dict schema's, SCHEMA a\nprocedure of the arguments before when it depends on them; options\n#:doc, #:default, #:optional and #:sensitive (redacted wherever it would\nbe recorded or written). READ says how to ask the user for each: (name\nhow option ...). EFFECTS is what it may do, a list of `read`, `query`,\n`edit`, `settings`, `external`, or a procedure of the arguments giving\nit. EXPOSE lists who else may invoke it (`agents`). AVAILABLE is a\nprocedure of the session giving #t or why not. STAGEABLE, #t, says the\nbody does not read its own edits back nor assume another effect of its\nlanded, so its `edit` effect may run in `stage` mode. RESULT is the\nschema of what it returns.",
       "is_macro": false
     },
     "make-document": {
@@ -965,7 +965,7 @@
       "is_macro": false
     },
     "message!": {
-      "description": "(message! s text)  procedure, @lisp@/editor/dispatch.scm:557\n\nShow TEXT in the echo area of session S; #f clears it.\nThe message is kept in *Messages*.",
+      "description": "(message! s text)  procedure, @lisp@/editor/dispatch.scm:566\n\nShow TEXT in the echo area of session S; #f clears it.\nThe message is kept in *Messages*.",
       "is_macro": false
     },
     "method-names": {
@@ -1009,7 +1009,7 @@
       "is_macro": false
     },
     "mode-on?": {
-      "description": "(mode-on? s name)  procedure, @lisp@/editor/modes.scm:436\n\nReturn #t if the minor mode NAME is on in the focused buffer of S.",
+      "description": "(mode-on? s name)  procedure, @lisp@/editor/modes.scm:455\n\nReturn #t if the minor mode NAME is on in the focused buffer of S.",
       "is_macro": false
     },
     "mode-parent": {
@@ -1269,7 +1269,11 @@
       "is_macro": false
     },
     "option": {
-      "description": "(option b name)  procedure, @lisp@/editor/modes.scm:378\n\nReturn the value of the option NAME in buffer B, #f meaning no buffer.",
+      "description": "(option b name)  procedure, @lisp@/editor/modes.scm:394\n\nReturn the value of the option NAME in buffer B, #f meaning no buffer.",
+      "is_macro": false
+    },
+    "option-user-only?": {
+      "description": "(option-user-only? record)  procedure, @lisp@/editor/modes.scm:275\n\nReturn the `user-only` field of RECORD, a `option-declaration` record.",
       "is_macro": false
     },
     "palette-color": {
@@ -1357,63 +1361,63 @@
       "is_macro": false
     },
     "process-close-input": {
-      "description": "(process-close-input process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1027\n\nClose the input of PROCESS, which then reads end of file.",
+      "description": "(process-close-input process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1065\n\nClose the input of PROCESS, which then reads end of file.",
       "is_macro": false
     },
     "process-dropped": {
-      "description": "(process-dropped process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1037\n\nReturn how many bytes of PROCESS's output were dropped, unread.",
+      "description": "(process-dropped process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1075\n\nReturn how many bytes of PROCESS's output were dropped, unread.",
       "is_macro": false
     },
     "process-exited?": {
-      "description": "(process-exited? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1039\n\nReturn #t if PROCESS has ended.",
+      "description": "(process-exited? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1077\n\nReturn #t if PROCESS has ended.",
       "is_macro": false
     },
     "process-kill": {
-      "description": "(process-kill process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:982\n\nKill PROCESS and its process group.",
+      "description": "(process-kill process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1020\n\nKill PROCESS and its process group.",
       "is_macro": false
     },
     "process-password-mode?": {
-      "description": "(process-password-mode? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1012\n\nWhether PROCESS's PTY is canonical and has echo disabled.",
+      "description": "(process-password-mode? process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1050\n\nWhether PROCESS's PTY is canonical and has echo disabled.",
       "is_macro": false
     },
     "process-pid": {
-      "description": "(process-pid process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:978\n\nReturn the operating system's id of PROCESS.",
+      "description": "(process-pid process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1016\n\nReturn the operating system's id of PROCESS.",
       "is_macro": false
     },
     "process-read": {
-      "description": "(process-read process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1019\n\nWait for the next output of PROCESS on STREAM, `stdout` or `stderr`.\nReturn it as a string, or the eof object once the stream is closed.",
+      "description": "(process-read process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1057\n\nWait for the next output of PROCESS on STREAM, `stdout` or `stderr`.\nReturn it as a string, or the eof object once the stream is closed.",
       "is_macro": false
     },
     "process-read-all": {
-      "description": "(process-read-all p stream)  procedure, <techne-process>:65\n\nReturn everything STREAM, `stdout` or `stderr`, of P outputs, as text.\nIt reads to the end of the stream.",
+      "description": "(process-read-all p stream)  procedure, <techne-process>:71\n\nReturn everything STREAM, `stdout` or `stderr`, of P outputs, as text.\nIt reads to the end of the stream.",
       "is_macro": false
     },
     "process-read-all-bytes": {
-      "description": "(process-read-all-bytes p stream)  procedure, <techne-process>:72\n\nReturn everything STREAM, `stdout` or `stderr`, of P outputs, as bytes.\nIt reads to the end of the stream; the result is a bytevector.",
+      "description": "(process-read-all-bytes p stream)  procedure, <techne-process>:78\n\nReturn everything STREAM, `stdout` or `stderr`, of P outputs, as bytes.\nIt reads to the end of the stream; the result is a bytevector.",
       "is_macro": false
     },
     "process-read-bytes": {
-      "description": "(process-read-bytes process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1022\n\nWait for the next output of PROCESS on STREAM, as a bytevector.\nSTREAM is `stdout` or `stderr`; once it is closed, return the eof object.",
+      "description": "(process-read-bytes process stream)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1060\n\nWait for the next output of PROCESS on STREAM, as a bytevector.\nSTREAM is `stdout` or `stderr`; once it is closed, return the eof object.",
       "is_macro": false
     },
     "process-resize": {
-      "description": "(process-resize process rows columns)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1033\n\nTell PROCESS, on a terminal, that it has ROWS and COLUMNS.",
+      "description": "(process-resize process rows columns)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1071\n\nTell PROCESS, on a terminal, that it has ROWS and COLUMNS.",
       "is_macro": false
     },
     "process-signal": {
-      "description": "(process-signal process signal)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1031\n\nSend SIGNAL to PROCESS's group.\nSIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and\n`cont`.",
+      "description": "(process-signal process signal)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1069\n\nSend SIGNAL to PROCESS's group.\nSIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and\n`cont`.",
       "is_macro": false
     },
     "process-spawn": {
-      "description": "(process-spawn program args #:pty (pty #f) #:node (node #f) #:persist (persist #f) #:directory (directory #f) #:environment (environment (quote ())) #:stdin (stdin #f) #:stdout (stdout #f) #:stderr (stderr #f))  procedure, <techne-process>:16\n\nStart PROGRAM with the list of strings ARGS; return the process.\nIt runs with pipes or, with PTY, on a terminal; here, or on NODE. With\nPERSIST, on a node session, it survives disconnects, keeping its newest\noutput. It starts in DIRECTORY, a path where it runs (by default the\ndirectory of whoever starts it), with the variables of ENVIRONMENT, a\nlist of (NAME . VALUE) strings, set besides those it inherits; a VALUE\n#f takes NAME out, and a later entry for a name replaces an earlier\none. STDIN, STDOUT and STDERR say where a local process's streams go:\n`pipe` (or #f), read and written here; `inherit`, this process's own;\n`null`; or a file's path, read from, or written from its start (both\noutputs to one path share it). A stream that is not a pipe reads as\nended here. The process is in a process group of its own, so it is not\nthe foreground of a terminal it inherits. The current scope owns a\nlocal process: shutting the scope kills it.",
+      "description": "(process-spawn program args #:pty (pty #f) #:node (node #f) #:persist (persist #f) #:directory (directory #f) #:environment (environment (quote ())) #:stdin (stdin #f) #:stdout (stdout #f) #:stderr (stderr #f) #:detach-tty (detach-tty #f))  procedure, <techne-process>:16\n\nStart PROGRAM with the list of strings ARGS; return the process.\nIt runs with pipes or, with PTY, on a terminal; here, or on NODE. With\nPERSIST, on a node session, it survives disconnects, keeping its newest\noutput. It starts in DIRECTORY, a path where it runs (by default the\ndirectory of whoever starts it), with the variables of ENVIRONMENT, a\nlist of (NAME . VALUE) strings, set besides those it inherits; a VALUE\n#f takes NAME out, and a later entry for a name replaces an earlier\none. STDIN, STDOUT and STDERR say where a local process's streams go:\n`pipe` (or #f), read and written here; `inherit`, this process's own;\n`null`; or a file's path, read from, or written from its start (both\noutputs to one path share it). A stream that is not a pipe reads as\nended here. With DETACH-TTY on a local non-PTY process, it starts in a\nnew session (`setsid`) without a controlling terminal; otherwise it is\nin a process group of its own, so it is not the foreground of a terminal\nit inherits. The current scope owns a local process: shutting the scope\nkills it.",
       "is_macro": false
     },
     "process-wait": {
-      "description": "(process-wait process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1035\n\nWait for PROCESS to end; return its exit code, or (signal N).",
+      "description": "(process-wait process)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1073\n\nWait for PROCESS to end; return its exit code, or (signal N).",
       "is_macro": false
     },
     "process-write": {
-      "description": "(process-write process data)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1025\n\nWrite DATA, a string or bytevector, to the input of PROCESS.\nIt waits while the input is full.",
+      "description": "(process-write process data)  built-in procedure, @source@/crates/techne-process/src/lib.rs:1063\n\nWrite DATA, a string or bytevector, to the input of PROCESS.\nIt waits while the input is full.",
       "is_macro": false
     },
     "project-root": {
@@ -1553,11 +1557,11 @@
       "is_macro": false
     },
     "register-command!": {
-      "description": "(register-command! name doc proc #:body (body #f) #:contract (contract #f))  procedure, @lisp@/editor/dispatch.scm:135\n\nMake PROC, a procedure of a session and a count, the command NAME.\nDOC documents it. The current scope owns the command. BODY, if given,\nis a thunk returning the procedure PROC runs now (a global binding's,\nwhich redefining changes), whose identity records of its runs keep.\nWith CONTRACT (`make-contract`), PROC is a procedure of a session and\nthe contract's arguments, in order, and the command is run with them:\nread from the user (keys, \\[execute-extended-command]), or given as\ndata (`invoke`).",
+      "description": "(register-command! name doc proc #:body (body #f) #:contract (contract #f))  procedure, @lisp@/editor/dispatch.scm:136\n\nMake PROC, a procedure of a session and a count, the command NAME.\nDOC documents it. The current scope owns the command. BODY, if given,\nis a thunk returning the procedure PROC runs now (a global binding's,\nwhich redefining changes), whose identity records of its runs keep.\nWith CONTRACT (`make-contract`), PROC is a procedure of a session and\nthe contract's arguments, in order, and the command is run with them:\nread from the user (keys, \\[execute-extended-command]), or given as\ndata (`invoke`).",
       "is_macro": false
     },
     "register-command-package!": {
-      "description": "(register-command-package! package path commands)  procedure, @lisp@/editor/dispatch.scm:168\n\nAdvertise COMMANDS of PACKAGE without loading PATH.\nCOMMANDS is a list of (name documentation) pairs. The current scope owns\nthe declarations. A failed load can be retried.",
+      "description": "(register-command-package! package path commands)  procedure, @lisp@/editor/dispatch.scm:170\n\nAdvertise COMMANDS of PACKAGE without loading PATH.\nCOMMANDS is a list of (name documentation) pairs. The current scope owns\nthe declarations. A failed load can be retried.",
       "is_macro": false
     },
     "register-face!": {
@@ -1581,11 +1585,11 @@
       "is_macro": false
     },
     "register-mode-line-segment!": {
-      "description": "(register-mode-line-segment! name proc)  procedure, @lisp@/editor/modes.scm:404\n\nShow (PROC buffer) in the mode line of the buffer's panes, as NAME.\nPROC returns a string, or #f for nothing. Segments are shown in the\norder of their names; one that fails shows nothing.",
+      "description": "(register-mode-line-segment! name proc)  procedure, @lisp@/editor/modes.scm:423\n\nShow (PROC buffer) in the mode line of the buffer's panes, as NAME.\nPROC returns a string, or #f for nothing. Segments are shown in the\norder of their names; one that fails shows nothing.",
       "is_macro": false
     },
     "register-option!": {
-      "description": "(register-option! name default doc #:type (type (quote any)))  procedure, @lisp@/editor/modes.scm:289\n\nDeclare the option NAME, its DEFAULT and its documentation DOC.\nTYPE is the schema of its values, as `valid?` takes it: boolean, natural,\n(one-of value ...), (or schema ...) and so on.",
+      "description": "(register-option! name default doc #:type (type (quote any)) #:user-only (user-only #f))  procedure, @lisp@/editor/modes.scm:290\n\nDeclare the option NAME, its DEFAULT and its documentation DOC.\nTYPE is the schema of its values, as `valid?` takes it: boolean, natural,\n(one-of value ...), (or schema ...) and so on. When USER-ONLY is true,\nNAME may only be set globally by the user (not per-buffer, per-mode, from\nproject settings, or by external agent principals).",
       "is_macro": false
     },
     "reload-document!": {
@@ -1613,7 +1617,7 @@
       "is_macro": false
     },
     "remove-hook!": {
-      "description": "(remove-hook! hook name)  procedure, @lisp@/editor/dispatch.scm:86\n\nRemove the procedure added to HOOK as NAME.",
+      "description": "(remove-hook! hook name)  procedure, @lisp@/editor/dispatch.scm:87\n\nRemove the procedure added to HOOK as NAME.",
       "is_macro": false
     },
     "replace-region!": {
@@ -1729,11 +1733,11 @@
       "is_macro": false
     },
     "run-command": {
-      "description": "(run-command s name n #:operation (operation #t))  procedure, @lisp@/editor/dispatch.scm:684\n\nRun the command NAME in session S with the count N.\nThe run is an operation, a child of the current one, unless OPERATION\nis #f: a key of the minibuffer, which only reads, runs in none.\nWhat commands record for the next one (a kill to append to, a goal\ncolumn) moves from now to last here; an error becomes the message.\nReturn #t when the command finished, #f when it raised an error.",
+      "description": "(run-command s name n #:operation (operation #t))  procedure, @lisp@/editor/dispatch.scm:693\n\nRun the command NAME in session S with the count N.\nThe run is an operation, a child of the current one, unless OPERATION\nis #f: a key of the minibuffer, which only reads, runs in none.\nWhat commands record for the next one (a kill to append to, a goal\ncolumn) moves from now to last here; an error becomes the message.\nReturn #t when the command finished, #f when it raised an error.",
       "is_macro": false
     },
     "run-hook!": {
-      "description": "(run-hook! s hook . args)  procedure, @lisp@/editor/dispatch.scm:90\n\nCall each procedure added to HOOK, in the order added.\nEach is called with the session S and ARGS; one that fails shows its\nerror in S, and the others still run. They run in no operation: what\nthey change is no command's doing.",
+      "description": "(run-hook! s hook . args)  procedure, @lisp@/editor/dispatch.scm:91\n\nCall each procedure added to HOOK, in the order added.\nEach is called with the session S and ARGS; one that fails shows its\nerror in S, and the others still run. They run in no operation: what\nthey change is no command's doing.",
       "is_macro": false
     },
     "save-document!": {
@@ -1849,7 +1853,7 @@
       "is_macro": false
     },
     "set-option!": {
-      "description": "(set-option! name value #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:325\n\nSet the option NAME to VALUE in buffer B or the major mode MODE.\nWithout either, it is set globally.",
+      "description": "(set-option! name value #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:338\n\nSet the option NAME to VALUE in buffer B or the major mode MODE.\nWithout either, it is set globally.",
       "is_macro": false
     },
     "set-palette!": {
@@ -2001,7 +2005,7 @@
       "is_macro": false
     },
     "take-violations!": {
-      "description": "(take-violations! s)  procedure, @lisp@/editor/dispatch.scm:645\n\nReturn and forget the violations raised in session S since last asked.\nThey are those of commands and hooks, oldest first, each as \"who: what\nit says\".",
+      "description": "(take-violations! s)  procedure, @lisp@/editor/dispatch.scm:654\n\nReturn and forget the violations raised in session S since last asked.\nThey are those of commands and hooks, oldest first, each as \"who: what\nit says\".",
       "is_macro": false
     },
     "target": {
@@ -2117,7 +2121,7 @@
       "is_macro": false
     },
     "toggle-mode!": {
-      "description": "(toggle-mode! s name)  procedure, @lisp@/editor/modes.scm:441\n\nTurn the minor mode NAME on or off in the focused buffer of S.",
+      "description": "(toggle-mode! s name)  procedure, @lisp@/editor/modes.scm:460\n\nTurn the minor mode NAME on or off in the focused buffer of S.",
       "is_macro": false
     },
     "traced-operation-records": {
@@ -2141,7 +2145,7 @@
       "is_macro": false
     },
     "unset-option!": {
-      "description": "(unset-option! name #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:335\n\nTake back the setting of the option NAME in buffer B or mode MODE.\nWithout either, the global setting is taken back.",
+      "description": "(unset-option! name #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:349\n\nTake back the setting of the option NAME in buffer B or mode MODE.\nWithout either, the global setting is taken back.",
       "is_macro": false
     },
     "view-document": {

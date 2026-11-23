@@ -303,6 +303,32 @@ code generation used by long-running tasks. Redefinition affects subsequent
 calls under documented semantics; it does not silently rewrite active stacks.
 Arbitrary heap persistence and automatic state migration are deferred.
 
+### Security and threat model
+
+A single Techne world is one trust domain. Isolation between mutually untrusted
+code belongs at the **world** boundary (separate heaps, separate host
+capabilities, separate processes/containers), never inside one shared Scheme
+world. Scopes exist for lifecycle and ownership (clean unloading, cancellation,
+and shadowing), not as an intra-VM security sandbox.
+
+Within a world, security enforces two concrete boundaries:
+
+1. **Untrusted repository and external inputs** (`.techne.scm`, `.envrc`,
+   `.editorconfig`, remote files, clipboard payloads, and external agent RPCs):
+   treat data as data, gate code execution and dangerous settings behind
+   explicit user trust with TOCTOU-checked hashes, run credential helpers in a
+   user-trusted working directory with a clean baseline environment, and keep
+   `#:user-only` options off limits to project files, buffer/mode overrides,
+   and non-`"user"` principals.
+2. **Accidental secret leakage**: opaque secret boxes do not print plaintext,
+   private buffers fail closed (no disk journals, no recovery files, no
+   unencrypted swap, no accidental agent/LSP disclosure), and helper processes
+   keep credentials off argv and out of logs.
+
+Do not add intra-VM root-authority tokens, scope-identity privilege gates,
+root-only parameters, or defensive value cloning to defend one loaded Scheme
+module in a world against another.
+
 ## 2. Implementation candidates, not product requirements
 
 | Need | Initial candidate / reuse strategy |

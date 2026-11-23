@@ -496,7 +496,7 @@ fn a_node_is_reached_through_another() {
     use techne_node::protocol::{Facts, Hello, VERSION};
     let hello = rmp_serde::to_vec_named(&Hello { version: VERSION, facts: Some(Facts::default()) }).unwrap();
     let escaped: String = (hello.len() as u32).to_be_bytes().into_iter().chain(hello).map(|b| format!("\\{b:03o}")).collect();
-    let deaf = format!("printf '{escaped}'; exec 0<&-; exec sleep 30");
+    let deaf = format!("printf '{escaped}'; dd bs=4096 count=1 >/dev/null 2>&1; exec 0<&-; exec sleep 30");
     eval(&mut vm, &format!("(define deaf (node-connect-via n \"sh\" (list \"-c\" {deaf:?})))"));
     eval(&mut vm, "(node-facts deaf)");
     let start = Instant::now();

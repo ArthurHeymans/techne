@@ -37,7 +37,7 @@
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          register-mode-line-segment! mode-line-segments
          define-option register-option! advertise-package!
-         find-option option-names option-name option-default option-doc option-type
+         find-option option-names option-name option-default option-doc option-type option-user-only?
          set-option! unset-option! option explain-option
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
          buffer-directory buffer-input buffer-display-options)
@@ -266,12 +266,13 @@ That is the one with the longest suffix of PATH, else
 ;;; Options
 
 (define-record-type option-declaration
-  (%make-option name default doc type)
+  (%make-option name default doc type user-only)
   option-declaration?
   (name option-name)
   (default option-default)
   (doc option-doc)
-  (type option-type))
+  (type option-type)
+  (user-only option-user-only?))
 
 (define %options (make-registry 'options #:changed display-changed!))
 
@@ -286,12 +287,14 @@ That is the one with the longest suffix of PATH, else
   "Return the names of the options declared."
   (registry-keys %options))
 
-(define (register-option! name default doc #:type [type 'any])
+(define (register-option! name default doc #:type [type 'any] #:user-only [user-only #f])
   "Declare the option NAME, its DEFAULT and its documentation DOC.
 TYPE is the schema of its values, as `valid?` takes it: boolean, natural,
-(one-of value ...), (or schema ...) and so on."
+(one-of value ...), (or schema ...) and so on. When USER-ONLY is true,
+NAME may only be set globally by the user (not per-buffer, per-mode, from
+project settings, or by external agent principals)."
   (unless (schema? type) (error "Not a schema:" type))
-  (registry-add! %options name (%make-option name default doc type))
+  (registry-add! %options name (%make-option name default doc type (and user-only #t)))
   name)
 
 (define-syntax define-option
@@ -322,9 +325,20 @@ declarations: if one of them fails, none is left."
       (error (string-append "Not a value of " (symbol->string name) ": expected " (schema-description (option-type o)) ", got")
              value))))
 
+(define (check-user-only-write! name b mode)
+  (let ((o (find-option name)))
+    (when (and o (option-user-only? o))
+      (when (or b mode)
+        (error (string-append "Option " (symbol->string name) " is user-only and cannot be set per-buffer or per-mode")))
+      (let ((who (current-principal)))
+        (unless (equal? who "user")
+          (error (string-append "Option " (symbol->string name) " is user-only and cannot be set by principal "
+                                (if (string? who) who "non-user"))))))))
+
 (define (set-option! name value #:buffer [b #f] #:mode [mode #f])
   "Set the option NAME to VALUE in buffer B or the major mode MODE.
 Without either, it is set globally."
+  (check-user-only-write! name b mode)
   (check-option name value)
   (note-effect! 'settings)
   (if b
@@ -335,6 +349,7 @@ Without either, it is set globally."
 (define (unset-option! name #:buffer [b #f] #:mode [mode #f])
   "Take back the setting of the option NAME in buffer B or mode MODE.
 Without either, the global setting is taken back."
+  (check-user-only-write! name b mode)
   (note-effect! 'settings)
   (if b
       (set-buffer-settings! b (remove (lambda (e) (eq? (car e) name)) (buffer-settings b)))
@@ -346,17 +361,18 @@ B #f means no buffer. Each is (cell value by), the one that wins first:
 CELL is `buffer`, a mode's name, `global` or `default`; BY is who made
 it (a package, `root` for the editor's own code and what is evaluated
 in it, a mode for its own options)."
-  (let* ((settings (lambda (cell key)
+  (let* ((o (find-option name))
+         (user-only? (and o (option-user-only? o)))
+         (settings (lambda (cell key)
                      (map (lambda (e) (list cell (car (car e)) (cdr (car e)))) (registry-entries %settings key))))
-         (in-buffer (and b (assq name (buffer-settings b))))
-         (in-modes (if b
+         (in-buffer (and (not user-only?) b (assq name (buffer-settings b))))
+         (in-modes (if (and (not user-only?) b)
                        (append-map (lambda (m)
                                      (let ((own (assq name (mode-options m))))
                                        (append (settings (mode-name m) (list name (mode-name m)))
                                                (if own (list (list (mode-name m) (cdr own) (mode-name m))) '()))))
                                    (mode-chain (buffer-mode b)))
-                       '()))
-         (o (find-option name)))
+                       '())))
     (append (if in-buffer (list (list 'buffer (cdr in-buffer) 'buffer)) '())
             in-modes
             (settings 'global (list name))
@@ -379,21 +395,24 @@ truncation and pointer reporting. With B false, return global values."
   "Return the value of the option NAME in buffer B, #f meaning no buffer."
   ;; Same precedence as explain-option, without building provenance rows or
   ;; looking up settings that cannot win. Entries are pairs even for #f.
-  (define (global-value)
-    (let ((entry (registry-ref %settings (list name))))
-      (if entry (car entry)
-          (let ((o (find-option name))) (and o (option-default o))))))
-  (let ((local (and b (assq name (buffer-settings b)))))
-    (cond (local (cdr local))
-          ((not b) (global-value))
-          (else
-           (let loop ((mode (buffer-mode b)) (seen '()))
-             (let ((m (and mode (not (memq mode seen)) (find-mode mode))))
-               (if (not m) (global-value)
-                   (let ((entry (registry-ref %settings (list name mode))))
-                     (if entry (car entry)
-                         (let ((own (assq name (mode-options m))))
-                           (if own (cdr own) (loop (mode-parent m) (cons mode seen)))))))))))))
+  (let* ((o (find-option name))
+         (user-only? (and o (option-user-only? o))))
+    (define (global-value)
+      (let ((entry (registry-ref %settings (list name))))
+        (if entry (car entry) (and o (option-default o)))))
+    (if user-only?
+        (global-value)
+        (let ((local (and b (assq name (buffer-settings b)))))
+          (cond (local (cdr local))
+                ((not b) (global-value))
+                (else
+                 (let loop ((mode (buffer-mode b)) (seen '()))
+                   (let ((m (and mode (not (memq mode seen)) (find-mode mode))))
+                     (if (not m) (global-value)
+                         (let ((entry (registry-ref %settings (list name mode))))
+                           (if entry (car entry)
+                               (let ((own (assq name (mode-options m))))
+                                 (if own (cdr own) (loop (mode-parent m) (cons mode seen)))))))))))))))
 
 ;;; Mode line segments: what a package says of a buffer in its mode
 ;;; line (a language server's state, its diagnostics' count), after the

@@ -1606,3 +1606,75 @@ fn a_group_chosen_from_outside_mail_opens_as_from_the_dashboard() {
     key(&mut rt, "q");
     assert!(pane(&mut rt, 0).contains("My previous workspace"));
 }
+
+#[test]
+fn mail_resolves_credentials_from_secret_sources_by_default() {
+    let (dir, mut rt) = editor();
+    real_accounts(&mut rt, dir.path());
+    let authinfo = dir.path().join("authinfo");
+    std::fs::write(&authinfo, "machine must-not-connect.invalid login ada port 993 password ULTRA-SECRET-MAIL-PW\n").unwrap();
+    let authinfo_str = authinfo.display().to_string();
+    rt.eval(&format!(
+        "(set-option! 'mail-credential-provider #f)
+         (set-option! 'secret-sources (list (list 'authinfo #:file {authinfo_str:?})))
+         (set-option! 'mail-accounts
+           '(((id . \"via-secrets\") (kind . imap) (host . \"must-not-connect.invalid\") (port . 993) (user . \"ada\"))))"
+    ))
+    .unwrap();
+    command(&mut rt, "mail");
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| pane(rt, 0).contains("Sync incomplete"));
+    command(&mut rt, "mail-sync-status");
+    let focus = rt.snapshot().focus;
+    let status = pane(&mut rt, focus);
+    assert!(status.contains("via-secrets"), "{status}");
+    // Credential lookup succeeded via secret-sources and moved on to Connect.
+    assert!(status.contains("Connect"), "{status}");
+    assert!(!status.contains("Credentials"), "{status}");
+    assert!(!status.contains("ULTRA-SECRET-MAIL-PW"), "{status}");
+}
+
+#[test]
+fn mail_per_account_secret_ref_inherits_query_and_rejects_plaintext_string() {
+    let (dir, mut rt) = editor();
+    real_accounts(&mut rt, dir.path());
+    let authinfo = dir.path().join("acct-authinfo");
+    std::fs::write(&authinfo, "machine must-not-connect.invalid login ada port 993 password ACCT-REF-PW\n").unwrap();
+    let authinfo_str = authinfo.display().to_string();
+    rt.eval(&format!(
+        "(import (techne secrets))
+         (set-option! 'mail-credential-provider #f)
+         (set-option! 'secret-sources '())
+         (set-option! 'mail-accounts
+           (list (list (cons 'id \"ref-acct\") (cons 'kind 'imap)
+                       (cons 'host \"must-not-connect.invalid\") (cons 'port 993) (cons 'user \"ada\")
+                       (cons 'secret (secret-ref 'authinfo #:file {authinfo_str:?})))))"
+    ))
+    .unwrap();
+    command(&mut rt, "mail");
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| pane(rt, 0).contains("Sync incomplete"));
+    command(&mut rt, "mail-sync-status");
+    let focus = rt.snapshot().focus;
+    let status = pane(&mut rt, focus);
+    assert!(status.contains("ref-acct"), "{status}");
+    assert!(status.contains("Connect"), "{status}");
+    assert!(!status.contains("Credentials"), "{status}");
+    assert!(!status.contains("ACCT-REF-PW"), "{status}");
+
+    // A plaintext string in per-account `secret` must fail at Credentials instead of being accepted.
+    rt.eval(
+        "(set-option! 'mail-accounts
+           '(((id . \"plain-acct\") (kind . imap) (host . \"must-not-connect.invalid\")
+              (port . 993) (user . \"ada\") (secret . \"PLAINTEXT-SHOULD-REJECT\"))))",
+    )
+    .unwrap();
+    command(&mut rt, "mail-sync");
+    pump_until(&mut rt, |rt| pane(rt, 0).contains("Sync incomplete"));
+    command(&mut rt, "mail-sync-status");
+    let focus2 = rt.snapshot().focus;
+    let status2 = pane(&mut rt, focus2);
+    assert!(status2.contains("plain-acct"), "{status2}");
+    assert!(status2.contains("Credentials"), "{status2}");
+    assert!(!status2.contains("PLAINTEXT-SHOULD-REJECT"), "{status2}");
+}

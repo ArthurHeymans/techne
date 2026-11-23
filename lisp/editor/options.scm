@@ -7,6 +7,7 @@
 (require "session.scm")
 (require "keymaps.scm")
 (require "dispatch.scm")
+(require "operations.scm")
 (require "modes.scm")
 (require "commands.scm")
 (require "minibuffer.scm")
@@ -28,6 +29,11 @@
                         (sort (option-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b)))))
                    #:accept (lambda (s c) (accept s (string->symbol (candidate-text c))))))
 
+(define (label-text v)
+  (cond ((symbol? v) (symbol->string v))
+        ((string? v) v)
+        (else (written v))))
+
 (define (option-rows b name)
   "Return rows describing the option NAME in buffer B, for a view.
 They are its documentation, type and value, and the settings that apply
@@ -38,9 +44,9 @@ in B, the one that wins first."
                   (row "type" (written (option-type o))))
             (map (lambda (l) (row "doc" l)) (string-split (option-doc o) "\n"))
             (map (lambda (e)
-                   (row (symbol->string (car e))
+                   (row (label-text (car e))
                         (string-append (written (cadr e))
-                                       (if (eq? (car e) 'default) "" (string-append "  set by " (symbol->string (caddr e)))))))
+                                       (if (eq? (car e) 'default) "" (string-append "  set by " (label-text (caddr e)))))))
                  (explain-option b name)))))
 
 (define-command (describe-option s n)
@@ -77,6 +83,9 @@ argument makes it GLOBAL."
   #:effects '(settings)
   #:expose '(agents)
   #:result 'any
+  (let ((o (find-option name)))
+    (when (and o (option-user-only? o) (not (equal? (current-principal) "user")))
+      (error (string-append "Option " (symbol->string name) " is user-only and cannot be set by " (current-principal)))))
   ;; Global only when asked: leaving BUFFER out does not mean everywhere.
   (cond (global (set-option! name value))
         (buffer (set-option! name value #:buffer buffer))

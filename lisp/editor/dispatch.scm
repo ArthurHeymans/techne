@@ -18,7 +18,8 @@
 (require "../schema.scm")
 
 (provide press press-keys type-text command-doc
-         define-command register-command! register-command-package! command command-names run-command command-joins! message!
+         define-command register-command! register-command-package! activate-command-package!
+         command command-names run-command command-joins! message!
          invoke make-contract command-contract command-code contract? contract-params contract-entries contract-read
          contract-effects contract-expose contract-available contract-stageable contract-result contract-hash
          contract-argument-schema contract-sensitive set-command-acquirer! contract-conform-argument ->data error-text messages-document message-log-max
@@ -163,6 +164,7 @@ Records of its runs keep the number of theirs (`record-code`)."
   (package offer-package) (doc offer-doc) (activate offer-activate)
   (impl offer-impl) (proxy offer-proxy))
 (define %offers (make-registry 'command-offers))
+(define %package-activators (make-registry 'command-package-activators))
 (define %offered-generation (make-parameter #f))
 
 (define (register-command-package! package path commands)
@@ -194,6 +196,7 @@ the declarations. A failed load can be retried."
               (for-each (lambda (c) (unless (hash-table-ref/default seen (car c) #f)
                                       (error "Package did not define advertised command" package (car c)))) commands)
               generation)))))
+    (registry-add! %package-activators package activate)
     (for-each (lambda (c)
                 (let* ((name (car c)) (proxy (lambda args (apply (caddr (resolve-command name)) args)))
                        ;; The bootstrap can reload independently of the implementation.
@@ -201,6 +204,12 @@ the declarations. A failed load can be retried."
                        (old (registry-ref %offers name)) (impl (if old (offer-impl old) (make-registry package)))
                        (offer (make-offer package (cadr c) activate impl proxy)))
                   (registry-add! %offers name offer) (registry-add! %commands name offer))) commands)))
+
+(define (activate-command-package! package)
+  "Activate the lazily registered command package PACKAGE."
+  (let ((act (registry-ref %package-activators package)))
+    (unless act (error "No command package registered" package))
+    (act)))
 
 (define (command-entry name)
   (let ((c (registry-ref %commands name)))

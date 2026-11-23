@@ -2,7 +2,7 @@
 ;;; one rich reader, and one composer. No source mail is deleted or changed.
 (import (techne editor) (mail store) (mail mime) (mail html) (mail address)
         (mail imap) (mail maildir) (mail smtp) (mail thread) (mail date)
-        (techne time) (techne uuid) (techne path) (techne task))
+        (techne time) (techne uuid) (techne path) (techne task) (techne secrets))
 
 
 (define-face mail.title "The mail workspace title." #:fg 'blue #:weight 'bold #:height 1.35)
@@ -84,11 +84,59 @@
 (define (configured-accounts)
   (let ((accounts (option #f 'mail-accounts))) (if (list? accounts) accounts '())))
 (define (account-by-id id) (find (lambda (a) (equal? (mail-ref a 'id) id)) (configured-accounts)))
+(define (reveal-credential value query)
+  (cond ((secret? value) (secret-reveal value))
+        ((secret-ref? value)
+         (let ((resolved (secret-resolve value #:query query)))
+           (and resolved (secret-reveal resolved))))
+        ((string? value) value)
+        (else #f)))
+
+(define (mail-secret-query account purpose)
+  (let* ((smtp? (eq? purpose 'smtp))
+         (host (mail-ref account (if smtp? 'smtp-host 'host) #f))
+         (user (if smtp? (mail-ref account 'smtp-user (mail-ref account 'user #f))
+                   (mail-ref account 'user #f)))
+         (security (mail-ref account (if smtp? 'smtp-security 'imap-security) 'implicit-tls))
+         (port (mail-ref account (if smtp? 'smtp-port 'port)
+                         (if smtp? (if (eq? security 'starttls) 587 465)
+                                   (if (eq? security 'starttls) 143 993))))
+         (acct (mail-ref account 'id #f)))
+    (append (list (cons 'service purpose))
+            (if host (list (cons 'host host)) '())
+            (if user (list (cons 'user user)) '())
+            (if port (list (cons 'port port)) '())
+            (if acct (list (cons 'account acct)) '()))))
+
 (define (secret account purpose)
-  (let ((provider (option #f 'mail-credential-provider)))
-    (unless (procedure? provider) (error "Set mail-credential-provider in your Scheme configuration"))
-    (let ((value (provider account purpose)))
-      (unless (string? value) (error "The mail credential provider returned no secret")) value)))
+  (let* ((query (mail-secret-query account purpose))
+         (direct (mail-ref account (if (eq? purpose 'smtp) 'smtp-secret 'secret) #f))
+         (provider (option #f 'mail-credential-provider)))
+    (cond
+      ((string? direct)
+       (error "Mail account secret must be a secret-ref, not a plaintext string"))
+      ((or (secret? direct) (secret-ref? direct))
+       (let ((value (reveal-credential direct query)))
+         (unless (string? value) (error "No mail secret found"))
+         value))
+      ((procedure? provider)
+       (let ((value (reveal-credential (provider account purpose) query)))
+         (unless (string? value) (error "The mail credential provider returned no secret"))
+         value))
+      (else
+       (let* ((host (let ((e (assq 'host query))) (and e (cdr e))))
+              (user (let ((e (assq 'user query))) (and e (cdr e))))
+              (port (let ((e (assq 'port query))) (and e (cdr e))))
+              (acct (let ((e (assq 'account query))) (and e (cdr e))))
+              (found (secret-lookup #:service purpose
+                                    #:host host
+                                    #:user user
+                                    #:port port
+                                    #:account acct
+                                    #:sources (option #f 'secret-sources))))
+         (unless found
+           (error "No mail secret found; configure secret-sources or mail-credential-provider"))
+         (secret-reveal found))))))
 (define (selected-message s)
   (let* ((st (mail-state s))
          (id (if (eq? (buffer-mode (current-buffer s)) 'mail-summary-mode)
@@ -1410,7 +1458,7 @@ Invalid UTF-8 bytes display as replacements; original octets remain in SQLite."
   (case phase ((credentials) "Credentials") ((connect) "Connect / authenticate") ((select) "Select mailbox")
         ((fetch) "Fetch new messages") ((maildir) "Read Maildir") ((cache) "Cache message") (else "Configuration")))
 (define (phase-remedy phase)
-  (case phase ((credentials) "Check mail-credential-provider and your secret manager; retry explicitly.")
+  (case phase ((credentials) "Check secret-sources, mail-credential-provider and your secret manager; retry explicitly.")
         ((connect) "Check host, TLS port/certificates and app-password authentication; no insecure fallback exists.")
         ((select) "Check the configured mailbox wire name and account permissions.")
         ((fetch) "Check server connectivity and message limits; g resumes after cached UIDs.")
