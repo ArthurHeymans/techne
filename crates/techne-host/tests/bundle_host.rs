@@ -367,6 +367,17 @@ fn load_verified_packaged_trees_rejects_forged_deps_and_corrupted_trees() {
              (depends ((acme dep) (path "../dep")))
              (cloud "app.scm" (bindings (greeting text))))"#,
     );
+    write(
+        &root_tmp,
+        "techne.lock",
+        &format!(
+            r#"(lock
+                 (techne "0.1.0")
+                 (package (acme dep) "0.1.0"
+                   (source (path "../dep"))
+                   (tree-sha256 "{dep_sha}")))"#
+        ),
+    );
     write(&root_tmp, "app.scm", "(import (acme dep)) (provide fetch) (define (fetch r e c) val)");
     let root_files = read_clean_package_tree(&root_tmp, &mut total, BUNDLE_BYTES).unwrap();
     let root_sha = canonical_tree_sha256(&root_files);

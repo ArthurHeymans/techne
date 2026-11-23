@@ -421,12 +421,21 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
 /// uniqueness, package graph integrity, and entry existence without touching
 /// the OS filesystem. Returns the bundle and the entry's deterministic virtual
 /// path.
-fn build_bundle_vfs(
+pub(crate) fn build_bundle_vfs(
     entry: &str,
     files: Vec<(String, Vec<u8>)>,
     root_package: Option<(String, String)>,
     packages: Vec<BundledPackage>,
 ) -> Result<(Arc<BundleVfs>, PathBuf), String> {
+    if root_package.is_none() && !packages.is_empty() {
+        return Err("deployment carries packages without a root package".into());
+    }
+    if root_package.is_some() && packages.is_empty() {
+        return Err("packaged deployment carries no packages".into());
+    }
+    if root_package.is_some() && !files.is_empty() {
+        return Err("packaged deployment cannot carry root files".into());
+    }
     let mut total_files = files.len();
     let mut total_bytes: usize = files.iter().map(|(_, b)| b.len()).sum();
     for pkg in &packages {
@@ -444,6 +453,16 @@ fn build_bundle_vfs(
     }
     let mut pkg_map = BTreeMap::new();
     for pkg in packages {
+        if !crate::package::is_sha256_hex(&pkg.tree_sha256) {
+            return Err(format!("package ({} {}) has invalid tree-sha256: {}", pkg.owner, pkg.pkg, pkg.tree_sha256));
+        }
+        let actual_sha = crate::package::canonical_tree_sha256(&pkg.files);
+        if actual_sha != pkg.tree_sha256 {
+            return Err(format!(
+                "package ({} {}) tree-sha256 mismatch: expected {}, got {actual_sha}",
+                pkg.owner, pkg.pkg, pkg.tree_sha256
+            ));
+        }
         let prefix = PackagePrefix::new(&pkg.owner, &pkg.pkg);
         let mut pkg_files = BTreeMap::new();
         for (path, bytes) in pkg.files.iter() {

@@ -541,7 +541,7 @@ fn packaged_deploy_caches_trees_and_enforces_contracts() {
     let (ok, said) = cloud_given(&[&["secret", "KEY"], &target[..]].concat(), Some(&acme), "prod-s3cret\n");
     assert!(ok, "{said}");
 
-    // First deploy uploads both root and dep trees and caches them under `<state>/trees/<sha>/`.
+    // First deploy uploads both root and dep trees and caches non-root dep trees under `<state>/tenants/acme/trees/<sha>/`.
     let (ok, said) = cloud_with_store(&[&["deploy", app_dir.to_str().unwrap()], &target[..]].concat(), Some(&acme), &store);
     assert!(ok, "{said}");
     assert_eq!(get(port, host, "/"), (200, "v1/prod".into()));
@@ -551,8 +551,13 @@ fn packaged_deploy_caches_trees_and_enforces_contracts() {
 
     let dep_files = techne_host::package::read_clean_package_tree(&dep_repo, &mut 0, 16 << 20).unwrap();
     let dep_sha = techne_host::package::canonical_tree_sha256(&dep_files);
-    assert!(state.join("trees").join(&dep_sha).is_dir(), "expected cached dep tree {dep_sha}");
-    assert!(!has_file_named(&state.join("trees"), ".secrets.scm"), "secrets must never be stored in trees");
+    let root_v1_files = techne_host::package::read_clean_package_tree(&app_dir, &mut 0, 16 << 20).unwrap();
+    let root_v1_sha = techne_host::package::canonical_tree_sha256(&root_v1_files);
+    let acme_trees = state.join("tenants/acme/trees");
+    assert!(acme_trees.join(&dep_sha).is_dir(), "expected cached dep tree {dep_sha}");
+    assert!(!acme_trees.join(&root_v1_sha).exists(), "root tree must never be cached in tenant trees");
+    assert!(!state.join("trees").exists(), "global trees directory must not be created");
+    assert!(!has_file_named(&acme_trees, ".secrets.scm"), "secrets must never be stored in trees");
 
     // Second deploy after editing root `app.scm` reuses cached dep tree and serves v2.
     write_pkg_file(&app_dir, "app.scm", &PKG_SERVE_APP.replace("VER", "v2"));

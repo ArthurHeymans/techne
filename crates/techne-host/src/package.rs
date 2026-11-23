@@ -11,10 +11,11 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use sha2::Digest;
-use techne_vm::{bundle::validate_bundle_relpath, data::Data, vm::Vm};
+use techne_vm::{bundle::validate_bundle_relpath, data::Data, reader::string_repr, tasks::LifetimeLimits, vm::Vm};
 
 use crate::{
     supervisor::{BindingKind, DeclaredBinding},
@@ -24,16 +25,116 @@ use crate::{
 /// Immutable regular-file list for one package tree, shared by `Arc`.
 pub type CachedFiles = Arc<Vec<(String, Vec<u8>)>>;
 
-/// In-memory cache of verified package trees keyed by canonical `tree-sha256`.
-pub type TreeCache = HashMap<String, CachedFiles>;
+/// Maximum total file bytes held in one supervisor's in-memory [`TreeCache`].
+pub const TREE_CACHE_BYTES: usize = 32 << 20;
 
-/// The maximum byte size of `manifest.scm` checked before loading.
-const MANIFEST_BYTES: u64 = 256 << 10;
+/// Bounded in-memory cache of verified dependency package trees keyed by
+/// canonical `tree-sha256`, with FIFO eviction under `max_bytes`.
+#[derive(Clone, Debug)]
+pub struct TreeCache {
+    entries: HashMap<String, (CachedFiles, usize)>,
+    order: VecDeque<String>,
+    total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for TreeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TreeCache {
+    pub fn new() -> Self {
+        Self::with_max_bytes(TREE_CACHE_BYTES)
+    }
+
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
+        Self { entries: HashMap::new(), order: VecDeque::new(), total_bytes: 0, max_bytes }
+    }
+
+    pub fn contains_key(&self, sha: &str) -> bool {
+        self.entries.contains_key(sha)
+    }
+
+    pub fn get(&self, sha: &str) -> Option<&CachedFiles> {
+        self.entries.get(sha).map(|(files, _)| files)
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.total_bytes = 0;
+    }
+
+    pub fn insert(&mut self, sha: String, files: CachedFiles) {
+        let bytes: usize = files.iter().map(|(_, b)| b.len()).sum();
+        if bytes > self.max_bytes {
+            return;
+        }
+        if let Some((_, old_bytes)) = self.entries.remove(&sha) {
+            self.total_bytes = self.total_bytes.saturating_sub(old_bytes);
+            self.order.retain(|k| k != &sha);
+        }
+        while self.total_bytes.saturating_add(bytes) > self.max_bytes {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some((_, evicted_bytes)) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted_bytes);
+            }
+        }
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.order.push_back(sha.clone());
+        self.entries.insert(sha, (files, bytes));
+    }
+}
+
+/// The maximum byte size of `manifest.scm`, `techne-package.scm`, and
+/// `techne.lock` checked before loading.
+pub(crate) const MANIFEST_BYTES: u64 = 256 << 10;
+
+/// CPU budget for bounded manifest/lockfile evaluation in helper VMs.
+pub(crate) const MANIFEST_CPU: Duration = Duration::from_secs(5);
+
+/// Reject files exceeding [`MANIFEST_BYTES`] before passing them to Scheme.
+pub(crate) fn check_bounded_file(path: &Path, label: &str) -> Result<(), String> {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MANIFEST_BYTES) {
+        return Err(format!("{label} is larger than a manifest may be"));
+    }
+    Ok(())
+}
+
+/// Call Scheme procedure `func` with `args` inside a CPU- and task-bounded
+/// lifetime so untrusted manifest/lockfile inputs cannot spin indefinitely.
+pub(crate) fn call_bounded(
+    vm: &mut Vm,
+    func: &techne_vm::api::Value,
+    args: &[techne_vm::api::Value],
+) -> Result<techne_vm::api::Value, techne_vm::vm::Error> {
+    let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(MANIFEST_CPU), tasks: Some(4) });
+    let task = vm.spawn_in_with(lifetime, func, args)?;
+    let run = vm.run_tasks();
+    let result = vm.task_result(&task);
+    vm.end_lifetime(lifetime);
+    run?;
+    result.unwrap_or_else(|| Err(techne_vm::vm::Error::new("bounded evaluation did not finish")))
+}
 
 /// What a cloud deployment target path resolves to on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CloudTarget {
-    /// A legacy plain-file deployment (no `techne-package.scm` above it).
+    /// A legacy plain-file deployment (no `techne-package.scm` owning it).
     Legacy { entry: PathBuf },
     /// A packaged deployment rooted at `root_dir` (`techne-package.scm`).
     /// When the user pointed to an entry file inside the package rather than
@@ -152,8 +253,37 @@ pub fn read_clean_package_tree(dir: &Path, total_bytes: &mut usize, max_bytes: u
     Ok(files)
 }
 
+/// Read the canonical `(cloud ENTRY ...)` entry path declared in
+/// `dir/techne-package.scm`, if any.
+fn read_package_cloud_entry(dir: &Path) -> Result<Option<PathBuf>, String> {
+    check_bounded_file(&dir.join("techne-package.scm"), "techne-package.scm")?;
+    let failed = |e: techne_vm::vm::Error| e.msg.clone();
+    let mut vm = Vm::new();
+    vm.set_memory_limit(64 << 20);
+    vm.set_locked_libraries(true);
+    vm.eval_source("(import (techne package))").map_err(failed)?;
+    let reader = vm
+        .eval_source(
+            r#"(lambda (dir)
+                 (let ((cloud (manifest-cloud (read-package-manifest dir))))
+                   (if cloud (car cloud) #f)))"#,
+        )
+        .map_err(failed)?;
+    let dir_val = vm.from_data(&Data::String(dir.display().to_string())).map_err(failed)?;
+    let res = call_bounded(&mut vm, &reader, &[dir_val]).map_err(failed)?;
+    match vm.to_data(&res, 65536).map_err(failed)? {
+        Data::Bool(false) => Ok(None),
+        Data::String(path) => Ok(PathBuf::from(path).canonicalize().ok()),
+        _ => Err("unexpected (cloud ...) entry".into()),
+    }
+}
+
 /// Resolve a user-supplied deployment target path into either a packaged cloud
 /// app (`techne-package.scm`) or a legacy plain-file deployment.
+///
+/// For a file path, only matches a `techne-package.scm` in the file's own
+/// directory or an ancestor whose declared `(cloud ENTRY ...)` explicitly
+/// resolves to that exact file.
 pub fn resolve_cloud_target(target: &Path) -> Result<CloudTarget, String> {
     let canon = target.canonicalize().map_err(|e| format!("{}: {e}", target.display()))?;
     if canon.is_dir() {
@@ -163,11 +293,20 @@ pub fn resolve_cloud_target(target: &Path) -> Result<CloudTarget, String> {
             Err(format!("{}: directory has no techne-package.scm", target.display()))
         }
     } else if canon.is_file() {
-        if let Some(root_dir) = canon.ancestors().skip(1).find(|d| d.join("techne-package.scm").is_file()) {
-            Ok(CloudTarget::Package { root_dir: root_dir.to_path_buf(), explicit_entry: Some(canon) })
-        } else {
-            Ok(CloudTarget::Legacy { entry: canon })
+        if let Some(parent) = canon.parent()
+            && parent.join("techne-package.scm").is_file()
+        {
+            return Ok(CloudTarget::Package { root_dir: parent.to_path_buf(), explicit_entry: Some(canon) });
         }
+        for ancestor in canon.ancestors().skip(2) {
+            if ancestor.join("techne-package.scm").is_file()
+                && let Ok(Some(declared_entry)) = read_package_cloud_entry(ancestor)
+                && declared_entry == canon
+            {
+                return Ok(CloudTarget::Package { root_dir: ancestor.to_path_buf(), explicit_entry: Some(canon) });
+            }
+        }
+        Ok(CloudTarget::Legacy { entry: canon })
     } else {
         Err(format!("{}: not a file or directory", target.display()))
     }
@@ -176,23 +315,27 @@ pub fn resolve_cloud_target(target: &Path) -> Result<CloudTarget, String> {
 /// Validate `dir/manifest.scm` against a package's declared `(cloud ...)`
 /// bindings without reading or requiring `.secrets.scm`.
 pub fn validate_manifest_contract(dir: &Path, declared: &[DeclaredBinding]) -> Result<(), String> {
-    let manifest_path = dir.join("manifest.scm");
-    if std::fs::metadata(&manifest_path).is_ok_and(|m| m.len() > MANIFEST_BYTES) {
-        return Err("manifest.scm is larger than a manifest may be".into());
-    }
+    check_bounded_file(&dir.join("manifest.scm"), "manifest.scm")?;
     let failed = |e: techne_vm::vm::Error| format!("the manifest: {}", e.msg);
     let mut vm = Vm::new();
     vm.set_memory_limit(64 << 20);
     vm.set_locked_libraries(true);
     let manifest_lib = techne_vm::library::lisp_dir().join("cloud/manifest.scm").display().to_string();
-    vm.eval_source(&format!("(require {manifest_lib:?})")).map_err(failed)?;
+    vm.eval_source(&format!("(require {})", string_repr(&manifest_lib))).map_err(failed)?;
     let checker = vm
         .eval_source(
             r#"(lambda (dir declared)
                  (let* ((path (string-append dir "/" manifest-file))
                         (manifest (if (file-exists? path)
-                                      (let ((data (call-with-input-file path read)))
-                                        (if (eof-object? data) (dict) data))
+                                      (call-with-input-file path
+                                        (lambda (port)
+                                          (let ((data (read port)))
+                                            (if (eof-object? data)
+                                                (dict)
+                                                (let ((extra (read port)))
+                                                  (unless (eof-object? extra)
+                                                    (error "Unexpected trailing datum in:" path))
+                                                  data)))))
                                       (dict)))
                         (bindings (if (dict? manifest)
                                       (dict-ref manifest 'bindings (dict))
@@ -204,18 +347,18 @@ pub fn validate_manifest_contract(dir: &Path, declared: &[DeclaredBinding]) -> R
     let contract =
         Data::List(declared.iter().map(|b| Data::List(vec![Data::Symbol(b.name.clone()), Data::Symbol(b.kind.as_str().into())])).collect());
     let contract_val = vm.from_data(&contract).map_err(failed)?;
-    vm.call(&checker, &[dir_val, contract_val]).map_err(failed)?;
+    call_bounded(&mut vm, &checker, &[dir_val, contract_val]).map_err(failed)?;
     Ok(())
 }
 
 /// Prepare a packaged cloud app strictly offline from `root_dir`, verifying
 /// `techne-package.scm`, `(cloud ...)` entry & bindings, and `techne.lock`
-/// (honoring `TECHNE_PACKAGE_STORE`), and reusing/populating `tree_cache` by
-/// `tree_sha256`.
+/// (honoring `TECHNE_PACKAGE_STORE`), and reusing/populating `tree_cache` for
+/// dependency trees only after all validation passes.
 pub fn prepare_packaged_bundle(
     root_dir: &Path,
     explicit_entry: Option<&Path>,
-    mut tree_cache: Option<&mut TreeCache>,
+    tree_cache: Option<&mut TreeCache>,
 ) -> Result<PackagedApp, String> {
     let root_dir = root_dir.canonicalize().map_err(|e| format!("{}: {e}", root_dir.display()))?;
     let meta = inspect_package_graph(&root_dir)?;
@@ -233,14 +376,13 @@ pub fn prepare_packaged_bundle(
 
     let mut total_bytes = 0usize;
     let mut packages = Vec::with_capacity(1 + meta.deps.len());
+    let mut pending_cache: Vec<(String, CachedFiles)> = Vec::new();
 
     // Root package: read clean tree and compute canonical tree-sha256.
+    // Never cache root trees in TreeCache (roots change on every edit).
     let root_raw = read_clean_package_tree(&root_dir, &mut total_bytes, BUNDLE_BYTES)?;
     let root_sha = canonical_tree_sha256(&root_raw);
-    let root_files = match tree_cache.as_deref_mut() {
-        Some(cache) => cache.entry(root_sha.clone()).or_insert_with(|| Arc::new(root_raw)).clone(),
-        None => Arc::new(root_raw),
-    };
+    let root_files = Arc::new(root_raw);
     let mut root_depends = meta.root_depends;
     root_depends.sort();
     packages.push(BundledPackage {
@@ -268,12 +410,16 @@ pub fn prepare_packaged_bundle(
                 ));
             }
             let arc = Arc::new(read);
-            if let Some(cache) = tree_cache.as_deref_mut() {
-                cache.insert(dep.tree_sha256.clone(), arc.clone());
-            }
+            pending_cache.push((dep.tree_sha256.clone(), arc.clone()));
             arc
         };
         packages.push(BundledPackage { owner: dep.owner, pkg: dep.pkg, tree_sha256: dep.tree_sha256, depends, files });
+    }
+
+    if let Some(cache) = tree_cache {
+        for (sha, arc) in pending_cache {
+            cache.insert(sha, arc);
+        }
     }
 
     packages.sort_by(|a, b| (&a.owner, &a.pkg).cmp(&(&b.owner, &b.pkg)));
@@ -281,24 +427,49 @@ pub fn prepare_packaged_bundle(
 }
 
 /// Verify and load a packaged deployment from immutable content-addressed tree
-/// directories under `trees_dir` (`<trees_dir>/<tree_sha256>/`), as used by
-/// `techne cloud serve` (`%cloud-prepare-packaged`).
-///
-/// Validates:
-/// - every `tree_sha256` is valid 64-hex and matches its tree contents
-/// - every package's `techne-package.scm` declares the claimed `(owner, pkg)`
-///   and exact dependency set (preventing forged dependency graphs)
-/// - `root_package` has a `(cloud ...)` clause matching `entry`
-/// - every dependency is present and every non-root package is reachable from
-///   `root_package`
-/// - only the root package's `(cloud ...)` bindings are returned.
+/// directories under `trees_dir` (`<trees_dir>/<tree_sha256>/`).
 pub fn load_verified_packaged_trees(
     trees_dir: &Path,
     entry: &str,
     root_package: &(String, String),
     specs: &[PackageSpec],
-    mut tree_cache: Option<&mut TreeCache>,
+    tree_cache: Option<&mut TreeCache>,
 ) -> Result<(Vec<BundledPackage>, Vec<DeclaredBinding>), String> {
+    let (packages, declared, pending_cache) =
+        load_verified_packaged_trees_staged(&[trees_dir], entry, root_package, specs, tree_cache.as_deref())?;
+    if let Some(cache) = tree_cache {
+        for (sha, arc) in pending_cache {
+            cache.insert(sha, arc);
+        }
+    }
+    Ok((packages, declared))
+}
+
+/// Verify and load a packaged deployment from one or more candidate tree
+/// directories (e.g. `[staged_trees_dir, tenant_trees_dir]`), returning
+/// `(packages, declared_bindings, pending_dep_cache)` without mutating any
+/// cache so callers can commit dependency trees only after binding validation
+/// and worker loading succeed.
+///
+/// Validates:
+/// - every `tree_sha256` is valid 64-hex and matches its tree contents
+/// - dependency graph is closed, acyclic (explicit DFS grey/black sets), and
+///   contains no unreachable packages
+/// - every package's `techne-package.scm` is within [`MANIFEST_BYTES`] and
+///   declares the claimed `(owner, pkg)` and exact dependency set
+/// - `root_package` has a `(cloud ...)` clause matching `entry`
+/// - when `root_package` has dependencies (or carries `techne.lock`), the
+///   in-memory `techne.lock` parses cleanly as data and matches every selected
+///   dependency's `(owner pkg)`, `tree-sha256`, and transitive `depends`
+/// - only the root package's `(cloud ...)` bindings are returned.
+#[allow(clippy::type_complexity)]
+pub(crate) fn load_verified_packaged_trees_staged(
+    tree_dirs: &[&Path],
+    entry: &str,
+    root_package: &(String, String),
+    specs: &[PackageSpec],
+    tree_cache: Option<&TreeCache>,
+) -> Result<(Vec<BundledPackage>, Vec<DeclaredBinding>, Vec<(String, CachedFiles)>), String> {
     validate_bundle_relpath(entry).map_err(|e| e.msg.clone())?;
     let mut by_name: BTreeMap<(String, String), &PackageSpec> = BTreeMap::new();
     for spec in specs {
@@ -314,32 +485,47 @@ pub fn load_verified_packaged_trees(
         return Err(format!("root package ({} {}) is missing from deployment packages", root_package.0, root_package.1));
     }
 
-    // Verify closure & reachability from root_package.
-    let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut queue = VecDeque::new();
-    visited.insert(root_package.clone());
-    queue.push_back(root_package.clone());
-    while let Some(cur) = queue.pop_front() {
-        let spec = by_name[&cur];
+    // Verify closure, acyclicity (grey/visiting set in DFS), and reachability from root_package.
+    fn dfs_check(
+        cur: &(String, String),
+        by_name: &BTreeMap<(String, String), &PackageSpec>,
+        visiting: &mut BTreeSet<(String, String)>,
+        visited: &mut BTreeSet<(String, String)>,
+    ) -> Result<(), String> {
+        if !visiting.insert(cur.clone()) {
+            return Err(format!("dependency cycle detected at package ({} {})", cur.0, cur.1));
+        }
+        let spec = by_name[cur];
         for dep in &spec.depends {
             if !by_name.contains_key(dep) {
                 return Err(format!("package ({} {}) declares missing dependency ({} {})", cur.0, cur.1, dep.0, dep.1));
             }
-            if visited.insert(dep.clone()) {
-                queue.push_back(dep.clone());
+            if visiting.contains(dep) {
+                return Err(format!("dependency cycle detected: ({} {}) -> ({} {})", cur.0, cur.1, dep.0, dep.1));
+            }
+            if !visited.contains(dep) {
+                dfs_check(dep, by_name, visiting, visited)?;
             }
         }
+        visiting.remove(cur);
+        visited.insert(cur.clone());
+        Ok(())
     }
+
+    let mut visiting: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
+    dfs_check(root_package, &by_name, &mut visiting, &mut visited)?;
     if visited.len() != by_name.len() {
         return Err("deployment contains unreachable packages".into());
     }
 
-    // Verify every package's techne-package.scm inside one bounded locked VM.
+    // Verify every package's techne-package.scm (and root's techne.lock) inside
+    // one CPU- and memory-bounded locked VM.
     let mut vm = Vm::new();
     vm.set_memory_limit(64 << 20);
     vm.set_locked_libraries(true);
     let failed = |e: techne_vm::vm::Error| format!("package manifest: {}", e.msg);
-    vm.eval_source("(import (techne package))").map_err(failed)?;
+    vm.eval_source("(import (techne package) (techne lock))").map_err(failed)?;
     let reader = vm
         .eval_source(
             r#"(lambda (dir)
@@ -363,14 +549,17 @@ pub fn load_verified_packaged_trees(
     let mut declared_bindings: Option<Vec<DeclaredBinding>> = None;
     let mut total_bytes = 0usize;
     let mut packages = Vec::with_capacity(by_name.len());
+    let mut pending_cache: Vec<(String, CachedFiles)> = Vec::new();
+    let mut root_files_ref: Option<CachedFiles> = None;
+    let mut root_deps_count = 0usize;
 
     for (key, spec) in &by_name {
-        let tree_dir = trees_dir.join(&spec.tree_sha256);
-        if !tree_dir.is_dir() {
+        let Some(tree_dir) = tree_dirs.iter().map(|d| d.join(&spec.tree_sha256)).find(|p| p.is_dir()) else {
             return Err(format!("missing cached tree {} for ({} {})", spec.tree_sha256, key.0, key.1));
-        }
+        };
+        check_bounded_file(&tree_dir.join("techne-package.scm"), "techne-package.scm")?;
         let dir_val = vm.from_data(&Data::String(tree_dir.display().to_string())).map_err(failed)?;
-        let res = vm.call(&reader, &[dir_val]).map_err(failed)?;
+        let res = call_bounded(&mut vm, &reader, &[dir_val]).map_err(failed)?;
         let data = vm.to_data(&res, 4 << 20).map_err(failed)?;
         let (manifest_name, manifest_dir, mut manifest_deps, cloud) = parse_manifest_summary(&data)?;
 
@@ -387,7 +576,8 @@ pub fn load_verified_packaged_trees(
             return Err(format!("package ({} {}) dependency list does not match techne-package.scm", key.0, key.1));
         }
 
-        if key == root_package {
+        let is_root = key == root_package;
+        if is_root {
             let Some((cloud_entry_abs, bindings)) = cloud else {
                 return Err(format!("root package ({} {}) techne-package.scm has no (cloud ...) clause", key.0, key.1));
             };
@@ -396,9 +586,11 @@ pub fn load_verified_packaged_trees(
                 return Err(format!("deployment entry {entry:?} does not match root package (cloud ...) entry {rel:?}"));
             }
             declared_bindings = Some(bindings);
+            root_deps_count = manifest_deps.len();
         }
 
-        let files = if let Some(cached) = tree_cache.as_deref().and_then(|c| c.get(&spec.tree_sha256)).cloned() {
+        // Never read/write root package trees via TreeCache; reuse verified dep trees only.
+        let files = if !is_root && let Some(cached) = tree_cache.and_then(|c| c.get(&spec.tree_sha256)).cloned() {
             add_cached_bytes(&cached, &mut total_bytes, BUNDLE_BYTES, &tree_dir)?;
             cached
         } else {
@@ -408,11 +600,15 @@ pub fn load_verified_packaged_trees(
                 return Err(format!("cached tree {} for ({} {}) is corrupted (computed {})", spec.tree_sha256, key.0, key.1, actual_sha));
             }
             let arc = Arc::new(read);
-            if let Some(cache) = tree_cache.as_deref_mut() {
-                cache.insert(spec.tree_sha256.clone(), arc.clone());
+            if !is_root {
+                pending_cache.push((spec.tree_sha256.clone(), arc.clone()));
             }
             arc
         };
+
+        if is_root {
+            root_files_ref = Some(files.clone());
+        }
 
         packages.push(BundledPackage {
             owner: key.0.clone(),
@@ -423,8 +619,83 @@ pub fn load_verified_packaged_trees(
         });
     }
 
+    // Verify root's techne.lock purely as data (zero host filesystem access).
+    let root_files = root_files_ref.ok_or_else(|| "root package missing from deployment packages".to_string())?;
+    let lock_bytes = root_files.iter().find(|(rel, _)| rel == "techne.lock").map(|(_, b)| b.as_slice());
+    if root_deps_count > 0 && lock_bytes.is_none() {
+        return Err(format!("root package ({} {}) has dependencies but no techne.lock in root tree", root_package.0, root_package.1));
+    }
+    if let Some(lock_bytes) = lock_bytes {
+        if lock_bytes.len() as u64 > MANIFEST_BYTES {
+            return Err("techne.lock is larger than a manifest may be".into());
+        }
+        let lock_text = std::str::from_utf8(lock_bytes).map_err(|_| "techne.lock is not valid UTF-8".to_string())?;
+        let lock_parser = vm
+            .eval_source(
+                r#"(lambda (text)
+                     (let* ((port (open-input-string text))
+                            (datum (read port)))
+                       (when (eof-object? datum)
+                         (error "techne.lock is empty"))
+                       (let ((extra (read port)))
+                         (unless (eof-object? extra)
+                           (error "techne.lock has unexpected trailing datum")))
+                       (let ((lf (parse-lockfile datum)))
+                         (map (lambda (p)
+                                (let ((n (locked-package-name p)))
+                                  (list (symbol->string (car n))
+                                        (symbol->string (cadr n))
+                                        (locked-package-tree-sha256 p)
+                                        (map (lambda (d) (list (symbol->string (car d)) (symbol->string (cadr d))))
+                                             (locked-package-depends p)))))
+                              (lockfile-packages lf)))))"#,
+            )
+            .map_err(|e| format!("techne.lock: {}", e.msg))?;
+        let text_val = vm.from_data(&Data::String(lock_text.to_string())).map_err(|e| format!("techne.lock: {}", e.msg))?;
+        let res = call_bounded(&mut vm, &lock_parser, &[text_val]).map_err(|e| format!("techne.lock: {}", e.msg))?;
+        let data = vm.to_data(&res, 4 << 20).map_err(|e| format!("techne.lock: {}", e.msg))?;
+        let locked = parse_locked_entries(&data)?;
+
+        let mut locked_map: BTreeMap<(String, String), (String, Vec<(String, String)>)> = BTreeMap::new();
+        for (owner, pkg, sha, mut deps) in locked {
+            deps.sort();
+            let key = (owner, pkg);
+            if &key == root_package {
+                return Err(format!("techne.lock cannot list root package ({} {})", key.0, key.1));
+            }
+            if locked_map.insert(key.clone(), (sha, deps)).is_some() {
+                return Err(format!("techne.lock has duplicate package ({} {})", key.0, key.1));
+            }
+        }
+        let non_root_count = packages.iter().filter(|p| (&p.owner, &p.pkg) != (&root_package.0, &root_package.1)).count();
+        if locked_map.len() != non_root_count {
+            return Err(format!(
+                "deployment dependency set ({non_root_count} packages) does not match techne.lock ({} packages)",
+                locked_map.len()
+            ));
+        }
+        for pkg in &packages {
+            if (&pkg.owner, &pkg.pkg) == (&root_package.0, &root_package.1) {
+                continue;
+            }
+            let key = (pkg.owner.clone(), pkg.pkg.clone());
+            let Some((locked_sha, locked_deps)) = locked_map.get(&key) else {
+                return Err(format!("package ({} {}) is not pinned in techne.lock", key.0, key.1));
+            };
+            if pkg.tree_sha256 != *locked_sha {
+                return Err(format!(
+                    "package ({} {}) tree-sha256 {} does not match techne.lock ({locked_sha})",
+                    key.0, key.1, pkg.tree_sha256
+                ));
+            }
+            if pkg.depends != *locked_deps {
+                return Err(format!("package ({} {}) dependencies do not match techne.lock", key.0, key.1));
+            }
+        }
+    }
+
     let declared_bindings = declared_bindings.ok_or_else(|| "root package missing (cloud ...) clause".to_string())?;
-    Ok((packages, declared_bindings))
+    Ok((packages, declared_bindings, pending_cache))
 }
 
 struct GraphMeta {
@@ -444,6 +715,8 @@ struct DepMeta {
 }
 
 fn inspect_package_graph(root_dir: &Path) -> Result<GraphMeta, String> {
+    check_bounded_file(&root_dir.join("techne-package.scm"), "techne-package.scm")?;
+    check_bounded_file(&root_dir.join("techne.lock"), "techne.lock")?;
     let failed = |e: techne_vm::vm::Error| e.msg.clone();
     let mut vm = Vm::new();
     vm.set_memory_limit(64 << 20);
@@ -497,9 +770,24 @@ fn inspect_package_graph(root_dir: &Path) -> Result<GraphMeta, String> {
         )
         .map_err(failed)?;
     let dir_val = vm.from_data(&Data::String(root_dir.display().to_string())).map_err(failed)?;
-    let res = vm.call(&inspector, &[dir_val]).map_err(failed)?;
+    let res = call_bounded(&mut vm, &inspector, &[dir_val]).map_err(failed)?;
     let data = vm.to_data(&res, 4 << 20).map_err(failed)?;
     parse_graph_meta(&data)
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_locked_entries(data: &Data) -> Result<Vec<(String, String, String, Vec<(String, String)>)>, String> {
+    let bad = || "unexpected techne.lock data".to_string();
+    let Data::List(items) = data else { return Err(bad()) };
+    let mut out = Vec::with_capacity(items.len());
+    for entry in items {
+        let Data::List(parts) = entry else { return Err(bad()) };
+        let [Data::String(owner), Data::String(pkg), Data::String(sha), deps_data] = &parts[..] else {
+            return Err(bad());
+        };
+        out.push((owner.clone(), pkg.clone(), sha.clone(), parse_name_list(deps_data)?));
+    }
+    Ok(out)
 }
 
 fn parse_graph_meta(data: &Data) -> Result<GraphMeta, String> {
@@ -628,7 +916,7 @@ mod tests {
 
         let mut vm = Vm::new();
         vm.eval_source("(import (techne package))").unwrap();
-        let val = vm.eval_source(&format!("(directory-tree-sha256 {:?})", dir.path().display().to_string())).unwrap();
+        let val = vm.eval_source(&format!("(directory-tree-sha256 {})", string_repr(&dir.path().display().to_string()))).unwrap();
         let scheme_sha: String = vm.get(&val).unwrap();
         assert_eq!(rust_sha, scheme_sha);
     }

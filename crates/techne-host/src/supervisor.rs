@@ -74,7 +74,7 @@ use std::{
 };
 
 use techne_sandbox::cgroup::{self, Cgroups};
-use techne_vm::{data::Data, tasks::Progress, vm::Vm};
+use techne_vm::{data::Data, reader::string_repr, tasks::Progress, vm::Vm};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
@@ -86,7 +86,10 @@ use crate::{
     ask::Asker,
     body::{self, DataValue, Piece, Reader},
     outbound::Service,
-    package::{CloudTarget, PackageSpec, TreeCache, load_verified_packaged_trees, prepare_packaged_bundle, resolve_cloud_target},
+    package::{
+        CloudTarget, PackageSpec, TreeCache, call_bounded, canonical_tree_sha256, check_bounded_file, is_sha256_hex,
+        load_verified_packaged_trees_staged, prepare_packaged_bundle, resolve_cloud_target,
+    },
     wire::{
         BUNDLE_BYTES, BundledPackage, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, decode_packages, decode_root_package, encode,
         encode_packages, encode_root_package, read_frame, write_encoded,
@@ -294,13 +297,31 @@ impl Bundle {
                 },
                 _ => Err(bad()),
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         let bindings = Bindings::from_data(&bindings_data)?;
         let (root_package, packages) = match (iter.next(), iter.next()) {
             (Some(rp), Some(pkgs)) => (decode_root_package(rp).map_err(|_| bad())?, decode_packages(pkgs).map_err(|_| bad())?),
             (None, None) => (None, Vec::new()),
             _ => return Err(bad()),
         };
+        if root_package.is_none() && !packages.is_empty() {
+            return Err(bad());
+        }
+        if root_package.is_some() && (packages.is_empty() || !files.is_empty()) {
+            return Err(bad());
+        }
+        for pkg in &packages {
+            if !is_sha256_hex(&pkg.tree_sha256) {
+                return Err(format!("bundle package ({} {}) has invalid tree-sha256: {}", pkg.owner, pkg.pkg, pkg.tree_sha256));
+            }
+            let actual = canonical_tree_sha256(&pkg.files);
+            if actual != pkg.tree_sha256 {
+                return Err(format!(
+                    "bundle package ({} {}) tree-sha256 mismatch: expected {}, got {actual}",
+                    pkg.owner, pkg.pkg, pkg.tree_sha256
+                ));
+            }
+        }
         Ok(DecodedBundle { name, entry, files, bindings, root_package, packages })
     }
 }
@@ -630,9 +651,6 @@ impl State {
     }
 }
 
-/// The most bytes of a manifest, and of the secrets beside it.
-const MANIFEST_BYTES: u64 = 256 << 10;
-
 /// The kind of binding declared in a package's `(cloud ...)` clause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BindingKind {
@@ -684,28 +702,78 @@ pub fn read_bindings_with_contract(dir: &Path, declared: &[DeclaredBinding]) -> 
 
 fn read_bindings_checked(dir: &Path, declared: Option<&[DeclaredBinding]>) -> Result<Bindings, String> {
     for file in ["manifest.scm", ".secrets.scm"] {
-        if std::fs::metadata(dir.join(file)).is_ok_and(|m| m.len() > MANIFEST_BYTES) {
-            return Err(format!("{file} is larger than a manifest may be"));
-        }
+        check_bounded_file(&dir.join(file), file)?;
     }
     let failed = |e: techne_vm::vm::Error| format!("the manifest: {}", e.msg);
     let mut vm = Vm::new();
     vm.set_memory_limit(64 << 20);
+    vm.set_locked_libraries(true);
     let manifest = techne_vm::library::lisp_dir().join("cloud/manifest.scm").display().to_string();
-    vm.eval_source(&format!("(require {manifest:?})")).map_err(failed)?;
+    vm.eval_source(&format!("(require {})", string_repr(&manifest))).map_err(failed)?;
     let read = vm.eval_source("read-bindings").map_err(failed)?;
     let dir = vm.from_data(&Data::String(dir.display().to_string())).map_err(failed)?;
     let found = match declared {
-        None => vm.call(&read, &[dir]).map_err(failed)?,
+        None => call_bounded(&mut vm, &read, &[dir]).map_err(failed)?,
         Some(declared) => {
             let contract = Data::List(
                 declared.iter().map(|b| Data::List(vec![Data::Symbol(b.name.clone()), Data::Symbol(b.kind.as_str().into())])).collect(),
             );
             let contract = vm.from_data(&contract).map_err(failed)?;
-            vm.call(&read, &[dir, contract]).map_err(failed)?
+            call_bounded(&mut vm, &read, &[dir, contract]).map_err(failed)?
         }
     };
     Bindings::from_data(&vm.to_data(&found, 4 << 20).map_err(failed)?)
+}
+
+/// Validate already-resolved [`Bindings`] against a packaged app's declared
+/// `(cloud ... (bindings ...))` contract (used by [`Supervisor::prepare`],
+/// [`Supervisor::deploy_with`], and `%cloud-prepare`).
+fn validate_bindings_against_contract(bindings: &Bindings, declared: &[DeclaredBinding]) -> Result<(), String> {
+    let Data::Dict(entries) = &bindings.env else {
+        return Err("the manifest: bindings env is not a dict".into());
+    };
+    let mut env_map: HashMap<&str, &Data> = HashMap::with_capacity(entries.len());
+    for (k, v) in entries {
+        let Data::Symbol(name) = k else {
+            return Err("the manifest: a binding's name is a symbol".into());
+        };
+        env_map.insert(name.as_str(), v);
+    }
+    let mut expected: HashMap<&str, BindingKind> = HashMap::with_capacity(declared.len());
+    for decl in declared {
+        if expected.insert(decl.name.as_str(), decl.kind).is_some() {
+            return Err(format!("the manifest: binding {} declared twice", decl.name));
+        }
+    }
+    for (&name, &val) in &env_map {
+        let Some(&want) = expected.get(name) else {
+            return Err(format!("the manifest: undeclared binding {name}: expected none"));
+        };
+        let is_kv_handle = matches!(val, Data::Dict(fields) if fields.iter().any(|(k, v)| matches!(k, Data::Symbol(s) if s == "kind") && matches!(v, Data::Symbol(s) if s == "kv")));
+        match want {
+            BindingKind::Kv => {
+                if !is_kv_handle || !bindings.stores.contains_key(name) {
+                    return Err(format!("the manifest: binding {name} must be a kv binding"));
+                }
+            }
+            BindingKind::Secret | BindingKind::Text => {
+                if is_kv_handle || bindings.stores.contains_key(name) || !matches!(val, Data::String(_)) {
+                    return Err(format!("the manifest: binding {name} has wrong kind, expected {}", want.as_str()));
+                }
+            }
+        }
+    }
+    for name in bindings.stores.keys() {
+        if expected.get(name.as_str()) != Some(&BindingKind::Kv) {
+            return Err(format!("the manifest: undeclared kv store binding {name}"));
+        }
+    }
+    for decl in declared {
+        if !env_map.contains_key(decl.name.as_str()) {
+            return Err(format!("the manifest: missing binding {}: expected {}, got none", decl.name, decl.kind.as_str()));
+        }
+    }
+    Ok(())
 }
 
 /// Which supervisor a name given to the natives that deploy is of, and
@@ -734,6 +802,18 @@ pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
         }
     });
     let of = resolve.clone();
+    front.register_async("%cloud-prepare-legacy-directory", 2, move |vm, args| {
+        let asked = (|| {
+            let (name, entry) = (args.get::<String>(vm, 0)?, args.get::<String>(vm, 1)?);
+            let (me, name) = of(&name).map_err(Error::new)?;
+            Ok::<_, Error>((me, name, entry))
+        })();
+        async move {
+            let (me, name, entry) = asked?;
+            me.prepare_legacy_directory(&name, Path::new(&entry)).await.map(listed).map_err(Error::new)
+        }
+    });
+    let of = resolve.clone();
     front.register_async("%cloud-prepare", 3, move |vm, args| {
         let asked = (|| {
             let (name, entry) = (args.get::<String>(vm, 0)?, args.get::<String>(vm, 1)?);
@@ -748,27 +828,36 @@ pub(crate) fn install_control_with(front: &mut Vm, resolve: Resolve) {
         }
     });
     let of = resolve.clone();
-    front.register_async("%cloud-prepare-packaged", 6, move |vm, args| {
+    front.register_async("%cloud-prepare-packaged", 7, move |vm, args| {
         let asked = (|| {
             let name = args.get::<String>(vm, 0)?;
             let source_dir = args.get::<String>(vm, 1)?;
-            let trees_dir = args.get::<String>(vm, 2)?;
-            let entry = args.get::<String>(vm, 3)?;
-            let root_val = args.value(vm, 4)?;
-            let specs_val = args.value(vm, 5)?;
+            let staged_trees_dir = args.get::<String>(vm, 2)?;
+            let cached_trees_dir = args.get::<String>(vm, 3)?;
+            let entry = args.get::<String>(vm, 4)?;
+            let root_val = args.value(vm, 5)?;
+            let specs_val = args.value(vm, 6)?;
             let root_data = vm.to_data(&root_val, 4096)?;
             let specs_data = vm.to_data(&specs_val, crate::REQUEST_BYTES)?;
             let root_package = parse_pair(&root_data).map_err(Error::new)?;
             let specs = parse_package_specs(&specs_data).map_err(Error::new)?;
             let (me, name) = of(&name).map_err(Error::new)?;
-            Ok::<_, Error>((me, name, source_dir, trees_dir, entry, root_package, specs))
+            Ok::<_, Error>((me, name, source_dir, staged_trees_dir, cached_trees_dir, entry, root_package, specs))
         })();
         async move {
-            let (me, name, source_dir, trees_dir, entry, root_package, specs) = asked?;
-            me.prepare_packaged_from_trees(&name, Path::new(&source_dir), Path::new(&trees_dir), &entry, root_package, &specs)
-                .await
-                .map(listed)
-                .map_err(Error::new)
+            let (me, name, source_dir, staged_trees_dir, cached_trees_dir, entry, root_package, specs) = asked?;
+            me.prepare_packaged_from_staged_trees(
+                &name,
+                Path::new(&source_dir),
+                Path::new(&staged_trees_dir),
+                Path::new(&cached_trees_dir),
+                &entry,
+                root_package,
+                &specs,
+            )
+            .await
+            .map(listed)
+            .map_err(Error::new)
         }
     });
     let of = resolve.clone();
@@ -933,7 +1022,7 @@ impl Supervisor {
                 repls: HashMap::new(),
                 next_cid: 0,
                 fetching: 0,
-                tree_cache: HashMap::new(),
+                tree_cache: TreeCache::new(),
                 on_failure: Box::new(|f| eprintln!("techne cloud: {} #{}: {} {}", f.deployment, f.request, f.status, f.message)),
                 on_output: Box::new(|p| {
                     for line in p.output.text.lines() {
@@ -975,10 +1064,11 @@ impl Supervisor {
         s.asleep = true;
         // Not one that ended by itself: not counted against restarts.
         s.started.pop_back();
-        let State { ready, routes, stores, .. } = &mut *s;
+        let State { ready, routes, stores, tree_cache, .. } = &mut *s;
         ready.retain(|_, r| routes.get(&r.bundle.name) == Some(&r.bundle.id));
         ready.values_mut().for_each(|r| r.loaded = false);
         stores.retain(|served, _| ready.contains_key(served));
+        tree_cache.clear();
         true
     }
 
@@ -1690,6 +1780,18 @@ impl Supervisor {
         self.state.borrow().tree_cache.contains_key(tree_sha256)
     }
 
+    /// Have the worker load a hosted legacy deployment at `entry` without
+    /// consulting `techne-package.scm`, `techne.lock`, ancestor directories,
+    /// or local package stores. Reads `manifest.scm` + `.secrets.scm` beside
+    /// `entry` and bundles only the files under `entry`'s directory.
+    pub async fn prepare_legacy_directory(&self, name: &str, entry: &Path) -> Result<Prepared, String> {
+        let dir = entry.parent().ok_or("an entry in no directory")?;
+        let rel = entry.strip_prefix(dir).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+        let files = bundle(dir)?;
+        let bindings = read_bindings(dir)?;
+        self.prepare_files(name, &rel, files, bindings).await
+    }
+
     /// Have the worker load the deployment at `target` (either a legacy entry
     /// file or a packaged cloud app directory / entry inside one), reading
     /// `manifest.scm` + `.secrets.scm` and validating declared `(cloud ...)`
@@ -1730,6 +1832,7 @@ impl Supervisor {
                     let mut s = self.state.borrow_mut();
                     prepare_packaged_bundle(&root_dir, explicit_entry.as_deref(), Some(&mut s.tree_cache))?
                 };
+                validate_bindings_against_contract(&bindings, &app.declared_bindings)?;
                 self.prepare_packaged(name, &app.entry, app.root_package, app.packages, bindings).await
             }
         }
@@ -1772,12 +1875,47 @@ impl Supervisor {
         root_package: (String, String),
         specs: &[PackageSpec],
     ) -> Result<Prepared, String> {
-        let (packages, declared) = {
-            let mut s = self.state.borrow_mut();
-            load_verified_packaged_trees(trees_dir, entry, &root_package, specs, Some(&mut s.tree_cache))?
+        self.prepare_packaged_from_tree_dirs(name, source_dir, &[trees_dir], entry, root_package, specs).await
+    }
+
+    /// Verify and load packaged trees from `staged_trees_dir` (ephemeral
+    /// upload stage) and `cached_trees_dir` (tenant-scoped persisted cache),
+    /// validate bindings, load in the worker, and commit non-root dependency
+    /// trees into the in-memory [`TreeCache`] only after preparation succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_packaged_from_staged_trees(
+        &self,
+        name: &str,
+        source_dir: &Path,
+        staged_trees_dir: &Path,
+        cached_trees_dir: &Path,
+        entry: &str,
+        root_package: (String, String),
+        specs: &[PackageSpec],
+    ) -> Result<Prepared, String> {
+        self.prepare_packaged_from_tree_dirs(name, source_dir, &[staged_trees_dir, cached_trees_dir], entry, root_package, specs).await
+    }
+
+    async fn prepare_packaged_from_tree_dirs(
+        &self,
+        name: &str,
+        source_dir: &Path,
+        tree_dirs: &[&Path],
+        entry: &str,
+        root_package: (String, String),
+        specs: &[PackageSpec],
+    ) -> Result<Prepared, String> {
+        let (packages, declared, pending_cache) = {
+            let s = self.state.borrow();
+            load_verified_packaged_trees_staged(tree_dirs, entry, &root_package, specs, Some(&s.tree_cache))?
         };
         let bindings = read_bindings_with_contract(source_dir, &declared)?;
-        self.prepare_packaged(name, entry, root_package, packages, bindings).await
+        let prepared = self.prepare_packaged(name, entry, root_package, packages, bindings).await?;
+        let mut s = self.state.borrow_mut();
+        for (sha, arc) in pending_cache {
+            s.tree_cache.insert(sha, arc);
+        }
+        Ok(prepared)
     }
 
     async fn prepare_bundle(

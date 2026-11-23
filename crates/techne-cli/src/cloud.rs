@@ -277,33 +277,34 @@ fn serve_fleet(args: &[String]) -> Result<(), String> {
         fleet.install_control(&mut front);
         let sessions = techne_host::ask::install(&mut front, "debug", AUTHENTICATING);
         let lisp = techne_vm::library::lisp_dir();
-        let file = |name: &str| lisp.join(name).display().to_string();
+        let file = |name: &str| techne_vm::reader::string_repr(&lisp.join(name).display().to_string());
+        let state_str = techne_vm::reader::string_repr(&state.display().to_string());
+        let kv_str = techne_vm::reader::string_repr(&state.join("kv").display().to_string());
+        let domain_str = techne_vm::reader::string_repr(&domain);
         front
             .eval_source(&format!(
-                r#"(require {:?} {:?} {:?} {:?})
-                   (define cloud (make-cloud {:?}))
-                   (spawn (lambda () (kv-serve-tenants {:?})))
+                r#"(require {} {} {} {})
+                   (define cloud (make-cloud {state_str}))
+                   (spawn (lambda () (kv-serve-tenants {kv_str})))
                    (spawn (lambda () (cloud-debug-serve cloud)))
                    (spawn (lambda ()
                             (cloud-restore! cloud)
                             (let ((ops (tcp-listen {ops})) (listener (tcp-listen {port})))
                               (display (string-append "Operations on http://127.0.0.1:"
                                                       (number->string (cadr (tcp-local-address ops))) "\n"))
-                              (display (string-append "Serving " {domain:?} " on http://127.0.0.1:"
+                              (display (string-append "Serving " {domain_str} " on http://127.0.0.1:"
                                                       (number->string (cadr (tcp-local-address listener))) "\n"))
                               (flush-output-port)
                               (spawn (lambda () (http-serve ops (cloud-ops-handler cloud) #:max-body (* 32 1024 1024)
                                                             #:max-connections 64 #:stream-bodies #t)))
                               (http-serve listener
-                                          (cloud-front-handler cloud {domain:?}
+                                          (cloud-front-handler cloud {domain_str}
                                                                (lambda (target request debug) (host-fetch target request #:debug debug)))
                                           #:stream-bodies #t))))"#,
                 file("cloud/serve.scm"),
                 file("cloud/kv.scm"),
                 file("cloud/hosts.scm"),
                 file("http/server.scm"),
-                state.display().to_string(),
-                state.join("kv").display().to_string(),
             ))
             .map_err(failed)?;
         if let Some(port) = nrepl {
@@ -324,9 +325,11 @@ fn invite_tenant(args: &[String]) -> Result<String, String> {
     let [tenant] = &args[..] else { return Err(String::new()) };
     let mut vm = Vm::new();
     let failed = |e: Error| e.msg.clone();
-    let serve = techne_vm::library::lisp_dir().join("cloud/serve.scm").display().to_string();
-    vm.eval_source(&format!("(require {serve:?})")).map_err(failed)?;
-    let token = vm.eval_source(&format!("(cloud-invite! (make-cloud {state:?}) {tenant:?})")).map_err(failed)?;
+    let serve = techne_vm::reader::string_repr(&techne_vm::library::lisp_dir().join("cloud/serve.scm").display().to_string());
+    let state_str = techne_vm::reader::string_repr(&state);
+    let tenant_str = techne_vm::reader::string_repr(tenant);
+    vm.eval_source(&format!("(require {serve})")).map_err(failed)?;
+    let token = vm.eval_source(&format!("(cloud-invite! (make-cloud {state_str}) {tenant_str})")).map_err(failed)?;
     vm.get::<String>(&token).map_err(failed)
 }
 
@@ -456,7 +459,9 @@ fn operate_remote(op: &str, args: &[String]) -> Result<String, String> {
     post(&addr, &token, Some(&target_header), &format!("{{{}}}", body.join(",")))
 }
 
-/// Parse the `"have"` tree-sha256 array from a `has-trees` reply.
+/// Parse the `"have"` tree-sha256 array from a `has-trees` reply, failing
+/// loudly on malformed JSON, unexpected response shapes, error statuses, or
+/// invalid digests.
 fn parse_have_trees(reply: &str) -> Result<std::collections::HashSet<String>, String> {
     let mut vm = Vm::new();
     vm.set_memory_limit(16 << 20);
@@ -465,24 +470,42 @@ fn parse_have_trees(reply: &str) -> Result<std::collections::HashSet<String>, St
         .eval_source(
             r#"(lambda (text)
                  (let ((arr (string->json text)))
-                   (if (and (vector? arr) (>= (vector-length arr) 1) (dict? (vector-ref arr 0)))
-                       (let ((have (dict-ref (vector-ref arr 0) "have" (vector))))
-                         (if (vector? have) (vector->list have) '()))
-                       '())))"#,
+                   (unless (and (vector? arr) (>= (vector-length arr) 1))
+                     (error "has-trees reply is not a non-empty JSON array"))
+                   (let ((obj (vector-ref arr 0)))
+                     (unless (dict? obj)
+                       (error "has-trees reply element is not a JSON object"))
+                     (let ((status (dict-ref obj "status" #f)))
+                       (unless (vector? status)
+                         (error "has-trees reply missing status array"))
+                       (let ((statuses (vector->list status)))
+                         (when (member "error" statuses)
+                           (let ((msg (dict-ref obj "message" #f)))
+                             (error (string-append "has-trees failed: " (if (string? msg) msg "error")))))
+                         (unless (member "done" statuses)
+                           (error "has-trees reply status is not done"))))
+                     (let ((have (dict-ref obj "have" #f)))
+                       (unless (vector? have)
+                         (error "has-trees reply missing have array"))
+                       (vector->list have)))))"#,
         )
-        .map_err(|e| e.msg.clone())?;
-    let arg = vm.from_data(&Data::String(reply.into())).map_err(|e| e.msg.clone())?;
-    let res = vm.call(&parser, &[arg]).map_err(|e| e.msg.clone())?;
-    let Data::List(items) = vm.to_data(&res, 1 << 20).map_err(|e| e.msg.clone())? else {
-        return Ok(std::collections::HashSet::new());
+        .map_err(|e| format!("has-trees: {}", e.msg))?;
+    let arg = vm.from_data(&Data::String(reply.into())).map_err(|e| format!("has-trees: {}", e.msg))?;
+    let res = vm.call(&parser, &[arg]).map_err(|e| format!("has-trees: {}", e.msg))?;
+    let Data::List(items) = vm.to_data(&res, 1 << 20).map_err(|e| format!("has-trees: {}", e.msg))? else {
+        return Err("has-trees reply did not decode to a list".into());
     };
-    Ok(items
-        .into_iter()
-        .filter_map(|d| match d {
-            Data::String(s) => Some(s),
-            _ => None,
-        })
-        .collect())
+    let mut out = std::collections::HashSet::with_capacity(items.len());
+    for item in items {
+        let Data::String(s) = item else {
+            return Err("has-trees reply contains a non-string digest".into());
+        };
+        if !techne_host::package::is_sha256_hex(&s) {
+            return Err(format!("has-trees reply contains invalid sha256 digest: {s:?}"));
+        }
+        out.insert(s);
+    }
+    Ok(out)
 }
 
 /// POST `body`, an operation, to the operations at `addr`, with `token`,
@@ -614,13 +637,14 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
         supervisor.install_control(&mut front);
         let control = techne_host::ask::install(&mut front, "control", 4);
         let cloud = techne_vm::library::lisp_dir().join("cloud");
+        let name_scm = techne_vm::reader::string_repr(NAME);
         front.eval_source(&format!(
-            r#"(require {:?})
-               (define control (make-control {NAME:?} {:?} {:?}))
+            r#"(require {})
+               (define control (make-control {name_scm} {} {}))
                (spawn (lambda () (control-serve control)))"#,
-            cloud.join("control.scm").display().to_string(),
-            target_path.display().to_string(),
-            dir.join(".techne").display().to_string(),
+            techne_vm::reader::string_repr(&cloud.join("control.scm").display().to_string()),
+            techne_vm::reader::string_repr(&target_path.display().to_string()),
+            techne_vm::reader::string_repr(&dir.join(".techne").display().to_string()),
         ))?;
         let deploy = || Data::List(vec![Data::String("deploy".into())]);
         // The first deployment, the front world driven until it is
@@ -642,25 +666,25 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
         }
         if let Some(port) = options.ops {
             front.eval_source(&format!(
-                r#"(require {:?})
+                r#"(require {})
                    (let ((listener (tcp-listen {port})))
-                     (replace-file {:?} (number->string (cadr (tcp-local-address listener))))
+                     (replace-file {} (number->string (cadr (tcp-local-address listener))))
                      (display (string-append "Operations on http://127.0.0.1:"
                                              (number->string (cadr (tcp-local-address listener))) "\n"))
                      (flush-output-port)
                      (spawn (lambda () (http-serve listener (control-ops-handler control token-key)))))"#,
-                techne_vm::library::lisp_dir().join("http/server.scm").display().to_string(),
-                dir.join(".techne/ops-port").display().to_string(),
+                techne_vm::reader::string_repr(&techne_vm::library::lisp_dir().join("http/server.scm").display().to_string()),
+                techne_vm::reader::string_repr(&dir.join(".techne/ops-port").display().to_string()),
             ))?;
         }
         if let Some(port) = options.nrepl {
             let addr = format!("127.0.0.1:{port}");
             let bound = match auth {
                 Some(auth) => {
-                    let scope = if options.debug { "prod" } else { "eval" };
+                    let scope = techne_vm::reader::string_repr(if options.debug { "prod" } else { "eval" });
                     front.eval_source(&format!(
-                        r#"(require {:?}) (spawn (lambda () (auth-serve token-key {NAME:?} {scope:?})))"#,
-                        cloud.join("auth.scm").display().to_string()
+                        r#"(require {}) (spawn (lambda () (auth-serve token-key {name_scm} {scope})))"#,
+                        techne_vm::reader::string_repr(&cloud.join("auth.scm").display().to_string())
                     ))?;
                     serve_repl_authenticated(supervisor.clone(), &addr, auth).await
                 }
@@ -693,18 +717,19 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
 /// too, for the commands that ask this one.
 fn tokens(front: &mut Vm, dir: &Path) -> Result<(), Error> {
     let cloud = techne_vm::library::lisp_dir().join("cloud");
+    let name_scm = techne_vm::reader::string_repr(NAME);
     front.eval_source(&format!(
-        r#"(require {:?} {:?})
-           (define token-key (token-key-in {:?}))
-           (let ((token (make-token token-key "dev" #:projects (list {NAME:?}) #:scopes token-scopes
+        r#"(require {} {})
+           (define token-key (token-key-in {}))
+           (let ((token (make-token token-key "dev" #:projects (list {name_scm}) #:scopes token-scopes
                                     #:expires (+ (current-second) (* 30 24 3600)))))
-             (replace-file {:?} token)
+             (replace-file {} token)
              (display (string-append "Token: " token "\n"))
              (flush-output-port))"#,
-        cloud.join("auth.scm").display().to_string(),
-        cloud.join("tokens.scm").display().to_string(),
-        dir.join(".techne").display().to_string(),
-        dir.join(".techne/token").display().to_string(),
+        techne_vm::reader::string_repr(&cloud.join("auth.scm").display().to_string()),
+        techne_vm::reader::string_repr(&cloud.join("tokens.scm").display().to_string()),
+        techne_vm::reader::string_repr(&dir.join(".techne").display().to_string()),
+        techne_vm::reader::string_repr(&dir.join(".techne/token").display().to_string()),
     ))?;
     Ok(())
 }
@@ -893,32 +918,33 @@ async fn serve_debug_sessions(
 fn serve_front(front: &mut Vm, port: u16, dir: &Path, target: &Path, debug: bool) -> Result<(), Error> {
     let http = techne_vm::library::lisp_dir().join("http");
     let kv = dir.join(".techne/kv");
+    let name_scm = techne_vm::reader::string_repr(NAME);
     front.eval_source(&format!(
-        r#"(require {:?})
-           (spawn (lambda () (kv-serve (make-kv-store {:?}))))"#,
-        techne_vm::library::lisp_dir().join("cloud/kv.scm").display().to_string(),
-        kv.display().to_string(),
+        r#"(require {})
+           (spawn (lambda () (kv-serve (make-kv-store {}))))"#,
+        techne_vm::reader::string_repr(&techne_vm::library::lisp_dir().join("cloud/kv.scm").display().to_string()),
+        techne_vm::reader::string_repr(&kv.display().to_string()),
     ))?;
     front.eval_source(&format!(
-        r#"(require {:?} {:?} {:?})
+        r#"(require {} {} {})
            (let* ((listener (tcp-listen {port}))
                   (credential (and {} (make-debug-credential)))
-                  (serve (lambda (request debug) (host-fetch {NAME:?} request #:debug debug)))
+                  (serve (lambda (request debug) (host-fetch {name_scm} request #:debug debug)))
                   (handler (if credential
                                (debug-routing serve credential)
                                (lambda (request) (serve request #f)))))
-             (display (string-append "Serving " {:?} " on http://127.0.0.1:"
+             (display (string-append "Serving " {} " on http://127.0.0.1:"
                                      (number->string (cadr (tcp-local-address listener))) "\n"))
              (when credential
                (display (string-append "Debug instance: it serves requests with the header "
                                        debug-route-header ": " credential "\n")))
              (flush-output-port)
              (spawn (lambda () (http-serve listener handler #:stream-bodies #t))))"#,
-        http.join("http.scm").display().to_string(),
-        http.join("server.scm").display().to_string(),
-        http.join("debug-route.scm").display().to_string(),
+        techne_vm::reader::string_repr(&http.join("http.scm").display().to_string()),
+        techne_vm::reader::string_repr(&http.join("server.scm").display().to_string()),
+        techne_vm::reader::string_repr(&http.join("debug-route.scm").display().to_string()),
         if debug { "#t" } else { "#f" },
-        target.display().to_string(),
+        techne_vm::reader::string_repr(&target.display().to_string()),
     ))?;
     Ok(())
 }

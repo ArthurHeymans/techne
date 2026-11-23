@@ -341,20 +341,33 @@ impl ToWorker {
 
     pub fn from_data(d: Data) -> io::Result<ToWorker> {
         let mut p = Parts::of(d)?;
-        Ok(match p.symbol()?.as_str() {
+        let msg = match p.symbol()?.as_str() {
             "deploy" => {
                 let (id, name, entry) = (p.uint()?, p.string()?, p.string()?);
-                let files = p
+                let files: Vec<(String, Vec<u8>)> = p
                     .list()?
                     .into_iter()
                     .map(|f| {
                         let mut f = Parts::of(f)?;
-                        Ok((f.string()?, f.bytes()?))
+                        let pair = (f.string()?, f.bytes()?);
+                        if f.has_more() {
+                            return Err(bad("a file entry has two parts"));
+                        }
+                        Ok(pair)
                     })
                     .collect::<io::Result<_>>()?;
                 let (wall_ms, dev, env) = (p.uint()?, p.flag()?, p.any()?);
                 let (root_package, packages) =
                     if p.has_more() { (decode_root_package(p.any()?)?, decode_packages(p.any()?)?) } else { (None, Vec::new()) };
+                if root_package.is_none() && !packages.is_empty() {
+                    return Err(bad("packages without root_package"));
+                }
+                if root_package.is_some() && packages.is_empty() {
+                    return Err(bad("root_package without packages"));
+                }
+                if root_package.is_some() && !files.is_empty() {
+                    return Err(bad("packaged deploy cannot carry root files"));
+                }
                 ToWorker::Deploy { id, name, entry, files, wall_ms, dev, env, root_package, packages }
             }
             "activate" => ToWorker::Activate { name: p.string()? },
@@ -377,7 +390,11 @@ impl ToWorker {
             "repl-data" => ToWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => ToWorker::ReplClose { cid: p.uint()? },
             other => return Err(bad(&format!("no message {other}"))),
-        })
+        };
+        if p.has_more() {
+            return Err(bad("trailing parts in message"));
+        }
+        Ok(msg)
     }
 }
 
@@ -418,7 +435,7 @@ impl FromWorker {
 
     pub fn from_data(d: Data) -> io::Result<FromWorker> {
         let mut p = Parts::of(d)?;
-        Ok(match p.symbol()?.as_str() {
+        let msg = match p.symbol()?.as_str() {
             "ready" => FromWorker::Ready,
             "deployed" => FromWorker::Deployed { id: p.uint()?, error: p.failure()?, output: p.string()? },
             "response" => FromWorker::Response { rid: p.uint()?, response: p.any()?, streams: p.flag()? },
@@ -436,7 +453,11 @@ impl FromWorker {
             "repl-data" => FromWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => FromWorker::ReplClose { cid: p.uint()? },
             other => return Err(bad(&format!("no message {other}"))),
-        })
+        };
+        if p.has_more() {
+            return Err(bad("trailing parts in message"));
+        }
+        Ok(msg)
     }
 }
 

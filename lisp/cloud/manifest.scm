@@ -31,10 +31,18 @@
   "The name of the file of a deployment's secrets, in its directory.")
 
 ;; What FILE holds, read as data, or DEFAULT if it is not there.
+;; Rejects trailing datums after the first expression.
 (define (read-data file default)
   (if (file-exists? file)
-      (let ((data (call-with-input-file file read)))
-        (if (eof-object? data) default data))
+      (call-with-input-file file
+        (lambda (port)
+          (let ((data (read port)))
+            (if (eof-object? data)
+                default
+                (let ((extra (read port)))
+                  (unless (eof-object? extra)
+                    (error "Unexpected trailing datum in:" file))
+                  data)))))
       default))
 
 (define (valid-binding-kind? kind)

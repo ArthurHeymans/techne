@@ -41,6 +41,9 @@
 (define max-files 1000)
 (define max-bytes (* 16 1024 1024))
 (define max-depth 8)
+;; Per-tenant cached dependency trees on disk, at most.
+(define max-tenant-trees 100)
+(define max-tenant-tree-bytes (* 64 1024 1024))
 ;; Operations at once, of all tenants: each may hold an upload.
 (define max-operations 8)
 
@@ -81,6 +84,11 @@
     (unless (box-cas! box now (remove (lambda (t) (equal? t target)) now))
       (release! cloud target))))
 
+;; Whether NAME is a valid project name ("trees" is reserved for the
+;; tenant's content-addressed dependency tree cache).
+(define (project-name? name)
+  (and (cloud-name? name) (not (equal? name "trees"))))
+
 ;; Whether TENANT's project in DIRECTORY is there, made if it is not and
 ;; MAKE says so and the tenant has room for one: one at a time, so that
 ;; none is made past the most a tenant has.
@@ -91,25 +99,24 @@
     (lambda ()
       (or (file-exists? directory)
           (and make
-               (< (length (names-in (tenant-directory cloud tenant))) max-projects)
+               (< (length (project-names-in (tenant-directory cloud tenant))) max-projects)
                (begin (create-directory directory #o700) #t))))
     (lambda () (channel-send (cloud-turn cloud) #t))))
 
 (define (ensure-directory directory)
   (unless (file-exists? directory) (create-directory directory #o700)))
 
-(define (trees-directory cloud)
-  (string-append (cloud-state cloud) "/trees"))
+(define (tenant-trees-directory cloud tenant)
+  (string-append (tenant-directory cloud tenant) "/trees"))
 
-(define (tree-directory cloud sha)
-  (string-append (trees-directory cloud) "/" sha))
+(define (tree-directory cloud tenant sha)
+  (string-append (tenant-trees-directory cloud tenant) "/" sha))
 
 (define (make-cloud state)
   "Return the cloud kept in the directory STATE, made if it is not there.
 Its token key is the one kept there, made if none is."
   (ensure-directory state)
   (ensure-directory (string-append state "/tenants"))
-  (ensure-directory (string-append state "/trees"))
   (let ((turn (make-channel 1)))
     (channel-send turn #t)
     (%make-cloud state (token-key-in state) (dict) (box '()) turn (box '()))))
@@ -161,6 +168,7 @@ hold, as `verify-token` has it), and past the sessions there may be. Asked
                  (named (and (string? target) (host-target (string-append (target-host target) ".x") "x")))
                  (credential (cadddr what)))
             (if (and claims named (equal? named target)
+                     (not (string-suffix? "/trees" target))
                      (string? credential) (= (string-length credential) 32)
                      (guard (e (#t #f)) (= (bytevector-length (hex-decode credential)) 16))
                      (token-allows? claims target "prod")
@@ -205,6 +213,10 @@ before is given another token."
                                (directory-list directory)))
       '()))
 
+;; The project names in a tenant's DIRECTORY (excluding the reserved "trees" cache).
+(define (project-names-in directory)
+  (filter project-name? (names-in directory)))
+
 ;; The control of TENANT's PROJECT, the one there is of it.
 (define (control-of cloud tenant project)
   (let ((target (string-append tenant "/" project)))
@@ -230,7 +242,7 @@ the others go on. The targets published, `tenant/project`."
                         #f)))
           (and (control-restore! (control-of cloud tenant project))
                (string-append tenant "/" project))))
-      (names-in (tenant-directory cloud tenant))))
+      (project-names-in (tenant-directory cloud tenant))))
    (names-in (string-append (cloud-state cloud) "/tenants"))))
 
 ;; Whether PATH names a file of a deployment: relative, its parts plain
@@ -325,44 +337,186 @@ the others go on. The targets published, `tenant/project`."
     (replace-file (string-append source "/.secrets.scm")
                   (call-with-output-string (lambda (port) (write (secrets-of directory) port))))))
 
-;; Atomically cache verified FILES under `<state>/trees/<sha>/` if not present.
-(define (cache-tree! cloud sha files)
-  (let ((dest (tree-directory cloud sha)))
+(define (strip-slash name)
+  (if (string-suffix? "/" name)
+      (substring name 0 (- (string-length name) 1))
+      name))
+
+(define (quarantine-tree! dir)
+  (guard (e (#t #f))
+    (when (file-exists? dir) (delete-path dir #t))))
+
+;; Walk a cached tree directory DIR without following symlinks, enforcing
+;; max-depth, max-files, max-bytes, and file-path? rules.
+;; Returns (list files-dict file-count byte-count).
+(define (read-tree-files-bounded dir)
+  (let ((root-attrs (file-attributes dir)))
+    (unless (and root-attrs (eq? (car root-attrs) 'directory))
+      (error "Cached tree is not a directory:" dir))
+    (let ((files (dict))
+          (file-count 0)
+          (byte-count 0))
+      (let walk ((cur dir) (prefix "") (depth 0))
+        (when (> depth max-depth)
+          (error "Cached tree exceeds max depth:" dir))
+        (for-each
+         (lambda (raw)
+           (let* ((name (strip-slash raw))
+                  (rel (if (string=? prefix "") name (string-append prefix "/" name)))
+                  (full (string-append cur "/" name))
+                  (attrs (file-attributes full)))
+             (unless (and attrs (file-path? rel))
+               (error "Invalid entry in cached tree:" rel))
+             (cond
+              ((eq? (car attrs) 'directory)
+               (walk full rel (+ depth 1)))
+              ((eq? (car attrs) 'file)
+               (set! file-count (+ file-count 1))
+               (when (> file-count max-files)
+                 (error "Cached tree exceeds max files:" dir))
+               (let ((bytes (read-file-bytes full)))
+                 (set! byte-count (+ byte-count (bytevector-length bytes)))
+                 (when (> byte-count max-bytes)
+                   (error "Cached tree exceeds max bytes:" dir))
+                 (set! files (dict-set files rel bytes))))
+              (else
+               (error "Non-regular entry in cached tree:" rel)))))
+         (directory-list cur)))
+      (list files file-count byte-count))))
+
+;; Verify that TENANT's cached tree SHA exists on disk and matches SHA.
+;; Returns #f if missing; deletes (quarantines) and returns #f if corrupted
+;; or unreadable; returns (file-count . byte-count) if valid.
+(define (verify-cached-tree! cloud tenant sha)
+  (let ((dir (tree-directory cloud tenant sha)))
+    (and (file-exists? dir)
+         (guard (e (#t (quarantine-tree! dir) #f))
+           (let* ((res (read-tree-files-bounded dir))
+                  (files (car res))
+                  (count (cadr res))
+                  (bytes (caddr res)))
+             (if (equal? (files-tree-sha256 files) sha)
+                 (cons count bytes)
+                 (begin (quarantine-tree! dir) #f)))))))
+
+(define (tree-disk-bytes dir)
+  (guard (e (#t 0))
+    (let walk ((cur dir) (acc 0))
+      (fold (lambda (raw total)
+              (let* ((name (strip-slash raw))
+                     (full (string-append cur "/" name))
+                     (attrs (file-attributes full)))
+                (cond ((not attrs) total)
+                      ((eq? (car attrs) 'directory) (walk full total))
+                      ((eq? (car attrs) 'file) (+ total (cadr attrs)))
+                      (else total))))
+            acc
+            (directory-list cur)))))
+
+;; Prune oldest cached dependency trees in TENANT's tree cache if the tenant
+;; exceeds max-tenant-trees or max-tenant-tree-bytes, never evicting SHAs in
+;; KEEP-SHAS.
+(define (prune-tenant-trees! cloud tenant keep-shas)
+  (let ((tdir (tenant-trees-directory cloud tenant)))
+    (when (file-exists? tdir)
+      (let* ((entries
+              (filter-map
+               (lambda (raw)
+                 (let ((name (strip-slash raw)))
+                   (and (sha256-hex? name)
+                        (let* ((path (string-append tdir "/" name))
+                               (attrs (guard (e (#t #f)) (file-attributes path))))
+                          (and attrs (eq? (car attrs) 'directory)
+                               (list name path (caddr attrs) (tree-disk-bytes path)))))))
+               (guard (e (#t '())) (directory-list tdir))))
+             (sorted (sort entries (lambda (a b) (< (caddr a) (caddr b)))))
+             (count (length sorted))
+             (total-bytes (fold (lambda (e acc) (+ acc (cadddr e))) 0 sorted)))
+        (let loop ((rest sorted) (n count) (bytes total-bytes))
+          (when (and (pair? rest)
+                     (or (> n max-tenant-trees) (> bytes max-tenant-tree-bytes)))
+            (let ((e (car rest)))
+              (if (member (car e) keep-shas)
+                  (loop (cdr rest) n bytes)
+                  (begin
+                    (guard (ex (#t #f)) (delete-path (cadr e) #t))
+                    (loop (cdr rest) (- n 1) (- bytes (cadddr e))))))))))))
+
+(define (write-tree-files! dir files)
+  (create-directory dir #o700)
+  (for-each (lambda (path)
+              (ensure-parents dir path)
+              (write-bytes (string-append dir "/" path) (dict-ref files path)))
+            (dict-keys files)))
+
+;; Atomically cache verified FILES under `<state>/tenants/<tenant>/trees/<sha>/`
+;; if not present.
+(define (cache-tree! cloud tenant sha files)
+  (let ((dest (tree-directory cloud tenant sha)))
     (unless (file-exists? dest)
-      (ensure-directory (trees-directory cloud))
-      (let ((tmp (string-append (trees-directory cloud) "/.tmp-" sha "-" (hex-encode (random-bytes 8)))))
+      (ensure-directory (tenant-trees-directory cloud tenant))
+      (let ((tmp (string-append (tenant-trees-directory cloud tenant) "/.tmp-" sha "-" (hex-encode (random-bytes 8)))))
         (guard (e (#t (when (file-exists? tmp) (delete-path tmp #t))
                       (unless (file-exists? dest) (raise e))))
-          (create-directory tmp #o700)
-          (for-each (lambda (path)
-                      (ensure-parents tmp path)
-                      (write-bytes (string-append tmp "/" path) (dict-ref files path)))
-                    (dict-keys files))
+          (write-tree-files! tmp files)
           (rename-file tmp dest))))))
 
-;; Stage a packaged deployment: cache any uploaded trees atomically under
-;; `<state>/trees/<sha>/`, and stage root's `manifest.scm` (if any) beside
-;; the project's server-side `.secrets.scm` in `<project>/source/`.
-(define (stage-packaged! cloud directory root-pair packages)
-  (for-each (lambda (pkg)
-              (let ((sha (caddr pkg))
-                    (files (list-ref pkg 4)))
-                (when files (cache-tree! cloud sha files))))
-            packages)
-  (let* ((root-pkg (find (lambda (p) (and (equal? (car p) (car root-pair)) (equal? (cadr p) (cadr root-pair)))) packages))
-         (root-sha (and root-pkg (caddr root-pkg)))
-         (source (string-append directory "/source")))
-    (unless root-sha (error "Root package missing from deployment packages"))
-    (when (file-exists? source) (delete-path source #t))
-    (ensure-directory source)
-    (let ((manifest (string-append (tree-directory cloud root-sha) "/manifest.scm")))
-      (when (file-exists? manifest)
-        (write-bytes (string-append source "/manifest.scm") (read-file-bytes manifest))))
-    (replace-file (string-append source "/.secrets.scm")
-                  (call-with-output-string (lambda (port) (write (secrets-of directory) port))))))
+;; Stage a packaged deployment in an ephemeral STAGE-DIR without mutating
+;; `<tenant>/trees/` or `<project>/source/`.
+(define (stage-packaged-ephemeral! cloud tenant directory stage-dir root-pair packages)
+  (let ((stage-source (string-append stage-dir "/source"))
+        (stage-trees (string-append stage-dir "/trees")))
+    (create-directory stage-dir #o700)
+    (create-directory stage-source #o700)
+    (create-directory stage-trees #o700)
+    (for-each (lambda (pkg)
+                (let ((sha (caddr pkg))
+                      (files (list-ref pkg 4)))
+                  (when files
+                    (let ((dest (string-append stage-trees "/" sha)))
+                      (unless (file-exists? dest)
+                        (write-tree-files! dest files))))))
+              packages)
+    (let* ((root-pkg (find (lambda (p) (and (equal? (car p) (car root-pair)) (equal? (cadr p) (cadr root-pair)))) packages))
+           (root-sha (and root-pkg (caddr root-pkg)))
+           (root-files (and root-pkg (list-ref root-pkg 4))))
+      (unless root-sha (error "Root package missing from deployment packages"))
+      (let ((manifest-bytes
+             (cond ((and root-files (dict-ref root-files "manifest.scm" #f))
+                    => (lambda (b) b))
+                   (else
+                    (let ((cached (string-append (tree-directory cloud tenant root-sha) "/manifest.scm")))
+                      (and (file-exists? cached) (read-file-bytes cached)))))))
+        (when manifest-bytes
+          (write-bytes (string-append stage-source "/manifest.scm") manifest-bytes)))
+      (replace-file (string-append stage-source "/.secrets.scm")
+                    (call-with-output-string (lambda (port) (write (secrets-of directory) port)))))))
 
-;; Decode a dict of relative-path -> base64 string, updating cumulative
-;; counts (total-files . total-bytes) and enforcing bounds.
+;; Persist verified non-root dependency trees into `<tenant>/trees/` and
+;; update `<project>/source/` (`manifest.scm` + `.secrets.scm`) ONLY AFTER
+;; validation and deployment succeed. Root package trees are never cached.
+(define (commit-packaged-trees! cloud tenant directory stage-source root-pair packages)
+  (let ((non-root
+         (filter (lambda (p)
+                   (not (and (equal? (car p) (car root-pair))
+                             (equal? (cadr p) (cadr root-pair)))))
+                 packages)))
+    (for-each (lambda (pkg)
+                (let ((sha (caddr pkg))
+                      (files (list-ref pkg 4)))
+                  (when files (cache-tree! cloud tenant sha files))))
+              non-root)
+    (prune-tenant-trees! cloud tenant (map caddr non-root))
+    (let ((source (string-append directory "/source"))
+          (staged-manifest (string-append stage-source "/manifest.scm")))
+      (when (file-exists? source) (delete-path source #t))
+      (ensure-directory source)
+      (when (file-exists? staged-manifest)
+        (write-bytes (string-append source "/manifest.scm") (read-file-bytes staged-manifest)))
+      (replace-file (string-append source "/.secrets.scm")
+                    (call-with-output-string (lambda (port) (write (secrets-of directory) port)))))))
+
+;; Decode a dict of relative-path -> base64 string, enforcing per-package bounds.
 (define (decode-files files)
   (unless (and (dict? files) (<= 1 (dict-size files) max-files)) (error "A deployment has 1 to 1000 files"))
   (let ((decoded (fold (lambda (path decoded)
@@ -389,7 +543,7 @@ the others go on. The targets published, `tenant/project`."
     (error "A package name is a 2-element array [owner, pkg]"))
   (list (vector-ref v 0) (vector-ref v 1)))
 
-(define (check-packaged-deploy cloud entry pkg-obj)
+(define (check-packaged-deploy cloud tenant entry pkg-obj)
   (unless (file-path? entry) (error "Not a path of a deployment's entry:" entry))
   (unless (dict? pkg-obj) (error "A packaged deploy's package field is an object"))
   (let ((root-pair (parse-package-pair (dict-ref pkg-obj "root" #f)))
@@ -424,8 +578,13 @@ the others go on. The targets published, `tenant/project`."
                             (let ((actual (files-tree-sha256 decoded)))
                               (unless (equal? actual sha)
                                 (error (string-append "Package tree-sha256 mismatch for (" owner " " pkg "): expected " sha ", got " actual)))))
-                          (unless (file-exists? (tree-directory cloud sha))
-                            (error "Missing cached package tree:" sha)))
+                          (let ((cached-stats (verify-cached-tree! cloud tenant sha)))
+                            (unless cached-stats
+                              (error "Missing cached package tree:" sha))
+                            (set! total-files (+ total-files (car cached-stats)))
+                            (set! total-bytes (+ total-bytes (cdr cached-stats)))
+                            (when (> total-files max-files) (error "A deployment has 1000 files at most"))
+                            (when (> total-bytes max-bytes) (error "A deployment's files are 16 MiB at most"))))
                       (list owner pkg sha deps decoded))))
                 (vector->list raw-pkgs))))
       (unless (any (lambda (p) (and (equal? (car p) (car root-pair)) (equal? (cadr p) (cadr root-pair)))) parsed)
@@ -438,7 +597,7 @@ the others go on. The targets published, `tenant/project`."
 ;; What MESSAGE, an operation OP, is to do, checked: a `deploy`'s entry
 ;; and files (or packaged descriptor), `has-trees`'s list of digests, a
 ;; `secret-put`'s name and value; #t for another. An error for what is none.
-(define (check-operation cloud op message)
+(define (check-operation cloud tenant op message)
   (cond ((equal? op "has-trees")
          (let ((trees (dict-ref message "trees" #f)))
            (unless (and (vector? trees) (<= (vector-length trees) 128))
@@ -450,7 +609,7 @@ the others go on. The targets published, `tenant/project`."
          (let ((entry (dict-ref message "entry" #f))
                (pkg-obj (dict-ref message "package" #f)))
            (if pkg-obj
-               (check-packaged-deploy cloud entry pkg-obj)
+               (check-packaged-deploy cloud tenant entry pkg-obj)
                (let ((files (uploaded message)))
                  (unless (and (file-path? entry) (dict-ref files entry #f)) (error "The entry is one of the files:" entry))
                  ;; Its entry at the top, as a directory deployed is.
@@ -499,7 +658,7 @@ without is answered 503, its body unread."
                           (else #f))))
         (cond ((not message) (reply 400 '("error" "not-an-operation" "done")))
               ((not scope) (reply 400 '("error" "unknown-op" "done")))
-              ((not (and (cloud-name? tenant) (cloud-name? project))) (reply 400 '("error" "not-a-project" "done")))
+              ((not (and (cloud-name? tenant) (project-name? project))) (reply 400 '("error" "not-a-project" "done")))
               ;; Refused alike for a tenant not invited and one that is
               ;; another's: neither says which there are.
               ((not (and (equal? target (string-append tenant "/" project))
@@ -510,12 +669,16 @@ without is answered 503, its body unread."
                (%fleet-tenant tenant)
                ;; Checked first: one that is no operation makes no project.
                (let ((directory (project-directory cloud tenant project))
-                     (checked (check-operation cloud op message)))
+                     (checked (check-operation cloud tenant op message)))
                  (cond
                   ((equal? op "has-trees")
-                   (let ((have (filter (lambda (sha) (file-exists? (tree-directory cloud sha))) checked))
-                         (missing (filter (lambda (sha) (not (file-exists? (tree-directory cloud sha)))) checked)))
-                     (reply 200 '("done") "have" (list->vector have) "missing" (list->vector missing))))
+                   (let loop ((shas checked) (have '()) (missing '()))
+                     (if (null? shas)
+                         (reply 200 '("done") "have" (list->vector (reverse have)) "missing" (list->vector (reverse missing)))
+                         (let ((sha (car shas)))
+                           (if (verify-cached-tree! cloud tenant sha)
+                               (loop (cdr shas) (cons sha have) missing)
+                               (loop (cdr shas) have (cons sha missing)))))))
                   ((not (project-there? cloud tenant directory (member op '("deploy" "secret-put"))))
                    (reply 404 '("error" "no-such-project" "done")))
                   ((equal? op "deployments")
@@ -535,27 +698,41 @@ without is answered 503, its body unread."
                    (let* ((entry (cadr checked))
                           (root-pair (caddr checked))
                           (packages (cadddr checked))
-                          (specs (map (lambda (p) (list (car p) (cadr p) (caddr p) (cadddr p))) packages)))
-                     (apply reply 200 '("done")
-                            (dict->fields
-                             (control-deploy!
-                              (control-of cloud tenant project)
-                              #:stage (lambda () (stage-packaged! cloud directory root-pair packages))
-                              #:prepare (lambda ()
-                                          (%cloud-prepare-packaged
-                                           (string-append tenant "/" project)
-                                           (string-append directory "/source")
-                                           (trees-directory cloud)
-                                           entry
-                                           root-pair
-                                           specs)))))))
+                          (specs (map (lambda (p) (list (car p) (cadr p) (caddr p) (cadddr p))) packages))
+                          (stage-dir (string-append directory "/.stage-" (hex-encode (random-bytes 8))))
+                          (stage-source (string-append stage-dir "/source"))
+                          (stage-trees (string-append stage-dir "/trees"))
+                          (tenant-trees (tenant-trees-directory cloud tenant)))
+                     (dynamic-wind
+                       (lambda () #f)
+                       (lambda ()
+                         (let ((result
+                                (control-deploy!
+                                 (control-of cloud tenant project)
+                                 #:stage (lambda () (stage-packaged-ephemeral! cloud tenant directory stage-dir root-pair packages))
+                                 #:prepare (lambda ()
+                                             (%cloud-prepare-packaged
+                                              (string-append tenant "/" project)
+                                              stage-source
+                                              stage-trees
+                                              tenant-trees
+                                              entry
+                                              root-pair
+                                              specs)))))
+                           (commit-packaged-trees! cloud tenant directory stage-source root-pair packages)
+                           (apply reply 200 '("done") (dict->fields result))))
+                       (lambda ()
+                         (when (file-exists? stage-dir) (delete-path stage-dir #t))))))
                   (else
                    (let ((entry (cadr checked))
                          (files (caddr checked)))
                      (apply reply 200 '("done")
                             (dict->fields (control-deploy! (control-of cloud tenant project)
                                                            #:stage (lambda () (stage! directory files))
-                                                           #:entry (string-append directory "/source/" entry)))))))))))))
+                                                           #:prepare (lambda ()
+                                                                       (%cloud-prepare-legacy-directory
+                                                                        (string-append tenant "/" project)
+                                                                        (string-append directory "/source/" entry)))))))))))))))
   ;; Answer a request refused from its head: a little of its body is
   ;; read and dropped first, so that one that small is answered rather
   ;; than cut off; more is not read, and its connection closed.
@@ -575,7 +752,8 @@ without is answered 503, its body unread."
       (cond ((not claims) (refuse request 401 "error" "unauthenticated" "done"))
             ((not (and (equal? (dict-ref request 'method) "POST") (equal? (dict-ref request 'path) "/v1/ops")))
              (refuse request 400 "error" "not-an-operation" "done"))
-            ((not (and named (equal? named target))) (refuse request 400 "error" "not-a-project" "done"))
+            ((not (and named (equal? named target) (not (string-suffix? "/trees" target))))
+             (refuse request 400 "error" "not-a-project" "done"))
             ((not (or (token-allows? claims target "inspect") (token-allows? claims target "deploy")))
              (refuse request 403 "error" "refused" "done"))
             ((not (admit! cloud target)) (refuse request 503 "error" "busy" "done"))

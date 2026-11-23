@@ -975,7 +975,9 @@ What techne-vm and techne-node need that they do not have:
    immutable, read-only in-memory `BundleVfs` (`crates/techne-vm/src/bundle.rs`,
    `Vm::install_bundle`, `Vm::eval_bundle_entry`) with locked library
    resolution, without clocks or randomness, and production snapshots
-   strip host OS `PathBuf`s (`crates/techne-vm/src/vm/template.rs`).
+   strip `library_providers`, `package_imports`, and host reading
+   confinement (setting `ReadingAccess::DenyAll`, while stdlib source
+   metadata remains; `crates/techne-vm/src/vm/template.rs`).
    With the Org library loaded a world starts in 0.43 ms
    (`examples/snapshot.rs`). Still needed: measurements of a larger
    project and of the cost of the first requests before the JIT has
