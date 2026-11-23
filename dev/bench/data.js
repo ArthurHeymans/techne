@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795425083149,
+  "lastUpdate": 1795425084858,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -61256,6 +61256,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 627836839,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104418,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9548bac15a4327ef09da0b0f0d9d19d74b099a05",
+          "message": "Merge pull request #395 from ArthurHeymans/tools/dogfood-friction\n\nSmooth the rough edges of techne tool found while profiling the editor",
+          "timestamp": "2026-11-23T10:04:51+01:00",
+          "tree_id": "32dfd4e9d29e846c1e2795bfd9422a6fa59ce4b8",
+          "url": "https://github.com/ArthurHeymans/techne/commit/9548bac15a4327ef09da0b0f0d9d19d74b099a05"
+        },
+        "date": 1795425084800,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697382144,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 627790463,
             "unit": "instructions"
           },
           {
