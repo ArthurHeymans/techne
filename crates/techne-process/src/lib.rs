@@ -173,13 +173,18 @@ async fn fill(mut rx: mpsc::Receiver<Item>, ring: Arc<Ring>, cap: usize) {
     ring.ready.notify_one();
 }
 
+struct WriteReq {
+    data: Vec<u8>,
+    done: oneshot::Sender<Result<(), String>>,
+}
+
 /// A running (or finished) child process.
 pub struct Process {
     pid: u32,
     stdout: Output,
     /// `None` on a pty, where stderr is the terminal too.
     stderr: Option<Output>,
-    stdin: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    stdin: Mutex<Option<mpsc::Sender<WriteReq>>>,
     pty: bool,
     /// A handle on the pty's master side, for resizing.
     terminal: Option<std::os::fd::OwnedFd>,
@@ -444,10 +449,16 @@ async fn pump(mut reader: impl AsyncRead + Unpin, tx: mpsc::Sender<Item>, exit: 
 /// terminal open until the child exits: closing the last handle to the
 /// master hangs up the session, and the child would die of SIGHUP when it
 /// closes its own end before exiting (as `cat` does).
-async fn feed(mut writer: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver<Vec<u8>>, exit: Option<watch::Receiver<Option<ExitStatus>>>) {
-    while let Some(data) = rx.recv().await {
-        if writer.write_all(&data).await.is_err() {
-            break;
+async fn feed(mut writer: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver<WriteReq>, exit: Option<watch::Receiver<Option<ExitStatus>>>) {
+    while let Some(req) = rx.recv().await {
+        match writer.write_all(&req.data).await {
+            Ok(()) => {
+                let _ = req.done.send(Ok(()));
+            }
+            Err(e) => {
+                let _ = req.done.send(Err(format!("process-write: {e}")));
+                break;
+            }
         }
     }
     match exit {
@@ -484,6 +495,8 @@ pub struct Place {
     pub removed: Vec<String>,
     /// Its input, output and error output, in that order.
     pub streams: [Io; 3],
+    /// Start in a new session (`setsid`) with no controlling terminal.
+    pub detach_tty: bool,
 }
 
 /// Where a process's standard stream goes.
@@ -528,7 +541,7 @@ impl Process {
     pub fn spawn_in(program: &str, args: &[String], pty: bool, retain: Retain, place: &Place) -> std::io::Result<Process> {
         let rt = runtime();
         let _enter = rt.enter();
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(QUEUE_CHUNKS);
+        let (stdin_tx, stdin_rx) = mpsc::channel::<WriteReq>(QUEUE_CHUNKS);
         let (out_tx, stdout) = output(retain);
         let (status_tx, status) = watch::channel(None);
         // Only the pipes use tokio's process types. A tokio Child reaps on
@@ -573,7 +586,20 @@ impl Process {
                 }
                 _ => (output.stdio(false)?, error.stdio(false)?),
             };
-            let child = command.args(args).stdin(input.stdio(true)?).stdout(stdout).stderr(stderr).process_group(0).spawn()?;
+            command.args(args).stdin(input.stdio(true)?).stdout(stdout).stderr(stderr);
+            if place.detach_tty {
+                // SAFETY: setsid is async-signal-safe and starts a new session
+                // and process group (pgid == pid) with no controlling terminal.
+                unsafe {
+                    command.pre_exec(|| {
+                        rustix::process::setsid().map_err(std::io::Error::from)?;
+                        Ok(())
+                    });
+                }
+            } else {
+                command.process_group(0);
+            }
+            let child = command.spawn()?;
             (child, None)
         };
         let pid = child.id();
@@ -675,10 +701,13 @@ impl Process {
         self.stdout.dropped() + self.stderr.as_ref().map_or(0, Output::dropped)
     }
 
-    /// Queue `data` for the child's input (waits while the queue is full).
+    /// Write `data` to the child's input, waiting until the OS accepts it
+    /// (and failing if the child closed its input).
     pub async fn write(&self, data: Vec<u8>) -> Result<(), String> {
         let input = self.stdin.lock().unwrap().clone().ok_or("process-write: input is closed")?;
-        input.send(data).await.map_err(|_| "process-write: the process closed its input".to_string())
+        let (done, ack) = oneshot::channel();
+        input.send(WriteReq { data, done }).await.map_err(|_| "process-write: the process closed its input".to_string())?;
+        ack.await.map_err(|_| "process-write: the process closed its input".to_string())?
     }
 
     pub fn close_input(&self) {
@@ -856,7 +885,8 @@ const PRELUDE: &str = r#"
 
 (define (process-spawn program args #:pty [pty #f] #:node [node #f] #:persist [persist #f]
                        #:directory [directory #f] #:environment [environment '()]
-                       #:stdin [stdin #f] #:stdout [stdout #f] #:stderr [stderr #f])
+                       #:stdin [stdin #f] #:stdout [stdout #f] #:stderr [stderr #f]
+                       #:detach-tty [detach-tty #f])
   "Start PROGRAM with the list of strings ARGS; return the process.
 It runs with pipes or, with PTY, on a terminal; here, or on NODE. With
 PERSIST, on a node session, it survives disconnects, keeping its newest
@@ -868,9 +898,11 @@ one. STDIN, STDOUT and STDERR say where a local process's streams go:
 `pipe` (or #f), read and written here; `inherit`, this process's own;
 `null`; or a file's path, read from, or written from its start (both
 outputs to one path share it). A stream that is not a pipe reads as
-ended here. The process is in a process group of its own, so it is not
-the foreground of a terminal it inherits. The current scope owns a
-local process: shutting the scope kills it."
+ended here. With DETACH-TTY on a local non-PTY process, it starts in a
+new session (`setsid`) without a controlling terminal; otherwise it is
+in a process group of its own, so it is not the foreground of a terminal
+it inherits. The current scope owns a local process: shutting the scope
+kills it."
   (let* ((environment (%last-of-each-name environment))
          (set (filter cdr environment))
          (removed (map car (remove cdr environment)))
@@ -889,18 +921,21 @@ local process: shutting the scope kills it."
            (scope-own! (%process-spawn program args pty directory
                                        (append (map (lambda (p) (list (car p) (cdr p))) set)
                                                (map list removed))
-                                       streams)
+                                       streams
+                                       (and detach-tty #t))
                        process-kill %process-exited?)))))
 
 (define (call-with-process program args f #:pty [pty #f] #:node [node #f] #:persist [persist #f]
                            #:directory [directory #f] #:environment [environment '()]
-                           #:stdin [stdin #f] #:stdout [stdout #f] #:stderr [stderr #f])
+                           #:stdin [stdin #f] #:stdout [stdout #f] #:stderr [stderr #f]
+                           #:detach-tty [detach-tty #f])
   "Call F with a new process, killed when F returns, fails or is cancelled.
-PROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY, ENVIRONMENT, STDIN, STDOUT
-and STDERR are as `process-spawn` takes them."
+PROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY, ENVIRONMENT, STDIN, STDOUT,
+STDERR and DETACH-TTY are as `process-spawn` takes them."
   (let ((p (process-spawn program args #:pty pty #:node node #:persist persist
                           #:directory directory #:environment environment
-                          #:stdin stdin #:stdout stdout #:stderr stderr)))
+                          #:stdin stdin #:stdout stdout #:stderr stderr
+                          #:detach-tty detach-tty)))
     (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p) (scope-disown! p)))))
 
 (define (process-read-all p stream)
@@ -941,7 +976,7 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
 fn natives(vm: &mut Vm) {
     vm.name_foreign_type::<ProcessRef>("process");
     techne_vm::procedures! { vm;
-        "(%process-spawn program args pty directory environment streams)" => |program: String, args: Vec<String>, pty: bool, directory: Option<String>, environment: Vec<Vec<String>>, streams: Vec<Vec<String>>| -> Result<Foreign<ProcessRef>, String> {
+        "(%process-spawn program args pty directory environment streams detach-tty)" => |program: String, args: Vec<String>, pty: bool, directory: Option<String>, environment: Vec<Vec<String>>, streams: Vec<Vec<String>>, detach_tty: bool| -> Result<Foreign<ProcessRef>, String> {
             // (NAME VALUE) sets NAME, (NAME) takes it out.
             let (mut set, mut removed) = (Vec::new(), Vec::new());
             for p in environment {
@@ -962,7 +997,7 @@ fn natives(vm: &mut Vm) {
                 _ => Err(format!("process-spawn: {io:?} is not where a stream goes")),
             }).collect::<Result<Vec<_>, _>>()?;
             let streams = <[Io; 3]>::try_from(streams).map_err(|_| "process-spawn: three streams".to_string())?;
-            let place = Place { directory: directory.map(std::path::PathBuf::from), environment, removed, streams };
+            let place = Place { directory: directory.map(std::path::PathBuf::from), environment, removed, streams, detach_tty };
             let p = Process::spawn_in(&program, &args, pty, Retain::Queue, &place).map_err(|e| format!("process-spawn: {program}: {e}"))?;
             Ok(Foreign::new(ProcessRef::new(Rc::new(Arc::new(p)))))
         };

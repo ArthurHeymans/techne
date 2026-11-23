@@ -1287,3 +1287,62 @@ fn bare_world_handlers_can_wait() {
         assert_eq!(vm.task_result(&task).unwrap().unwrap().as_int(), Some(42), "{jit:?}");
     }
 }
+
+/// Round 22 (Finding 3): even in a bare world where raw handler primitives are
+/// still bound, VM authority barriers (`with_masked_outer_handlers`) cannot be
+/// popped, inspected, masked, or unwound across by Scheme code.
+#[test]
+fn bare_world_handler_primitives_cannot_cross_vm_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let dep_pop = dir.path().join("dep-pop.scm");
+    let dep_ops = dir.path().join("dep-ops.scm");
+    std::fs::write(&dep_pop, "(%pop-handler)\n").unwrap();
+    std::fs::write(
+        &dep_ops,
+        "(set-box! inner-res
+           (list
+             (%with-escape (lambda (e) (%push-handler (lambda (_) (e 'blocked))) (%handler-at 0)))
+             (%with-escape (lambda (e) (%push-handler (lambda (_) (e 'blocked))) (%handler-at 1)))
+             (%continuable-handler)
+             (%with-escape (lambda (e) (%push-handler (lambda (_) (e 'blocked))) (%with-escape (lambda (_) (%pop-handler))) 'popped))
+             (%with-escape (lambda (e) (%push-handler (lambda (_) (e 'blocked))) (%push-mask 1) 'masked))
+             (%with-escape (lambda (e) (%push-handler (lambda (_) (e 'blocked))) (%resume-unwind) 'resumed))))
+         (error \"inside-barrier\")\n",
+    )
+    .unwrap();
+    let dep_pop = dep_pop.canonicalize().unwrap().display().to_string();
+    let dep_ops = dep_ops.canonicalize().unwrap().display().to_string();
+
+    for jit in [None, Some(1)] {
+        let mut vm = Vm::bare();
+        vm.set_jit(jit);
+        let res = eval_str(
+            &mut vm,
+            &format!(
+                "(%make-world-scope)
+                 ((%compile-expression '(define inner-res (box 'unset)) \"root\"))
+                 (define child (%make-scope 'child (authority-scope)))
+                 (define outer-auth 'unset)
+                 (define outer-err-1 #f)
+                 (%scope-narrow! child)
+                 (define direct-pop
+                   (%with-escape
+                     (lambda (exit)
+                       (%push-handler (lambda (c) (set! outer-auth (root-authority?)) (set! outer-err-1 (error-object-message c)) (exit 'outer-caught)))
+                       ((%compile-expression (list 'require {dep_pop:?}) #f))
+                       'popped-barrier)))
+                 (define outer-err-2 #f)
+                 (%with-escape
+                   (lambda (exit)
+                     (%push-handler (lambda (c) (set! outer-err-2 (error-object-message c)) (exit 'outer-caught-2)))
+                     ((%compile-expression (list 'require {dep_ops:?}) #f))))
+                 (list direct-pop outer-auth outer-err-1 outer-err-2 (unbox inner-res))"
+            ),
+        );
+        assert_eq!(
+            res,
+            "(outer-caught #f \"%pop-handler: cannot pop past VM barrier\" \"inside-barrier\" (blocked blocked #f blocked blocked blocked))",
+            "{jit:?}"
+        );
+    }
+}

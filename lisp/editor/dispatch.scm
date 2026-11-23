@@ -18,7 +18,9 @@
 (require "../schema.scm")
 
 (provide press press-keys type-text command-doc
-         define-command register-command! register-command-package! command command-names run-command command-joins! message!
+         define-command register-command! register-command-package!
+         %register-command-package-in-scope! activate-command-package!
+         command command-names run-command command-joins! message!
          invoke make-contract command-contract command-code contract? contract-params contract-entries contract-read
          contract-effects contract-expose contract-available contract-stageable contract-result contract-hash
          contract-argument-schema contract-sensitive set-command-acquirer! contract-conform-argument ->data error-text messages-document message-log-max
@@ -163,12 +165,35 @@ Records of its runs keep the number of theirs (`record-code`)."
   (package offer-package) (doc offer-doc) (activate offer-activate)
   (impl offer-impl) (proxy offer-proxy))
 (define %offers (make-registry 'command-offers))
+(define %package-activators (make-registry 'command-package-activators))
 (define %offered-generation (make-parameter #f))
+(define %root-load-package (scope-procedure load-package))
 
-(define (register-command-package! package path commands)
-  "Advertise COMMANDS of PACKAGE without loading PATH.
-COMMANDS is a list of (name documentation) pairs. The current scope owns
-the declarations. A failed load can be retried."
+(define %builtin-packages-dir
+  (let* ((mod (current-module))
+         (n (string-length mod)))
+    (let loop ((i (- n 1)))
+      (cond ((< i 0) "packages/")
+            ((char=? (string-ref mod i) #\/)
+             (string-append (substring mod 0 (+ i 1)) "packages/"))
+            (else (loop (- i 1)))))))
+
+(define %builtin-bootstraps
+  '((compile compile-runtime . "../compile/runtime.scm")
+    (dired dired-runtime . "dired/runtime.scm")
+    (ibuffer ibuffer-runtime . "../ibuffer/runtime.scm")
+    (vc vc-runtime . "vc/runtime.scm")))
+
+(define (builtin-bootstrap-registration? package path)
+  (let* ((auth (authority-scope))
+         (expected (and (eq? (%staging-scope) auth)
+                        (assq (scope-name auth) %builtin-bootstraps))))
+    (and expected
+         (eq? package (cadr expected))
+         (string? path)
+         (string=? path (string-append %builtin-packages-dir (cddr expected))))))
+
+(define (%register-command-package-unchecked! package path commands)
   (unless (and (symbol? package) (string? path) (list? commands) (pair? commands)
                (every (lambda (c) (and (list? c) (= (length c) 2) (symbol? (car c)) (string? (cadr c)))) commands))
     (error "Invalid command package" package))
@@ -184,7 +209,7 @@ the declarations. A failed load can be retried."
     (define (activate)
       (when loading? (error "Package activation in progress" package))
       (unless (find-package package)
-        (dynamic-wind (lambda () (set! loading? #t)) (lambda () (load-package package path))
+        (dynamic-wind (lambda () (set! loading? #t)) (lambda () (%root-load-package package path))
                       (lambda () (set! loading? #f)))))
     (reserve-package! package path
       (lambda (load)
@@ -194,6 +219,7 @@ the declarations. A failed load can be retried."
               (for-each (lambda (c) (unless (hash-table-ref/default seen (car c) #f)
                                       (error "Package did not define advertised command" package (car c)))) commands)
               generation)))))
+    (registry-add! %package-activators package activate)
     (for-each (lambda (c)
                 (let* ((name (car c)) (proxy (lambda args (apply (caddr (resolve-command name)) args)))
                        ;; The bootstrap can reload independently of the implementation.
@@ -201,6 +227,26 @@ the declarations. A failed load can be retried."
                        (old (registry-ref %offers name)) (impl (if old (offer-impl old) (make-registry package)))
                        (offer (make-offer package (cadr c) activate impl proxy)))
                   (registry-add! %offers name offer) (registry-add! %commands name offer))) commands)))
+
+(define (%register-command-package-in-scope! scope package path commands)
+  (unless (root-authority?)
+    (error "register-command-package!: requires root authority" package))
+  (with-scope scope
+    (%register-command-package-unchecked! package path commands)))
+
+(define (register-command-package! package path commands)
+  "Advertise COMMANDS of PACKAGE without loading PATH.
+COMMANDS is a list of (name documentation) pairs. The current scope owns
+the declarations. A failed load can be retried."
+  (unless (or (root-authority?) (builtin-bootstrap-registration? package path))
+    (error "register-command-package!: requires root authority" package))
+  (%register-command-package-unchecked! package path commands))
+
+(define (activate-command-package! package)
+  "Activate the lazily registered command package PACKAGE."
+  (let ((act (registry-ref %package-activators package)))
+    (unless act (error "No command package registered" package))
+    (act)))
 
 (define (command-entry name)
   (let ((c (registry-ref %commands name)))

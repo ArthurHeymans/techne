@@ -210,7 +210,7 @@ impl Vm {
             let Some(i) = vm.continuable_handler() else { return Err(vm.raise_error_raw(v)) };
             let handler = vm.handler_at(i).expect("a handler procedure");
             let depth = vm.handlers.len();
-            vm.handlers.push(Handler::Mask { lo: i, raised: None });
+            vm.handlers.push(Handler::Mask { lo: i, raised: None, vm_barrier: false });
             let result = vm.call_host(handler, &[v]);
             vm.handlers.truncate(depth);
             result

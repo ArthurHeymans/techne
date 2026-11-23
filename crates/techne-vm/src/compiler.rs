@@ -2358,7 +2358,11 @@ impl Inline {
         };
         fn size(s: &Sexp, name: u32) -> Option<usize> {
             match s {
-                Sexp::Sym(x) if *x == name || special_form(*x) == Some("set!") => None,
+                Sexp::Sym(x)
+                    if *x == name || special_form(*x) == Some("set!") || crate::vm::scopes::is_boot_sealed(&reader::symbol_name(*x)) =>
+                {
+                    None
+                }
                 Sexp::List(items, tail, _) => items.iter().chain(tail.as_deref()).try_fold(1, |n, i| Some(n + size(i, name)?)),
                 Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => items.iter().try_fold(1, |n, i| Some(n + size(i, name)?)),
                 _ => Some(1),

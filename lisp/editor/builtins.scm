@@ -16,6 +16,7 @@
 (require "dispatch.scm")
 (require "modes.scm")
 (require "terminal-options.scm")
+(require "secrets-options.scm")
 
 (define builtin-packages (quote (compile dired ibuffer vc markdown-preview mail terminal))
   "The editor's own packages, loaded at start in this order.")

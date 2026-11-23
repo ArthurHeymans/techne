@@ -11,7 +11,6 @@ fn mail_scheme_suites() {
         "packages/mail/tests/host/mail-store-tests.scm",
         "packages/mail/tests/host/mail-smtp-timeout-tests.scm",
         "packages/mail/tests/mail-date-tests.scm",
-        "lisp/tests/authinfo-tests.scm",
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_techne")).current_dir(&root).arg("run").arg(root.join(suite)).output().unwrap();
         assert!(

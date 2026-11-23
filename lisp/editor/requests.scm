@@ -61,12 +61,13 @@ Its result is never delivered."
 ;; cancelled, OP ending, or the scope owning the task shutting.
 (define (hold-for-request! op task)
   (let* ((owned (list 'request))
+         (disown-owned (scope-procedure (lambda () (scope-disown! owned))))
          (hold #f)
          (released #f)
          (release (lambda (cancelled shut)
                     (unless released
                       (set! released #t)
-                      (unless shut (scope-disown! owned))
+                      (unless shut (disown-owned))
                       (operation-release! op hold #:cancelled cancelled))))
          ;; SHUT: the scope shuts, and cancelled the task already.
          (stop (lambda (shut)

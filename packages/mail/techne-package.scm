@@ -18,11 +18,13 @@ to, and mailbox makes the path one folder of that name.
 Sending uses from, smtp-host, smtp-port and smtp-user. The imap-security
 and smtp-security settings default to implicit-tls (IMAP 993, SMTP 465).
 Set either to starttls for mandatory STARTTLS (IMAP 143, SMTP 587).
-Passwords are never stored here: `mail-credential-provider` supplies them.")
+Passwords are never stored here: `secret-sources` (or per-account `secret` /
+`smtp-secret` refs, or `mail-credential-provider`) supplies them.")
       (mail-credential-provider #f any
         "Procedure (account purpose) returning a secret for imap or smtp.
-Use a secret manager in this procedure. Secrets are not persisted or logged.
-No password is read in the visible minibuffer.")
+Overrides `secret-sources` when set; may return a string, `secret` or
+`secret-ref`. Secrets are not persisted or logged. No password is read
+in the visible minibuffer.")
       (mail-database #f any
         "Local mail SQLite file, or #f for the XDG data directory.
 The default is XDG_DATA_HOME/techne/mail/cache.sqlite. Set this before

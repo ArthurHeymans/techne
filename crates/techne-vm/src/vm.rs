@@ -576,6 +576,13 @@ pub(crate) struct Module {
     /// Its package generation was retired or its library load aborted:
     /// it is freed once nothing live uses it.
     retired: bool,
+    /// True only for ephemeral R7RS `(environment ...)` modules, which contain
+    /// only public imports and never expose any library's private bindings.
+    pub(crate) is_environment: bool,
+    /// True only when loaded directly from a canonical file on disk under
+    /// Techne's shipped core Lisp tree (never for caller-supplied text or
+    /// untrusted paths).
+    pub(crate) trusted_disk_source: bool,
     /// What its tables took when last counted (`Vm::recharge_module`).
     pub(crate) charged: usize,
 }
@@ -665,6 +672,9 @@ impl Labels<'_> {
 pub(crate) struct SourceFile {
     pub name: Rc<str>,
     pub text: Rc<str>,
+    /// True only for source files read directly from disk by the VM's module
+    /// loader, never for caller-supplied `eval` / `%read-forms` / `load-module-from`.
+    pub(crate) from_disk: bool,
     /// Where each line after the first starts, once a position was asked
     /// for (`line_col`): help asks for thousands.
     lines: Rc<std::cell::OnceCell<Box<[u32]>>>,
@@ -672,7 +682,7 @@ pub(crate) struct SourceFile {
 
 impl SourceFile {
     pub(crate) fn new(name: &str, text: &str) -> SourceFile {
-        SourceFile { name: name.into(), text: text.into(), lines: Rc::default() }
+        SourceFile { name: name.into(), text: text.into(), from_disk: false, lines: Rc::default() }
     }
 
     /// The line and column, from 1, of byte position `pos`, as
@@ -721,11 +731,11 @@ enum Handler {
     /// An after-thunk is running. Its normal return resumes this owned,
     /// rooted transfer; an error/escape unwinding past it drops it instead.
     Unwind { pending: Rc<RefCell<Option<Error>>> },
-    /// A handler procedure is running: entries from `lo` up to this one
-    /// are hidden from what it raises (escape points and winds there stay
-    /// live). Pushed when it is called, popped when it returns, and with
-    /// the rest when unwinding past it.
-    Mask { lo: usize, raised: Option<Rc<Raised>> },
+    /// A handler procedure is running (or a VM authority barrier is active):
+    /// entries from `lo` up to this one are hidden from what it raises (escape
+    /// points and winds there stay live). When `vm_barrier` is true, Scheme
+    /// handler operations cannot pop, inspect, mask, or unwind across this entry.
+    Mask { lo: usize, raised: Option<Rc<Raised>>, vm_barrier: bool },
 }
 
 /// Source text being evaluated a form at a time (`Vm::read_forms`): the
@@ -734,6 +744,15 @@ pub(crate) struct Forms {
     module: u32,
     forms: RefCell<VecDeque<(Sexp, u32)>>,
     library: bool,
+    /// True only for forms loaded directly from disk by the VM's module/library
+    /// loaders for a world (`generation == 0`) module, never for `%read-forms`.
+    world_load: bool,
+    /// True only for forms loaded directly from disk by the VM's package/module/
+    /// library loaders for the active staged package generation, never for
+    /// caller-supplied `%read-forms` or `load-module-from`.
+    staging_load: bool,
+    /// Ensures a privileged `Forms` handle can only enter world/staging loading once.
+    pub(crate) world_entered: std::cell::Cell<bool>,
     /// Let go of once the forms are done (`Vm::finish_forms`), or else
     /// when the collector finds them unreachable. Includes may add files.
     holds: RefCell<Vec<Hold>>,
@@ -816,8 +835,17 @@ pub enum SpecialObj {
     UnwindAfter = 8,
     InputForms = 9,
     InputCall = 10,
+    ScopeCapRtd = 11,
+    ProtectedParamRtd = 12,
+    SavedParamRtd = 13,
+    CleanupActionRtd = 14,
+    ParameterRtd = 15,
+    PrimResumeUnwind = 16,
+    PrimPushWind = 17,
+    PrimPopHandler = 18,
+    PrimEnterFormsModule = 19,
 }
-const SPECIALS: usize = 11;
+const SPECIALS: usize = 20;
 
 /// Whether compiled code runs small functions inline (`TECHNE_JIT_INLINE=0`
 /// turns it off).
@@ -1042,6 +1070,8 @@ pub struct Vm {
     /// Scheme names for foreign Rust types (by `type_name`), for dispatch.
     pub(crate) foreign_type_names: FxHashMap<&'static str, u32>,
     next_id: i64,
+    pub(crate) next_protected_local_key: i64,
+    pub(crate) next_owned_id: u64,
     pub(crate) tasks: Vec<crate::tasks::Task>,
     /// Slots of `tasks` free for new tasks: those of finished ones.
     pub(crate) free_tasks: Vec<usize>,
@@ -1481,6 +1511,12 @@ impl Vm {
         vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", crate::tasks::TASK_FIELDS);
         vm.specials[SpecialObj::ChannelRtd as usize] = vm.make_rtd("channel", &["slot", "generation"]);
         vm.specials[SpecialObj::ScopeRtd as usize] = vm.make_rtd("scope", scopes::SCOPE_FIELDS);
+        vm.specials[SpecialObj::ScopeCapRtd as usize] = vm.make_rtd("scope-capability", scopes::SCOPE_CAP_FIELDS);
+        vm.specials[SpecialObj::ProtectedParamRtd as usize] =
+            vm.make_applicable_rtd("protected-parameter", scopes::PROTECTED_PARAM_FIELDS, 0);
+        vm.specials[SpecialObj::SavedParamRtd as usize] = vm.make_rtd("saved-parameter", scopes::SAVED_PARAM_FIELDS);
+        vm.specials[SpecialObj::CleanupActionRtd as usize] = vm.make_rtd("cleanup-action", scopes::CLEANUP_ACTION_FIELDS);
+        vm.specials[SpecialObj::ParameterRtd as usize] = vm.make_applicable_rtd("parameter", &["proc", "key", "convert"], 0);
         crate::builtins::install(&mut vm);
         let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
         vm.apply_native = vm.globals[apply as usize];
@@ -1585,6 +1621,8 @@ impl Vm {
             foreign_free: Vec::new(),
             foreign_type_names: FxHashMap::default(),
             next_id: 0,
+            next_protected_local_key: scopes::PROTECTED_PARAM_KEY_BASE,
+            next_owned_id: 1,
             tasks: Vec::new(),
             free_tasks: Vec::new(),
             live: 0,
@@ -1633,6 +1671,14 @@ impl Vm {
     }
 
     fn make_rtd(&mut self, name: &str, fields: &[&str]) -> Value {
+        self.make_rtd_with(name, fields, Value::FALSE)
+    }
+
+    fn make_applicable_rtd(&mut self, name: &str, fields: &[&str], proc_field: usize) -> Value {
+        self.make_rtd_with(name, fields, Value::int_unchecked(proc_field as i64))
+    }
+
+    fn make_rtd_with(&mut self, name: &str, fields: &[&str], applicable: Value) -> Value {
         let names = Sexp::list_of(fields.iter().map(|f| Sexp::Sym(reader::intern(f))).collect());
         let names = self.constant(&names);
         let id = self.fresh_id();
@@ -1642,9 +1688,36 @@ impl Vm {
             set_field(p, 0, Value::symbol(reader::intern(name)));
             set_field(p, 1, names);
             set_field(p, 2, Value::int_unchecked(id));
-            set_field(p, 3, Value::FALSE);
+            set_field(p, 3, applicable);
         }
         Value::ptr(p)
+    }
+
+    /// Remove VM-internal bootstrap primitives from `ROOT_MODULE` after the
+    /// prelude has captured them into sealed closures.
+    pub(crate) fn seal_boot_globals(&mut self, names: &[&str]) {
+        for (name, slot) in [
+            ("%resume-unwind", SpecialObj::PrimResumeUnwind),
+            ("%push-wind", SpecialObj::PrimPushWind),
+            ("%pop-handler", SpecialObj::PrimPopHandler),
+            ("%enter-forms-module", SpecialObj::PrimEnterFormsModule),
+        ] {
+            let sym = reader::intern(name);
+            if let Some(&GlobalBinding::Var(g)) = self.bindings.get(&(ROOT_MODULE, sym)) {
+                self.specials[slot as usize] = self.globals[g as usize];
+            }
+        }
+        let mut removed = Vec::with_capacity(names.len());
+        for &name in names {
+            let sym = reader::intern(name);
+            removed.push(sym);
+            // Unbind from ROOT_MODULE without clearing `self.globals[g]`:
+            // prelude procedures compiled before sealing keep their direct
+            // global-slot references, unreachable by name from any later code.
+            self.bindings.remove(&(ROOT_MODULE, sym));
+        }
+        self.modules[ROOT_MODULE as usize].defined.retain(|s| !removed.contains(s));
+        self.recharge_module(ROOT_MODULE);
     }
 
     // ----- modules and globals -----
@@ -1668,6 +1741,8 @@ impl Vm {
             isolated: false,
             generation,
             retired: false,
+            is_environment: false,
+            trusted_disk_source: false,
             charged: 0,
         };
         let m = match self.free_modules.pop() {
@@ -2096,12 +2171,12 @@ impl Vm {
                 // From the idle host (`find_module`, `require`), the body is
                 // an input, which can wait; from a native, it nests.
                 let name = path.to_string_lossy();
-                let result = self.in_module_load_scope(m, |vm| {
+                let result = self.in_module_load_scope(m, true, |vm| {
                     if vm.input_ready() {
                         let mut module = m;
                         vm.eval_input_source(&mut module, &name, &text).map(drop)
                     } else {
-                        vm.eval_in_raw(m, &name, &text).map(drop)
+                        vm.eval_in_raw_from_disk(m, &name, &text).map(drop)
                     }
                 });
                 self.end_module_load(m);
@@ -2144,6 +2219,7 @@ impl Vm {
             }
             None => {
                 // The text, and the copy kept as the file's source.
+                let from_disk = text.is_none();
                 let text = match text {
                     Some(text) => text,
                     None => self.read_file_admitted(&path.to_string_lossy(), 2)?,
@@ -2155,6 +2231,7 @@ impl Vm {
                 };
                 self.modules[m as usize].loading = true;
                 self.modules[m as usize].loader = loader;
+                self.modules[m as usize].trusted_disk_source = from_disk && self.is_trusted_core_module_path(path);
                 Ok(ModuleLoad::Load(m, text))
             }
         }
@@ -2220,7 +2297,12 @@ impl Vm {
                     Ok::<_, Error>(read)
                 })?),
                 "define-library" => {
-                    let library = self.pinning(|vm| vm.library_forms(form.list().unwrap(), forms.module, file, &dir))?;
+                    let mut library = self.pinning(|vm| vm.library_forms(form.list().unwrap(), forms.module, file, &dir))?;
+                    let module_gen = self.modules[library.module as usize].generation;
+                    library.world_load = forms.world_load && module_gen == 0;
+                    library.staging_load = forms.staging_load && self.staging_here().is_some_and(|s| module_gen == s.generation);
+                    self.modules[library.module as usize].trusted_disk_source =
+                        forms.world_load && self.modules[forms.module as usize].trusted_disk_source;
                     forms.forms.borrow_mut().pop_front();
                     return Ok(Some(library));
                 }
@@ -2255,9 +2337,14 @@ impl Vm {
             let loader = Some(self.running_execution());
             match self.begin_module_load(&path, loader)? {
                 ModuleLoad::Load(m, text) => {
-                    let forms = self.read_forms(m, &path.to_string_lossy(), &text);
-                    if forms.is_err() {
-                        self.end_module_load(m);
+                    let mut forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                    match &mut forms {
+                        Ok(f) => {
+                            let module_gen = self.modules[m as usize].generation;
+                            f.world_load = module_gen == 0;
+                            f.staging_load = self.staging_here().is_some_and(|s| module_gen == s.generation);
+                        }
+                        Err(_) => self.end_module_load(m),
                     }
                     return forms.map(Some);
                 }
@@ -2401,13 +2488,44 @@ impl Vm {
         *self.held_files.entry(file).or_default() += 1;
         *self.held_modules.entry(module).or_default() += 1;
         let hold = Hold { file, module, unheld: self.unheld_files.clone() };
-        let forms = Forms { module, forms: RefCell::new(VecDeque::new()), library, holds: RefCell::new(vec![hold]) };
+        let forms = Forms {
+            module,
+            forms: RefCell::new(VecDeque::new()),
+            library,
+            world_load: false,
+            staging_load: false,
+            world_entered: std::cell::Cell::new(false),
+            holds: RefCell::new(vec![hold]),
+        };
         self.hold_form_files(&forms, &read);
         for (form, _) in &read {
             predeclare(self, module, form);
         }
         *forms.forms.borrow_mut() = read.into();
         forms
+    }
+
+    /// The forms of the module at `path`, read from disk: made and marked
+    /// loading as `begin_module_load` does, to evaluate in it (`%load-forms`).
+    pub(crate) fn module_forms_from_disk(&mut self, path: &Path) -> Result<Option<Forms>, Error> {
+        self.check_loading()?;
+        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let loader = Some(self.running_execution());
+        match self.begin_module_load(&path, loader)? {
+            ModuleLoad::Loaded(_) => Ok(None),
+            ModuleLoad::Load(m, text) => {
+                let mut forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                match &mut forms {
+                    Ok(f) => {
+                        let module_gen = self.modules[m as usize].generation;
+                        f.world_load = module_gen == 0;
+                        f.staging_load = self.staging_here().is_some_and(|s| module_gen == s.generation);
+                    }
+                    Err(_) => self.end_module_load(m),
+                }
+                forms.map(Some)
+            }
+        }
     }
 
     /// The forms of the module of the file at `path`, read from `text`
@@ -2417,13 +2535,23 @@ impl Vm {
     pub(crate) fn module_forms_from(&mut self, path: &Path, text: String) -> Result<Option<Forms>, Error> {
         self.check_loading()?;
         let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        if !self.is_root_authority() && self.is_trusted_core_module_path(&path) {
+            return Err(Error::new("load-module-from: requires root authority for core library path"));
+        }
         let loader = Some(self.running_execution());
         match self.begin_module_load_from(&path, loader, Some(text))? {
             ModuleLoad::Loaded(_) => Ok(None),
             ModuleLoad::Load(m, text) => {
-                let forms = self.read_forms(m, &path.to_string_lossy(), &text);
-                if forms.is_err() {
-                    self.end_module_load(m);
+                let mut forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                match &mut forms {
+                    Ok(f) => {
+                        // Caller-supplied text never gains staging authority or
+                        // trusted core authority; world-generation loads still
+                        // run in an isolated non-root world-dep scope.
+                        f.world_load = self.modules[m as usize].generation == 0;
+                        f.staging_load = false;
+                    }
+                    Err(_) => self.end_module_load(m),
                 }
                 forms.map(Some)
             }
@@ -2485,9 +2613,39 @@ impl Vm {
     /// Whether `forms` are those of a module that is the world's, loading
     /// while this execution stages a package: a file or library from
     /// outside its directory, or one a package provides. What it starts
-    /// and registers as it loads is the world's with it (`%load-forms`).
+    /// and registers as it loads is the world's with it (`%load-forms`),
+    /// though execution authority is granted separately based on trusted
+    /// provenance (`is_trusted_core_module`).
     pub(crate) fn forms_of_world(&self, forms: &Forms) -> bool {
-        self.staging_here().is_some() && self.modules[forms.module as usize].generation == 0
+        self.scopes.len() >= 2
+            && (self.staging_here().is_some() || !self.is_root_authority())
+            && forms.world_load
+            && self.modules[forms.module as usize].generation == 0
+    }
+
+    /// Whether `forms` are loader-issued forms belonging to the package
+    /// currently being staged by this execution.
+    pub(crate) fn forms_of_staging(&self, forms: &Forms) -> bool {
+        forms.staging_load && self.staging_here().is_some_and(|s| self.modules[forms.module as usize].generation == s.generation)
+    }
+
+    /// Whether canonical `path` has trusted core provenance (Techne's shipped
+    /// standard/core Lisp under `library::lisp_dir()`, excluding packages,
+    /// examples, and tests).
+    pub(crate) fn is_trusted_core_module_path(&self, path: &Path) -> bool {
+        let Ok(own) = crate::library::lisp_dir().canonicalize() else { return false };
+        let Ok(rel) = path.strip_prefix(&own) else { return false };
+        let mut comps = rel.components();
+        match comps.next().and_then(|c| c.as_os_str().to_str()) {
+            Some("techne" | "srfi") => true,
+            Some("editor") => !matches!(comps.next().and_then(|c| c.as_os_str().to_str()), Some("packages" | "examples" | "tests")),
+            _ => false,
+        }
+    }
+
+    /// Whether `module` is a world module with verified trusted core disk provenance.
+    pub(crate) fn is_trusted_core_module(&self, module: u32) -> bool {
+        self.modules.get(module as usize).is_some_and(|m| m.generation == 0 && m.trusted_disk_source)
     }
 
     /// Whether a module of the file at `path` is the staged package's own:
@@ -2538,9 +2696,10 @@ impl Vm {
         let forms = match self.begin_module_load(&path, owner) {
             Ok(ModuleLoad::Load(m, text)) => {
                 self.staging.as_mut().expect("staging").main = Some(m);
-                let forms = self.read_forms(m, &path.to_string_lossy(), &text);
-                if forms.is_err() {
-                    self.end_module_load(m);
+                let mut forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                match &mut forms {
+                    Ok(f) => f.staging_load = true,
+                    Err(_) => self.end_module_load(m),
                 }
                 forms
             }
@@ -3403,7 +3562,11 @@ impl Vm {
         // thread may be running.
         let _charged = self.charging();
         let root = Root::new(v, self.world);
-        self.roots.get_mut().push(Rc::downgrade(root.cell()));
+        let roots = self.roots.get_mut();
+        if roots.len() == roots.capacity() && roots.capacity() >= 1024 {
+            roots.retain(|w| w.strong_count() > 0);
+        }
+        roots.push(Rc::downgrade(root.cell()));
         root
     }
 
@@ -3643,7 +3806,7 @@ impl Vm {
         let result = (|| {
             let helper = SpecialObj::InputForms;
             if !is_kind(self.special(helper), Kind::Closure) {
-                self.compile_vm_helper(helper, include_str!("input.scm"))?;
+                self.compile_input_forms()?;
             }
             let value = self.make_foreign_raw(forms.clone(), "forms");
             self.drive_input(self.special(helper), &[value])
@@ -3724,7 +3887,7 @@ impl Vm {
     /// `*module` to the module current at the end (`in-module` switches it).
     pub(crate) fn eval_interactive_raw(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {
         let saved = std::mem::replace(&mut self.current_module, *module);
-        let result = self.eval_forms(*module, name, source);
+        let result = self.eval_forms(*module, name, source, false);
         *module = std::mem::replace(&mut self.current_module, saved);
         result
     }
@@ -3732,17 +3895,28 @@ impl Vm {
     /// Evaluate source text in `module`, the file `name`.
     pub(crate) fn eval_in_raw(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
         let saved = std::mem::replace(&mut self.current_module, module);
-        let result = self.eval_forms(module, name, source);
+        let result = self.eval_forms(module, name, source, false);
         self.current_module = saved;
         result
     }
 
-    fn eval_forms(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
-        self.as_execution(|vm| vm.pinning(|vm| vm.eval_forms_pinned(module, name, source)))
+    /// Evaluate disk-backed module source text in `module`, marking its
+    /// `SourceFile` as `from_disk = true` so nested `(define-library ...)`
+    /// declarations retain disk provenance.
+    pub(crate) fn eval_in_raw_from_disk(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
+        let saved = std::mem::replace(&mut self.current_module, module);
+        let result = self.eval_forms(module, name, source, true);
+        self.current_module = saved;
+        result
     }
 
-    fn eval_forms_pinned(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
+    fn eval_forms(&mut self, module: u32, name: &str, source: &str, from_disk: bool) -> Result<Value, Error> {
+        self.as_execution(|vm| vm.pinning(|vm| vm.eval_forms_pinned(module, name, source, from_disk)))
+    }
+
+    fn eval_forms_pinned(&mut self, module: u32, name: &str, source: &str, from_disk: bool) -> Result<Value, Error> {
         let file = self.add_file(name, source)?;
+        self.files[file as usize].from_disk = from_disk;
         let meter = meter::Meter::new(self);
         let forms = reader::read_metered(source, false, &meter).map_err(|e| match e.pos {
             Some(pos) => {
@@ -3870,7 +4044,15 @@ impl Vm {
         })?;
         *self.held_modules.entry(module).or_default() += 1;
         let hold = Hold { file, module, unheld: self.unheld_files.clone() };
-        let forms = Forms { module, forms: RefCell::new(VecDeque::new()), library: false, holds: RefCell::new(vec![hold]) };
+        let forms = Forms {
+            module,
+            forms: RefCell::new(VecDeque::new()),
+            library: false,
+            world_load: false,
+            staging_load: false,
+            world_entered: std::cell::Cell::new(false),
+            holds: RefCell::new(vec![hold]),
+        };
         let meter = meter::Meter::new(self);
         let read = reader::read_metered(source, false, &meter).map_err(|e| match e.pos {
             Some(pos) => {
@@ -3885,6 +4067,18 @@ impl Vm {
         }
         *forms.forms.borrow_mut() = read.into_iter().map(|f| (f, file)).collect();
         Ok(forms)
+    }
+
+    /// Enforce that non-root callers cannot evaluate in or switch into another
+    /// module's private namespace (`eval`, `eval-source`, `in-module`,
+    /// `%enter-module`). Non-root callers may target their own current module
+    /// or an ephemeral R7RS `(environment ...)` module (which holds only public
+    /// exports).
+    pub(crate) fn require_module_eval_access(&self, module: u32, who: &str) -> Result<(), Error> {
+        if self.is_root_authority() || module == self.current_module() || self.modules[module as usize].is_environment {
+            return Ok(());
+        }
+        Err(Error::new(format!("{who}: requires root authority to evaluate in module {}", self.modules[module as usize].name)))
     }
 
     /// Make `module` current, saving the one current before for
@@ -4043,10 +4237,28 @@ impl Vm {
         self.handlers.push(Handler::Proc { handler });
     }
 
-    /// Pop the innermost handler entry (end of a dynamic-wind body or a
-    /// with-exception-handler thunk).
-    pub(crate) fn pop_handler(&mut self) {
-        self.handlers.pop();
+    /// Index immediately above the topmost VM authority barrier on the handler
+    /// stack, or 0 if none is active. Scheme-level handler operations cannot
+    /// cross this floor.
+    pub(crate) fn handler_barrier_floor(&self) -> usize {
+        self.handlers.iter().rposition(|h| matches!(h, Handler::Mask { vm_barrier: true, .. })).map_or(0, |i| i + 1)
+    }
+
+    /// Pop the innermost handler entry (end of a dynamic-wind body,
+    /// with-exception-handler thunk, or handler mask), refusing to cross a VM
+    /// authority barrier or remove compiler-managed Guard/Escape/Unwind entries.
+    pub(crate) fn pop_handler(&mut self) -> Result<(), Error> {
+        let floor = self.handler_barrier_floor();
+        if self.handlers.len() <= floor {
+            return Err(Error::new("%pop-handler: cannot pop past VM barrier"));
+        }
+        match self.handlers.last() {
+            Some(Handler::Wind { .. } | Handler::Proc { .. } | Handler::Mask { vm_barrier: false, .. }) => {
+                self.handlers.pop();
+                Ok(())
+            }
+            _ => Err(Error::new("%pop-handler: top handler is not Scheme-poppable")),
+        }
     }
 
     /// Task termination has no guest work left after dispatch, including
@@ -4071,9 +4283,11 @@ impl Vm {
     }
 
     pub(crate) fn resume_unwind(&mut self) -> Error {
-        let Some(i) = self.handlers.iter().rposition(|h| matches!(h, Handler::Unwind { .. })) else {
+        let floor = self.handler_barrier_floor();
+        let Some(rel) = self.handlers[floor..].iter().rposition(|h| matches!(h, Handler::Unwind { .. })) else {
             return Error::new("no unwind to resume");
         };
+        let i = floor + rel;
         self.handlers.truncate(i + 1);
         match self.handlers.pop() {
             Some(Handler::Unwind { pending }) => pending.borrow_mut().take().unwrap_or_else(|| Error::new("unwind already resumed")),
@@ -4478,12 +4692,16 @@ impl Vm {
         pending: Error,
     ) -> Result<(*const Code, usize), Error> {
         let helper = SpecialObj::UnwindAfter;
+        let base = unsafe { bp + (*code).frame_size as usize };
         if !is_kind(self.special(helper), Kind::Closure) {
-            self.compile_vm_helper(helper, "(lambda (after) (after) (%resume-unwind))")?;
+            let saved_top = self.stack_top;
+            self.stack_top = saved_top.max(base);
+            let res = self.compile_unwind_after();
+            self.stack_top = saved_top;
+            res?;
         }
         unsafe {
             let callee = self.closure_code(self.special(helper));
-            let base = bp + (*code).frame_size as usize;
             let new_bp = base + 1;
             let top = self.stack_top.max(base) as u32;
             self.ensure_regs(new_bp + (*callee).frame_size as usize + 1)?;
@@ -4524,10 +4742,78 @@ impl Vm {
             self.stack_top = self.stack_top.max(new_bp + 3);
             self.enter(callee, new_bp, 3)?;
             self.stack_top = self.stack_top.max(new_bp + (*callee).frame_size as usize);
-            self.handlers.push(Handler::Mask { lo: call.index, raised: Some(call.raised) });
+            self.handlers.push(Handler::Mask { lo: call.index, raised: Some(call.raised), vm_barrier: false });
             self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top, trace_call: false });
             Ok((callee, new_bp))
         }
+    }
+
+    fn compile_unwind_after(&mut self) -> Result<SpecialObj, Error> {
+        self.compile_vm_helper_capturing(
+            SpecialObj::UnwindAfter,
+            "(lambda (%resume-unwind) (lambda (after) (after) (%resume-unwind)))",
+            &[("%resume-unwind", SpecialObj::PrimResumeUnwind)],
+        )
+    }
+
+    fn compile_input_forms(&mut self) -> Result<SpecialObj, Error> {
+        let wrapped = format!("(lambda (%push-wind %pop-handler %enter-forms-module) {})", include_str!("input.scm"));
+        self.compile_vm_helper_capturing(
+            SpecialObj::InputForms,
+            &wrapped,
+            &[
+                ("%push-wind", SpecialObj::PrimPushWind),
+                ("%pop-handler", SpecialObj::PrimPopHandler),
+                ("%enter-forms-module", SpecialObj::PrimEnterFormsModule),
+            ],
+        )
+    }
+
+    fn compile_vm_helper_capturing(
+        &mut self,
+        special: SpecialObj,
+        factory_source: &str,
+        captures: &[(&str, SpecialObj)],
+    ) -> Result<SpecialObj, Error> {
+        let mut args = Vec::with_capacity(captures.len());
+        for &(name, slot) in captures {
+            let saved = self.special(slot);
+            let v = if saved != Value::VOID && saved != Value::UNDEFINED {
+                saved
+            } else {
+                let sym = reader::intern(name);
+                let Some(&GlobalBinding::Var(g)) = self.bindings.get(&(ROOT_MODULE, sym)) else {
+                    return Err(Error::new(format!("compile_vm_helper_capturing: missing boot primitive {name}")));
+                };
+                let gval = self.globals[g as usize];
+                if gval == Value::UNDEFINED {
+                    return Err(Error::new(format!("compile_vm_helper_capturing: undefined boot primitive {name}")));
+                }
+                gval
+            };
+            args.push(self.root(v));
+        }
+        let factory = self.pinning(|vm| {
+            let file = vm.add_file("<vm helper>", factory_source)?;
+            let form = reader::read(factory_source).map_err(Error::new)?.remove(0);
+            let compiling = vm.compiling.len();
+            let code = Compiler::new(vm, ROOT_MODULE, file).compile_closed_lambda(&form)?;
+            if matches!(special, SpecialObj::InputForms) {
+                for &code in &vm.compiling[compiling..] {
+                    vm.code(code).jit.failed.set(true);
+                }
+            }
+            let p = vm.alloc(2);
+            unsafe {
+                *p = header(Kind::Closure, 1, 0);
+                set_field(p, 0, Value::int_unchecked(code as i64));
+            }
+            Ok::<_, Error>(vm.root(Value::ptr(p)))
+        })?;
+        let arg_vals: Vec<Value> = args.iter().map(Root::get).collect();
+        let closure = self.call_running(factory.get(), &arg_vals)?;
+        self.specials[special as usize] = closure;
+        Ok(special)
     }
 
     /// Bare worlds need the same handler call as the prelude supplies.
@@ -4589,8 +4875,12 @@ impl Vm {
         })?
     }
 
-    /// The handler procedure at `index` of the handler stack.
+    /// The handler procedure at `index` of the handler stack, if visible above
+    /// any active VM barrier and unmasked.
     pub(crate) fn handler_at(&self, index: usize) -> Option<Value> {
+        if index < self.handler_barrier_floor() || index >= self.handlers.len() || self.masked(index) {
+            return None;
+        }
         match self.handlers.get(index) {
             Some(Handler::Proc { handler }) => Some(handler.get()),
             _ => None,
@@ -4603,7 +4893,7 @@ impl Vm {
         if self.handler_at(lo).is_none() {
             return Err(Error::new("%push-mask: no handler procedure there"));
         }
-        self.handlers.push(Handler::Mask { lo, raised: None });
+        self.handlers.push(Handler::Mask { lo, raised: None, vm_barrier: false });
         Ok(())
     }
 
@@ -4632,7 +4922,8 @@ impl Vm {
     pub(crate) fn handler_returned(&mut self, condition: Value, index: usize) -> Error {
         let msg = crate::builtins::condition_message(self, condition);
         let mut e = Error::new(format!("exception handler returned from non-continuable raise: {msg}"));
-        e.searched = Some((self.world, index.min(self.handlers.len()) as u32));
+        let floor = self.handler_barrier_floor();
+        e.searched = Some((self.world, index.clamp(floor, self.handlers.len()) as u32));
         e
     }
 

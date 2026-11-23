@@ -297,6 +297,8 @@ impl Vm {
             specials,
             foreign_type_names,
             next_id,
+            next_protected_local_key,
+            next_owned_id,
         } = &**template;
 
         let mut vm = Vm::empty(*grants, account);
@@ -379,6 +381,8 @@ impl Vm {
         vm.natives.clone_from(natives);
         vm.foreign_type_names.clone_from(foreign_type_names);
         vm.next_id = *next_id;
+        vm.next_protected_local_key = *next_protected_local_key;
+        vm.next_owned_id = *next_owned_id;
         vm.free_scopes.clone_from(free_scopes);
         // Its copies of the tables are its own, and need not keep the
         // template's spare room.

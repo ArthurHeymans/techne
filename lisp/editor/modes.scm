@@ -37,7 +37,7 @@
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          register-mode-line-segment! mode-line-segments
          define-option register-option! advertise-package!
-         find-option option-names option-name option-default option-doc option-type
+         find-option option-names option-name option-default option-doc option-type option-user-only?
          set-option! unset-option! option explain-option
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
          buffer-directory buffer-input buffer-display-options)
@@ -265,13 +265,55 @@ That is the one with the longest suffix of PATH, else
 
 ;;; Options
 
+(define (clone-option-value v [strict? #f])
+  (cond
+    ((or (boolean? v) (symbol? v) (keyword? v) (number? v) (null? v) (char? v) (eof-object? v)) v)
+    ((string? v) (string-copy v))
+    ((bytevector? v) (bytevector-copy v))
+    ((pair? v) (cons (clone-option-value (car v) strict?) (clone-option-value (cdr v) strict?)))
+    ((vector? v)
+     (let* ((n (vector-length v))
+            (out (make-vector n)))
+       (let loop ((i 0))
+         (when (< i n)
+           (vector-set! out i (clone-option-value (vector-ref v i) strict?))
+           (loop (+ i 1))))
+       out))
+    ((dict? v)
+     (fold (lambda (k acc)
+             (dict-set acc (clone-option-value k strict?) (clone-option-value (dict-ref v k) strict?)))
+           (dict)
+           (dict-keys v)))
+    ((hash-table? v)
+     (let ((out (make-hash-table)))
+       (for-each (lambda (k)
+                   (hash-table-set! out (clone-option-value k strict?)
+                                    (clone-option-value (hash-table-ref v k) strict?)))
+                 (hash-table-keys v))
+       out))
+    (strict?
+     (error "User-only option value cannot be safely isolated; supply #:snapshot or use immutable/container data" v))
+    (else v)))
+
 (define-record-type option-declaration
-  (%make-option name default doc type)
+  (%make-option name default doc type user-only snapshot)
   option-declaration?
   (name option-name)
-  (default option-default)
+  (default %option-default)
   (doc option-doc)
-  (type option-type))
+  (type option-type)
+  (user-only option-user-only?)
+  (snapshot option-snapshot))
+
+(define (snapshot-option-value o v)
+  (cond ((not o) v)
+        ((option-snapshot o) => (lambda (snap) (snap v)))
+        ((option-user-only? o) (clone-option-value v #t))
+        (else v)))
+
+(define (option-default o)
+  "Return the default value of option declaration O."
+  (snapshot-option-value o (%option-default o)))
 
 (define %options (make-registry 'options #:changed display-changed!))
 
@@ -286,12 +328,46 @@ That is the one with the longest suffix of PATH, else
   "Return the names of the options declared."
   (registry-keys %options))
 
-(define (register-option! name default doc #:type [type 'any])
+(define (root-scope? s)
+  (and (scope? s) (not (scope-parent s))))
+
+(define (scope-label s)
+  (let ((n (and (scope? s) (scope-name s))))
+    (cond ((symbol? n) (symbol->string n))
+          ((string? n) n)
+          (else "<anonymous>"))))
+
+(define (register-option! name default doc #:type [type 'any] #:user-only [user-only #f]
+                          #:snapshot [snapshot #f])
   "Declare the option NAME, its DEFAULT and its documentation DOC.
 TYPE is the schema of its values, as `valid?` takes it: boolean, natural,
-(one-of value ...), (or schema ...) and so on."
+(one-of value ...), (or schema ...) and so on. When USER-ONLY is true,
+only root/user authority may set NAME globally; packages, buffers, and
+modes cannot override it, and mutable values outside standard scalars
+and containers require a SNAPSHOT procedure that returns an independent
+copy on both write and read."
   (unless (schema? type) (error "Not a schema:" type))
-  (registry-add! %options name (%make-option name default doc type))
+  (when (and snapshot (not (procedure? snapshot)))
+    (error "register-option!: #:snapshot must be a procedure or #f" snapshot))
+  (let* ((existing (registry-entries %options name))
+         (root-user-only?
+          (any (lambda (entry)
+                 (and (root-scope? (cdr entry))
+                      (option-user-only? (car entry))))
+               existing)))
+    (when root-user-only?
+      (unless (root-authority?)
+        (error (string-append "Option " (symbol->string name)
+                              " is user-only and cannot be shadowed from scope "
+                              (scope-label (authority-scope)))))
+      (unless user-only
+        (error (string-append "Option " (symbol->string name)
+                              " is user-only and cannot be weakened")))))
+  (let* ((user-only? (and user-only #t))
+         (stored-default (cond (snapshot (snapshot default))
+                               (user-only? (clone-option-value default #t))
+                               (else default))))
+    (registry-add! %options name (%make-option name stored-default doc type user-only? snapshot)))
   name)
 
 (define-syntax define-option
@@ -308,11 +384,13 @@ are declared, and COMMANDS, each (name documentation), offered, the
 first use of one loading ENTRY as the package
 (`register-command-package!`). A scope of the package's name owns the
 declarations: if one of them fails, none is left."
+  (unless (root-authority?)
+    (error "advertise-package!: requires root authority" name))
   (let ((scope (make-scope name #:parent %root-scope)))
     (guard (e (#t (scope-shutdown! scope) (raise e)))
       (with-scope scope
-        (for-each (lambda (o) (register-option! (car o) (cadr o) (cadddr o) #:type (caddr o))) options)
-        (register-command-package! name entry commands)))
+        (for-each (lambda (o) (register-option! (car o) (cadr o) (cadddr o) #:type (caddr o))) options))
+      (%register-command-package-in-scope! scope name entry commands))
     name))
 
 ;; Raise an error unless VALUE is a value of the option NAME.
@@ -322,19 +400,36 @@ declarations: if one of them fails, none is left."
       (error (string-append "Not a value of " (symbol->string name) ": expected " (schema-description (option-type o)) ", got")
              value))))
 
+(define (check-user-only-write! name b mode)
+  (let ((o (find-option name)))
+    (when (and o (option-user-only? o))
+      (when (or b mode)
+        (error (string-append "Option " (symbol->string name) " is user-only and cannot be set per-buffer or per-mode")))
+      (let ((who (current-principal)))
+        (unless (root-authority?)
+          (error (string-append "Option " (symbol->string name) " is user-only and cannot be set from scope "
+                                (scope-label (authority-scope)))))
+        (unless (equal? who "user")
+          (error (string-append "Option " (symbol->string name) " is user-only and cannot be set by principal "
+                                (if (string? who) who "non-user"))))))))
+
 (define (set-option! name value #:buffer [b #f] #:mode [mode #f])
   "Set the option NAME to VALUE in buffer B or the major mode MODE.
 Without either, it is set globally."
+  (check-user-only-write! name b mode)
   (check-option name value)
-  (note-effect! 'settings)
-  (if b
-      (set-buffer-settings! b (cons (cons name value) (remove (lambda (e) (eq? (car e) name)) (buffer-settings b))))
-      (registry-add! %settings (if mode (list name mode) (list name)) (cons value (scope-name (current-scope)))))
-  value)
+  (let* ((o (find-option name))
+         (stored (snapshot-option-value o value)))
+    (note-effect! 'settings)
+    (if b
+        (set-buffer-settings! b (cons (cons name stored) (remove (lambda (e) (eq? (car e) name)) (buffer-settings b))))
+        (registry-add! %settings (if mode (list name mode) (list name)) (cons stored (scope-name (current-scope)))))
+    (snapshot-option-value o stored)))
 
 (define (unset-option! name #:buffer [b #f] #:mode [mode #f])
   "Take back the setting of the option NAME in buffer B or mode MODE.
 Without either, the global setting is taken back."
+  (check-user-only-write! name b mode)
   (note-effect! 'settings)
   (if b
       (set-buffer-settings! b (remove (lambda (e) (eq? (car e) name)) (buffer-settings b)))
@@ -346,18 +441,25 @@ B #f means no buffer. Each is (cell value by), the one that wins first:
 CELL is `buffer`, a mode's name, `global` or `default`; BY is who made
 it (a package, `root` for the editor's own code and what is evaluated
 in it, a mode for its own options)."
-  (let* ((settings (lambda (cell key)
-                     (map (lambda (e) (list cell (car (car e)) (cdr (car e)))) (registry-entries %settings key))))
-         (in-buffer (and b (assq name (buffer-settings b))))
-         (in-modes (if b
+  (let* ((o (find-option name))
+         (user-only? (and o (option-user-only? o)))
+         (settings (lambda (cell key)
+                     (filter-map (lambda (e)
+                                   (let ((val (car (car e)))
+                                         (by (cdr (car e)))
+                                         (owner (cdr e)))
+                                     (and (or (not user-only?) (root-scope? owner))
+                                          (list cell (snapshot-option-value o val) by))))
+                                 (registry-entries %settings key))))
+         (in-buffer (and (not user-only?) b (assq name (buffer-settings b))))
+         (in-modes (if (and (not user-only?) b)
                        (append-map (lambda (m)
                                      (let ((own (assq name (mode-options m))))
                                        (append (settings (mode-name m) (list name (mode-name m)))
-                                               (if own (list (list (mode-name m) (cdr own) (mode-name m))) '()))))
+                                               (if own (list (list (mode-name m) (snapshot-option-value o (cdr own)) (mode-name m))) '()))))
                                    (mode-chain (buffer-mode b)))
-                       '()))
-         (o (find-option name)))
-    (append (if in-buffer (list (list 'buffer (cdr in-buffer) 'buffer)) '())
+                       '())))
+    (append (if in-buffer (list (list 'buffer (snapshot-option-value o (cdr in-buffer)) 'buffer)) '())
             in-modes
             (settings 'global (list name))
             (list (list 'default (and o (option-default o)) 'default)))))
@@ -379,21 +481,26 @@ truncation and pointer reporting. With B false, return global values."
   "Return the value of the option NAME in buffer B, #f meaning no buffer."
   ;; Same precedence as explain-option, without building provenance rows or
   ;; looking up settings that cannot win. Entries are pairs even for #f.
-  (define (global-value)
-    (let ((entry (registry-ref %settings (list name))))
-      (if entry (car entry)
-          (let ((o (find-option name))) (and o (option-default o))))))
-  (let ((local (and b (assq name (buffer-settings b)))))
-    (cond (local (cdr local))
-          ((not b) (global-value))
-          (else
-           (let loop ((mode (buffer-mode b)) (seen '()))
-             (let ((m (and mode (not (memq mode seen)) (find-mode mode))))
-               (if (not m) (global-value)
-                   (let ((entry (registry-ref %settings (list name mode))))
-                     (if entry (car entry)
-                         (let ((own (assq name (mode-options m))))
-                           (if own (cdr own) (loop (mode-parent m) (cons mode seen)))))))))))))
+  (let* ((o (find-option name))
+         (user-only? (and o (option-user-only? o))))
+    (define (global-value)
+      (let ((entry (if user-only?
+                       (find (lambda (e) (root-scope? (cdr e))) (registry-entries %settings (list name)))
+                       (let ((e (registry-ref %settings (list name)))) (and e (cons e #f))))))
+        (if entry (snapshot-option-value o (car (car entry))) (and o (option-default o)))))
+    (if user-only?
+        (global-value)
+        (let ((local (and b (assq name (buffer-settings b)))))
+          (cond (local (snapshot-option-value o (cdr local)))
+                ((not b) (global-value))
+                (else
+                 (let loop ((mode (buffer-mode b)) (seen '()))
+                   (let ((m (and mode (not (memq mode seen)) (find-mode mode))))
+                     (if (not m) (global-value)
+                         (let ((entry (registry-ref %settings (list name mode))))
+                           (if entry (snapshot-option-value o (car entry))
+                               (let ((own (assq name (mode-options m))))
+                                 (if own (snapshot-option-value o (cdr own)) (loop (mode-parent m) (cons mode seen)))))))))))))))
 
 ;;; Mode line segments: what a package says of a buffer in its mode
 ;;; line (a language server's state, its diagnostics' count), after the

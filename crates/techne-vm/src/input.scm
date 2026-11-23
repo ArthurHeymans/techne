@@ -10,7 +10,7 @@
                 (%pop-handler) (after) value)))
            (load
             (lambda (forms)
-              (wind (lambda () (%enter-module forms))
+              (wind (lambda () (%enter-forms-module forms))
                     (lambda ()
                       (let ((value (evaluate forms)))
                         (%forms-evaluated forms) value))

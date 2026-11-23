@@ -241,6 +241,7 @@ impl Vm {
     pub fn environment(&mut self, sets: &[Sexp]) -> R<u32> {
         let m = self.new_module(&format!("#<environment {}>", self.modules.len()), None);
         self.modules[m as usize].isolated = true;
+        self.modules[m as usize].is_environment = true;
         // This host/compiler fallback still nests if an environment loads
         // a library. Unlike top-level import, it has no forms loop to run
         // dependencies before returning the environment's module id.
@@ -347,17 +348,20 @@ impl Vm {
         self.modules[m as usize].exports = Some(Vec::new());
         self.recharge_module(m);
         self.modules[m as usize].isolated = true;
+        self.modules[m as usize].trusted_disk_source = self.modules[owner as usize].trusted_disk_source;
         self.begin_library_load(m, owner);
         Ok(m)
     }
 
     /// `(define-library name declaration ...)`, from a file in `dir`.
     pub fn define_library(&mut self, form: &[Sexp], owner: u32, file: u32, dir: &Path) -> R<()> {
+        let from_disk = self.files.get(file as usize).is_some_and(|f| f.from_disk);
         let m = self.new_library(form, owner, dir)?;
+        self.modules[m as usize].trusted_disk_source = from_disk && self.modules[owner as usize].trusted_disk_source;
         // A compiler/host fallback: it must return with the library loaded
         // before the enclosing form can compile. The Scheme forms loop uses
         // library_forms instead, so its bodies can wait without Rust nesting.
-        let result = self.in_module_load_scope(m, |vm| {
+        let result = self.in_module_load_scope(m, from_disk, |vm| {
             let mut imports = Vec::new();
             let mut body = Vec::new();
             vm.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body)?;
@@ -421,8 +425,7 @@ impl Vm {
             }
             self.check_loading()?;
             let path = self.library_file(&parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
-            let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
-            match self.module_forms_from(&path, text) {
+            match self.module_forms_from_disk(&path) {
                 Ok(Some(forms)) => return Ok(Some(forms)),
                 Ok(None) => {
                     self.abort_library_file(&path);

@@ -175,10 +175,24 @@ fn make_rtd(vm: &mut Vm, args: usize, n: usize) -> R {
     Ok(Value::ptr(p))
 }
 
+fn is_sealed_rtd(vm: &Vm, rtd: Value) -> bool {
+    rtd == vm.special(SpecialObj::ScopeRtd)
+        || rtd == vm.special(SpecialObj::ScopeCapRtd)
+        || rtd == vm.special(SpecialObj::ProtectedParamRtd)
+        || rtd == vm.special(SpecialObj::SavedParamRtd)
+        || rtd == vm.special(SpecialObj::CleanupActionRtd)
+        || rtd == vm.special(SpecialObj::TaskRtd)
+        || rtd == vm.special(SpecialObj::ChannelRtd)
+        || rtd == vm.special(SpecialObj::ContinuationRtd)
+}
+
 fn record(vm: &mut Vm, args: usize, n: usize) -> R {
     let rtd = arg(vm, args, 0);
     if !is_kind(rtd, Kind::Rtd) {
         return Err(type_error("%record", "record type", rtd));
+    }
+    if is_sealed_rtd(vm, rtd) {
+        return Err(Error::new("%record: sealed VM record type cannot be constructed directly"));
     }
     let count = list_values(unsafe { field(rtd.as_ptr(), 1) }).expect("validated field names").len();
     if n - 1 != count {
@@ -217,12 +231,18 @@ fn record_p(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn record_ref(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, rtd, i) = (arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2));
+    if is_sealed_rtd(vm, rtd) {
+        return Err(Error::new("%record-ref: sealed VM record type cannot be inspected directly"));
+    }
     let index = record_index(v, rtd, i)?;
     Ok(unsafe { field(v.as_ptr(), index) })
 }
 
 fn record_set(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, rtd, i, x) = (arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2), arg(vm, args, 3));
+    if is_sealed_rtd(vm, rtd) || rtd == vm.special(SpecialObj::ParameterRtd) {
+        return Err(Error::new("%record-set!: immutable VM record type cannot be mutated"));
+    }
     let index = record_index(v, rtd, i)?;
     unsafe { set_field(v.as_ptr(), index, x) };
     vm.write_barrier(v.as_ptr(), x);
@@ -265,7 +285,7 @@ fn apply(vm: &mut Vm, args: usize, n: usize) -> R {
 
 /// `(eval datum [module])`: in the named module, or the current one.
 /// The forms (`Vm::read_forms`) `v` is.
-fn forms_arg(vm: &Vm, v: Value, who: &str) -> Result<std::rc::Rc<crate::vm::Forms>, Error> {
+pub(crate) fn forms_arg(vm: &Vm, v: Value, who: &str) -> Result<std::rc::Rc<crate::vm::Forms>, Error> {
     vm.foreign_raw(v).and_then(|(f, _)| f.clone().downcast::<crate::vm::Forms>().ok()).ok_or_else(|| type_error(who, "forms", v))
 }
 
@@ -280,6 +300,7 @@ fn compile_expression(vm: &mut Vm, args: usize, n: usize) -> R {
         m if m == Value::FALSE => vm.current_module(),
         m => module_arg(vm, m, "eval")?,
     };
+    vm.require_module_eval_access(module, "eval")?;
     vm.compile_expression(module, &datum)
 }
 
@@ -918,6 +939,7 @@ pub fn install(vm: &mut Vm) {
         "(%record? obj type)" => record_p;
         "(%record-ref record type k)" => record_ref;
         "(%record-set! record type k value)" => record_set;
+        "(%parameter-type)" => |vm: &mut Vm, _, _| Ok(vm.special(SpecialObj::ParameterRtd));
         /// Return #t if OBJ is a record.
         "(record? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Record)));
         // A record's fields as a list of (name . value), for inspectors.
@@ -926,6 +948,13 @@ pub fn install(vm: &mut Vm) {
             let r = arg(vm, a, 0);
             if !is_kind(r, Kind::Record) {
                 return Err(type_error("record-fields", "record", r));
+            }
+            if record_check(r, vm.special(SpecialObj::ScopeCapRtd))
+                || record_check(r, vm.special(SpecialObj::ProtectedParamRtd))
+                || record_check(r, vm.special(SpecialObj::SavedParamRtd))
+                || record_check(r, vm.special(SpecialObj::CleanupActionRtd))
+            {
+                return Ok(Value::NIL);
             }
             let mut names = list_values(unsafe { field(field(r.as_ptr(), 0).as_ptr(), 1) }).unwrap_or_default();
             // As many as the record has fields, whatever its type says.
@@ -968,7 +997,7 @@ pub fn install(vm: &mut Vm) {
         "(%push-handler handler)" => |vm: &mut Vm, a, _| { let h = vm.root(arg(vm, a, 0)); vm.push_proc_handler(h); Ok(Value::VOID) };
         "(%push-wind after)" => |vm: &mut Vm, a, _| { let after = vm.root(arg(vm, a, 0)); vm.push_wind(after); Ok(Value::VOID) };
         "(%resume-unwind)" => |vm: &mut Vm, _, _| Err(vm.resume_unwind());
-        "(%pop-handler)" => |vm: &mut Vm, _, _| { vm.pop_handler(); Ok(Value::VOID) };
+        "(%pop-handler)" => |vm: &mut Vm, _, _| { vm.pop_handler()?; Ok(Value::VOID) };
         // Handler procedures called as frames (prelude: `%handle-raise`,
         // `raise-continuable`; `Vm::call_handler`).
         "(%set-raise-handler! proc)" => |vm: &mut Vm, a, _| { let f = arg(vm, a, 0); vm.set_raise_handler(f).map(|()| Value::VOID) };
@@ -987,10 +1016,43 @@ pub fn install(vm: &mut Vm) {
             Err(vm.handler_returned(c, i)) };
         "(%fresh-key)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.fresh_id()));
         "(%task-local-ref key default)" => |vm: &mut Vm, a, _| {
-            let key = arg(vm, a, 0).as_int();
-            Ok(vm.locals.get(&key).map_or(arg(vm, a, 1), |r| r.get())) };
+            let k = arg(vm, a, 0);
+            if !k.is_int() {
+                return Err(type_error("%task-local-ref", "integer", k));
+            }
+            let key = k.as_int();
+            if key == crate::vm::scopes::AUTHORITY_SCOPE_KEY
+                || key <= crate::vm::scopes::PROTECTED_PARAM_KEY_BASE
+            {
+                return Err(Error::new("%task-local-ref: cannot read protected or authority key"));
+            }
+            Ok(vm.locals.get(&key).map_or(arg(vm, a, 1), |r| r.get()))
+        };
         "(%task-local-set! key value)" => |vm: &mut Vm, a, _| {
-            let key = arg(vm, a, 0).as_int(); let v = vm.root(arg(vm, a, 1)); vm.locals.insert(key, v); Ok(Value::VOID) };
+            let k = arg(vm, a, 0);
+            if !k.is_int() {
+                return Err(type_error("%task-local-set!", "integer", k));
+            }
+            let key = k.as_int();
+            if key <= crate::vm::scopes::CURRENT_SCOPE_KEY {
+                return Err(Error::new("%task-local-set!: cannot modify reserved or protected key"));
+            }
+            let v = vm.root(arg(vm, a, 1));
+            vm.locals.insert(key, v);
+            Ok(Value::VOID)
+        };
+        "(%task-local-delete! key)" => |vm: &mut Vm, a, _| {
+            let k = arg(vm, a, 0);
+            if !k.is_int() {
+                return Err(type_error("%task-local-delete!", "integer", k));
+            }
+            let key = k.as_int();
+            if key <= crate::vm::scopes::CURRENT_SCOPE_KEY {
+                return Err(Error::new("%task-local-delete!: cannot modify reserved or protected key"));
+            }
+            vm.locals.remove(&key);
+            Ok(Value::VOID)
+        };
         /// Return OBJS as multiple values, to `call-with-values`.
         "(values . objs)" => values;
         "(%values? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(record_check(arg(vm, a, 0), vm.special(SpecialObj::ValuesRtd))));
@@ -1010,6 +1072,7 @@ pub fn install(vm: &mut Vm) {
         "(%read-forms source module file)" => |vm: &mut Vm, a, _| {
             let source = string(vm, arg(vm, a, 0), "eval-source")?;
             let module = module_arg(vm, arg(vm, a, 1), "eval-source")?;
+            vm.require_module_eval_access(module, "eval-source")?;
             let file = string(vm, arg(vm, a, 2), "eval-source")?;
             let forms = vm.read_forms(module, &file, &source)?;
             Ok(vm.make_foreign_raw(std::rc::Rc::new(forms), "forms")) };
@@ -1018,11 +1081,19 @@ pub fn install(vm: &mut Vm) {
                 "(%enter-module module)" => |vm: &mut Vm, a, _| {
             let m = match arg(vm, a, 0) {
                                 m if m == Value::FALSE => vm.current_module(),
-                // The module of forms being evaluated (`%load-forms`).
+                // The module of forms being evaluated.
                 m if vm.foreign_raw(m).is_some() => crate::vm::Vm::forms_module(&*forms_arg(vm, m, "%enter-module")?),
                 m => module_arg(vm, m, "eval")?,
             };
+            vm.require_module_eval_access(m, "%enter-module")?;
             vm.enter_module(m);
+            Ok(Value::VOID) };
+        // Boot-sealed helper for VM-controlled `%load-forms` and `input.scm`
+        // so loading a dependency module enters its module without exposing
+        // cross-module `%enter-module` to unprivileged callers.
+        "(%enter-forms-module forms)" => |vm: &mut Vm, a, _| {
+            let forms = forms_arg(vm, arg(vm, a, 0), "%enter-forms-module")?;
+            vm.enter_module(crate::vm::Vm::forms_module(&forms));
             Ok(Value::VOID) };
                 "(%leave-module)" => |vm: &mut Vm, _, _| { vm.leave_module(); Ok(Value::VOID) };
         // A module the next form requires, loaded from Scheme first
@@ -1053,12 +1124,22 @@ pub fn install(vm: &mut Vm) {
         "(%forms-of-world? forms)" => |vm: &mut Vm, a, _| {
             let forms = forms_arg(vm, arg(vm, a, 0), "%forms-of-world?")?;
             Ok(Value::bool(vm.forms_of_world(&forms))) };
+        // Whether FORMS are loader-issued forms belonging to the active staged package.
+        "(%forms-of-staging? forms)" => |vm: &mut Vm, a, _| {
+            let forms = forms_arg(vm, arg(vm, a, 0), "%forms-of-staging?")?;
+            Ok(Value::bool(vm.forms_of_staging(&forms))) };
         "(%package-begin path)" => |vm: &mut Vm, a, _| {
+            if !vm.is_root_authority() && !vm.in_active_staging_scope() {
+                return Err(Error::new("%package-begin: requires root authority"));
+            }
             let path = string(vm, arg(vm, a, 0), "load-package")?;
             let (forms, _) = vm.begin_package(std::path::Path::new(&path))?;
             Ok(vm.make_foreign_raw(std::rc::Rc::new(forms), "forms")) };
         // The main module's name and the generation, or #f.
         "(%package-end ok)" => |vm: &mut Vm, a, _| {
+            if !vm.is_root_authority() && !vm.in_active_staging_scope() {
+                return Err(Error::new("%package-end: requires root authority"));
+            }
             let ok = arg(vm, a, 0).is_truthy();
             match vm.end_package(ok) {
                 Some((m, generation)) => {
@@ -1088,7 +1169,11 @@ pub fn install(vm: &mut Vm) {
             Ok(vm.next_form(&forms)?.unwrap_or(Value::FALSE)) };
         /// Make MODULE current for what is evaluated after this.
         /// MODULE is named by a string: "root", "user" or a file's path.
-        "(in-module module)" => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };
+        "(in-module module)" => |vm: &mut Vm, a, _| {
+            let m = module_arg(vm, arg(vm, a, 0), "in-module")?;
+            vm.require_module_eval_access(m, "in-module")?;
+            vm.set_current_module(m);
+            Ok(Value::VOID) };
         /// Return the name of the current module: "root", "user" or a path.
         "(current-module)" => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string_raw(&name)) };
 
@@ -1191,10 +1276,18 @@ pub fn install(vm: &mut Vm) {
             let items = vm.scratch.split_off(mark);
             Ok(vm.make_list_raw(&items)) };
         "(%retire-generation generation)" => |vm: &mut Vm, a, _| {
+            if !vm.is_root_authority() {
+                return Err(Error::new("%retire-generation: requires root authority"));
+            }
             let generation = crate::num::integer(arg(vm, a, 0), "%retire-generation")? as u32;
             vm.retire_generation(generation);
             Ok(Value::VOID) };
-        "(%package-publish)" => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
+        "(%package-publish)" => |vm: &mut Vm, _, _| {
+            if !vm.is_root_authority() {
+                return Err(Error::new("%package-publish: requires root authority"));
+            }
+            vm.publish_staged();
+            Ok(Value::VOID) };
         // Whose libraries are found where (`(techne package)`).
         "(%provide-libraries! name directory)" => |vm: &mut Vm, a, _| {
             let name = string(vm, arg(vm, a, 0), "%provide-libraries!")?;
@@ -1249,7 +1342,12 @@ pub fn install(vm: &mut Vm) {
                 Some(dir) => Ok(vm.make_string_raw(&dir)),
                 None => Ok(Value::FALSE),
             } };
-        "(%package-discard)" => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
+        "(%package-discard)" => |vm: &mut Vm, _, _| {
+            if !vm.is_root_authority() {
+                return Err(Error::new("%package-discard: requires root authority"));
+            }
+            vm.discard_staged();
+            Ok(Value::VOID) };
         // The names a module sees, for completion: a list of (name kind),
         // the name a string, the kind `syntax`, `macro`, `procedure` or
         // `variable`. A module not loaded yet is not loaded (completing
