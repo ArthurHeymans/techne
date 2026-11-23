@@ -22,7 +22,8 @@
     (error "Expected (branch name), (tag name) or (commit full-object-id)" ref))
   (%ref (car ref) (cadr ref)))
 (define (parse-package-source datum)
-  "Validate DATUM and return a package source, without accessing a repository."
+  "Validate DATUM and return a package source.
+Does not access any repository."
   (unless (and (list? datum) (memv (length datum) '(2 3 4)) (string? (cadr datum)))
     (error "Expected (github owner/repo [ref] [(package (owner pkg))]), (git https-url ...) or (local absolute-repo ...)" datum))
   (let* ((kind (car datum)) (s (cadr datum))
@@ -45,217 +46,346 @@
                 packages)
       (%source kind url (and (pair? refs) (parse-ref (car refs))) (and (pair? packages) (cadr (car packages)))))))
 (define (register-package-recipe! datum)
-  "Register a catalog entry DATUM, (recipe (owner pkg) source), without fetching it."
+  "Register a catalog entry DATUM without fetching it.
+DATUM has the form `(recipe (owner pkg) source)`."
   (unless (and (list? datum) (= 3 (length datum)) (eq? 'recipe (car datum)) (package-name? (cadr datum)))
     (error "Invalid recipe" datum))
   (let ((wanted (package-source-package (parse-package-source (caddr datum)))))
     (when (and wanted (not (equal? wanted (cadr datum)))) (error "Recipe names another package than its source" (cadr datum) wanted)))
   (hash-table-set! catalog (cadr datum) (%recipe (cadr datum) (caddr datum))))
 
-(define (store)
-  (let ((xdg (get-environment-variable "XDG_DATA_HOME")))
-    (path-join (if (and xdg (path-absolute? xdg)) xdg (path-join (get-environment-variable "HOME") ".local/share"))
-               "techne/packages")))
-(define (one-datum file)
-  (call-with-input-file file (lambda (p)
-    (let ((d (read p))) (unless (and (not (eof-object? d)) (eof-object? (read p))) (error "Expected one datum" file)) d))))
-(define (git dir protocol . args)
-  (call-with-process "git" (append (list "-c" "core.hooksPath=/dev/null" "-c" "protocol.allow=never"
-                                         "-c" (string-append "protocol." protocol ".allow=always")) args)
-    (lambda (p) (let ((out (process-read-all p 'stdout)))
-                  (unless (eqv? 0 (process-wait p)) (error "Package Git operation failed" (car args)))
-                  (string-trim out))) #:directory dir #:stdin 'null #:stderr 'inherit
-    #:environment '(("GIT_TERMINAL_PROMPT" . "0"))))
-;; A store entry is one checkout of a repository at a commit, shared by the
-;; packages installed from it: what they depend on beside them is one
-;; directory for all. Its pin is (pin SOURCE COMMIT DIRECTORY ...): the
-;; source without the package wanted, and the directories in the checkout
-;; of the packages installed, relative; none, for a checkout that is itself
-;; the one package.
-(define (pin path)
-  (let ((d (one-datum (path-join path "pin"))))
-    (unless (and (list? d) (>= (length d) 3) (eq? (car d) 'pin) (oid? (caddr d))
-                 (every (lambda (sub) (and (string? sub) (every component? (string-split sub "/")))) (cdddr d)))
-      (error "Invalid package pin"))
-    d))
-(define (pin-directories d) (if (null? (cdddr d)) '("") (cdddr d)))
-;; SOURCE, a source datum, without the package it wants: what is fetched.
-(define (checkout-datum datum)
-  (remove (lambda (e) (and (pair? e) (eq? (car e) 'package))) datum))
-;; An installation: (ENTRY . DIRECTORY), a store entry and the directory in
-;; its checkout of a package installed from it.
-(define (installations path) (map (lambda (sub) (cons path sub)) (pin-directories (pin path))))
-(define (installation-checkout i) (path-join (car i) "tree"))
-(define (installation-tree i)
-  (if (string=? (cdr i) "") (installation-checkout i) (path-join (installation-checkout i) (cdr i))))
-(define (all-installations dir) (append-map installations (installed-paths dir)))
-;; Where the package wanted is in the checkout TREE, relative: TREE itself
-;; if it is a package, else the directory under it of the package WANTED,
-;; or of the only one. A manifest that does not read is no candidate, nor
-;; a directory a pin would not hold (`pin`): a name with a space, say.
-(define (package-subdirectory tree wanted)
-  (let ((found (filter (lambda (dir) (or (string=? dir "") (every component? (string-split dir "/"))))
-                       (package-directories tree))))
-    (cond ((null? found) (error "Repository holds no package: no techne-package.scm"))
-          ((equal? found '("")) "")
-          (else
-           (let* ((named (filter-map (lambda (dir)
-                                       (guard (e (#t #f)) (cons (manifest-name (read-package-manifest (path-join tree dir))) dir)))
-                                     found))
-                  (hit (and wanted (assoc wanted named))))
-             (cond (hit (cdr hit))
-                   (wanted (error "Repository holds no package of this name" wanted (map car named)))
-                   ((and (pair? named) (null? (cdr named))) (cdar named))
-                   (else (error "Repository holds several packages: say which with (package (owner pkg))" (map car named)))))))))
-;; The package in DIRECTORY and what it depends on stay in the checkout
-;; TREE, links resolved, and can be made known here: checked before a
-;; checkout is published, and changing nothing.
-(define (check-contained! tree directory)
-  (let ((root (file-truename tree)) (dir (file-truename directory)))
-    (unless (or (equal? root dir) (string-prefix? (string-append root "/") dir)) (error "Package leaves its repository" directory))
-    (package-closure dir #:within root)))
-;; The manifest of the package in ROOT, as `(techne package)` reads it: what
-;; is installed here is for the editor.
-(define (manifest root)
-  (let ((m (read-package-manifest root)))
-    (unless (manifest-editor m) (error "Package declares nothing for the editor" (manifest-name m)))
-    m))
-(define (commands m) (cadr (manifest-editor m)))
-(define (options m) (caddr (manifest-editor m)))
+;; --- Content-addressed store, world.lock & installed roots ---
 
-;; One immutable checkout per source. Publish pin + tree by renaming the
-;; temporary directory. Never overwrite another install or fetch on restore.
-;; DATUM is what is fetched (`checkout-datum`), WANTED the package to
-;; install from it, or #f. Return whether this published DEST: not if
-;; another editor did meanwhile.
-(define (fetch! dir dest datum source wanted)
-  (let* ((tmp (path-join dir (string-append ".install-" (hex-encode (random-bytes 12)))))
-         (tree (path-join tmp "tree")) (ref (package-source-ref source))
-         (protocol (if (eq? (package-source-kind source) 'local) "file" "https")))
-    (create-directory tmp #o700)
-    (dynamic-wind (lambda () #f)
-      (lambda ()
-        (create-directory tree #o700)
-        (git tree protocol "init" "--quiet" "--template=")
-        (git tree protocol "fetch" "--quiet" "--depth=1" "--no-tags" "--" (package-source-url source)
-             (if ref (case (git-ref-kind ref) ((branch) (string-append "refs/heads/" (git-ref-value ref)))
-                       ((tag) (string-append "refs/tags/" (git-ref-value ref))) (else (git-ref-value ref))) "HEAD"))
-        (let ((oid (git tree protocol "rev-parse" "--verify" "FETCH_HEAD^{commit}")))
-          (unless (oid? oid) (error "Git returned an invalid commit"))
-          (git tree protocol "checkout" "--quiet" "--detach" oid)
-          (let* ((sub (package-subdirectory tree wanted))
-                 (d (manifest (path-join tree sub))))
-            (call-with-output-file (path-join tmp "pin")
-              (lambda (p) (write (if (string=? sub "") (list 'pin datum oid) (list 'pin datum oid sub)) p)))
-            ;; Two editors may have fetched different sources at the same time.
-            ;; Serialize only the local preflight and atomic rename, not fetch.
-            (publishing dir
-              (lambda ()
-                (and (not (file-exists? dest))
-                     (begin
-                       (check-declarations! d wanted)
-                       (check-contained! tree (path-join tree sub))
-                       (check-disjoint! (cons d (map stored-manifest (all-installations dir))))
-                       (rename-file tmp dest)
-                       #t)))))))
-      (lambda () (when (file-exists? tmp) (delete-path tmp #t))))))
+(define (store) (packages-data-dir))
+(define (store-dir dir) (path-join dir "store"))
+(define (world-lock-path dir) (path-join dir "world.lock"))
+(define (installed-roots-path dir) (path-join dir "installed.scm"))
+
+(define (one-datum file)
+  (call-with-input-file file
+    (lambda (p)
+      (let ((d (read p)))
+        (unless (and (not (eof-object? d)) (eof-object? (read p)))
+          (error "Expected one datum" file))
+        d))))
+
+(define (strip-package-clause datum)
+  (remove (lambda (e) (and (pair? e) (eq? (car e) 'package))) datum))
+
+(define (with-package-clause datum name)
+  (if (any (lambda (e) (and (pair? e) (eq? (car e) 'package))) (cddr datum))
+      datum
+      (append datum (list (list 'package name)))))
+
+(define (read-installed-roots dir)
+  (let ((path (installed-roots-path dir)))
+    (if (not (file-exists? path))
+        '()
+        (let ((d (one-datum path)))
+          (unless (and (list? d) (pair? d) (eq? 'installed (car d)))
+            (error "Invalid installed.scm" path))
+          (map (lambda (entry)
+                 (unless (and (list? entry) (= 3 (length entry)) (eq? 'root (car entry))
+                              (package-name? (cadr entry)) (package-source-datum? (caddr entry)))
+                   (error "Invalid root entry in installed.scm" entry))
+                 (cons (cadr entry) (caddr entry)))
+               (cdr d))))))
+
+(define (write-installed-roots! dir roots)
+  (let ((sorted (sort roots (lambda (a b) (package-name<? (car a) (car b))))))
+    (replace-file (installed-roots-path dir)
+                  (call-with-output-string
+                    (lambda (port)
+                      (display "(installed" port)
+                      (for-each (lambda (r)
+                                  (display "\n  (root " port)
+                                  (write (car r) port)
+                                  (display " " port)
+                                  (write (cdr r) port)
+                                  (display ")" port))
+                                sorted)
+                      (display ")\n" port))))))
+
+(define (read-world-lock dir)
+  (let ((path (world-lock-path dir)))
+    (and (file-exists? path) (read-lockfile path))))
+
+;; Compute the subset of LF reachable from all installed ROOTS except DROP-NAME.
+;; Used when upgrading DROP-NAME so its old version and exclusive dependencies do
+;; not conflict with the upgrade, while dependencies still shared with other
+;; installed roots remain locked and conflict-checked.
+(define (lockfile-without-root lf roots drop-name)
+  (if (not lf)
+      #f
+      (let ((by-name (make-hash-table equal?))
+            (keep (make-hash-table equal?)))
+        (for-each (lambda (p) (hash-table-set! by-name (locked-package-name p) p))
+                  (lockfile-packages lf))
+        (define (mark! name)
+          (unless (hash-table-ref/default keep name #f)
+            (let ((p (hash-table-ref/default by-name name #f)))
+              (when p
+                (hash-table-set! keep name p)
+                (for-each mark! (locked-package-depends p))))))
+        (for-each (lambda (r)
+                    (unless (equal? (car r) drop-name)
+                      (mark! (car r))))
+                  roots)
+        (if (zero? (hash-table-size keep))
+            #f
+            (make-lockfile (lockfile-techne lf) (hash-table-values keep))))))
+
+(define (find-installed-root roots datum wanted)
+  (if wanted
+      (find (lambda (r)
+              (and (equal? (car r) wanted)
+                   (equal? (strip-package-clause (cdr r)) (strip-package-clause datum))))
+            roots)
+      (let ((hits (filter (lambda (r) (equal? (cdr r) datum)) roots)))
+        (and (= 1 (length hits)) (car hits)))))
+
+(define (upsert-root roots name datum)
+  (cons (cons name datum)
+        (remove (lambda (r) (equal? (car r) name)) roots)))
 
 ;; Call THUNK as the store DIR's only publisher (doc/packages.md).
 (define (publishing dir thunk)
   (let ((lock (path-join dir ".publishing")))
     (dynamic-wind (lambda () (create-directory lock #o700)) thunk (lambda () (delete-path lock #f)))))
-(define (write-pin! path d)
-  (replace-file (path-join path "pin") (call-with-output-string (lambda (p) (write d p)))))
-;; Install the package in the directory SUB of the checkout already at
-;; DEST, beside those installed from it: checked as a fetched one is, then
-;; added to the pin. Return whether it was added: not if it is there.
-(define (add-installation! dir dest sub wanted)
-  (publishing dir
-    (lambda ()
-      (let ((p (pin dest)) (i (cons dest sub)))
-        (and (not (member sub (pin-directories p)))
-             (let ((d (stored-manifest i)))
-               (check-declarations! d wanted)
-               (check-contained! (installation-checkout i) (installation-tree i))
-               (check-disjoint! (cons d (map stored-manifest (all-installations dir))))
-               (write-pin! dest (append p (list sub)))
-               #t))))))
-;; Take the installation of SUB put in DEST back: it could not be made
-;; known here. The others installed from the checkout stay, another editor's
-;; added meanwhile too; the checkout goes with the last.
-(define (remove-installation! dir dest sub)
-  (publishing dir
-    (lambda ()
-      (let* ((p (pin dest)) (others (delete sub (pin-directories p))))
-        (if (null? others)
-            (delete-path dest #t)
-            (write-pin! dest (append (list 'pin (cadr p) (caddr p)) others)))))))
 
-(define (installed-paths dir)
-  (map (lambda (key) (path-join dir key))
-       (filter oid? (map path-file-name (filter (lambda (entry) (string-suffix? "/" entry)) (directory-list dir))))))
-(define (stored-manifest i) (manifest (installation-tree i)))
+;; --- Manifest inspection (editor clause is optional) ---
+
+(define (commands m) (if (manifest-editor m) (cadr (manifest-editor m)) '()))
+(define (options m) (if (manifest-editor m) (caddr (manifest-editor m)) '()))
+
 (define (check-disjoint! manifests)
   (let ((unique! (lambda (names)
-                   (unless (= (length names) (length (delete-duplicates names))) (error "Conflicting package declarations" names)))))
+                   (unless (= (length names) (length (delete-duplicates names)))
+                     (error "Conflicting package declarations" names)))))
     (unique! (map manifest-name manifests))
     (unique! (append-map (lambda (d) (map car (commands d))) manifests))
     (unique! (append-map (lambda (d) (map car (options d))) manifests))))
+
+;; Names announced in this editor VM, mapped to their verified tree-sha256.
 (define indexed (make-hash-table equal?))
-;; Run the same checks before rename and before restoring any declarations.
+
+;; Run the same checks before publishing and before restoring any declarations.
 (define (check-declarations! d expected)
   (let ((name (manifest-name d)))
     (when (and expected (not (equal? expected name))) (error "Recipe and manifest disagree" expected name))
     (when (or (find-package name) (package-declared? name)) (error "Package name already installed" name))
     (for-each (lambda (c) (when (memq (car c) (command-names)) (error "Command already registered" (car c)))) (commands d))
     (for-each (lambda (o) (when (find-option (car o)) (error "Option already declared" (car o)))) (options d))))
-;; Advertise the installation I; EXPECTED is the name it must have, or #f.
-(define (announce! i expected)
-  (let* ((tree (installation-tree i)) (d (manifest tree)) (name (manifest-name d)) (old (hash-table-ref/default indexed name #f)))
-    (when (and expected (not (equal? expected name))) (error "Package name mismatch" name expected))
-    (cond (old (unless (equal? old i) (error "Package name already installed" name)))
+
+;; Collect the manifests of ROOT-NAME and all its transitive dependencies in LF,
+;; using MANIFEST-ALIST `((owner pkg) . manifest)`.
+(define (closure-manifests lf manifest-alist root-name)
+  (let ((by-name (make-hash-table equal?))
+        (seen (make-hash-table equal?))
+        (result '()))
+    (for-each (lambda (p) (hash-table-set! by-name (locked-package-name p) p))
+              (lockfile-packages lf))
+    (define (visit name)
+      (unless (hash-table-ref/default seen name #f)
+        (hash-table-set! seen name #t)
+        (let ((p (or (hash-table-ref/default by-name name #f)
+                     (error "Missing package in world.lock" name)))
+              (pair (or (assoc name manifest-alist)
+                        (error "Missing verified manifest" name))))
+          (for-each visit (locked-package-depends p))
+          (set! result (cons (cdr pair) result)))))
+    (visit root-name)
+    (reverse result)))
+
+(define (locked-package-hash lf name)
+  (let ((p (find (lambda (e) (equal? (locked-package-name e) name)) (lockfile-packages lf))))
+    (unless p (error "Missing package in world.lock" name))
+    (locked-package-tree-sha256 p)))
+
+(define (locked-package-subdir-of lf name)
+  (let* ((p (find (lambda (e) (equal? (locked-package-name e) name)) (lockfile-packages lf)))
+         (src (and p (locked-package-source p)))
+         (sub (and src (assq 'subdir (cddr src)))))
+    (and sub (cadr sub))))
+
+;; Wire libraries and (when declared) editor commands/options for ROOT-NAME
+;; from a verified world lockfile LF and MANIFEST-ALIST.
+(define (announce-root! lf manifest-alist root-name expected upgrade?)
+  (let* ((pair (or (assoc root-name manifest-alist)
+                   (error "Missing verified manifest" root-name)))
+         (d (cdr pair))
+         (hash (locked-package-hash lf root-name))
+         (old (hash-table-ref/default indexed root-name #f)))
+    (when (and expected (not (equal? expected root-name)))
+      (error "Package name mismatch" root-name expected))
+    (cond ((and old (string=? old hash)) root-name)
+          ((and old upgrade?)
+           ;; Upgraded checkout is stored and locked for subsequent sessions;
+           ;; keep the running VM's existing library bindings intact.
+           root-name)
+          (old (error "Package name already installed" root-name))
           (else
            (check-declarations! d expected)
-           (check-contained! (installation-checkout i) tree)
-           ;; As a package directory Techne ships is advertised, its
-           ;; libraries and those of what it depends on found first: the
-           ;; packages beside it in its checkout, at the commit pinned.
-           (use-package-directory! tree #:within (installation-checkout i))
-           (advertise-package! name (car (manifest-editor d)) (commands d) (options d))
-           (hash-table-set! indexed name i))) name))
-(define (package-install! spec #:directory [directory (store)])
+           (let ((closure (closure-manifests lf manifest-alist root-name)))
+             (register-package-world! closure)
+             (when (manifest-editor d)
+               (advertise-package! root-name (car (manifest-editor d)) (commands d) (options d)))
+             (hash-table-set! indexed root-name hash)
+             root-name)))))
+
+;; Validate that staged manifests for a candidate install are compatible with
+;; already installed roots and current editor declarations.
+(define (validate-candidate! dir root-name staged-manifests existing-lock existing-roots wanted upgrade?)
+  (let* ((root-pair (or (assoc root-name staged-manifests)
+                        (error "Resolved package missing from staged manifests" root-name)))
+         (root-manifest (cdr root-pair))
+         (old-in-vm (hash-table-ref/default indexed root-name #f)))
+    (when (and (not upgrade?) (assoc root-name existing-roots))
+      (error "Package name already installed" root-name))
+    (unless (and old-in-vm upgrade?)
+      (check-declarations! root-manifest wanted))
+    (let* ((sdir (store-dir dir))
+           (other-manifests
+            (if existing-lock
+                (filter-map (lambda (r)
+                              (and (not (and upgrade? (equal? (car r) root-name)))
+                                   (let ((p (find (lambda (e) (equal? (locked-package-name e) (car r)))
+                                                  (lockfile-packages existing-lock))))
+                                     (and p (read-package-manifest (path-join sdir (locked-package-tree-sha256 p)))))))
+                            existing-roots)
+                '())))
+      (check-disjoint! (cons root-manifest other-manifests)))))
+
+;; Roll back disk state if announcing fails after publishing.
+(define (rollback-install! dir old-lock old-roots newly-published)
+  (publishing dir
+    (lambda ()
+      (if old-lock
+          (write-lockfile (world-lock-path dir) old-lock)
+          (when (file-exists? (world-lock-path dir))
+            (delete-file (world-lock-path dir))))
+      (if (pair? old-roots)
+          (write-installed-roots! dir old-roots)
+          (when (file-exists? (installed-roots-path dir))
+            (delete-file (installed-roots-path dir))))
+      (for-each (lambda (entry)
+                  (when (file-exists? (cdr entry))
+                    (delete-path (cdr entry) #t)))
+                newly-published)
+      (let ((sdir (store-dir dir)))
+        (when (and (not old-lock) (file-exists? sdir) (null? (directory-list sdir)))
+          (delete-path sdir #f))))))
+
+(define (package-install! spec #:directory [directory (store)] #:upgrade [upgrade #f])
   "Install SPEC (a source datum or catalog `(owner pkg)`) and advertise it.
-DIRECTORY is the package store. First install pins a commit; repeats are offline.
-Of a repository holding several packages, the one installed is the one
-the source names with (package (owner pkg)), else the one of the catalog
-name. The packages installed from one source share its checkout, and so
-the packages beside them that they depend on."
+DIRECTORY is the packages data directory holding `store/<tree-sha256>/`,
+`world.lock`, and `installed.scm`. First install pins commits and content
+hashes; repeats are offline unless UPGRADE is `#t`. Packages without an
+`(editor ...)` clause (pure library or `(cloud ...)` packages) are stored,
+verified, and registered cleanly without requiring editor commands or
+options."
   (let* ((recipe (and (package-name? spec) (or (hash-table-ref/default catalog spec #f) (error "Unknown recipe" spec))))
-         (datum (if recipe (recipe-source recipe) spec)) (source (parse-package-source datum)) (dir directory)
-         (wanted (or (package-source-package source) (and recipe (recipe-name recipe))))
-         ;; The package wanted is no part of what is fetched, nor of its key.
-         (checkout (checkout-datum datum))
-         (key (hex-encode (sha-256 (string->utf8 (call-with-output-string (lambda (p) (write checkout p)))))))
-         (dest (path-join dir key)))
+         (datum (if recipe (recipe-source recipe) spec))
+         (source (parse-package-source datum))
+         (dir directory)
+         (sdir (store-dir dir))
+         (wanted (or (package-source-package source) (and recipe (recipe-name recipe)))))
     (make-directory dir)
-    (let ((published (and (not (file-exists? dest)) (fetch! dir dest checkout source wanted))))
-      (unless (equal? (cadr (pin dest)) checkout) (error "Pin does not match recipe"))
-      (let* ((sub (package-subdirectory (path-join dest "tree") wanted))
-             ;; A repeat takes no part in publishing.
-             (added (and (not (member sub (pin-directories (pin dest)))) (add-installation! dir dest sub wanted))))
-        ;; What was just put in the store and cannot be made known here
-        ;; after all is taken back: left there, it would fail every later
-        ;; install and restore.
-        (guard (e ((or published added) (remove-installation! dir dest sub) (raise e)))
-          (announce! (cons dest sub) wanted))))))
+    (let* ((initial-roots (read-installed-roots dir))
+           (hit (and (not upgrade) (find-installed-root initial-roots datum wanted))))
+      (if hit
+          ;; Offline repeat: verify world.lock + store tree-sha256 without touching Git.
+          (let* ((lf (or (read-world-lock dir) (error "Missing world.lock for installed package" (car hit))))
+                 (manifests (verify-world-lockfile lf #:store sdir)))
+            (announce-root! lf manifests (car hit) wanted #f))
+          ;; Fetch, stage, resolve transitive dependencies + diamond conflicts, then publish atomically.
+          (let* ((pre-lock (read-world-lock dir))
+                 (pre-roots initial-roots)
+                 (drop-target (and upgrade
+                                   (or wanted
+                                       (let ((existing (find-installed-root pre-roots datum #f)))
+                                         (and existing (car existing)))
+                                       (let ((same-repo
+                                              (filter (lambda (r)
+                                                        (and (eq? (car (cdr r)) (car datum))
+                                                             (equal? (cadr (cdr r)) (cadr datum))))
+                                                      pre-roots)))
+                                         (and (= 1 (length same-repo)) (caar same-repo))))))
+                 (base-lock (if (and upgrade drop-target)
+                                (lockfile-without-root pre-lock pre-roots drop-target)
+                                pre-lock))
+                 (saved-old-lock #f)
+                 (saved-old-roots '())
+                 (recorded-datum #f))
+            (call-with-values
+              (lambda ()
+                (resolve-package-source
+                  datum
+                  #:wanted wanted
+                  #:store sdir
+                  #:existing-lock base-lock
+                  #:stage-root dir
+                  #:wrap-publish
+                  (lambda (root-name staged-manifests merged-lock publish!)
+                    (publishing dir
+                      (lambda ()
+                        (let ((cur-lock (read-world-lock dir))
+                              (cur-roots (read-installed-roots dir)))
+                          (set! saved-old-lock cur-lock)
+                          (set! saved-old-roots cur-roots)
+                          (validate-candidate! dir root-name staged-manifests cur-lock cur-roots wanted upgrade)
+                          (let* ((published (publish!))
+                                 (sub (locked-package-subdir-of merged-lock root-name))
+                                 (root-datum (if sub (with-package-clause datum root-name) datum))
+                                 (new-roots (upsert-root cur-roots root-name root-datum)))
+                            (set! recorded-datum root-datum)
+                            (write-lockfile (world-lock-path dir) merged-lock)
+                            (write-installed-roots! dir new-roots)
+                            published)))))))
+              (lambda (root-name merged-lock newly-published)
+                (guard (e (#t
+                           (rollback-install! dir saved-old-lock saved-old-roots newly-published)
+                           (raise e)))
+                  (let ((manifests (verify-world-lockfile merged-lock #:store sdir)))
+                    (announce-root! merged-lock manifests root-name wanted upgrade))))))))))
+
 (define (package-restore! #:directory [directory (store)])
-  "Advertise all packages installed in DIRECTORY without fetching or loading."
+  "Verify and restore all packages installed in DIRECTORY strictly offline.
+Reads `world.lock` and `installed.scm`, checks every materialized package's
+`tree-sha256` against `<DIRECTORY>/store/<tree-sha256>/`, registers library
+providers and import boundaries, and advertises editor declarations when
+present."
   (let ((dir directory))
-    (if (file-exists? dir)
-        (let* ((all (all-installations dir)) (manifests (map stored-manifest all)))
-          (check-disjoint! manifests)
-          (for-each (lambda (i d)
-                      (let ((old (hash-table-ref/default indexed (manifest-name d) #f)))
-                        (if old (unless (equal? old i) (error "Package name already installed" (manifest-name d)))
-                            (check-declarations! d #f)))) all manifests)
-          (map (lambda (i) (announce! i #f)) all)) '())))
+    (if (not (and (file-exists? dir) (file-exists? (world-lock-path dir))))
+        '()
+        (let* ((sdir (store-dir dir))
+               (lf (read-world-lock dir))
+               (roots (read-installed-roots dir))
+               (root-names (map car roots))
+               (manifest-alist (verify-world-lockfile lf #:store sdir))
+               (root-manifests (map (lambda (name)
+                                      (let ((p (assoc name manifest-alist)))
+                                        (unless p (error "Installed root missing from world.lock" name))
+                                        (cdr p)))
+                                    root-names)))
+          ;; Validate all declarations and disjointness before mutating editor state.
+          (check-disjoint! root-manifests)
+          (for-each (lambda (name m)
+                      (let ((hash (locked-package-hash lf name))
+                            (old (hash-table-ref/default indexed name #f)))
+                        (if old
+                            (unless (string=? old hash)
+                              (error "Package name already installed" name))
+                            (check-declarations! m #f))))
+                    root-names root-manifests)
+          ;; Register all verified package libraries atomically, then advertise editor packages.
+          (register-package-world! (map cdr manifest-alist))
+          (map (lambda (name m)
+                 (let ((hash (locked-package-hash lf name))
+                       (old (hash-table-ref/default indexed name #f)))
+                   (unless old
+                     (when (manifest-editor m)
+                       (advertise-package! name (car (manifest-editor m)) (commands m) (options m)))
+                     (hash-table-set! indexed name hash))
+                   name))
+               root-names root-manifests)))))

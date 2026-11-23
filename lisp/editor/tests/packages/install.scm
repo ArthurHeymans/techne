@@ -198,13 +198,81 @@
     (register-package-recipe! `(recipe (acme multi-other) (local ,multi)))
     (check "a catalog name says which" '(acme multi-other) (package-install! '(acme multi-other) #:directory dir))
     (check "that one runs" 'other ((command 'multi-other) (current-session) 1))
-    (check "one checkout for the repository" 1 (length (directory-list dir)))
+    (check "content-addressed store deduplicates shared dep across 4 packages" 4
+           (length (directory-list (path-join dir "store"))))
+    (check "world.lock and installed.scm recorded" '(#t #t)
+           (list (file-exists? (path-join dir "world.lock"))
+                 (file-exists? (path-join dir "installed.scm"))))
     ;; One that cannot be installed, asked of the checkout that is there.
     (check "refused beside them" #t (bad? (lambda () (package-install! `(local ,multi (package (acme multi-stray))) #:directory dir))))
     (check "and not advertised" #f (command-doc 'multi-stray))
     (delete-path multi #t)
     (check "repeat without remote" '(acme multi-edit)
-           (package-install! `(local ,multi (package (acme multi-edit))) #:directory dir))))
+           (package-install! `(local ,multi (package (acme multi-edit))) #:directory dir)))
+  (install-non-editor-and-upgrade tmp))
+
+(define (install-non-editor-and-upgrade tmp)
+  ;; Pure library package and (cloud ...) package without (editor ...),
+  ;; plus moving-branch content-addressed store upgrade without clobbering.
+  (let* ((lib-repo (path-join tmp "pure-lib"))
+         (cloud-repo (path-join tmp "cloud-pkg"))
+         (dir (path-join tmp "store-non-editor")))
+    (create-directory lib-repo #o700)
+    (git lib-repo "init" "--quiet")
+    (write-file! lib-repo "techne-package.scm"
+                 '(package (acme pure-lib) (version "0.1.0")))
+    (write-file! lib-repo "lib/acme/pure-lib/math.sld"
+                 '(define-library (acme pure-lib math) (export answer) (import (scheme base))
+                    (begin (define (answer) 41))))
+    (git lib-repo "add" ".")
+    (git lib-repo "-c" "user.name=Test" "-c" "user.email=test@example.org" "-c" "commit.gpgSign=false" "commit" "-qm" "v1")
+    (git lib-repo "branch" "-M" "main")
+
+    (create-directory cloud-repo #o700)
+    (git cloud-repo "init" "--quiet")
+    (write-file! cloud-repo "techne-package.scm"
+                 `(package (acme cloud-svc)
+                    (version "0.1.0")
+                    (depends ((acme pure-lib) (local ,lib-repo (branch "main"))))
+                    (cloud "service.scm" (bindings (state kv)))))
+    (write-file! cloud-repo "service.scm" '(import (scheme base) (acme pure-lib math)) '(answer))
+    (git cloud-repo "add" ".")
+    (git cloud-repo "-c" "user.name=Test" "-c" "user.email=test@example.org" "-c" "commit.gpgSign=false" "commit" "-qm" "cloud")
+
+    (check "install pure library without (editor ...)" '(acme pure-lib)
+           (package-install! `(local ,lib-repo (branch "main")) #:directory dir))
+    (check "pure library provider wired" #t
+           (string-prefix? (file-truename (path-join dir "store")) (%library-provider '(acme pure-lib))))
+    (check "install (cloud ...) package with cross-repo dep" '(acme cloud-svc)
+           (package-install! `(local ,cloud-repo) #:directory dir))
+    (let ((before-entries (directory-list (path-join dir "store"))))
+      (check "two distinct content-addressed entries" 2 (length before-entries))
+      ;; Advance main branch of pure-lib and upgrade: old entry stays intact, new hash added.
+      (let ((sld (path-join lib-repo "lib/acme/pure-lib/math.sld")))
+        (delete-file sld)
+        (write-file! lib-repo "lib/acme/pure-lib/math.sld"
+                     '(define-library (acme pure-lib math) (export answer) (import (scheme base))
+                        (begin (define (answer) 42)))))
+      (git lib-repo "-c" "user.name=Test" "-c" "user.email=test@example.org" "-c" "commit.gpgSign=false" "commit" "-qam" "v2")
+      ;; Upgrading pure-lib while cloud-svc still locks the old pure-lib must fail loudly (diamond conflict)!
+      (check "upgrade conflicting with another installed root fails" #t
+             (bad? (lambda () (package-install! `(local ,lib-repo (branch "main")) #:directory dir #:upgrade #t))))
+      ;; In a separate store with only pure-lib installed, upgrading main adds a new <tree-sha256> without clobbering the old one.
+      (let ((up-dir (path-join tmp "store-upgrade")))
+        (git lib-repo "checkout" "--quiet" "HEAD~1")
+        (git lib-repo "branch" "-f" "track" "HEAD")
+        (check "install track@v1" '(acme pure-lib)
+               (package-install! `(local ,lib-repo (branch "track")) #:directory up-dir))
+        (let ((v1-entries (directory-list (path-join up-dir "store"))))
+          (check "one store entry at v1" 1 (length v1-entries))
+          (git lib-repo "checkout" "--quiet" "main")
+          (git lib-repo "branch" "-f" "track" "main")
+          (check "upgrade track@v2" '(acme pure-lib)
+                 (package-install! `(local ,lib-repo (branch "track")) #:directory up-dir #:upgrade #t))
+          (let ((v2-entries (directory-list (path-join up-dir "store"))))
+            (check "old and new store entries both exist" 2 (length v2-entries))
+            (check "old tree-sha256 entry was not clobbered" #t
+                   (and (member (car v1-entries) v2-entries) #t))))))))
 
 (define (restore-offline tmp)
   (let ((owner (make-scope 'restore-option)))
@@ -217,10 +285,27 @@
   (check "restore into fresh editor" '((acme pkg-test)) (package-restore! #:directory (path-join tmp "store")))
   (check "still cold" #f (find-package '(acme pkg-test)))
   (check "real command" 5 (invoke (current-session) 'pkg-hello (dict 'value 3)))
-  ;; Packages from a repository's subdirectories, each where its pin says.
+  ;; Packages from a repository's subdirectories, each verified from world.lock + store.
   (check "restore those of a repository of several" '("(acme multi-edit)" "(acme multi-more)" "(acme multi-other)")
          (sort (map repr (package-restore! #:directory (path-join tmp "store-multi"))) string<?))
   (check "cold" #f (and (find-package '(acme multi-edit)) #t))
   (check "with the package beside it" "hi!" ((command 'multi-shout) (current-session) 1))
   (check "which another shares" "more!!" ((command 'multi-more) (current-session) 1))
+  ;; Restore non-editor packages (pure library + cloud package) offline.
+  (check "restore pure-lib and cloud-svc offline" '("(acme cloud-svc)" "(acme pure-lib)")
+         (sort (map repr (package-restore! #:directory (path-join tmp "store-non-editor"))) string<?))
+  (check "restored pure-lib provider active" #t
+         (string-prefix? (file-truename (path-join tmp "store-non-editor/store")) (%library-provider '(acme pure-lib))))
+  ;; Tampering with a materialized store entry must fail offline restore loudly!
+  (let* ((up-dir (path-join tmp "store-upgrade"))
+         (entries (directory-list (path-join up-dir "store")))
+         (tampered-dir (path-join (path-join up-dir "store") (car entries)))
+         (tampered-file (path-join tampered-dir "tampered.txt")))
+    ;; Tamper with BOTH entries so whichever world.lock points to fails tree-sha256 verification.
+    (for-each (lambda (e)
+                (call-with-output-file (path-join (path-join (path-join up-dir "store") e) "tampered.txt")
+                  (lambda (p) (display "corrupted" p))))
+              entries)
+    (check "restore rejects tampered store tree-sha256" #t
+           (bad? (lambda () (package-restore! #:directory up-dir)))))
   (test-failures))
