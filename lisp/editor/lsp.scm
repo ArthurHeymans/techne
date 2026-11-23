@@ -713,6 +713,7 @@ saying so; QUIET passes it over, as opening a file does, and leaves out
 servers whose project files (#:roots) are not there."
   (let* ((d (buffer-document b)) (path (document-path d)))
     (cond ((not path) (if quiet '() (error "lsp: the buffer has no file")))
+          ((document-private? d) (if quiet '() (error "lsp: refused for private buffers")))
           ((remote-path? path) (if quiet '() (error "lsp: not for files on other machines yet")))
           (else
            (let* ((servers (servers-for b))
@@ -1676,7 +1677,7 @@ the region, or of the thing at point."
 
 (add-hook! 'file-buffer-added 'lsp
            (lambda (s b)
-             (when (option b 'lsp-auto)
+             (when (and (option b 'lsp-auto) (not (document-private? (buffer-document b))))
                (let* ((path (document-path (buffer-document b)))
                       (local? (and path (not (remote-path? path))))
                       (dir (and local? (directory-of path)))
@@ -1694,7 +1695,8 @@ the region, or of the thing at point."
                                             (execution-site-env-snapshot (execution-site-for r #:policy 'project)))
                                           need-warm)
                                 (when (and (memq b (buffer-list))
-                                           (option b 'lsp-auto))
+                                           (option b 'lsp-auto)
+                                           (not (document-private? (buffer-document b))))
                                   (lsp-attach! b #:quiet #t)))))
                      (lsp-attach! b #:quiet #t))))))
 
@@ -1737,7 +1739,8 @@ the region, or of the thing at point."
                                    (hash-table-values (session-documents ls))))
                        (hash-table-values %sessions))
              (let ((b (document-buffer d)))
-               (when (and b (option b 'lsp-mode)) (lsp-attach! b #:quiet #t)))))
+               (when (and b (option b 'lsp-mode) (not (document-private? d)))
+                 (lsp-attach! b #:quiet #t)))))
 
 ;;; The servers built in: each attaches where its program is installed.
 

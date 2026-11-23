@@ -14,7 +14,7 @@ blake3 = "1"
 crc32fast = "1"
 zerocopy = { version = "0.8", features = ["derive"] }
 tempfile = "3"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 proptest = "1"

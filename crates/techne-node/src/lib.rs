@@ -344,7 +344,19 @@ impl Node {
     /// The bytes of the file at `path` and their hash, or `None` if there is
     /// no file.
     pub fn read_file(&self, path: Vec<u8>) -> impl Future<Output = Result<Option<(Vec<u8>, fs::Hash)>, String>> + use<> {
-        let reply = self.conn.request(Request::ReadFile { path });
+        let reply = self.conn.request(Request::ReadFile { path, pinned: false });
+        async move {
+            match reply.await? {
+                Reply::File(f) => Ok(f.map(|f| (f.bytes, f.hash))),
+                _ => Err("unexpected reply from node".into()),
+            }
+        }
+    }
+
+    /// As `read_file`, for an already-classified absolute canonical `path`:
+    /// traverses every parent component and the leaf with `O_NOFOLLOW`.
+    pub fn read_file_pinned(&self, path: Vec<u8>) -> impl Future<Output = Result<Option<(Vec<u8>, fs::Hash)>, String>> + use<> {
+        let reply = self.conn.request(Request::ReadFile { path, pinned: true });
         async move {
             match reply.await? {
                 Reply::File(f) => Ok(f.map(|f| (f.bytes, f.hash))),
@@ -366,6 +378,17 @@ impl Node {
         async move { reply.await.map_err(|e| e.to_string()) }
     }
 
+    /// The canonical path of `path` on the node, following symlinks.
+    pub fn canonical_path(&self, path: Vec<u8>) -> impl Future<Output = Result<Vec<u8>, String>> + use<> {
+        let reply = self.conn.request(Request::CanonicalPath { path });
+        async move {
+            match reply.await? {
+                Reply::Path(Some(p)) => Ok(p),
+                _ => Err("unexpected reply from node".into()),
+            }
+        }
+    }
+
     /// As `write_file`, distinguishing a definitive error from a lost reply.
     pub fn write_file_tracked(
         &self,
@@ -373,7 +396,39 @@ impl Node {
         data: Vec<u8>,
         expect: protocol::Expect,
     ) -> impl Future<Output = Result<Result<[u8; 32], Option<[u8; 32]>>, RequestError>> + use<> {
-        let reply = self.conn.request_tracked(Request::WriteFile { path, data, expect });
+        self.write_file_tracked_with_privacy(path, data, expect, false)
+    }
+
+    /// As `write_file_tracked`, setting `private` so written files get mode
+    /// `0o600` (both new files and replacements).
+    pub fn write_file_tracked_with_privacy(
+        &self,
+        path: Vec<u8>,
+        data: Vec<u8>,
+        expect: protocol::Expect,
+        private: bool,
+    ) -> impl Future<Output = Result<Result<[u8; 32], Option<[u8; 32]>>, RequestError>> + use<> {
+        let reply = self.conn.request_tracked(Request::WriteFile { path, data, expect, private, pinned: false });
+        async move {
+            match reply.await? {
+                Reply::Written(h) => Ok(Ok(h)),
+                Reply::Conflict(now) => Ok(Err(now)),
+                _ => Err(RequestError::Unknown("unexpected reply from node".into())),
+            }
+        }
+    }
+
+    /// As `write_file_tracked_with_privacy`, for an already-classified absolute
+    /// canonical `path`: never re-canonicalizes `path` and enforces `O_NOFOLLOW`
+    /// on every parent component and the leaf on the node.
+    pub fn write_file_tracked_pinned(
+        &self,
+        path: Vec<u8>,
+        data: Vec<u8>,
+        expect: protocol::Expect,
+        private: bool,
+    ) -> impl Future<Output = Result<Result<[u8; 32], Option<[u8; 32]>>, RequestError>> + use<> {
+        let reply = self.conn.request_tracked(Request::WriteFile { path, data, expect, private, pinned: true });
         async move {
             match reply.await? {
                 Reply::Written(h) => Ok(Ok(h)),
@@ -932,6 +987,10 @@ fn natives(vm: &mut Vm) {
             let fut = path_request(vm, args, |n, path| n.read_file(path));
             async move { Ok::<_, String>(fut?.await?.map(|(bytes, _)| techne_vm::api::Bytes(bytes))) }
         });
+        vm.register_async("%node-file-read-pinned", 2, |vm: &mut Vm, args: Args<'_>| {
+            let fut = path_request(vm, args, |n, path| n.read_file_pinned(path));
+            async move { Ok::<_, String>(fut?.await?.map(|(bytes, _)| techne_vm::api::Bytes(bytes))) }
+        });
     });
     requiring_all(vm, &[Capability::Network, Capability::Files], |vm| {
         vm.register_async("node-file-write", 3, |vm: &mut Vm, args: Args<'_>| {
@@ -946,6 +1005,15 @@ fn natives(vm: &mut Vm) {
                     Ok(_) => Ok(()),
                     Err(_) => Err("node-file-write: the file was not as expected".to_string()),
                 }
+            }
+        });
+    });
+    requiring_all(vm, &[Capability::Network, Capability::Files], |vm| {
+        vm.register_async("node-file-canonical", 2, |vm: &mut Vm, args: Args<'_>| {
+            let fut = path_request(vm, args, |n, path| n.canonical_path(path));
+            async move {
+                let p = fut?.await?;
+                String::from_utf8(p).map_err(|_| "node-file-canonical: canonical path is not valid UTF-8".to_string())
             }
         });
     });
@@ -1027,9 +1095,13 @@ fn natives(vm: &mut Vm) {
         /// Return the bytes of the file at PATH on NODE, or #f if there is none.
         /// PATH is NODE's: `~` and a relative path start at its home.
         "(node-file-read node path)";
+        "(%node-file-read-pinned node path)";
         /// Replace the file at PATH on NODE with the bytevector BYTES.
         /// It is written through a temporary file and a rename.
         "(node-file-write node path bytes)";
+        /// Return the canonical path of PATH on NODE, following symlinks.
+        /// When the final component does not exist yet, its parent is canonicalized.
+        "(node-file-canonical node path)";
         /// Return the entries of the directory PATH on NODE, sorted.
         /// Subdirectories have a slash after their name.
         "(node-directory-list node path)";
@@ -1095,7 +1167,7 @@ mod request_tests {
     }
 
     fn write() -> Request {
-        Request::WriteFile { path: b"file".to_vec(), data: b"text".to_vec(), expect: protocol::Expect::Any }
+        Request::WriteFile { path: b"file".to_vec(), data: b"text".to_vec(), expect: protocol::Expect::Any, private: false, pinned: false }
     }
 
     #[test]

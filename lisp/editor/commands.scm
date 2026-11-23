@@ -180,6 +180,8 @@ the extents deleted."
 ;; The session that changed the kill ring last: only its kills join the
 ;; newest one.
 (define %kill-ring-by #f)
+;; Whether the newest entry in %kill-ring contains text from a private source.
+(define %kill-ring-top-private? #f)
 
 (define (kill-ring s)
   "Return the kill ring, which S shares: (text . linewise?), newest first."
@@ -197,7 +199,8 @@ to or taken from the clipboard."
     (unless (or (string=? text "")
                 (and (pair? ring) (string=? text (caar ring)))
                 (equal? text (sget s 'clipboard-seen)))
-      (set-kill-ring! s (cons (cons text #f) ring)))
+      (set-kill-ring! s (cons (cons text #f) ring))
+      (set! %kill-ring-top-private? #f))
     (sset! s 'clipboard-seen text)))
 
 (define (take-clipboard-out! s)
@@ -216,18 +219,29 @@ Otherwise return #f."
         ((and (> (string-length text) 0) (char=? (string-ref text (- (string-length text) 1)) #\newline)) text)
         (else (string-append text "\n"))))
 
-(define (kill-save! s text linewise backward)
+(define (kill-save! s text linewise backward #:private [private? #f])
   "Save TEXT as a kill in session S, joining it to a kill just made.
-With LINEWISE it is whole lines; with BACKWARD it joins at the front."
-  (let ((ring (kill-ring s))
-        (text (if linewise (as-lines text) text)))
+With LINEWISE it is whole lines; with BACKWARD it joins at the front.
+When PRIVATE? is true (or S's pane/session document is private, or a joined
+previous kill was private), the kill stays in-process and is never exported
+to the system clipboard."
+  (let* ((ring (kill-ring s))
+         (text (if linewise (as-lines text) text))
+         (joining? (and (sget s 'last-kill) (pair? ring) (eq? %kill-ring-by s)))
+         (source-private? (or (and private? #t)
+                              (private-document? (view-document (pane-view s)))
+                              (private-document? (session-document s))))
+         (entry-private? (or source-private? (and joining? %kill-ring-top-private?))))
     (set-kill-ring! s
-                    (if (and (sget s 'last-kill) (pair? ring) (eq? %kill-ring-by s))
+                    (if joining?
                         (cons (cons (if backward (string-append text (caar ring)) (string-append (caar ring) text))
                                     (cdar ring))
                               (cdr ring))
                         (cons (cons text linewise) ring)))
-    (sset! s 'clipboard-out (caar (kill-ring s)))
+    (set! %kill-ring-top-private? entry-private?)
+    (if entry-private?
+        (sset! s 'clipboard-out #f)
+        (sset! s 'clipboard-out (caar (kill-ring s))))
     (sset! s 'kill-now #t)))
 
 (define (current-prefix s)
@@ -386,8 +400,11 @@ The region is active."
   (sset! s 'extend #t)
   (set-ranges! s (lambda (a h) (list h h))))
 
+(define-hook keyboard-quit-hook "When `keyboard-quit` runs: (session).")
+
 (define-command (keyboard-quit s n)
   "Cancel: deactivate the region."
   (sset! s 'extend #f)
   (set-ranges! s (lambda (a h) (list h h)))
+  (run-hook! s 'keyboard-quit-hook)
   (message! s "Quit"))

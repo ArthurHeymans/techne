@@ -360,22 +360,37 @@ impl Node {
                 Ok(Reply::Unit)
             }
             Request::Stat { path } => blocking(move || crate::fs::stat(&path).map(Reply::Stat), "stat").await,
-            Request::ReadFile { path } => {
+            Request::ReadFile { path, pinned } => {
                 blocking(
-                    move || crate::fs::read(&path).map(|f| Reply::File(f.map(|(bytes, hash)| protocol::FileData { bytes, hash }))),
+                    move || {
+                        let res = if pinned { crate::fs::read_pinned(&path) } else { crate::fs::read(&path) };
+                        res.map(|f| Reply::File(f.map(|(bytes, hash)| protocol::FileData { bytes, hash })))
+                    },
                     "read",
                 )
                 .await
             }
-            Request::WriteFile { path, data, expect } => {
+            Request::WriteFile { path, data, expect, private, pinned } => {
                 blocking(
                     move || {
-                        crate::fs::write(&path, &data, expect).map(|r| match r {
+                        let res = if pinned {
+                            crate::fs::write_pinned(&path, &data, expect, private)
+                        } else {
+                            crate::fs::write(&path, &data, expect, private)
+                        };
+                        res.map(|r| match r {
                             Ok(hash) => Reply::Written(hash),
                             Err(crate::fs::Conflict(now)) => Reply::Conflict(now),
                         })
                     },
                     "write",
+                )
+                .await
+            }
+            Request::CanonicalPath { path } => {
+                blocking(
+                    move || crate::fs::canonical_path(&path).map(|p| Reply::Path(Some(p.into_os_string().into_encoded_bytes()))),
+                    "canonical",
                 )
                 .await
             }

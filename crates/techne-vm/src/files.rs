@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{self, Read},
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
@@ -651,6 +651,247 @@ pub fn delete_confined_file_nofollow(root: &Path, leaf: &Path) -> io::Result<boo
     delete_pinned_file_in_dir(&dir_fd, leaf)
 }
 
+/// Read a regular file at `path` as UTF-8, bounded by `max_bytes`.
+/// Opens with `O_NONBLOCK` and checks `fstat` on the open descriptor so
+/// a FIFO or non-regular file cannot block or bypass validation.
+pub fn read_regular_file(path: &Path, max_bytes: usize) -> io::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new().read(true).custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let cap = max_bytes.saturating_add(1);
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+    file.take(cap as u64).read_to_end(&mut buf)?;
+    if buf.len() > max_bytes {
+        return Err(io::Error::other("file exceeded size limit"));
+    }
+    String::from_utf8(buf).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not valid UTF-8"))
+}
+
+/// Walk every component of canonical absolute directory `root` from `/` using
+/// `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. Refuses relative paths,
+/// `.` / `..` / empty segments, and any symlink or non-directory component.
+fn open_canonical_pinned_dir(root: &Path, missing: RootMissing) -> io::Result<Option<(rustix::fd::OwnedFd, PathBuf)>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use rustix::{
+        fs::{CWD, Mode, OFlags, openat},
+        io::Errno,
+    };
+
+    let raw = root.as_os_str().as_bytes();
+    if !raw.starts_with(b"/") {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "confined root must be an absolute path"));
+    }
+    let trimmed = if raw.len() > 1 && raw.ends_with(b"/") { &raw[..raw.len() - 1] } else { raw };
+    let mut segments: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut canon = PathBuf::from("/");
+    if trimmed.len() > 1 {
+        for part in trimmed[1..].split(|&b| b == b'/') {
+            if part.is_empty() || part == b"." || part == b".." {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "confined root must be canonical without '.', '..', or empty segments",
+                ));
+            }
+            let seg = std::ffi::OsStr::from_bytes(part);
+            segments.push(seg);
+            canon.push(seg);
+        }
+    }
+
+    let mut dir_fd = openat(CWD, "/", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(io::Error::from)?;
+    for seg in segments {
+        dir_fd = match openat(&dir_fd, seg, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => match missing {
+                RootMissing::ReturnNone => return Ok(None),
+                RootMissing::Error => return Err(io::Error::from(Errno::NOENT)),
+            },
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "root contains symlink or non-directory component"));
+            }
+            Err(e) => return Err(io::Error::from(e)),
+        };
+    }
+    Ok(Some((dir_fd, canon)))
+}
+
+fn read_confined_file_inner(
+    root: &Path,
+    relative: &Path,
+    max_bytes: usize,
+    follow_symlinks: bool,
+    missing: RootMissing,
+) -> io::Result<Option<String>> {
+    use std::{collections::VecDeque, ffi::OsString, path::Component};
+
+    use rustix::{
+        fs::{Mode, OFlags, openat, readlinkat},
+        io::Errno,
+    };
+
+    const MAX_SYMLINK_HOPS: usize = 16;
+
+    let Some((root_fd, canon_root)) = open_canonical_pinned_dir(root, missing)? else {
+        return Ok(None);
+    };
+    let mut stack: Vec<rustix::fd::OwnedFd> = Vec::new();
+    let mut owned_components: Vec<OsString> = Vec::new();
+    for comp in relative.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(s) => owned_components.push(s.to_os_string()),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "path resolves outside allowed root"));
+            }
+        }
+    }
+    if owned_components.is_empty() {
+        return Err(io::Error::other("not a regular file"));
+    }
+
+    enum Step {
+        Normal(OsString),
+        Parent,
+    }
+    let mut steps: VecDeque<Step> = owned_components.into_iter().map(Step::Normal).collect();
+    let mut hops = 0usize;
+
+    while let Some(step) = steps.pop_front() {
+        match step {
+            Step::Parent => {
+                if stack.pop().is_none() {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "resolves outside allowed root"));
+                }
+            }
+            Step::Normal(name) => {
+                let is_last = steps.is_empty();
+                let dir_fd = stack.last().unwrap_or(&root_fd);
+                let flags = if is_last {
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
+                } else {
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+                };
+                match openat(dir_fd, name.as_os_str(), flags, Mode::empty()) {
+                    Ok(fd) => {
+                        if is_last {
+                            let file = fs::File::from(fd);
+                            let meta = file.metadata()?;
+                            if !meta.is_file() {
+                                return Err(io::Error::other("not a regular file"));
+                            }
+                            if meta.len() > max_bytes as u64 {
+                                return Err(io::Error::other("file exceeded size limit"));
+                            }
+                            let cap = max_bytes.saturating_add(1);
+                            let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+                            file.take(cap as u64).read_to_end(&mut buf)?;
+                            if buf.len() > max_bytes {
+                                return Err(io::Error::other("file exceeded size limit"));
+                            }
+                            let text = String::from_utf8(buf)
+                                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not valid UTF-8"))?;
+                            return Ok(Some(text));
+                        } else {
+                            stack.push(fd);
+                        }
+                    }
+                    Err(Errno::NOENT) => {
+                        if (hops == 0 && is_last) || (!follow_symlinks && matches!(missing, RootMissing::ReturnNone)) {
+                            return Ok(None);
+                        }
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "dangling or missing target"));
+                    }
+                    Err(Errno::LOOP) if !follow_symlinks => {
+                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "refusing symlink"));
+                    }
+                    Err(Errno::NOTDIR) if !follow_symlinks && readlinkat(dir_fd, name.as_os_str(), Vec::new()).is_ok() => {
+                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "refusing symlink"));
+                    }
+                    Err(Errno::LOOP) | Err(Errno::NOTDIR)
+                        if follow_symlinks && {
+                            // On Linux, openat(O_DIRECTORY | O_NOFOLLOW) on a symlink returns ELOOP;
+                            // on some BSDs/macOS it can return EMLINK or ENOTDIR; check readlinkat.
+                            readlinkat(dir_fd, name.as_os_str(), Vec::new()).is_ok()
+                        } =>
+                    {
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return Err(io::Error::other("too many symlink levels"));
+                        }
+                        let raw_target = readlinkat(dir_fd, name.as_os_str(), Vec::new()).map_err(io::Error::from)?;
+                        let target_path = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(raw_target.as_bytes());
+                        let target_path = Path::new(target_path);
+                        let mut expanded: Vec<Step> = Vec::new();
+                        if target_path.is_absolute() {
+                            let tail = target_path
+                                .strip_prefix(&canon_root)
+                                .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "resolves outside allowed root"))?;
+                            stack.clear();
+                            for c in tail.components() {
+                                match c {
+                                    Component::CurDir => {}
+                                    Component::ParentDir => expanded.push(Step::Parent),
+                                    Component::Normal(s) => expanded.push(Step::Normal(s.to_os_string())),
+                                    Component::RootDir | Component::Prefix(_) => {
+                                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "resolves outside allowed root"));
+                                    }
+                                }
+                            }
+                        } else {
+                            for c in target_path.components() {
+                                match c {
+                                    Component::CurDir => {}
+                                    Component::ParentDir => expanded.push(Step::Parent),
+                                    Component::Normal(s) => expanded.push(Step::Normal(s.to_os_string())),
+                                    Component::RootDir | Component::Prefix(_) => {
+                                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "resolves outside allowed root"));
+                                    }
+                                }
+                            }
+                        }
+                        if expanded.is_empty() && is_last {
+                            return Err(io::Error::other("not a regular file"));
+                        }
+                        for item in expanded.into_iter().rev() {
+                            steps.push_front(item);
+                        }
+                    }
+                    Err(e) => return Err(io::Error::from(e)),
+                }
+            }
+        }
+    }
+    Err(io::Error::other("not a regular file"))
+}
+
+/// Read `relative` confined under canonical `root` without TOCTOU races.
+///
+/// Opens `root` via no-follow component traversal from `/` (refusing symlink
+/// ancestors), then walks each component of `relative` from that handle with
+/// `O_NOFOLLOW`, resolving symlinks strictly within `root`, checking `fstat`
+/// for a regular file on the opened descriptor, and enforcing `max_bytes`.
+/// Returns `Ok(None)` only when the direct entry does not exist; symlinked
+/// roots, dangling symlinks, symlinks escaping `root`, non-regular files, and
+/// oversized files return `Err` so callers fail closed.
+pub fn read_confined_file(root: &Path, relative: &Path, max_bytes: usize) -> io::Result<Option<String>> {
+    read_confined_file_inner(root, relative, max_bytes, true, RootMissing::Error)
+}
+
+/// Read `relative` under canonical `root` refusing ALL symlinks (including
+/// in-root symlinks, leaf symlinks, and symlinked root ancestors).
+///
+/// Opens `root` via no-follow traversal from `/` and every component of
+/// `relative` with `O_NOFOLLOW`, validating `fstat` for a regular file on the
+/// opened descriptor and enforcing `max_bytes`. Returns `Ok(None)` when `root`
+/// or `relative` is absent (`ENOENT`); symlinks, dangling symlinks, non-regular
+/// files, and oversized files return `Err` so callers fail closed.
+pub fn read_confined_file_nofollow(root: &Path, relative: &Path, max_bytes: usize) -> io::Result<Option<String>> {
+    read_confined_file_inner(root, relative, max_bytes, false, RootMissing::ReturnNone)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,7 +947,6 @@ mod tests {
         assert_eq!(head(&f, 2).unwrap(), "a");
         assert_eq!(head(&f, 3).unwrap(), "aé");
     }
-
     #[test]
     fn pinned_nofollow_ops_create_read_write_delete_and_refuse_symlinks() {
         let dir = tempfile::tempdir().unwrap();
@@ -803,5 +1043,57 @@ mod tests {
         assert!(handle.try_lock().is_err());
         assert!(handle.read_bytes(Path::new("deny"), 1024).is_err());
         assert!(handle2.try_lock().unwrap());
+    }
+
+    #[test]
+    fn confined_file_reads_in_root_and_rejects_escapes_and_specials() {
+        let outer = tempfile::tempdir().unwrap();
+        let outer_canon = fs::canonicalize(outer.path()).unwrap();
+        let root = outer_canon.join("store");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join(".gpg-id"), "alice\n").unwrap();
+        fs::write(outer_canon.join("outside.txt"), "evil\n").unwrap();
+        std::os::unix::fs::symlink("../.gpg-id", root.join("sub/internal-link")).unwrap();
+        std::os::unix::fs::symlink(outer_canon.join("outside.txt"), root.join("sub/escape-abs")).unwrap();
+        std::os::unix::fs::symlink("../../outside.txt", root.join("sub/escape-rel")).unwrap();
+        std::os::unix::fs::symlink("missing", root.join("sub/dangling")).unwrap();
+        let fifo = root.join("sub/fifo");
+        rustix::fs::mknodat(rustix::fs::CWD, &fifo, rustix::fs::FileType::Fifo, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR, 0)
+            .unwrap();
+
+        assert_eq!(read_confined_file(&root, Path::new(".gpg-id"), 1024).unwrap().as_deref(), Some("alice\n"));
+        assert_eq!(read_confined_file(&root, Path::new("sub/internal-link"), 1024).unwrap().as_deref(), Some("alice\n"));
+        assert_eq!(read_confined_file(&root, Path::new("sub/absent"), 1024).unwrap(), None);
+        assert!(read_confined_file(&root, Path::new("sub/escape-abs"), 1024).is_err());
+        assert!(read_confined_file(&root, Path::new("sub/escape-rel"), 1024).is_err());
+        assert!(read_confined_file(&root, Path::new("sub/dangling"), 1024).is_err());
+        assert!(read_confined_file(&root, Path::new("sub/fifo"), 1024).is_err());
+        assert!(read_confined_file(&root, Path::new("sub"), 1024).is_err());
+        assert!(read_confined_file(&root, Path::new(".gpg-id"), 3).is_err());
+        assert!(read_regular_file(&fifo, 1024).is_err());
+        assert_eq!(read_regular_file(&root.join(".gpg-id"), 1024).unwrap(), "alice\n");
+
+        // Symlinked root or symlinked ancestor of root must be refused without following.
+        let root_alias = outer_canon.join("store-alias");
+        std::os::unix::fs::symlink(&root, &root_alias).unwrap();
+        assert!(read_confined_file(&root_alias, Path::new(".gpg-id"), 1024).is_err());
+        assert!(read_confined_file(&root_alias.join("sub"), Path::new("internal-link"), 1024).is_err());
+        assert!(read_confined_file(Path::new("relative/root"), Path::new(".gpg-id"), 1024).is_err());
+        assert!(read_confined_file(&root.join("../store"), Path::new(".gpg-id"), 1024).is_err());
+
+        // No-follow variant refuses in-root leaf symlinks, symlinked ancestors,
+        // dangling symlinks, and non-regular files, while returning None when absent.
+        assert_eq!(read_confined_file_nofollow(&root, Path::new(".gpg-id"), 1024).unwrap().as_deref(), Some("alice\n"));
+        assert_eq!(read_confined_file_nofollow(&root, Path::new("sub/absent"), 1024).unwrap(), None);
+        assert_eq!(read_confined_file_nofollow(&outer_canon.join("nonexistent-dir"), Path::new(".gpg-id"), 1024).unwrap(), None);
+        assert!(read_confined_file_nofollow(&root, Path::new("sub/internal-link"), 1024).is_err());
+        assert!(read_confined_file_nofollow(&root, Path::new("sub/escape-abs"), 1024).is_err());
+        assert!(read_confined_file_nofollow(&root, Path::new("sub/dangling"), 1024).is_err());
+        assert!(read_confined_file_nofollow(&root, Path::new("sub/fifo"), 1024).is_err());
+        assert!(read_confined_file_nofollow(&root, Path::new("sub"), 1024).is_err());
+        assert!(read_confined_file_nofollow(&root_alias, Path::new(".gpg-id"), 1024).is_err());
+        let dangling_root = outer_canon.join("dangling-root");
+        std::os::unix::fs::symlink(outer_canon.join("no-such-dir"), &dangling_root).unwrap();
+        assert!(read_confined_file_nofollow(&dangling_root, Path::new(".gpg-id"), 1024).is_err());
     }
 }

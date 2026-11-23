@@ -87,18 +87,43 @@ pub fn read(path: &[u8]) -> io::Result<Option<(Vec<u8>, Hash)>> {
     Ok(Some((bytes, h)))
 }
 
+/// Read the regular file at an already-canonicalized absolute `path` via
+/// directory-handle-relative no-follow traversal (`O_NOFOLLOW`), refusing any
+/// symlink at a parent component or at the leaf.
+pub fn read_pinned(path: &[u8]) -> io::Result<Option<(Vec<u8>, Hash)>> {
+    let path = Path::new(OsStr::from_bytes(path));
+    match techne_text::document::read_pinned_bytes(path, Some(MAX_READ), "reading")? {
+        Some(bytes) => {
+            let h = hash(&bytes);
+            Ok(Some((bytes, h)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Why a write did not happen: the file is not as expected. The hash of
 /// what it has, `None` when there is none.
+#[derive(Debug)]
 pub struct Conflict(pub Option<Hash>);
+
+/// The canonical path of `path` on this node, following symlinks (and
+/// canonicalizing the existing parent when the leaf does not exist yet).
+pub fn canonical_path(path: &[u8]) -> io::Result<PathBuf> {
+    techne_text::document::file_path(&expand(path))
+}
+
+static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Replace the file at `path` with `data` through a temporary file and a
 /// rename, keeping its permissions, if it is as `expect` says. A symbolic
-/// link is followed, its target replaced. Between the check and the
-/// rename another writer can still change the file: this refuses a
-/// stale save, it is not a lock. Writes this node makes are one at a
-/// time, so two it is asked for do not both pass the check.
-pub fn write(path: &[u8], data: &[u8], expect: Expect) -> io::Result<Result<Hash, Conflict>> {
-    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// link is followed, its target replaced. When `private` is true, the written
+/// file always gets mode `0o600` (both new files and replacements). When
+/// `expect` is `Expect::Absent`, creation uses a no-clobber persist so a
+/// concurrent creator cannot be overwritten. Between the check and the rename
+/// another writer can still change an existing file: this refuses a stale
+/// save, it is not a lock. Writes this node makes are one at a time, so two
+/// it is asked for do not both pass the check.
+pub fn write(path: &[u8], data: &[u8], expect: Expect, private: bool) -> io::Result<Result<Hash, Conflict>> {
     let _one = WRITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = techne_text::document::file_path(&expand(path))?;
     if expect != Expect::Any {
@@ -117,8 +142,73 @@ pub fn write(path: &[u8], data: &[u8], expect: Expect) -> io::Result<Result<Hash
             return Ok(Err(Conflict(now)));
         }
     }
-    techne_text::journal::write_atomically(&path, data)?;
+    if expect == Expect::Absent {
+        match techne_text::journal::write_atomically_if_absent(&path, data, private) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let now = read(path.as_os_str().as_bytes()).ok().flatten().map(|(_, h)| h);
+                return Ok(Err(Conflict(now)));
+            }
+            Err(e) => return Err(e),
+        }
+    } else if private {
+        techne_text::journal::write_atomically_private(&path, data)?;
+    } else {
+        techne_text::journal::write_atomically(&path, data)?;
+    }
     Ok(Ok(hash(data)))
+}
+
+/// As `write`, for an already-classified absolute canonical `path`: never
+/// re-canonicalizes `path`, traverses every parent component and opens the
+/// leaf with `O_NOFOLLOW`, stream-hashes for conflict detection without
+/// buffering unbounded bytes, and stages/publishes strictly relative to the
+/// verified parent directory handle.
+pub fn write_pinned(path: &[u8], data: &[u8], expect: Expect, private: bool) -> io::Result<Result<Hash, Conflict>> {
+    let _one = WRITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = Path::new(OsStr::from_bytes(path));
+    let (dir_fd, leaf) = techne_text::document::open_pinned_parent_dir(path, "saving")?;
+
+    let stream_leaf_hash = || -> io::Result<Option<Hash>> {
+        match techne_text::document::open_leaf_in_dir(&dir_fd, &leaf, "saving")? {
+            Some(file) => match techne_text::document::stream_regular_file_hash(file, Some(MAX_READ))? {
+                Some(h) => Ok(Some(h)),
+                // Too large to read is not what was read: changed.
+                None => Ok(Some([0; 32])),
+            },
+            None => Ok(None),
+        }
+    };
+
+    if expect != Expect::Any {
+        let now = stream_leaf_hash()?;
+        let expected = match expect {
+            Expect::Absent => None,
+            Expect::Hash(h) => Some(h),
+            Expect::Any => unreachable!(),
+        };
+        if now != expected {
+            return Ok(Err(Conflict(now)));
+        }
+    } else if let Some(file) = techne_text::document::open_leaf_in_dir(&dir_fd, &leaf, "saving")? {
+        let kind = file.metadata()?.file_type();
+        if kind.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
+        }
+        if !kind.is_file() {
+            return Err(io::Error::other("not a regular file"));
+        }
+    }
+
+    let no_clobber = expect == Expect::Absent;
+    match techne_text::journal::write_atomically_in_dir(&dir_fd, &leaf, data, private, private && !no_clobber, no_clobber) {
+        Ok(()) => Ok(Ok(hash(data))),
+        Err(e) if no_clobber && e.kind() == io::ErrorKind::AlreadyExists => {
+            let now = stream_leaf_hash().ok().flatten();
+            Ok(Err(Conflict(now)))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The entries of the directory at `path`, sorted by name.
@@ -194,12 +284,12 @@ mod tests {
         let path = dir.path().join("f");
         let p = path.as_os_str().as_bytes();
         assert!(read(p).unwrap().is_none());
-        let first = write(p, b"one", Expect::Absent).unwrap().ok().unwrap();
-        assert!(matches!(write(p, b"two", Expect::Absent).unwrap(), Err(Conflict(Some(h))) if h == first));
-        let second = write(p, b"two", Expect::Hash(first)).unwrap().ok().unwrap();
-        assert!(matches!(write(p, b"three", Expect::Hash(first)).unwrap(), Err(Conflict(Some(h))) if h == second));
+        let first = write(p, b"one", Expect::Absent, false).unwrap().ok().unwrap();
+        assert!(matches!(write(p, b"two", Expect::Absent, false).unwrap(), Err(Conflict(Some(h))) if h == first));
+        let second = write(p, b"two", Expect::Hash(first), false).unwrap().ok().unwrap();
+        assert!(matches!(write(p, b"three", Expect::Hash(first), false).unwrap(), Err(Conflict(Some(h))) if h == second));
         assert_eq!(read(p).unwrap(), Some((b"two".to_vec(), second)));
-        write(p, b"four", Expect::Any).unwrap().ok().unwrap();
+        write(p, b"four", Expect::Any, false).unwrap().ok().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"four");
     }
 
@@ -212,10 +302,24 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751)).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        write(link.as_os_str().as_bytes(), b"b", Expect::Hash(hash(b"a"))).unwrap().ok().unwrap();
+        write(link.as_os_str().as_bytes(), b"b", Expect::Hash(hash(b"a")), false).unwrap().ok().unwrap();
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read(&target).unwrap(), b"b");
         assert_eq!(target.metadata().unwrap().permissions().mode() & 0o777, 0o751);
+        assert_eq!(canonical_path(link.as_os_str().as_bytes()).unwrap(), std::fs::canonicalize(&target).unwrap());
+    }
+
+    #[test]
+    fn a_private_write_enforces_0600_on_create_and_replace() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        write(path.as_os_str().as_bytes(), b"cipher", Expect::Absent, true).unwrap().ok().unwrap();
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        // Existing overly-permissive file is tightened to 0o600 on private replacement.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write(path.as_os_str().as_bytes(), b"cipher2", Expect::Hash(hash(b"cipher")), true).unwrap().ok().unwrap();
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]
@@ -230,5 +334,60 @@ mod tests {
         assert_eq!(expand(b"/x"), PathBuf::from("/x"));
         let names: Vec<_> = list(dir.path().join("p").as_os_str().as_bytes()).unwrap().into_iter().map(|e| (e.name, e.directory)).collect();
         assert_eq!(names, vec![(b".git".to_vec(), true), (b"a".to_vec(), true)]);
+    }
+
+    #[test]
+    fn pinned_read_and_write_refuse_leaf_and_parent_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let pub_dir = root.join("pub");
+        let priv_dir = root.join("priv");
+        std::fs::create_dir(&pub_dir).unwrap();
+        std::fs::create_dir(&priv_dir).unwrap();
+
+        let pub_file = pub_dir.join("note.txt");
+        let priv_file = priv_dir.join("secret.txt");
+        std::fs::write(&pub_file, "public").unwrap();
+        std::fs::write(&priv_file, "SECRET").unwrap();
+
+        // Real canonical path works for pinned read and write.
+        let (bytes, h) = read_pinned(pub_file.as_os_str().as_bytes()).unwrap().unwrap();
+        assert_eq!(bytes, b"public");
+        let h2 = write_pinned(pub_file.as_os_str().as_bytes(), b"updated", Expect::Hash(h), false).unwrap().ok().unwrap();
+        assert_eq!(h2, hash(b"updated"));
+
+        // Relative path refused.
+        assert!(read_pinned(b"relative.txt").is_err());
+        assert!(write_pinned(b"relative.txt", b"x", Expect::Any, false).is_err());
+
+        // Leaf symlink swap refused for both pinned read and write (including Expect::Any).
+        std::fs::remove_file(&pub_file).unwrap();
+        std::os::unix::fs::symlink(&priv_file, &pub_file).unwrap();
+        assert!(
+            read_pinned(pub_file.as_os_str().as_bytes()).unwrap_err().to_string().contains("file target changed on disk while reading")
+        );
+        assert!(
+            write_pinned(pub_file.as_os_str().as_bytes(), b"overwrite", Expect::Any, false)
+                .unwrap_err()
+                .to_string()
+                .contains("file target changed on disk while saving")
+        );
+        assert_eq!(std::fs::read_to_string(&priv_file).unwrap(), "SECRET");
+
+        // Parent directory symlink swap refused for both pinned read and write.
+        let pub_bak = root.join("pub.bak");
+        let priv_same = priv_dir.join("same.txt");
+        std::fs::write(&priv_same, "SECRET-SAME").unwrap();
+        std::fs::rename(&pub_dir, &pub_bak).unwrap();
+        std::os::unix::fs::symlink(&priv_dir, &pub_dir).unwrap();
+        let swapped = pub_dir.join("same.txt");
+        assert!(read_pinned(swapped.as_os_str().as_bytes()).unwrap_err().to_string().contains("file target changed on disk while reading"));
+        assert!(
+            write_pinned(swapped.as_os_str().as_bytes(), b"pwn", Expect::Hash(hash(b"SECRET-SAME")), false)
+                .unwrap_err()
+                .to_string()
+                .contains("file target changed on disk while saving")
+        );
+        assert_eq!(std::fs::read_to_string(&priv_same).unwrap(), "SECRET-SAME");
     }
 }

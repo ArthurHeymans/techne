@@ -59,7 +59,7 @@ use techne_text::{
     ropey::Rope,
 };
 use techne_vm::{
-    api::{Arg, Foreign, FromValue, IntoValue, Value},
+    api::{Arg, Bytes, Foreign, FromValue, IntoValue, Value},
     regexp::Regexp,
     vm::{Error, Vm},
 };
@@ -69,6 +69,7 @@ type Pres = Foreign<RefCell<Presentation>>;
 type Mat = Foreign<RefCell<matcher::Matcher>>;
 type Specs = Foreign<RefCell<lisp_indent::Specs>>;
 pub(crate) type Documents = Rc<RefCell<HashMap<PathBuf, Weak<RefCell<Document>>>>>;
+pub(crate) type LastRecovery = Rc<RefCell<Option<(u64, techne_text::Recovery)>>>;
 
 /// The document of the file at `path`: the one open already, or opened with
 /// the journal `journal` gives, and what was recovered from it then.
@@ -79,12 +80,116 @@ pub(crate) fn open_shared(
 ) -> Result<(Rc<RefCell<Document>>, Option<techne_text::Recovery>), String> {
     let canonical = techne_text::document::file_path(path).map_err(|e| e.to_string())?;
     if let Some(doc) = documents.borrow().get(&canonical).and_then(Weak::upgrade) {
+        if doc.borrow().is_decoded() {
+            return Err(format!("{}: already open through a codec", path.display()));
+        }
+        if !doc.borrow().has_journal() {
+            return Err(format!("{}: already open without a journal", path.display()));
+        }
         return Ok((doc, None));
     }
-    let (doc, recovery) = Document::open(&canonical, &journal()?).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (doc, recovery) = Document::open_pinned(&canonical, &journal()?).map_err(|e| format!("{}: {e}", path.display()))?;
     let doc = Rc::new(RefCell::new(doc));
     documents.borrow_mut().insert(canonical, Rc::downgrade(&doc));
     Ok((doc, Some(recovery)))
+}
+
+/// The document of a previously canonicalized and classified file at `path`:
+/// the one open already, or opened via directory-handle-relative no-follow
+/// verification with the journal `journal` gives. Never re-canonicalizes or
+/// adopts a different target path.
+pub(crate) fn open_shared_pinned(
+    documents: &Documents,
+    path: &Path,
+    journal: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<(Rc<RefCell<Document>>, Option<techne_text::Recovery>), String> {
+    techne_text::document::verify_pinned_path(path, "opening").map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(doc) = documents.borrow().get(path).and_then(Weak::upgrade) {
+        if doc.borrow().is_decoded() {
+            return Err(format!("{}: already open through a codec", path.display()));
+        }
+        if !doc.borrow().has_journal() {
+            return Err(format!("{}: already open without a journal", path.display()));
+        }
+        return Ok((doc, None));
+    }
+    let (doc, recovery) = Document::open_pinned(path, &journal()?).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc = Rc::new(RefCell::new(doc));
+    documents.borrow_mut().insert(path.to_path_buf(), Rc::downgrade(&doc));
+    Ok((doc, Some(recovery)))
+}
+
+/// The document of the file at `path`: the one open already (refusing to
+/// reuse a non-decoded document or one with a different retention policy),
+/// or opened from pre-decoded `text` and stored `raw_bytes`. When `journal`
+/// is `None`, fails closed if a journal already exists on disk or is held
+/// by another process, without creating any directory or lock file.
+pub(crate) fn open_shared_decoded(
+    documents: &Documents,
+    path: &Path,
+    alias: Option<&Path>,
+    raw_bytes: Option<&[u8]>,
+    text: String,
+    journal: Option<impl FnOnce() -> Result<PathBuf, String>>,
+) -> Result<(Rc<RefCell<Document>>, Option<techne_text::Recovery>), String> {
+    techne_text::document::verify_pinned_path(path, "decoding").map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(doc) = documents.borrow().get(path).and_then(Weak::upgrade) {
+        if !doc.borrow().is_decoded() {
+            return Err(format!("{}: already open without a codec", path.display()));
+        }
+        if journal.is_none() && doc.borrow().has_journal() {
+            return Err(format!("{}: already open with a journal", path.display()));
+        }
+        if journal.is_some() && !doc.borrow().has_journal() {
+            return Err(format!("{}: already open without a journal", path.display()));
+        }
+        return Ok((doc, None));
+    }
+    let journal_path = match journal {
+        Some(f) => Some(f()?),
+        None => {
+            runtime::check_no_existing_journal(path, alias)?;
+            None
+        }
+    };
+    let (doc, recovery) = Document::open_decoded(techne_text::Place::File(path.to_path_buf()), raw_bytes, text, journal_path.as_deref())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc = Rc::new(RefCell::new(doc));
+    documents.borrow_mut().insert(path.to_path_buf(), Rc::downgrade(&doc));
+    Ok((doc, Some(recovery)))
+}
+
+/// The document of the file at `path` with `Retention::None`: the one open
+/// already (refusing to reuse a decoded or journaled document), or opened
+/// without a journal or lock file after checking no journal exists on disk.
+pub(crate) fn open_shared_without_journal(
+    documents: &Documents,
+    path: &Path,
+    alias: Option<&Path>,
+) -> Result<Rc<RefCell<Document>>, String> {
+    techne_text::document::verify_pinned_path(path, "opening").map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(doc) = documents.borrow().get(path).and_then(Weak::upgrade) {
+        if doc.borrow().is_decoded() {
+            return Err(format!("{}: already open through a codec", path.display()));
+        }
+        if doc.borrow().has_journal() {
+            return Err(format!("{}: already open with a journal", path.display()));
+        }
+        return Ok(doc);
+    }
+    runtime::check_no_existing_journal(path, alias)?;
+    let doc = Document::open_without_journal_pinned(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc = Rc::new(RefCell::new(doc));
+    documents.borrow_mut().insert(path.to_path_buf(), Rc::downgrade(&doc));
+    Ok(doc)
+}
+
+struct ReloadState {
+    document: u64,
+    revision: Revision,
+    disk_hash: Option<[u8; 32]>,
+    location_gen: u64,
+    generation: Option<u64>,
 }
 
 /// What a view shows: a document, or a presentation.
@@ -546,10 +651,10 @@ impl FromValue for BatchArg {
 
 /// Define the editor procedures in `vm`.
 pub fn install(vm: &mut Vm) {
-    install_with(vm, Documents::default(), syntax::Shared::default());
+    install_with(vm, Documents::default(), LastRecovery::default(), syntax::Shared::default());
 }
 
-pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Shared) {
+pub(crate) fn install_with(vm: &mut Vm, documents: Documents, last_recovery: LastRecovery, trees: syntax::Shared) {
     syntax::install(vm, trees);
     images::install(vm);
     capture::install(vm);
@@ -625,6 +730,20 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             techne_text::Place::File(p) => Some(p.display().to_string()),
             techne_text::Place::Remote(name) => Some(name.clone()),
         });
+        /// Return the retention policy of TEXT: `journal`, `none`, or #f if unbacked.
+        "(document-retention text)" => |t: TextArg| t.0.document().and_then(|d| match d.borrow().retention() {
+            Some(techne_text::Retention::Journal) => Some(Value::symbol("journal")),
+            Some(techne_text::Retention::None) => Some(Value::symbol("none")),
+            None => None,
+        });
+        /// Return the BLAKE3 hash of TEXT's stored bytes on disk as a bytevector, or #f.
+        "(document-disk-hash text)" => |t: TextArg| t.0.document().and_then(|d| d.borrow().disk_hash().map(|h| Bytes(h.to_vec())));
+        /// Return #t if RAW-BYTES (bytevector or #f for absent) matches TEXT's stored disk hash.
+        "(%document-stored-matches? text raw-bytes)" => |t: TextArg, raw_bytes: Option<Bytes>| t.0.document().is_some_and(|d| d.borrow().stored_matches(raw_bytes.as_ref().map(|b| b.0.as_slice())));
+        /// Return #t if TEXT is a codec-decoded document whose raw I/O paths are locked.
+        "(document-decoded? text)" => |t: TextArg| t.0.document().is_some_and(|d| d.borrow().is_decoded());
+        /// Return TEXT's location generation, incremented each time the document relocates.
+        "(document-location-generation text)" => |t: TextArg| t.0.document().map_or(0i64, |d| d.borrow().location_generation() as i64);
     }
     techne_vm::procedures! { vm;
         /// Return the part of TEXT between the byte positions FROM and TO.
@@ -801,10 +920,17 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         };
     }
     let moved_documents = documents.clone();
+    let pinned_documents = documents.clone();
+    let private_documents = documents.clone();
+    let decoded_documents = documents.clone();
     let remote_documents = documents.clone();
+    let remote_decoded_documents = documents.clone();
+    let remote_private_documents = documents.clone();
     let reload_current = current.clone();
+    let reload_decoded_current = current.clone();
     let revert_current = current.clone();
     let save_current = current.clone();
+    let save_encoded_current = current.clone();
     let overwrite_current = current.clone();
     let remote_current = current.clone();
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
@@ -816,8 +942,14 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             /// it is an error if it cannot be, or holds unsaved edits.
             "(document-prepare-relocation document path)" => |d: Doc, path: String| -> Result<Foreign<RefCell<Option<techne_text::Relocation>>>, String> {
                 let p = Path::new(&path);
-                let journal = runtime::journal_named(p).map_err(|e| format!("{path}: {e}"))?;
-                d.borrow().prepare_relocation(p, &journal).map(|r| Foreign::new(RefCell::new(Some(r)))).map_err(|e| format!("{path}: {e}"))
+                let doc = d.borrow();
+                let journal = if doc.has_journal() {
+                    runtime::journal_named(p).map_err(|e| format!("{path}: {e}"))?
+                } else {
+                    runtime::check_no_existing_journal(p, None)?;
+                    PathBuf::new()
+                };
+                doc.prepare_relocation(p, &journal).map(|r| Foreign::new(RefCell::new(Some(r)))).map_err(|e| format!("{path}: {e}"))
             };
             /// Give up RELOCATION, unlocking the journal it prepared.
             "(relocation-cancel! relocation)" => |r: Foreign<RefCell<Option<techne_text::Relocation>>>| { r.borrow_mut().take(); };
@@ -862,6 +994,29 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                     Err(e) => (Err(e.to_string()), false),
                 }
             });
+            /// Write encoded BYTES for DOCUMENT at REVISION to its local file,
+            /// refusing an external change unless OVERWRITE is true.
+            /// If EXPECTED-LOC-GEN is an integer, refuse if DOCUMENT relocated since.
+            #[vm]
+            "(%document-save-encoded! document revision bytes overwrite expected-loc-gen)" => move |vm: &mut Vm, d: Doc, revision: i64, bytes: Bytes, overwrite: bool, expected_loc_gen: Option<i64>| save_encoded_current.commit(vm, "document-save-encoded!", |op| {
+                if revision < 0 {
+                    return (Err("document-save-encoded!: negative revision".into()), false);
+                }
+                if let Some(expected) = expected_loc_gen
+                    && d.borrow().location_generation() as i64 != expected
+                {
+                    return (Err("document relocated while encoding; save again".into()), false);
+                }
+                let mode = if overwrite { techne_text::SaveMode::Overwrite } else { techne_text::SaveMode::IfUnchanged };
+                let written = d.borrow_mut().save_encoded_at(mode, revision as Revision, &bytes.0);
+                match written {
+                    Ok(()) => {
+                        saved(op, &d.borrow());
+                        (Ok(()), true)
+                    }
+                    Err(e) => (Err(e.to_string()), false),
+                }
+            });
             /// Read DOCUMENT's file again if it changed on disk.
             /// It is an edit by "disk", refused while DOCUMENT has unsaved
             /// edits. Return #t if the text changed.
@@ -894,11 +1049,130 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                     Err(e) => (Err(e.to_string()), false),
                 }
             });
+            /// Snapshot DOCUMENT's state before reading and decoding its local file.
+            "(%local-reload-prepare document)" => |d: Doc| -> Foreign<ReloadState> {
+                let doc = d.borrow();
+                Foreign::new(ReloadState {
+                    document: doc.id(),
+                    revision: doc.revision(),
+                    disk_hash: doc.disk_hash(),
+                    location_gen: doc.location_generation(),
+                    generation: None,
+                })
+            };
+            /// Finish reloading or reverting a local codec-backed DOCUMENT from
+            /// STATE (from `%local-reload-prepare`), RAW-BYTES, and decoded TEXT.
+            #[vm]
+            "(%document-reload-decoded! document state raw-bytes text revert-as)" => move |vm: &mut Vm, d: Doc, state: Foreign<ReloadState>, raw_bytes: Option<Bytes>, text: String, revert_as: Option<String>| reload_decoded_current.commit(vm, "document-reload-decoded!", |op| {
+                if state.0.document != d.borrow().id() || state.0.generation.is_some() {
+                    return (Err("document-reload-decoded!: invalid reload state".into()), false);
+                }
+                if (d.borrow().revision(), d.borrow().disk_hash(), d.borrow().location_generation())
+                    != (state.0.revision, state.0.disk_hash, state.0.location_gen)
+                {
+                    return (Err("the document changed while its file was read; read it again".into()), false);
+                }
+                let id = op.as_ref().map(|o| o.id());
+                let raw = raw_bytes.as_ref().map(|b| b.0.as_slice());
+                let res = match revert_as {
+                    Some(actor) => d.borrow_mut().revert_decoded_in(&Arc::from(actor.as_str()), raw, text, id),
+                    None => d.borrow_mut().reload_decoded_in(&Arc::from("disk"), raw, text, id),
+                };
+                match res {
+                    Ok(changed) => {
+                        if let Some(op) = op.filter(|_| changed) {
+                            op.changed(&d.0, d.borrow().revision());
+                        }
+                        (Ok(changed), changed)
+                    }
+                    Err(e) => (Err(e.to_string()), false),
+                }
+            });
+            /// Return the canonical UTF-8 file path of PATH (including a non-existent
+            /// file's canonical parent), following symlinks.
+            "(%canonical-file-path path)" => |path: String| -> Result<String, String> {
+                techne_text::document::file_path(Path::new(&path))
+                    .and_then(|p| {
+                        p.into_os_string()
+                            .into_string()
+                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "canonical path is not valid UTF-8"))
+                    })
+                    .map_err(|e| format!("{path}: {e}"))
+            };
+            /// Return the raw bytes of the pinned regular file at PATH, or #f.
+            /// When MAX-BYTES is an integer, refuse files larger than MAX-BYTES.
+            "(%read-file-bytes path max-bytes)" => |path: String, max_bytes: Option<i64>| -> Result<Option<Bytes>, String> {
+                let p = Path::new(&path);
+                let bytes = match max_bytes {
+                    Some(n) if n < 0 => return Err("read-file-bytes: negative max-bytes".into()),
+                    Some(n) => techne_text::document::read_disk_bytes_pinned_bounded(p, n as usize),
+                    None => techne_text::document::read_disk_bytes_pinned(p),
+                };
+                bytes.map(|opt| opt.map(Bytes)).map_err(|e| format!("{path}: {e}"))
+            };
             /// Return the file at PATH as a document, with its unsaved edits.
             /// The edits come from its journal in the state directory.
             "(open-file path)" => move |path: String| -> Result<Doc, String> {
                 let p = Path::new(&path);
                 open_shared(&documents, p, || runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))).map(|(d, _)| Foreign(d))
+            };
+            /// Return the pinned canonical file at PATH as a journaled document.
+            /// JOURNAL overrides the journal path; ALIAS migrates a legacy journal.
+            "(%open-file-pinned path journal alias)" => move |path: String, journal: Option<String>, alias: Option<String>| -> Result<Doc, String> {
+                let p = Path::new(&path);
+                let alias_p = alias.as_deref().map(Path::new);
+                open_shared_pinned(&pinned_documents, p, || match journal {
+                    Some(jp) => Ok(PathBuf::from(jp)),
+                    None => runtime::journal_for_pinned(p, alias_p).map_err(|e| format!("{path}: {e}")),
+                })
+                .map(|(d, _)| Foreign(d))
+            };
+            /// Return the file at PATH as a Retention::None document with no journal.
+            /// Optional ALIAS (a string or #f) is also checked for legacy journals.
+            "(%open-file-without-journal path alias)" => move |path: String, alias: Option<String>| -> Result<Doc, String> {
+                let p = Path::new(&path);
+                let alias_p = alias.as_deref().map(Path::new);
+                open_shared_without_journal(&private_documents, p, alias_p).map(Foreign)
+            };
+            /// Return a local document at PATH opened from RAW-BYTES and decoded TEXT.
+            /// JOURNAL is #f for Retention::None, #t for the default state-dir journal,
+            /// or a string giving an explicit journal path. Optional ALIAS (a string
+            /// or #f) is also checked for legacy journals when JOURNAL is #f.
+            #[vm]
+            "(%open-file-decoded path raw-bytes text journal alias)" => move |vm: &mut Vm, path: String, raw_bytes: Option<Bytes>, text: String, journal: Value, alias: Option<String>| -> Result<Doc, String> {
+                let p = Path::new(&path);
+                let alias_p = alias.as_deref().map(Path::new);
+                let explicit: Option<PathBuf> = if journal.is_false() {
+                    None
+                } else if let Ok(s) = vm.get::<String>(&journal) {
+                    Some(PathBuf::from(s))
+                } else {
+                    None
+                };
+                let journal_fn: Option<Box<dyn FnOnce() -> Result<PathBuf, String>>> = if journal.is_false() {
+                    None
+                } else if let Some(override_path) = explicit {
+                    Some(Box::new(move || Ok(override_path)))
+                } else {
+                    let path_owned = path.clone();
+                    let alias_owned = alias.clone();
+                    Some(Box::new(move || {
+                        runtime::journal_for_pinned(Path::new(&path_owned), alias_owned.as_deref().map(Path::new))
+                            .map_err(|e| format!("{path_owned}: {e}"))
+                    }))
+                };
+                let (doc, recovery) = open_shared_decoded(
+                    &decoded_documents,
+                    p,
+                    alias_p,
+                    raw_bytes.as_ref().map(|b| b.0.as_slice()),
+                    text,
+                    journal_fn,
+                )?;
+                if let Some(rec) = recovery {
+                    *last_recovery.borrow_mut() = Some((doc.borrow().id(), rec));
+                }
+                Ok(Foreign(doc))
             };
         }
     });
@@ -907,6 +1181,105 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
         let saving = remote_save::Saves::default();
         let open_saving = saving.clone();
+        let prepare_open_saving = saving.clone();
+        let finish_open_saving = saving.clone();
+        let finish_private_saving = saving.clone();
+        let save_encoded_saving = saving.clone();
+        let prepare_reload_saving = saving.clone();
+        let finish_reload_saving = saving.clone();
+        let reload_remote_decoded_current = remote_current.clone();
+        let save_remote_encoded_current = remote_current.clone();
+        techne_vm::procedures! { vm;
+            /// Settle pending remote saves for NAME and return its generation.
+            "(%remote-open-prepare name)" => move |name: String| -> Result<i64, String> {
+                prepare_open_saving.settle_location(&name)?;
+                Ok(prepare_open_saving.generation_location(&name) as i64)
+            };
+            /// Finish opening a remote document NAME from GENERATION, RAW-BYTES,
+            /// and decoded TEXT. When JOURNAL is #f, uses Retention::None.
+            "(%open-remote-file-decoded name generation raw-bytes text journal)" => move |name: String, generation: i64, raw_bytes: Option<Bytes>, text: String, journal: bool| -> Result<Doc, String> {
+                if generation < 0 {
+                    return Err("open-remote-file-decoded: negative generation".into());
+                }
+                let key = PathBuf::from(&name);
+                finish_open_saving
+                    .finish_open_decoded(
+                        &remote_decoded_documents,
+                        &name,
+                        generation as u64,
+                        raw_bytes.as_ref().map(|b| b.0.as_slice()),
+                        text,
+                        journal.then_some(|| runtime::journal_named(&key).map_err(|e| format!("{name}: {e}"))),
+                    )
+                    .map(Foreign)
+            };
+            /// Finish opening a remote document NAME with Retention::None (no
+            /// codec, no journal) from GENERATION and RAW-BYTES.
+            "(%open-remote-file-without-journal name generation raw-bytes)" => move |name: String, generation: i64, raw_bytes: Option<Bytes>| -> Result<Doc, String> {
+                if generation < 0 {
+                    return Err("open-remote-file-without-journal: negative generation".into());
+                }
+                finish_private_saving
+                    .finish_open_without_journal(
+                        &remote_private_documents,
+                        &name,
+                        generation as u64,
+                        raw_bytes.map(|b| b.0),
+                    )
+                    .map(Foreign)
+            };
+            /// Settle pending remote saves for DOCUMENT and snapshot its reload state.
+            "(%remote-reload-prepare document)" => move |d: Doc| -> Result<Foreign<ReloadState>, String> {
+                prepare_reload_saving.settle(&d.0)?;
+                let generation = prepare_reload_saving.generation(&d.0)?;
+                let doc = d.borrow();
+                Ok(Foreign::new(ReloadState {
+                    document: doc.id(),
+                    revision: doc.revision(),
+                    disk_hash: doc.disk_hash(),
+                    location_gen: doc.location_generation(),
+                    generation: Some(generation),
+                }))
+            };
+            /// Finish reloading or reverting a remote codec-backed DOCUMENT from
+            /// STATE (from `%remote-reload-prepare`), RAW-BYTES, and decoded TEXT.
+            #[vm]
+            "(%document-reload-remote-decoded! document state raw-bytes text revert-as)" => move |vm: &mut Vm, d: Doc, state: Foreign<ReloadState>, raw_bytes: Option<Bytes>, text: String, revert_as: Option<String>| reload_remote_decoded_current.commit(vm, "document-reload-remote-decoded!", |op| {
+                let Some(generation) = state.0.generation else {
+                    return (Err("document-reload-remote-decoded!: invalid reload state".into()), false);
+                };
+                if state.0.document != d.borrow().id() {
+                    return (Err("document-reload-remote-decoded!: state is for another document".into()), false);
+                }
+                if let Err(e) = finish_reload_saving.settle(&d.0) {
+                    return (Err(e), false);
+                }
+                let cur_gen = match finish_reload_saving.generation(&d.0) {
+                    Ok(g) => g,
+                    Err(e) => return (Err(e), false),
+                };
+                if (d.borrow().revision(), d.borrow().disk_hash(), d.borrow().location_generation(), cur_gen)
+                    != (state.0.revision, state.0.disk_hash, state.0.location_gen, generation)
+                {
+                    return (Err("the document changed while its file was read; read it again".into()), false);
+                }
+                let id = op.as_ref().map(|o| o.id());
+                let raw = raw_bytes.as_ref().map(|b| b.0.as_slice());
+                let res = match revert_as {
+                    Some(actor) => d.borrow_mut().revert_decoded_in(&Arc::from(actor.as_str()), raw, text, id),
+                    None => d.borrow_mut().reload_decoded_in(&Arc::from("disk"), raw, text, id),
+                };
+                match res {
+                    Ok(changed) => {
+                        if let Some(op) = op.filter(|_| changed) {
+                            op.changed(&d.0, d.borrow().revision());
+                        }
+                        (Ok(changed), changed)
+                    }
+                    Err(e) => (Err(e.to_string()), false),
+                }
+            });
+        }
         vm.register_async("%open-remote-file", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
             let documents = remote_documents.clone();
             let saving = open_saving.clone();
@@ -924,7 +1297,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                         &documents,
                         &name,
                         move || {
-                            let read = node.0.0.read_file(path.into_bytes());
+                            let read = node.0.0.read_file_pinned(path.into_bytes());
                             async move { read.await.map(|file| file.map(|(bytes, _)| bytes)) }
                         },
                         || runtime::journal_named(&key).map_err(|e| format!("{name}: {e}")),
@@ -946,6 +1319,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
                 let overwrite: bool = args.get(vm, 3)?;
+                let private = !d.borrow().has_journal();
                 let name = path.clone();
                 saving
                     .start(&d.0, move |save| {
@@ -954,7 +1328,52 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                             (false, None) => techne_node::protocol::Expect::Absent,
                             (false, Some(h)) => techne_node::protocol::Expect::Hash(h),
                         };
-                        node.0.0.write_file_tracked(path.into_bytes(), save.bytes.clone(), expect)
+                        node.0.0.write_file_tracked_pinned(path.into_bytes(), save.bytes.clone(), expect, private)
+                    })
+                    .map_err(Error::new)
+                    .map(|saved| (op, name, saved))
+            })();
+            async move {
+                let (op, d_name, saved) = request.map_err(|e| e.into_inner().msg)?;
+                let done = saved.await;
+                if let Some(op) = op
+                    && done.is_ok()
+                {
+                    op.saved(&d_name);
+                }
+                done
+            }
+        });
+        vm.register_async("%document-save-remote-encoded!", 7, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let saving = save_encoded_saving.clone();
+            let op = save_remote_encoded_current.committing(vm, "document-save-remote-encoded!");
+            let request = (|| {
+                let op = op.map_err(Error::new)?;
+                let d: Doc = args.get(vm, 0)?;
+                let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
+                let path: String = args.get(vm, 2)?;
+                let revision: i64 = args.get(vm, 3)?;
+                let bytes: Bytes = args.get(vm, 4)?;
+                let overwrite: bool = args.get(vm, 5)?;
+                let expected_loc_gen: Option<i64> = args.get(vm, 6)?;
+                if revision < 0 {
+                    return Err(Error::new("document-save-remote-encoded!: negative revision"));
+                }
+                if let Some(expected) = expected_loc_gen
+                    && d.borrow().location_generation() as i64 != expected
+                {
+                    return Err(Error::new("document relocated while encoding; save again"));
+                }
+                let private = !d.borrow().has_journal();
+                let name = path.clone();
+                saving
+                    .start_encoded(&d.0, revision as Revision, bytes.0, move |save| {
+                        let expect = match (overwrite, save.base) {
+                            (true, _) => techne_node::protocol::Expect::Any,
+                            (false, None) => techne_node::protocol::Expect::Absent,
+                            (false, Some(h)) => techne_node::protocol::Expect::Hash(h),
+                        };
+                        node.0.0.write_file_tracked_pinned(path.into_bytes(), save.bytes.clone(), expect, private)
                     })
                     .map_err(Error::new)
                     .map(|saved| (op, name, saved))
@@ -982,14 +1401,24 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                 let revert_as: Option<String> = args.get(vm, 3)?;
                 saving.settle(&d.0).map_err(Error::new)?;
                 // What the document was when the file was asked for.
-                let before = (d.borrow().revision(), d.borrow().disk_hash(), saving.generation(&d.0).map_err(Error::new)?);
-                Ok::<_, Error>((op, d, before, revert_as, node.0.0.read_file(path.into_bytes())))
+                let before = (
+                    d.borrow().revision(),
+                    d.borrow().disk_hash(),
+                    d.borrow().location_generation(),
+                    saving.generation(&d.0).map_err(Error::new)?,
+                );
+                Ok::<_, Error>((op, d, before, revert_as, node.0.0.read_file_pinned(path.into_bytes())))
             })();
             async move {
                 let (op, d, before, revert_as, read) = request.map_err(|e| e.into_inner().msg)?;
                 let bytes = read.await?.map(|(bytes, _)| bytes);
                 saving.settle(&d.0)?;
-                let now = (d.borrow().revision(), d.borrow().disk_hash(), saving.generation(&d.0)?);
+                let now = (
+                    d.borrow().revision(),
+                    d.borrow().disk_hash(),
+                    d.borrow().location_generation(),
+                    saving.generation(&d.0)?,
+                );
                 if now != before {
                     return Err("the document changed while its file was read; read it again".to_string());
                 }
@@ -1019,6 +1448,10 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             /// Write the remote DOCUMENT to PATH on NODE, refusing an external
             /// change unless OVERWRITE.
             "(%document-save-remote! document node path overwrite)";
+            /// Write encoded BYTES for remote DOCUMENT at REVISION to PATH on
+            /// NODE, refusing an external change unless OVERWRITE.
+            /// If EXPECTED-LOC-GEN is an integer, refuse if DOCUMENT relocated since.
+            "(%document-save-remote-encoded! document node path revision bytes overwrite expected-loc-gen)";
             /// Read the remote DOCUMENT's file at PATH on NODE again. With
             /// REVERT-AS, an actor, its unsaved edits are replaced by the
             /// file's text as that actor's edit; else it is refused while
