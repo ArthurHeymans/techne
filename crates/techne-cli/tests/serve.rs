@@ -852,3 +852,82 @@ fn hosted_legacy_isolation_tenant_tree_cache_quarantine_and_combined_caps() {
     assert_eq!(status, 422, "{body}");
     assert!(body.contains("1000 files at most"), "{body}");
 }
+
+/// Remote `techne cloud patch-library --to URL --tenant T --project P`:
+/// - refuses with `no-mutable-world` when no debug instance is attached,
+/// - patches only the attached debug instance once an nREPL debug session opens,
+///   leaving unrouted production traffic strictly on the immutable snapshot,
+/// - and refuses again once the debug session disconnects.
+#[test]
+fn remote_patch_library_targets_attached_debug_instance_only() {
+    use techne_node::bencode::B;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let app_dir = tmp.path().join("app");
+
+    write_pkg_file(&app_dir, "techne-package.scm", r#"(package (acme app) (version "0.1.0") (cloud "app.scm"))"#);
+    let lib_v1 = r#"(define-library (acme app util)
+  (export label)
+  (import (techne))
+  (begin
+    (define (label) "prod-v1")))"#;
+    write_pkg_file(&app_dir, "lib/acme/app/util.sld", lib_v1);
+    write_pkg_file(
+        &app_dir,
+        "app.scm",
+        r#"(import (techne http) (acme app util))
+(provide fetch)
+(define (fetch request env ctx)
+  (response (label)))
+"#,
+    );
+
+    let invite = |tenant: &str| cloud(&["invite", "--state", state.to_str().unwrap(), tenant], None).1.trim().to_string();
+    let acme = invite("acme");
+    let (_child, port, ops, nrepl) = serve(&state);
+    let target = ["--to", ops.as_str(), "--tenant", "acme", "--project", "app"];
+    let (ok, said) = cloud(&[&["deploy", app_dir.to_str().unwrap()], &target[..]].concat(), Some(&acme));
+    assert!(ok, "{said}");
+    let host = "app.acme.cloud.test";
+    assert_eq!(get(port, host, "/"), (200, "prod-v1".into()));
+
+    let lib_v2 = lib_v1.replace("\"prod-v1\"", "\"debug-v2\"");
+
+    // 1. No attached debug instance -> refused with no-mutable-world.
+    let (ok, reply) = cloud(&[&["patch-library", "(acme app util)", "--code", &lib_v2], &target[..]].concat(), Some(&acme));
+    assert!(!ok && reply.contains("no-mutable-world"), "{reply}");
+    assert_eq!(get(port, host, "/"), (200, "prod-v1".into()));
+
+    // 2. Open an nREPL debug session for acme/app -> attaches a debug instance.
+    let mut c = TcpStream::connect(("127.0.0.1", nrepl)).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    let opened = ask_repl(
+        &mut c,
+        vec![("op", B::str("authenticate")), ("token", B::str(&acme)), ("project", B::str("acme/app")), ("id", B::str("1"))],
+        "done",
+    )
+    .expect("authenticate reply");
+    let credential = opened.get("techne-debug-route").and_then(B::as_str).expect("debug credential").to_string();
+
+    // 3. Patch via remote CLI -> succeeds on the debug instance alone!
+    let (ok, reply) = cloud(&[&["patch-library", "(acme app util)", "--code", &lib_v2], &target[..]].concat(), Some(&acme));
+    assert!(ok, "{reply}");
+    assert!(reply.contains("\"dirty\":true") && reply.contains("\"label\""), "{reply}");
+
+    let (status, _head, body) = get_routed(port, host, "/", &credential);
+    assert_eq!((status, body.as_str()), (200, "debug-v2"));
+    assert_eq!(get(port, host, "/"), (200, "prod-v1".into()));
+
+    // 4. Disconnect debug session -> debug instance detaches and patching is refused again.
+    drop(c);
+    let start = Instant::now();
+    loop {
+        let (ok, reply) = cloud(&[&["patch-library", "(acme app util)", "--code", &lib_v2], &target[..]].concat(), Some(&acme));
+        if !ok && reply.contains("no-mutable-world") {
+            break;
+        }
+        assert!(start.elapsed() < PATIENCE, "debug instance never detached: {reply}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(get(port, host, "/"), (200, "prod-v1".into()));
+}

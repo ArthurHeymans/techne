@@ -980,4 +980,98 @@ mod tests {
         };
         assert!(ToWorker::from_data(no_root.to_data()).is_err());
     }
+
+    #[test]
+    fn patch_library_wire_roundtrip_and_bounds() {
+        let req = ToWorker::PatchLibrary {
+            id: 7,
+            name: "app@1".into(),
+            library: vec!["bob".into(), "util".into()],
+            code: "(define-library (bob util) (export f) (import (techne)) (begin (define (f) 2)))".into(),
+            check_retained: false,
+        };
+        let encoded = encode(&req.to_data());
+        match ToWorker::from_data(decode(&encoded).unwrap()).unwrap() {
+            ToWorker::PatchLibrary { id, name, library, code, check_retained } => {
+                assert_eq!(id, 7);
+                assert_eq!(name, "app@1");
+                assert_eq!(library, vec!["bob", "util"]);
+                assert!(code.contains("(define (f) 2)"));
+                assert!(!check_retained);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Empty library parts and oversized source are rejected.
+        let empty_lib = ToWorker::PatchLibrary { id: 8, name: "app@1".into(), library: vec![], code: "x".into(), check_retained: true };
+        assert!(ToWorker::from_data(empty_lib.to_data()).is_err());
+
+        let too_big = ToWorker::PatchLibrary {
+            id: 9,
+            name: "app@1".into(),
+            library: vec!["a".into()],
+            code: "x".repeat(MAX_PATCH_BYTES + 1),
+            check_retained: true,
+        };
+        assert!(ToWorker::from_data(too_big.to_data()).is_err());
+
+        // PatchedLibrary Ok roundtrip with stale holders.
+        let ok_reply = FromWorker::PatchedLibrary {
+            id: 7,
+            result: Ok(crate::PatchReport {
+                library: vec!["bob".into(), "util".into()],
+                patched: vec!["f".into()],
+                unchanged: 3,
+                stale_holders: vec![crate::StaleHolder { binding: "f".into(), chain: vec!["global saved".into(), "pair car".into()] }],
+                source_sha256: "a".repeat(64),
+            }),
+        };
+        let encoded_ok = encode(&ok_reply.to_data());
+        match FromWorker::from_data(decode(&encoded_ok).unwrap()).unwrap() {
+            FromWorker::PatchedLibrary { id, result: Ok(report) } => {
+                assert_eq!(id, 7);
+                assert_eq!(report.library, vec!["bob", "util"]);
+                assert_eq!(report.patched, vec!["f"]);
+                assert_eq!(report.unchanged, 3);
+                assert_eq!(report.stale_holders.len(), 1);
+                assert_eq!(report.stale_holders[0].binding, "f");
+                assert_eq!(report.stale_holders[0].chain, vec!["global saved", "pair car"]);
+                assert_eq!(report.source_sha256, "a".repeat(64));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // PatchedLibrary Err roundtrip with binding.
+        let err_reply = FromWorker::PatchedLibrary {
+            id: 8,
+            result: Err(crate::HostPatchError {
+                reason: "record-layout-changed".into(),
+                message: "record `item` changed".into(),
+                binding: Some("item".into()),
+            }),
+        };
+        let encoded_err = encode(&err_reply.to_data());
+        match FromWorker::from_data(decode(&encoded_err).unwrap()).unwrap() {
+            FromWorker::PatchedLibrary { id, result: Err(err) } => {
+                assert_eq!(id, 8);
+                assert_eq!(err.reason, "record-layout-changed");
+                assert_eq!(err.message, "record `item` changed");
+                assert_eq!(err.binding.as_deref(), Some("item"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Trailing element inside stale holder tuple is rejected.
+        let bad_holder = Data::List(vec![
+            sym("patched-library"),
+            int(1),
+            Data::Bool(true),
+            Data::List(vec![Data::String("bob".into())]),
+            Data::List(vec![]),
+            int(0),
+            Data::List(vec![Data::List(vec![Data::String("f".into()), Data::List(vec![]), Data::Int(99)])]),
+            Data::String("a".repeat(64)),
+        ]);
+        assert!(FromWorker::from_data(bad_holder).is_err());
+    }
 }

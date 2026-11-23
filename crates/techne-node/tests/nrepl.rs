@@ -170,7 +170,7 @@ fn standard_operations() {
     let mut c = Client::connect(&server);
     let described = c.request(vec![("op", B::str("describe"))]);
     let ops = described[0].get("ops").unwrap();
-    for op in ["eval", "interrupt", "completions", "lookup", "techne-debug-restart", "techne-inspect"] {
+    for op in ["eval", "interrupt", "completions", "lookup", "techne-debug-restart", "techne-inspect", "techne-patch-library"] {
         assert!(ops.get(op).is_some(), "describe lists {op}");
     }
     // Values, printed output, *1.
@@ -553,4 +553,120 @@ fn exit_does_not_end_the_server() {
     let r = c.eval("(exit 3)");
     assert!(field(&r, "err").iter().any(|e| e.contains("not granted")), "{r:?}");
     assert_eq!(field(&c.eval("(+ 1 2)"), "value"), ["3"]);
+}
+
+#[test]
+fn techne_patch_library_and_paused_debugger_retry() {
+    let server = server();
+    let mut a = Client::connect(&server);
+    let mut b = Client::connect(&server);
+
+    // Load a library with record type, mutable state, and procedure.
+    let setup = a.eval(
+        r#"(define-library (demo lib)
+             (export make-rec rec? rec-v bump! compute)
+             (import (techne))
+             (begin
+               (define-record-type rec (make-rec v) rec? (v rec-v))
+               (define counter (vector 0))
+               (define (bump!)
+                 (vector-set! counter 0 (+ (vector-ref counter 0) 1))
+                 (vector-ref counter 0))
+               (define (compute x) (+ x 1))))
+           (import (demo lib))
+           (define r0 (make-rec 'ok))
+           (bump!)"#,
+    );
+    assert!(!has_status(&setup, "eval-error"), "{setup:?}");
+    assert_eq!(field(&a.eval("(compute 10)"), "value"), ["11"]);
+
+    // 1. Patch with bencode list `["demo", "lib"]`.
+    let v2 = r#"(define-library (demo lib)
+                  (export make-rec rec? rec-v bump! compute)
+                  (import (techne))
+                  (begin
+                    (define-record-type rec (make-rec v) rec? (v rec-v))
+                    (define counter (vector 0))
+                    (define (bump!)
+                      (vector-set! counter 0 (+ (vector-ref counter 0) 1))
+                      (vector-ref counter 0))
+                    (define (compute x) (+ x 20))))"#;
+    let r = a.request(vec![
+        ("op", B::str("techne-patch-library")),
+        ("library", B::List(vec![B::str("demo"), B::str("lib")])),
+        ("code", B::str(v2)),
+    ]);
+    assert!(has_status(&r, "done") && !has_status(&r, "error"), "{r:?}");
+    assert_eq!(r[0].get("patched"), Some(&B::List(vec![B::str("compute")])));
+    assert_eq!(r[0].get("unchanged"), Some(&B::Int(3)));
+    assert_eq!(r[0].get("stale-holders"), Some(&B::List(vec![])));
+    assert!(r[0].get("source-sha256").and_then(B::as_str).is_some_and(|s| s.len() == 64));
+
+    // Pre-patch record identity & mutable state survive; patched procedure takes effect.
+    assert_eq!(field(&a.eval("(list (rec? r0) (rec-v r0) (bump!) (compute 10))"), "value"), ["(#t ok 2 30)"]);
+
+    // 2. Patch with Scheme string `"(demo lib)"` and check stale-holder detection.
+    a.eval("(define held (list compute))");
+    let v3 = v2.replace("(+ x 20)", "(+ x 30)");
+    let r = a.request(vec![("op", B::str("techne-patch-library")), ("library", B::str("(demo lib)")), ("code", B::str(&v3))]);
+    assert!(has_status(&r, "done") && !has_status(&r, "error"), "{r:?}");
+    let Some(B::List(holders)) = r[0].get("stale-holders") else { panic!("{r:?}") };
+    assert_eq!(holders.len(), 1, "{holders:?}");
+    assert_eq!(holders[0].get("binding").and_then(B::as_str), Some("compute"));
+
+    // 3. Structural change is refused cleanly with typed error fields.
+    let bad = v3.replace("(define counter (vector 0))", "(define counter (vector 99))");
+    let r = a.request(vec![("op", B::str("techne-patch-library")), ("library", B::str("(demo lib)")), ("code", B::str(&bad))]);
+    assert!(has_status(&r, "error") && has_status(&r, "patch-refused") && has_status(&r, "done"), "{r:?}");
+    assert_eq!(field(&r, "reason"), ["state-initializer-changed"]);
+    assert_eq!(field(&r, "binding"), ["counter"]);
+    assert!(!field(&r, "message").concat().is_empty());
+
+    // 4. Paused-debugger retry workflow: break inside a library procedure,
+    //    patch the library while paused, then invoke the `retry` restart.
+    let buggy_setup = a.eval(
+        r#"(define-library (demo buggy)
+             (export process-item)
+             (import (techne))
+             (begin
+               (define (process-item x) (car x))))
+           (import (demo buggy))"#,
+    );
+    assert!(!has_status(&buggy_setup, "eval-error"), "{buggy_setup:?}");
+
+    let id = a.send(vec![
+        ("op", B::str("eval")),
+        ("code", B::str("(let loop () (restart-case (process-item 41) (retry () (loop))))")),
+        ("techne-debug", B::Int(2)),
+    ]);
+    let paused = loop {
+        let msg = a.next_for(&id);
+        if has_status(std::slice::from_ref(&msg), "techne-debug") {
+            break msg;
+        }
+        assert!(!has_status(std::slice::from_ref(&msg), "done"), "{msg:?}");
+    };
+    let debug_id = paused.get("debug-id").unwrap().clone();
+    let Some(B::List(restarts)) = paused.get("restarts") else { panic!("{paused:?}") };
+    let retry_idx = restarts.iter().position(|r| r.get("name").and_then(B::as_str) == Some("retry")).unwrap();
+
+    // While `a` is paused in the debugger, patch `(demo buggy)` from `b`.
+    let fixed_src = r#"(define-library (demo buggy)
+                         (export process-item)
+                         (import (techne))
+                         (begin
+                           (define (process-item x) (+ x 1))))"#;
+    let patched = b.request(vec![("op", B::str("techne-patch-library")), ("library", B::str("(demo buggy)")), ("code", B::str(fixed_src))]);
+    assert!(has_status(&patched, "done") && !has_status(&patched, "error"), "{patched:?}");
+
+    // Resume via `retry` and verify the paused evaluation returns the fixed result.
+    a.request(vec![
+        ("op", B::str("techne-debug-restart")),
+        ("debug-id", debug_id),
+        ("restart", B::Int(retry_idx as i64)),
+        ("args", B::str("")),
+    ]);
+    let done = a.until_done(&id);
+    assert!(!has_status(&done, "eval-error"), "{done:?}");
+    assert_eq!(field(&done, "value"), ["42"]);
 }

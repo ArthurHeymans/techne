@@ -811,3 +811,292 @@ fn packaged_cloud_dev_rejects_binding_contract_mismatch() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("key") && err.contains("secret") && err.contains("text"), "{err}");
 }
+
+/// Mode 2 live library patching via `techne cloud patch-library`:
+/// - refuses production-only `cloud dev` (no `--nrepl`) with `no-mutable-world`,
+/// - patches a dev world's imported package library via file and `--code` while
+///   preserving mutable state,
+/// - refuses structural changes with typed errors without disturbing live state,
+/// - and resets cleanly on a fresh Mode 1 deploy.
+#[test]
+fn cloud_patch_library_dev_world_and_production_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store");
+    let dep_repo = tmp.path().join("dep-util");
+    let app_dir = tmp.path().join("app");
+
+    write_pkg_file(&dep_repo, "techne-package.scm", r#"(package (acme util) (version "0.1.0"))"#);
+    let util_v1 = r#"(define-library (acme util)
+  (export next-val)
+  (import (techne))
+  (begin
+    (define counter (vector 0))
+    (define (next-val)
+      (vector-set! counter 0 (+ (vector-ref counter 0) 1))
+      (string-append "v1#" (number->string (vector-ref counter 0))))))"#;
+    write_pkg_file(&dep_repo, "lib/acme/util.sld", util_v1);
+    git_init_commit(&dep_repo, "init dep");
+
+    write_pkg_file(
+        &app_dir,
+        "techne-package.scm",
+        &format!(
+            r#"(package (demo app)
+                 (version "0.1.0")
+                 (depends ((acme util) (local {:?})))
+                 (cloud "app.scm"))"#,
+            dep_repo.display().to_string()
+        ),
+    );
+    let app_src = r#"(import (techne http) (acme util))
+(provide fetch)
+(define (fetch request env ctx)
+  (response (next-val)))
+"#;
+    write_pkg_file(&app_dir, "app.scm", app_src);
+
+    let lock_out = Command::new(env!("CARGO_BIN_EXE_techne"))
+        .args(["lock", app_dir.to_str().unwrap()])
+        .env("TECHNE_PACKAGE_STORE", &store)
+        .output()
+        .unwrap();
+    assert!(lock_out.status.success(), "{}{}", String::from_utf8_lossy(&lock_out.stdout), String::from_utf8_lossy(&lock_out.stderr));
+
+    let util_v2 = util_v1.replace("\"v1#\"", "\"v2#\"");
+    let util_v3 = util_v1.replace("\"v1#\"", "\"v3#\"");
+    let util_bad = util_v1.replace("(vector 0)", "(vector 99)");
+    let patch_file = tmp.path().join("util-v2.sld");
+    std::fs::write(&patch_file, &util_v2).unwrap();
+
+    // 1. Production-only (`cloud dev` without `--nrepl`): patch-library is refused.
+    {
+        let mut child = Killed(
+            Command::new(env!("CARGO_BIN_EXE_techne"))
+                .args(["cloud", "dev", app_dir.to_str().unwrap(), "--port", "0", "--ops", "0"])
+                .env("TECHNE_PACKAGE_STORE", &store)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let out = lines(child.0.stdout.take().unwrap());
+        let (mut port, mut ops) = (None, false);
+        while port.is_none() || !ops {
+            let line = out.recv_timeout(PATIENCE).expect("the ports");
+            if line.starts_with("Serving") {
+                port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+            } else if line.starts_with("Operations on") {
+                ops = true;
+            }
+        }
+        let port = port.unwrap();
+        assert_eq!(get(port, "/"), "v1#1");
+
+        let (ok, reply) = cloud(&["patch-library", "(acme util)", patch_file.to_str().unwrap()], &app_dir, None);
+        assert!(!ok && reply.contains("no-mutable-world"), "{reply}");
+        assert!(get(port, "/").starts_with("v1#"));
+    }
+
+    // 2. Dev world (`cloud dev --nrepl 0 --ops 0`): patch-library succeeds and preserves state.
+    {
+        let mut child = Killed(
+            Command::new(env!("CARGO_BIN_EXE_techne"))
+                .args(["cloud", "dev", app_dir.to_str().unwrap(), "--port", "0", "--nrepl", "0", "--ops", "0"])
+                .env("TECHNE_PACKAGE_STORE", &store)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let out = lines(child.0.stdout.take().unwrap());
+        let err = lines(child.0.stderr.take().unwrap());
+        let (mut port, mut nrepl, mut ops) = (None, None, false);
+        while port.is_none() || nrepl.is_none() || !ops {
+            let line = out.recv_timeout(PATIENCE).expect("the ports");
+            if line.starts_with("Serving") {
+                port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+            } else if line.starts_with("nREPL server started on port") {
+                nrepl = line.split_whitespace().nth(5).and_then(|p| p.parse::<u16>().ok());
+            } else if line.starts_with("Operations on") {
+                ops = true;
+            }
+        }
+        let port = port.unwrap();
+        assert_eq!(get(port, "/"), "v1#1");
+
+        // Patch from file path.
+        let (ok, reply) = cloud(&["patch-library", "(acme util)", patch_file.to_str().unwrap()], &app_dir, None);
+        assert!(ok, "{reply}");
+        assert!(reply.contains("\"dirty\":true") && reply.contains("\"next-val\""), "{reply}");
+        assert_eq!(get(port, "/"), "v2#2");
+
+        // Patch inline via --code and --no-check-retained.
+        let (ok, reply) = cloud(&["patch-library", "(acme util)", "--code", &util_v3, "--no-check-retained"], &app_dir, None);
+        assert!(ok, "{reply}");
+        assert_eq!(get(port, "/"), "v3#3");
+
+        // Structural change is refused cleanly without mutating live world.
+        let (ok, reply) = cloud(&["patch-library", "(acme util)", "--code", &util_bad], &app_dir, None);
+        assert!(!ok, "{reply}");
+        assert!(reply.contains("patch-refused") && reply.contains("state-initializer-changed"), "{reply}");
+        assert_eq!(get(port, "/"), "v3#4");
+
+        // Mode 1 redeploy resets the dev world cleanly back to the disk snapshot.
+        write_pkg_file(&app_dir, "app.scm", &format!("; redeploy\n{app_src}"));
+        line_with(&err, "techne cloud: deployed", PATIENCE);
+        assert_eq!(get(port, "/"), "v1#1");
+    }
+}
+
+/// With `--nrepl --debug --ops`, `techne cloud patch-library` patches only the
+/// attached debug instance; unrouted production requests keep serving the
+/// immutable snapshot untouched.
+#[test]
+fn cloud_patch_library_isolates_debug_instance_from_production() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app_dir = tmp.path().join("app");
+
+    write_pkg_file(&app_dir, "techne-package.scm", r#"(package (demo app) (version "0.1.0") (cloud "app.scm"))"#);
+    let lib_v1 = r#"(define-library (demo app util)
+  (export tag)
+  (import (techne))
+  (begin
+    (define counter (vector 0))
+    (define (tag)
+      (vector-set! counter 0 (+ (vector-ref counter 0) 1))
+      (string-append "prod#" (number->string (vector-ref counter 0))))))"#;
+    write_pkg_file(&app_dir, "lib/demo/app/util.sld", lib_v1);
+    write_pkg_file(
+        &app_dir,
+        "app.scm",
+        r#"(import (techne http) (demo app util))
+(provide fetch)
+(define (fetch request env ctx)
+  (response (tag)))
+"#,
+    );
+
+    let mut child = Killed(
+        Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["cloud", "dev", app_dir.to_str().unwrap(), "--port", "0", "--nrepl", "0", "--debug", "--ops", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let out = lines(child.0.stdout.take().unwrap());
+    let (mut port, mut credential, mut ops) = (None, None, false);
+    while port.is_none() || credential.is_none() || !ops {
+        let line = out.recv_timeout(PATIENCE).expect("the ports and credential");
+        if line.starts_with("Serving") {
+            port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+        } else if line.starts_with("Debug instance") {
+            credential = line.rsplit(' ').next().map(str::to_string);
+        } else if line.starts_with("Operations on") {
+            ops = true;
+        }
+    }
+    let (port, credential) = (port.unwrap(), credential.unwrap());
+
+    assert_eq!(get(port, "/"), "prod#1");
+    assert_eq!(get_routed(port, "/", &credential).1, "prod#1");
+
+    let lib_v2 = lib_v1.replace("\"prod#\"", "\"debug#\"");
+    let (ok, reply) = cloud(&["patch-library", "(demo app util)", "--code", &lib_v2], &app_dir, None);
+    assert!(ok, "{reply}");
+    assert!(reply.contains("\"dirty\":true"), "{reply}");
+
+    // Routed debug request uses patched procedure with preserved debug-instance counter.
+    assert_eq!(get_routed(port, "/", &credential).1, "debug#2");
+    // Unrouted production request still runs from the untouched immutable snapshot.
+    assert!(get(port, "/").starts_with("prod#"));
+}
+
+/// A failing HTTP request calling an imported library pauses in the debugger;
+/// patching that library over nREPL (`techne-patch-library`) and invoking
+/// `retry` completes the in-flight HTTP request with the fixed response.
+#[test]
+fn cloud_dev_paused_debugger_retry_after_nrepl_patch_library() {
+    use techne_node::bencode::B;
+    let tmp = tempfile::tempdir().unwrap();
+    let app_dir = tmp.path().join("app");
+
+    write_pkg_file(&app_dir, "techne-package.scm", r#"(package (demo app) (version "0.1.0") (cloud "app.scm"))"#);
+    let lib_v1 = r#"(define-library (demo app buggy)
+  (export answer)
+  (import (techne))
+  (begin
+    (define (answer x) (car x))))"#;
+    write_pkg_file(&app_dir, "lib/demo/app/buggy.sld", lib_v1);
+    write_pkg_file(
+        &app_dir,
+        "app.scm",
+        r#"(import (techne http) (demo app buggy))
+(provide fetch)
+(define (fetch request env ctx)
+  (response (answer 41)))
+"#,
+    );
+
+    let mut child = Killed(
+        Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["cloud", "dev", app_dir.to_str().unwrap(), "--port", "0", "--nrepl", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let out = lines(child.0.stdout.take().unwrap());
+    let (mut port, mut nrepl) = (None, None);
+    while port.is_none() || nrepl.is_none() {
+        let line = out.recv_timeout(PATIENCE).expect("the ports");
+        if line.starts_with("Serving") {
+            port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+        } else if line.starts_with("nREPL server started on port") {
+            nrepl = line.split_whitespace().nth(5).and_then(|p| p.parse::<u16>().ok());
+        }
+    }
+    let (port, nrepl) = (port.unwrap(), nrepl.unwrap());
+
+    let mut c = TcpStream::connect(("127.0.0.1", nrepl)).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    nrepl_until(&mut c, vec![("op", B::str("techne-debug-subscribe")), ("id", B::str("sub"))], "techne-debug-subscribed");
+
+    let answer = std::thread::spawn(move || get(port, "/"));
+    let debugger = nrepl_until(&mut c, Vec::new(), "techne-debug");
+    let Some(B::List(restarts)) = debugger.get("restarts") else { panic!("no restarts") };
+    let retry_idx = restarts.iter().position(|r| r.get("name").and_then(B::as_str) == Some("retry")).unwrap();
+    let debug_id = debugger.get("debug-id").and_then(B::as_int).unwrap();
+
+    // Patch `(demo app buggy)` while the HTTP request is paused in the debugger.
+    let lib_fixed = r#"(define-library (demo app buggy)
+  (export answer)
+  (import (techne))
+  (begin
+    (define (answer x) (string-append "patched:" (number->string (+ x 1))))))"#;
+    let patched = nrepl_until(
+        &mut c,
+        vec![
+            ("op", B::str("techne-patch-library")),
+            ("id", B::str("patch1")),
+            ("library", B::str("(demo app buggy)")),
+            ("code", B::str(lib_fixed)),
+        ],
+        "done",
+    );
+    assert_eq!(patched.get("patched"), Some(&B::List(vec![B::str("answer")])), "{patched:?}");
+
+    // Retry the paused request and verify it finishes with the patched library response.
+    nrepl_until(
+        &mut c,
+        vec![
+            ("op", B::str("techne-debug-restart")),
+            ("id", B::str("retry1")),
+            ("debug-id", B::Int(debug_id)),
+            ("restart", B::Int(retry_idx as i64)),
+            ("args", B::str("")),
+        ],
+        "techne-debug-end",
+    );
+    assert_eq!(answer.join().unwrap(), "patched:42");
+}
