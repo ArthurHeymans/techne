@@ -36,9 +36,10 @@ and hidden dot-prefixed entries, and rejecting symlinks), computes its
 canonical `tree-sha256`, and atomically publishes it into the content-addressed
 store under `$XDG_DATA_HOME/techne/packages/store/<tree-sha256>/` (normally
 `~/.local/share/techne/packages/store/<tree-sha256>/`, overridable via
-`$TECHNE_PACKAGE_STORE` or `#:directory`). Installed roots and the resolved
-dependency graph are recorded in `installed.scm` and `world.lock` beside
-`store/`.
+`$TECHNE_PACKAGE_STORE` or `#:store`; passing an explicit `#:directory` without
+`#:store` uses `<DIRECTORY>/store` for isolated environments and tests).
+Installed roots and the resolved dependency graph are recorded in
+`installed.scm` and `world.lock` in the packages data directory.
 
 - Repeating the same `package-install!` declaration reuses `world.lock` and the
   content-addressed store offline without running Git.
@@ -46,9 +47,10 @@ dependency graph are recorded in `installed.scm` and `world.lock` beside
   published under its new `<tree-sha256>` without clobbering or mutating earlier
   store entries, while still checking diamond-dependency compatibility with
   other installed packages.
-- In a fresh editor, call `(package-restore!)` to verify every locked entry's
-  `tree-sha256` against `store/<tree-sha256>/` strictly offline, register
-  library providers, and advertise editor declarations.
+- In a fresh editor, call `(package-restore!)` to verify the exact transitive
+  closure of `installed.scm` against `world.lock` and every entry's
+  `tree-sha256` strictly offline, register library providers, and advertise
+  editor declarations.
 - Packages without an `(editor ...)` clause — pure library packages and
   `(cloud ...)` packages — install, lock, verify, and restore cleanly without
   requiring commands or options.
@@ -96,6 +98,8 @@ this file:
   - `(github "owner/repo" [(tag "...") | (branch "...") | (commit "...")] [(package (owner pkg))])`
   - `(git "https://..." [(tag "...") | (branch "...") | (commit "...")] [(package (owner pkg))])`
   - `(local "/absolute/path/to/repo" [(tag "...") | (branch "...") | (commit "...")] [(package (owner pkg))])`
+    — allowed only in the root manifest and root `(override ...)` (rejected in
+    non-root/transitive dependency manifests).
   At most one ref selector (`tag`, `branch`, or `commit`) and one optional
   `(package (owner pkg))` monorepo selector may appear. Duplicate dependency
   names and self-dependencies are refused.
@@ -154,12 +158,14 @@ and read by `(techne lock)` without evaluation:
     (depends))
   (package (bob lsp-helpers) "1.2.0"
     (source (github "bob/techne-lsp-helpers"
-              (commit "0123456789abcdef0123456789abcdef01234567")))
+              (commit "0123456789abcdef0123456789abcdef01234567")
+              (ref (tag "v1.2"))))
     (tree-sha256 "9a1c...64-hex...")
     (depends))
   (package (bob mono-fmt) "0.3.0"
     (source (git "https://example.org/bob/mono.git"
               (commit "0123456789abcdef0123456789abcdef01234567")
+              (ref (commit "0123456789abcdef0123456789abcdef01234567"))
               (subdir "packages/mono-fmt")))
     (tree-sha256 "7b2d...64-hex...")
     (depends (bob lsp-helpers))))
@@ -168,27 +174,42 @@ and read by `(techne lock)` without evaluation:
 - Package entries and their `(depends ...)` lists are sorted deterministically
   by canonical `(owner pkg)` name for minimal diffs.
 - Every Git source (`github`, `git`, `local`) is pinned to its full resolved
-  `(commit "<sha>")` and optional `(subdir "...")` for monorepo packages.
+  `(commit "<sha>")`, along with its normalized requested `(ref ...)` clause
+  (`(ref (tag "..."))`, `(ref (branch "..."))`, or `(ref (commit "..."))`,
+  omitted for default `HEAD`) and optional `(subdir "...")` for monorepo
+  packages. Persisting `(ref ...)` ensures that changing a declared tag, branch,
+  or commit in `techne-package.scm` immediately invalidates `techne.lock` during
+  offline `--check`, `--frozen`, and `techne run --locked`.
 - **One version per `(owner pkg)` per world:** Each canonical `(owner pkg)`
   may appear at most once in a resolved world.
-  - If two dependency paths resolve the same `(owner pkg)` to the same commit
-    and `tree-sha256` (or the same canonical local path), they deduplicate into
-    one entry.
-  - If they resolve to different commits, paths, or `tree-sha256` hashes,
-    resolution fails loudly with a diagnostic naming **both** full dependency
-    chains (for example `(root app) -> (alice a) -> (bob util)` vs
+  - If two dependency paths resolve the same `(owner pkg)` to the same origin
+    source, requested ref, commit, subdir, and `tree-sha256` (or the same
+    canonical local path), they deduplicate into one entry.
+  - If they resolve to different sources/mirrors, refs, commits, paths, or
+    `tree-sha256` hashes, resolution fails loudly with a diagnostic naming
+    **both** full dependency chains (for example
+    `(root app) -> (alice a) -> (bob util)` vs
     `(root app) -> (alice b) -> (bob util)`). Add a root `(override ...)` in
     `techne-package.scm` to pick one version explicitly.
 - Dependency cycles are rejected with the full cycle chain.
 
 ## CLI & LSP
 
-- **`techne lock [DIR] [--check] [--store DIR]`**
+- **`techne lock [DIR] [--check | --frozen | --update] [--store DIR]`**
   - Resolves `techne-package.scm` in `DIR` (default `.`), fetches and
     materializes Git dependencies into the content-addressed store
     (`$TECHNE_PACKAGE_STORE` or `$XDG_DATA_HOME/techne/packages/store`, or
     `--store DIR`), checks for diamond conflicts and cycles, and writes
-    `techne.lock` beside `techne-package.scm`.
+    `techne.lock` beside `techne-package.scm`. When `techne.lock` already
+    exists, existing valid pins for unchanged dependency edges are preserved
+    (hydrating any missing store entries at their pinned commit and verifying
+    `tree-sha256`).
+  - With `--update`, ignores existing pins in `techne.lock` and re-resolves all
+    dependencies from their declared refs.
+  - With `--frozen`, strictly materializes any missing store entries by the
+    exact pinned `(commit ...)` in `techne.lock`, verifies every `tree-sha256`
+    and freshness against `techne-package.scm`, and fails if `techne.lock` is
+    missing or stale — without ever modifying `techne.lock`.
   - With `--check`, verifies strictly offline (without running Git or modifying
     `techne.lock`) that `techne.lock` exists, matches `techne-package.scm` and
     root overrides, and every locked package's `tree-sha256` matches its
@@ -196,17 +217,22 @@ and read by `(techne lock)` without evaluation:
 - **`techne run [--locked] [--package DIR] [--store DIR] FILE [ARGS]`**
   - Without `--locked`, locates the nearest `techne-package.scm` above `FILE`
     (or `--package DIR`) and registers local `(path ...)` packages via
-    `(use-package-directory!)`.
-  - With `--locked`, requires a valid, up-to-date `techne.lock`, verifies every
-    locked package's `tree-sha256` strictly offline against the content-addressed
-    store and local paths (never invoking Git or touching the network), wires
-    every `(owner pkg)` library provider and direct import boundary into the
-    VM, and runs `FILE`.
+    `(use-package-directory!)`. Passing `--store DIR` without `--locked` is an
+    error.
+  - With `--locked`, enables locked library isolation (ignoring
+    `TECHNE_LIBRARY_PATH` and working-directory fallbacks), requires a valid,
+    up-to-date `techne.lock`, verifies every locked package's `tree-sha256`
+    strictly offline against the content-addressed store and local paths (never
+    invoking Git or touching the network; directs you to `techne lock --frozen`
+    if store entries are missing), wires every `(owner pkg)` library provider
+    and direct import boundary into the VM, and runs `FILE`.
 - **`techne lsp`**
   - Resolves a package's own `(owner pkg ...)` libraries from `lib/` and its
-    direct `(depends ...)` via root `(override ...)`, `techne.lock` + the
-    content-addressed store, or `(path ...)`, reading manifests and lockfiles
-    strictly as pure data while preserving direct-dependency boundaries.
+    direct `(depends ...)` via the consuming workspace/project root's
+    `(override ...)`, `techne.lock` + the content-addressed store (honoring
+    `$TECHNE_PACKAGE_STORE`), or unlocked `(path ...)`, reading manifests and
+    lockfiles strictly as pure data while preserving direct-dependency
+    boundaries and ignoring overrides inside non-root dependency manifests.
 
 ## Package directories
 
@@ -224,9 +250,10 @@ mail/
 ```
 
 - **Identity & libraries.** A package's canonical name is a two-symbol list
-  `(owner pkg)` where both `owner` and `pkg` are lowercase path components
-  (letters, digits, `-`, `_`, `.`). Package `(owner pkg)` exclusively owns the
-  libraries whose names begin with `(owner pkg)`: `(owner pkg)` is
+  `(owner pkg)` where both `owner` and `pkg` are ASCII lowercase identifiers
+  starting with `[a-z0-9]` followed by `[a-z0-9._-]` (never starting with `.`
+  or `-`, and no non-ASCII characters). Package `(owner pkg)` exclusively owns
+  the libraries whose names begin with `(owner pkg)`: `(owner pkg)` is
   `lib/owner/pkg.sld` and `(owner pkg sub ...)` is `lib/owner/pkg/sub/....sld`
   in its directory and nowhere else. They belong to the world, not to a
   generation: one instance, whoever imports them, staying when the package is

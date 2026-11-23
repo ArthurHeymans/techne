@@ -21,7 +21,7 @@ usage: techne [SUBCOMMAND] [ARGS...]
   daemon                   the editor with no frontend, for frontends to attach
   attach --stdio [--start] relay to the editor running here (what ssh runs)
   run [ARGS] FILE [ARGS]   run a Scheme file (--locked, --package DIR, --store DIR)
-  lock [DIR] [--check]     resolve or verify techne.lock for a package directory
+  lock [DIR] [FLAGS]       resolve, hydrate, or verify techne.lock (--check, --frozen, --update)
   repl                     a Lisp REPL in this terminal
   tool ROOT [FORM [SESSION]] bounded tools for callers; tool --help to begin
   node [ARGS]              serve the node protocol, or nREPL with --nrepl PORT
@@ -43,20 +43,28 @@ Run the Scheme FILE with ARGS as its (command-line).
                   verifying every package's tree-sha256 before running
   --package DIR   use DIR as the root package directory instead of searching
                   ancestors of FILE
-  --store DIR     override the content-addressed store directory (otherwise
-                  $TECHNE_PACKAGE_STORE or $XDG_DATA_HOME/techne/packages/store)";
+  --store DIR     override the content-addressed store directory (requires
+                  --locked; otherwise $TECHNE_PACKAGE_STORE or
+                  $XDG_DATA_HOME/techne/packages/store)";
 
 const LOCK_USAGE: &str = "\
-usage: techne lock [DIR] [--check] [--store DIR]
+usage: techne lock [DIR] [--check | --frozen | --update] [--store DIR]
 
 Resolve techne-package.scm in DIR (default .), materialize Git dependencies
 into the content-addressed tree-sha256 store, reject diamond conflicts and
-cycles, and write techne.lock beside techne-package.scm.
+cycles, and write techne.lock beside techne-package.scm. Existing valid pins
+in techne.lock are preserved for unchanged edges unless --update is given.
 
   --check       verify strictly offline that techne.lock exists, matches
                 techne-package.scm and root overrides, and every locked
                 package's tree-sha256 matches its directory, without modifying
                 techne.lock
+  --frozen      materialize missing store entries by the exact pinned commits
+                in techne.lock, verify every tree-sha256 and freshness against
+                techne-package.scm, and fail if techne.lock is missing or
+                stale, without modifying techne.lock
+  --update      re-resolve dependencies from their declared refs instead of
+                preserving existing pins in techne.lock
   --store DIR   override the content-addressed store directory (otherwise
                 $TECHNE_PACKAGE_STORE or $XDG_DATA_HOME/techne/packages/store)";
 
@@ -159,10 +167,14 @@ fn run_cmd(args: Vec<String>) -> ExitCode {
     if script_args.is_empty() {
         return bad();
     }
+    if options.store_dir.is_some() && !options.locked {
+        eprintln!("techne run: --store requires --locked");
+        return ExitCode::from(2);
+    }
     techne_vm::cli::run_with(script_args, options, install)
 }
 
-/// `techne lock [DIR] [--check] [--store DIR]`
+/// `techne lock [DIR] [--check | --frozen | --update] [--store DIR]`
 fn lock_cmd(args: Vec<String>) -> ExitCode {
     let bad = || {
         eprintln!("{LOCK_USAGE}");
@@ -170,11 +182,15 @@ fn lock_cmd(args: Vec<String>) -> ExitCode {
     };
     let mut dir: Option<std::path::PathBuf> = None;
     let mut check = false;
+    let mut frozen = false;
+    let mut update = false;
     let mut store: Option<std::path::PathBuf> = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--check" => check = true,
+            "--frozen" => frozen = true,
+            "--update" => update = true,
             "--store" => {
                 let Some(path) = it.next().filter(|v| !v.is_empty()) else { return bad() };
                 store = Some(std::path::PathBuf::from(path));
@@ -187,6 +203,10 @@ fn lock_cmd(args: Vec<String>) -> ExitCode {
             _ if dir.is_none() => dir = Some(std::path::PathBuf::from(arg)),
             _ => return bad(),
         }
+    }
+    if (check as u8) + (frozen as u8) + (update as u8) > 1 {
+        eprintln!("techne lock: --check, --frozen, and --update are mutually exclusive");
+        return ExitCode::from(2);
     }
     let raw_dir = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
     let root = match raw_dir.canonicalize() {
@@ -211,19 +231,25 @@ fn lock_cmd(args: Vec<String>) -> ExitCode {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
+    vm.set_locked_libraries(true);
     let lock_sld = techne_vm::library::lisp_dir().join("techne/lock.sld");
     if let Err(e) = vm.find_module(&lock_sld.to_string_lossy()) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
-    let proc_name = if check { "check-lockfile" } else { "lock-project!" };
-    let call = match abs_store {
-        Some(store_path) => format!(
-            "((eval '{proc_name} (environment '(techne lock))) {:?} #:store {:?})",
-            root.display().to_string(),
-            store_path.display().to_string()
-        ),
-        None => format!("((eval '{proc_name} (environment '(techne lock))) {:?})", root.display().to_string()),
+    let root_lit = techne_vm::cli::scheme_string_literal(&root.display().to_string());
+    let store_arg = match abs_store {
+        Some(store_path) => format!(" #:store {}", techne_vm::cli::scheme_string_literal(&store_path.display().to_string())),
+        None => String::new(),
+    };
+    let call = if check {
+        format!("((eval 'check-lockfile (environment '(techne lock))) {root_lit}{store_arg})")
+    } else if frozen {
+        format!("((eval 'lock-project! (environment '(techne lock))) {root_lit} #:frozen #t{store_arg})")
+    } else if update {
+        format!("((eval 'lock-project! (environment '(techne lock))) {root_lit} #:update #t{store_arg})")
+    } else {
+        format!("((eval 'lock-project! (environment '(techne lock))) {root_lit}{store_arg})")
     };
     let res = vm.eval_source(&call);
     vm.flush();

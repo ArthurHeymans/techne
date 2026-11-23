@@ -94,6 +94,14 @@ pub fn run_with(args: Vec<String>, options: RunOptions, setup: impl FnOnce(&mut 
     }
 }
 
+/// Format a Rust string as a valid R7RS Scheme string literal.
+///
+/// Uses the VM reader's own serializer rather than Rust's `{:?}`, which emits
+/// `\'` and `\u{...}` escapes that Scheme does not accept.
+pub fn scheme_string_literal(s: &str) -> String {
+    crate::reader::string_repr(s)
+}
+
 /// The directory of the package the file at PATH is in: the nearest one
 /// above it holding a manifest, `techne-package.scm`.
 pub fn package_root(path: &Path) -> Option<PathBuf> {
@@ -105,8 +113,11 @@ pub fn package_root(path: &Path) -> Option<PathBuf> {
 pub fn use_package_dir(vm: &mut Vm, dir: &Path) -> Result<(), crate::vm::Error> {
     let root = dir.canonicalize().map_err(|e| crate::vm::Error::new(format!("package directory {}: {e}", dir.display())))?;
     vm.find_module(&crate::library::lisp_dir().join("techne/package.sld").to_string_lossy())?;
-    vm.eval_source(&format!("((eval 'use-package-directory! (environment '(techne package))) {:?})", root.display().to_string()))
-        .map(|_| ())
+    vm.eval_source(&format!(
+        "((eval 'use-package-directory! (environment '(techne package))) {})",
+        scheme_string_literal(&root.display().to_string())
+    ))
+    .map(|_| ())
 }
 
 /// Make the package the file at PATH is in known to VM, with those it
@@ -145,6 +156,7 @@ pub fn use_locked_package_of(
     }
     vm.set_locked_libraries(true);
     vm.find_module(&crate::library::lisp_dir().join("techne/lock.sld").to_string_lossy())?;
+    let root_lit = scheme_string_literal(&root.display().to_string());
     let call = match store_dir {
         Some(store) => {
             let abs_store = if store.is_absolute() {
@@ -153,12 +165,11 @@ pub fn use_locked_package_of(
                 std::env::current_dir().map_err(|e| crate::vm::Error::new(format!("current directory: {e}")))?.join(store)
             };
             format!(
-                "((eval 'use-locked-package! (environment '(techne lock))) {:?} #:store {:?})",
-                root.display().to_string(),
-                abs_store.display().to_string()
+                "((eval 'use-locked-package! (environment '(techne lock))) {root_lit} #:store {})",
+                scheme_string_literal(&abs_store.display().to_string())
             )
         }
-        None => format!("((eval 'use-locked-package! (environment '(techne lock))) {:?})", root.display().to_string()),
+        None => format!("((eval 'use-locked-package! (environment '(techne lock))) {root_lit})"),
     };
     vm.eval_source(&call).map(|_| ())
 }

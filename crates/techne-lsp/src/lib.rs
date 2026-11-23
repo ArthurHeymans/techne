@@ -49,15 +49,114 @@ fn package_store_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/techne/packages/store"))
 }
 
-/// Find the materialized directory of `(owner pkg)` from `root/techne.lock`,
+/// Whether a library name segment is a safe, non-hidden path component.
+fn valid_lib_part(part: &str) -> bool {
+    !part.is_empty() && !part.starts_with('.') && !part.contains('/') && !part.contains('\\') && !part.contains('\0') && part != ".."
+}
+
+/// Resolve `<package>/lib/<parts>.sld`, verifying every name component and
+/// canonical containment inside `<package>/lib`.
+fn contained_package_library_file(package: &Path, parts: &[String]) -> Option<PathBuf> {
+    if !parts.iter().all(|p| valid_lib_part(p)) {
+        return None;
+    }
+    let lib_dir = package.join("lib").canonicalize().ok()?;
+    let candidate = lib_dir.join(format!("{}.sld", parts.join("/"))).canonicalize().ok()?;
+    (candidate.is_file() && candidate.starts_with(&lib_dir)).then_some(candidate)
+}
+
+/// Resolve a relative directory path `rel` against `base`, rejecting absolute
+/// paths and (when `boundary` is given) any canonical path escaping `boundary`.
+fn safe_relative_dir(base: &Path, rel: &str, boundary: Option<&Path>) -> Option<PathBuf> {
+    if rel.is_empty() || rel.contains('\0') || rel.contains('\\') {
+        return None;
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() || rel_path.components().any(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Prefix(_)))
+    {
+        return None;
+    }
+    let canon = base.join(rel_path).canonicalize().ok()?;
+    if let Some(bound) = boundary {
+        let canon_bound = bound.canonicalize().ok()?;
+        if !canon.starts_with(&canon_bound) {
+            return None;
+        }
+    }
+    Some(canon)
+}
+
+/// Whether `path` resides inside the content-addressed package store.
+fn is_inside_store(path: &Path) -> bool {
+    let Some(store) = package_store_dir() else { return false };
+    let store = store.canonicalize().unwrap_or(store);
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canon.starts_with(&store)
+}
+
+/// Read and parse `dir/techne-package.scm` as pure data, returning its top-level
+/// `(package ...)` form elements if valid.
+fn read_manifest_forms(dir: &Path) -> Option<Vec<Syntax>> {
+    let text = std::fs::read_to_string(dir.join("techne-package.scm")).ok()?;
+    let forms = techne_vm::reader::read_syntax(&text).ok()?;
+    let manifest = list(forms.first()?)?;
+    if head(manifest).as_deref() != Some("package") {
+        return None;
+    }
+    Some(manifest.to_vec())
+}
+
+/// Locate the consuming workspace/project root that owns `techne.lock` and
+/// root `(override ...)` declarations, kept distinct from `pkg_root` (the
+/// nearest manifest above the file being analysed).
+fn find_project_root(dir: &Path, pkg_root: &Path, workspace_roots: &[PathBuf]) -> Option<PathBuf> {
+    let canon_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let canon_pkg = pkg_root.canonicalize().unwrap_or_else(|_| pkg_root.to_path_buf());
+    let enclosing_ws = workspace_roots.iter().find(|ws| canon_dir.starts_with(ws));
+
+    if let Some(ws) = enclosing_ws {
+        for anc in canon_dir.ancestors() {
+            if !anc.starts_with(ws) {
+                break;
+            }
+            if anc.join("techne.lock").is_file() {
+                return Some(anc.to_path_buf());
+            }
+        }
+        if ws.join("techne.lock").is_file() {
+            return Some(ws.clone());
+        }
+    }
+    // Files opened inside `store/<tree-sha256>/` or outside the workspace
+    // still resolve against the open workspace project's `techne.lock`.
+    if let Some(ws) = workspace_roots.iter().find(|ws| ws.join("techne.lock").is_file()) {
+        return Some(ws.clone());
+    }
+    if let Some(anc) = canon_dir.ancestors().find(|d| d.join("techne.lock").is_file()) {
+        return Some(anc.to_path_buf());
+    }
+    // Without a lockfile, a package inside the content-addressed store is still
+    // a dependency and never acts as a root project for overrides.
+    if is_inside_store(&canon_pkg) {
+        return None;
+    }
+    Some(canon_pkg)
+}
+
+/// Find the materialized directory of `(owner pkg)` from `lock_root/techne.lock`,
 /// reading the lockfile as pure data without evaluating anything.
-fn locked_package_dir(root: &Path, owner: &str, pkg: &str) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(root.join("techne.lock")).ok()?;
+///
+/// Rejects absolute paths and relative `(path ...)` entries escaping the
+/// enclosing workspace root (or `lock_root` when no workspace root encloses it).
+fn locked_package_dir(lock_root: &Path, workspace_roots: &[PathBuf], owner: &str, pkg: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(lock_root.join("techne.lock")).ok()?;
     let forms = techne_vm::reader::read_syntax(&text).ok()?;
     let lock = list(forms.first()?)?;
     if head(lock).as_deref() != Some("lock") {
         return None;
     }
+    let canon_lock_root = lock_root.canonicalize().unwrap_or_else(|_| lock_root.to_path_buf());
+    let boundary = workspace_roots.iter().find(|ws| canon_lock_root.starts_with(ws)).map(PathBuf::as_path).unwrap_or(&canon_lock_root);
     for clause in lock.iter().skip(1).filter_map(list) {
         if head(clause).as_deref() != Some("package") {
             continue;
@@ -86,7 +185,7 @@ fn locked_package_dir(root: &Path, owner: &str, pkg: &str) -> Option<PathBuf> {
             }
         }
         if let Some(rel) = source_path {
-            return Some(root.join(rel));
+            return safe_relative_dir(lock_root, &rel, Some(boundary));
         }
         if is_git_source {
             let hash = tree_hash?;
@@ -118,46 +217,45 @@ fn manifest_clause_source<'a>(manifest: &'a [Syntax], clause_name: &str, owner: 
 /// as the runtime does once the file's package is used (`(techne
 /// package)` / `(techne lock)`): the package the file is in, by the nearest
 /// manifest above, `techne-package.scm`, for the libraries of its own
-/// `(owner pkg)`, under its `lib`; or a package that manifest depends on,
-/// resolved via root `(override ...)`, `techne.lock` + content-addressed
-/// store, or `(path "directory")`, for those of that `(owner pkg)`, under
-/// its `lib`. Some: the library is such a package's, found there or, None
-/// inside, missing: it is looked for nowhere else, whatever the library
-/// path holds. None: no package the file may import from provides it. The
-/// manifest and lockfile are read as data; a file of another name under a
-/// `lib` is no library of that package's, and the packages a dependency
-/// depends on are not a file's to import.
-fn package_library(parts: &[String], dir: &Path) -> Option<Option<PathBuf>> {
+/// `(owner pkg)`, under its `lib`; or a package that manifest directly
+/// depends on, resolved via the consuming project root's `(override ...)`
+/// and `techne.lock` + content-addressed store, or unlocked `(path "...")`.
+///
+/// Direct-import permission always comes from the importing file's nearest
+/// `techne-package.scm`, while `techne.lock` and root `(override ...)` come
+/// solely from the consuming workspace/project root (never from a dependency
+/// manifest inside `store/` or a nested package).
+fn package_library(parts: &[String], dir: &Path, workspace_roots: &[PathBuf]) -> Option<Option<PathBuf>> {
     let [owner, pkg, ..] = parts else { return None };
-    let root = dir.ancestors().find(|d| d.join("techne-package.scm").is_file())?;
-    let text = std::fs::read_to_string(root.join("techne-package.scm")).ok()?;
-    let forms = techne_vm::reader::read_syntax(&text).ok()?;
-    let manifest = list(forms.first()?)?;
-    if head(manifest).as_deref() != Some("package") {
-        return None;
-    }
-    let file = format!("{}.sld", parts.join("/"));
-    let under = |package: PathBuf| Some(package.join("lib").join(&file)).filter(|p| p.is_file());
+    let pkg_root = dir.ancestors().find(|d| d.join("techne-package.scm").is_file())?;
+    let manifest = read_manifest_forms(pkg_root)?;
     if package_id(manifest.get(1)?).is_some_and(|(o, p)| o == *owner && p == *pkg) {
-        return Some(under(root.to_path_buf()));
+        return Some(contained_package_library_file(pkg_root, parts));
     }
-    let dep_source = manifest_clause_source(manifest, "depends", owner, pkg)?;
-    // Root `(override ...)` with a local `(path ...)` takes precedence even before re-locking.
-    if let Some(ov) = manifest_clause_source(manifest, "override", owner, pkg)
-        && head(ov).as_deref() == Some("path")
-        && let Some(rel) = ov.get(1).and_then(string_lit)
-    {
-        return Some(under(root.join(rel)));
+    let dep_source = manifest_clause_source(&manifest, "depends", owner, pkg)?;
+    let project_root = find_project_root(dir, pkg_root, workspace_roots);
+    if let Some(proj) = project_root.as_deref() {
+        // Only the consuming project root's `(override ...)` is honored.
+        if let Some(proj_manifest) = read_manifest_forms(proj)
+            && let Some(ov) = manifest_clause_source(&proj_manifest, "override", owner, pkg)
+            && head(ov).as_deref() == Some("path")
+            && let Some(rel) = ov.get(1).and_then(string_lit)
+            && let Some(ov_dir) = safe_relative_dir(proj, &rel, None)
+        {
+            return Some(contained_package_library_file(&ov_dir, parts));
+        }
+        // Locked dependency from the consuming project's `techne.lock` + store.
+        if let Some(locked_dir) = locked_package_dir(proj, workspace_roots, owner, pkg) {
+            return Some(contained_package_library_file(&locked_dir, parts));
+        }
     }
-    // Locked dependency (Git in content-addressed store, or locked path).
-    if let Some(locked_dir) = locked_package_dir(root, owner, pkg) {
-        return Some(under(locked_dir));
-    }
-    // Unlocked fallback for local `(path ...)` dependencies.
-    if head(dep_source).as_deref() == Some("path")
+    // Unlocked fallback for local `(path ...)` dependencies (never for immutable store packages).
+    if !is_inside_store(pkg_root)
+        && head(dep_source).as_deref() == Some("path")
         && let Some(rel) = dep_source.get(1).and_then(string_lit)
+        && let Some(dep_dir) = safe_relative_dir(pkg_root, &rel, None)
     {
-        return Some(under(root.join(rel)));
+        return Some(contained_package_library_file(&dep_dir, parts));
     }
     Some(None)
 }
@@ -211,6 +309,7 @@ struct External {
 struct Backend {
     client: Client,
     docs: Mutex<HashMap<Url, String>>,
+    workspace_roots: Mutex<Vec<PathBuf>>,
     builtins: HashMap<String, String>,
     /// The runtime's macros (from `builtins`).
     builtin_macros: HashSet<String>,
@@ -221,6 +320,10 @@ struct Backend {
 impl Backend {
     fn text(&self, uri: &Url) -> Option<String> {
         self.docs.lock().unwrap().get(uri).cloned()
+    }
+
+    fn workspace_roots(&self) -> Vec<PathBuf> {
+        self.workspace_roots.lock().unwrap().clone()
     }
 
     /// The analysis of a file, with the definitions of the files it
@@ -329,7 +432,8 @@ impl Backend {
                 }
                 // A package's, where the package has it and nowhere else;
                 // any other where the library path finds it.
-                let file = package_library(&parts, base)
+                let ws_roots = self.workspace_roots();
+                let file = package_library(&parts, base, &ws_roots)
                     .unwrap_or_else(|| techne_vm::library::library_file(&parts, base))
                     .ok_or_else(|| format!("cannot find library {written}"))?;
                 let text = std::fs::read_to_string(&file).map_err(|_| format!("cannot read library {written}"))?;
@@ -464,7 +568,32 @@ fn completion_kind(kind: DefKind) -> CompletionItemKind {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let mut roots = Vec::new();
+        let mut push_root = |p: PathBuf| {
+            let p = p.canonicalize().unwrap_or(p);
+            if !roots.contains(&p) {
+                roots.push(p);
+            }
+        };
+        if let Some(folders) = params.workspace_folders {
+            for folder in folders {
+                if let Ok(path) = folder.uri.to_file_path() {
+                    push_root(path);
+                }
+            }
+        }
+        #[allow(deprecated)]
+        if let Some(uri) = params.root_uri
+            && let Ok(path) = uri.to_file_path()
+        {
+            push_root(path);
+        }
+        #[allow(deprecated)]
+        if let Some(path) = params.root_path {
+            push_root(PathBuf::from(path));
+        }
+        *self.workspace_roots.lock().unwrap() = roots;
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -670,6 +799,7 @@ async fn serve(catalog: Catalog) {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         docs: Mutex::new(HashMap::new()),
+        workspace_roots: Mutex::new(Vec::new()),
         builtins: builtins.clone(),
         builtin_macros: builtin_macros.clone(),
         runtime_names: runtime_names.clone(),
