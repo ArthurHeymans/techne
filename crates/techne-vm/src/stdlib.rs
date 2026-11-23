@@ -35,6 +35,22 @@ fn string(vm: &Vm, v: Value, who: &str) -> Result<String, Error> {
     str_arg(vm, v, who).map(str::to_owned)
 }
 
+/// Parse a 2-part `(owner pkg)` package prefix of symbols or strings.
+fn package_prefix(vm: &Vm, v: Value, who: &str) -> Result<(String, String), Error> {
+    let part = |v: Value| {
+        if v.is_symbol() { Ok(symbol_name(v.as_symbol()).to_string()) } else { string(vm, v, who) }
+    };
+    let items = list_values(v).ok_or_else(|| Error::new(format!("{who}: expected a 2-part (owner pkg) name")))?;
+    if items.len() != 2 {
+        return Err(Error::new(format!("{who}: expected a 2-part (owner pkg) name")));
+    }
+    let (owner, pkg) = (part(items[0])?, part(items[1])?);
+    if owner.is_empty() || pkg.is_empty() {
+        return Err(Error::new(format!("{who}: expected non-empty (owner pkg) components")));
+    }
+    Ok((owner, pkg))
+}
+
 /// `repr` with an optional byte bound. Bounded runtime inspection cannot
 /// use `write` followed by substring: that first walks and copies the
 /// whole graph. No Scheme printer is called, and no cycle-label prepass
@@ -1195,20 +1211,21 @@ pub fn install(vm: &mut Vm) {
             vm.retire_generation(generation);
             Ok(Value::VOID) };
         "(%package-publish)" => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
-        // Whose libraries are found where (`(techne package)`).
+        // Whose libraries are found where (`(techne package)`): NAME is a
+        // 2-part `(owner pkg)` list of symbols or strings.
         "(%provide-libraries! name directory)" => |vm: &mut Vm, a, _| {
-            let name = string(vm, arg(vm, a, 0), "%provide-libraries!")?;
+            let (owner, pkg) = package_prefix(vm, arg(vm, a, 0), "%provide-libraries!")?;
             let directory = string(vm, arg(vm, a, 1), "%provide-libraries!")?;
-            vm.provide_libraries(&name, std::path::Path::new(&directory))?;
+            vm.provide_libraries(&owner, &pkg, std::path::Path::new(&directory))?;
             Ok(Value::VOID) };
         // What the files of the package PACKAGE, in ROOT, import among the
-        // libraries packages provide: those of the packages NAMES, strings.
+        // libraries packages provide: those of the packages NAMES, each `(owner pkg)`.
         "(%package-imports! root package names)" => |vm: &mut Vm, a, _| {
             let root = string(vm, arg(vm, a, 0), "%package-imports!")?;
-            let package = string(vm, arg(vm, a, 1), "%package-imports!")?;
+            let (owner, pkg) = package_prefix(vm, arg(vm, a, 1), "%package-imports!")?;
             let items = crate::builtins::list_values(arg(vm, a, 2)).ok_or_else(|| Error::new("%package-imports!: expected a list of names"))?;
-            let names = items.into_iter().map(|name| string(vm, name, "%package-imports!")).collect::<Result<Vec<_>, _>>()?;
-            vm.declare_imports(std::path::Path::new(&root), &package, &names)?;
+            let names = items.into_iter().map(|name| package_prefix(vm, name, "%package-imports!")).collect::<Result<Vec<_>, _>>()?;
+            vm.declare_imports(std::path::Path::new(&root), (&owner, &pkg), &names)?;
             Ok(Value::VOID) };
         // What `(techne package)` reads by the authority to load, which a
         // world deciding what it loads has, not that over files: a package's
@@ -1236,16 +1253,16 @@ pub fn install(vm: &mut Vm) {
             } };
         // Why NAME's libraries cannot be provided from DIRECTORY, or #f.
         "(%library-conflict name directory)" => |vm: &mut Vm, a, _| {
-            let name = string(vm, arg(vm, a, 0), "%library-conflict")?;
+            let (owner, pkg) = package_prefix(vm, arg(vm, a, 0), "%library-conflict")?;
             let directory = string(vm, arg(vm, a, 1), "%library-conflict")?;
             vm.check_loading()?;
-            match vm.library_conflict(&name, std::path::Path::new(&directory)) {
+            match vm.library_conflict(&owner, &pkg, std::path::Path::new(&directory)) {
                 Some(conflict) => Ok(vm.make_string_raw(&conflict)),
                 None => Ok(Value::FALSE),
             } };
         "(%library-provider name)" => |vm: &mut Vm, a, _| {
-            let name = string(vm, arg(vm, a, 0), "%library-provider")?;
-            match vm.library_provider(&name).map(|dir| dir.display().to_string()) {
+            let (owner, pkg) = package_prefix(vm, arg(vm, a, 0), "%library-provider")?;
+            match vm.library_provider(&owner, &pkg).map(|dir| dir.display().to_string()) {
                 Some(dir) => Ok(vm.make_string_raw(&dir)),
                 None => Ok(Value::FALSE),
             } };

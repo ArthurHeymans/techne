@@ -887,9 +887,9 @@ pub struct Vm {
     /// The last package generation staged.
     generations: u32,
     module_paths: FxHashMap<PathBuf, u32>,
-    /// Whose libraries are found where (`provide_libraries`): the first
-    /// part of their names, and the directory their files are under.
-    pub(crate) library_providers: Vec<(Box<str>, PathBuf)>,
+    /// Whose libraries are found where (`provide_libraries`): the 2-part
+    /// `(owner pkg)` prefix of their names, and the directory their files are under.
+    pub(crate) library_providers: Vec<(crate::library::PackagePrefix, PathBuf)>,
     /// What the files of each package may import (`declare_imports`).
     pub(crate) package_imports: Vec<crate::library::PackageImports>,
     /// A package generation being loaded: its files load into fresh
@@ -1994,17 +1994,14 @@ impl Vm {
         file.or_else(|| self.named_module(name))
     }
 
-    /// The name of a library loaded whose name begins with `first`, as
-    /// `(first ...)`, from a file not under `dir`.
-    pub(crate) fn library_loaded_outside(&self, first: &str, dir: &Path) -> Option<&str> {
-        let (whole, prefix) = (format!("({first})"), format!("({first} "));
+    /// The name of a library loaded whose name begins with `(owner pkg)`, as
+    /// `(owner pkg)` or `(owner pkg ...)`, from a file not under `dir`.
+    pub(crate) fn library_loaded_outside(&self, owner: &str, pkg: &str, dir: &Path) -> Option<&str> {
+        let (whole, prefix) = (format!("({owner} {pkg})"), format!("({owner} {pkg} "));
         self.modules
             .iter()
             .find(|m| {
-                !m.retired
-                    && m.library.is_some()
-                    && (*m.name == *whole || m.name.starts_with(&prefix))
-                    && !m.path.as_deref().is_some_and(|p| p.starts_with(dir))
+                !m.retired && (*m.name == *whole || m.name.starts_with(&prefix)) && !m.path.as_deref().is_some_and(|p| p.starts_with(dir))
             })
             .map(|m| &*m.name)
     }

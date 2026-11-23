@@ -10,13 +10,14 @@
 //! the like are views of the root module's bindings, `(techne)` is all of
 //! them. Any other library is defined where it is first imported from, or
 //! else searched for as `a/b.sld` (for `(a b)`): under the directory that
-//! provides the libraries named `(a ...)` and nowhere else, if a package
+//! provides the libraries named `(a b ...)` and nowhere else, if a package
 //! does (`Vm::provide_libraries`); otherwise in the importing file's
 //! directory, then in the directories of `TECHNE_LIBRARY_PATH`, then in
 //! Techne's own Lisp ([`lisp_dir`]). Ordinary modules
 //! (files, the REPL's) also see the root module, imports or not.
 
 use std::{
+    fmt,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -28,15 +29,38 @@ use crate::{
 
 type R<T> = Result<T, Error>;
 
+/// A canonical 2-part `(owner pkg)` package identity.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PackagePrefix {
+    pub(crate) owner: Box<str>,
+    pub(crate) name: Box<str>,
+}
+
+impl PackagePrefix {
+    pub(crate) fn new(owner: &str, name: &str) -> Self {
+        Self { owner: owner.into(), name: name.into() }
+    }
+
+    pub(crate) fn matches(&self, owner: &str, name: &str) -> bool {
+        &*self.owner == owner && &*self.name == name
+    }
+}
+
+impl fmt::Display for PackagePrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({} {})", self.owner, self.name)
+    }
+}
+
 /// What the files of a package may import (`Vm::declare_imports`).
 #[derive(Clone)]
 pub(crate) struct PackageImports {
     /// The package's directory.
     root: PathBuf,
-    package: Box<str>,
+    package: PackagePrefix,
     /// The packages whose libraries its files import: itself and those
     /// its manifest depends on.
-    names: Vec<Box<str>>,
+    names: Vec<PackagePrefix>,
 }
 
 fn err<T>(msg: impl Into<String>) -> R<T> {
@@ -552,14 +576,16 @@ impl Vm {
         }
     }
 
-    /// Find the libraries whose names begin with `name` under `dir`, and
-    /// nowhere else: `(name a b)` is `dir/name/a/b.sld`. A package's
-    /// manifest says so of its own (`(techne package)`); the libraries are
-    /// the world's, shared by every importer. `dir` need not be there yet,
-    /// in a directory that is: a package without libraries owns its name
-    /// all the same, and its first library is found once written. It is
-    /// an error if another directory provides them already.
-    pub fn provide_libraries(&mut self, name: &str, dir: &Path) -> R<()> {
+    /// Find the libraries whose names begin with `(owner pkg)` under `dir`,
+    /// and nowhere else: `(owner pkg)` is `dir/owner/pkg.sld` and
+    /// `(owner pkg a b)` is `dir/owner/pkg/a/b.sld`. A package's manifest says
+    /// so of its own (`(techne package)`); the libraries are the world's,
+    /// shared by every importer. `dir` need not be there yet, in a directory
+    /// that is: a package without libraries owns its 2-part prefix all the
+    /// same, and its first library is found once written. It is an error if
+    /// another directory provides them already, if the prefix collides with
+    /// Techne's own libraries, or if one is already loaded from elsewhere.
+    pub fn provide_libraries(&mut self, owner: &str, pkg: &str, dir: &Path) -> R<()> {
         self.check_loading()?;
         let missing = || Error::new(format!("{}: no such directory", dir.display()));
         let resolved = match dir.canonicalize() {
@@ -567,32 +593,43 @@ impl Vm {
             Err(_) => dir.parent().and_then(|parent| Some(parent.canonicalize().ok()?.join(dir.file_name()?))),
         };
         let dir = resolved.filter(|d| self.may_read(d.parent().unwrap_or(d))).ok_or_else(missing)?;
-        if let Some(conflict) = self.library_conflict(name, &dir) {
+        if let Some(conflict) = self.library_conflict(owner, pkg, &dir) {
             return err(conflict);
         }
-        if self.library_provider(name).is_none() {
-            self.library_providers.push((name.into(), dir));
+        if self.library_provider(owner, pkg).is_none() {
+            self.library_providers.push((PackagePrefix::new(owner, pkg), dir));
         }
         Ok(())
     }
 
-    /// Why the libraries whose names begin with `name` cannot be provided
-    /// from `dir` (`provide_libraries`), or None if they can: another
-    /// directory provides them, `dir` is something else than a directory,
-    /// or one of them is loaded from elsewhere already, which importers
-    /// would go on finding whatever `dir` holds. What makes several
-    /// packages known at once asks before it changes anything.
-    pub fn library_conflict(&self, name: &str, dir: &Path) -> Option<String> {
+    /// Why the libraries whose names begin with `(owner pkg)` cannot be
+    /// provided from `dir` (`provide_libraries`), or None if they can: the
+    /// owner is reserved (`scheme` or `srfi`), another directory provides
+    /// them, `dir` is something else than a directory, Techne's own Lisp
+    /// provides `(owner pkg)`, or one of them is loaded from elsewhere
+    /// already, which importers would go on finding whatever `dir` holds.
+    /// What makes several packages known at once asks before it changes
+    /// anything.
+    pub fn library_conflict(&self, owner: &str, pkg: &str, dir: &Path) -> Option<String> {
+        if matches!(owner, "scheme" | "srfi") {
+            return Some(format!("namespace ({owner} ...) is reserved"));
+        }
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        match self.library_provider(name) {
+        match self.library_provider(owner, pkg) {
             Some(old) if old == dir => return None,
-            Some(old) => return Some(format!("libraries ({name} ...) are provided from {} already", old.display())),
+            Some(old) => return Some(format!("libraries ({owner} {pkg} ...) are provided from {} already", old.display())),
             None => {}
         }
         if dir.exists() && !dir.is_dir() {
             return Some(format!("{} is not a directory", dir.display()));
         }
-        self.library_loaded_outside(name, &dir).map(|library| format!("library {library} is loaded from elsewhere already"))
+        if owner == "techne" {
+            let stdlib = lisp_dir().join("techne");
+            if stdlib.join(format!("{pkg}.sld")).is_file() || stdlib.join(pkg).is_dir() {
+                return Some(format!("libraries ({owner} {pkg} ...) are part of Techne's own libraries"));
+            }
+        }
+        self.library_loaded_outside(owner, pkg, &dir).map(|library| format!("library {library} is loaded from elsewhere already"))
     }
 
     /// The files under `root`, the directory of the package `package`,
@@ -601,11 +638,15 @@ impl Vm {
     /// packages its manifest depends on. Libraries no package provides
     /// (Techne's own, those beside the importing file) are not concerned.
     /// Declared again for a directory, this replaces what was declared.
-    pub fn declare_imports(&mut self, root: &Path, package: &str, names: &[String]) -> R<()> {
+    pub fn declare_imports(&mut self, root: &Path, package: (&str, &str), names: &[(String, String)]) -> R<()> {
         self.check_loading()?;
         let missing = || Error::new(format!("{}: no such directory", root.display()));
         let root = root.canonicalize().ok().filter(|d| d.is_dir() && self.may_read(d)).ok_or_else(missing)?;
-        let declared = PackageImports { root, package: package.into(), names: names.iter().map(|n| n.as_str().into()).collect() };
+        let declared = PackageImports {
+            root,
+            package: PackagePrefix::new(package.0, package.1),
+            names: names.iter().map(|(o, n)| PackagePrefix::new(o, n)).collect(),
+        };
         match self.package_imports.iter_mut().find(|p| p.root == declared.root) {
             Some(old) => *old = declared,
             None => self.package_imports.push(declared),
@@ -622,13 +663,16 @@ impl Vm {
         if dir.as_os_str().is_empty() {
             return Ok(());
         }
-        let Some(first) = parts.first().filter(|first| !self.package_imports.is_empty() && self.library_provider(first).is_some()) else {
+        let Some([owner, pkg]) = parts.get(..2) else {
             return Ok(());
         };
+        if self.package_imports.is_empty() || self.library_provider(owner, pkg).is_none() {
+            return Ok(());
+        }
         let Ok(dir) = dir.canonicalize() else { return Ok(()) };
         match self.package_imports.iter().filter(|p| dir.starts_with(&p.root)).max_by_key(|p| p.root.as_os_str().len()) {
-            Some(p) if !p.names.iter().any(|n| **n == **first) => err(format!(
-                "import: {}: the package {} does not depend on {first} (its techne-package.scm says what it depends on)",
+            Some(p) if !p.names.iter().any(|n| n.matches(owner, pkg)) => err(format!(
+                "import: {}: the package {} does not depend on ({owner} {pkg}) (its techne-package.scm says what it depends on)",
                 module_name(parts),
                 p.package
             )),
@@ -636,15 +680,15 @@ impl Vm {
         }
     }
 
-    /// The directory providing the libraries whose names begin with `name`.
-    pub fn library_provider(&self, name: &str) -> Option<&Path> {
-        self.library_providers.iter().find(|(n, _)| &**n == name).map(|(_, dir)| &**dir)
+    /// The directory providing the libraries whose names begin with `(owner pkg)`.
+    pub fn library_provider(&self, owner: &str, pkg: &str) -> Option<&Path> {
+        self.library_providers.iter().find(|(p, _)| p.matches(owner, pkg)).map(|(_, dir)| &**dir)
     }
 
     /// Where library `parts` is defined: under its provider's directory if
-    /// its name has one, else where [`library_file`] finds it.
+    /// its 2-part prefix has one, else where [`library_file`] finds it.
     pub(crate) fn library_file(&self, parts: &[String], dir: &Path) -> Option<PathBuf> {
-        match parts.first().and_then(|name| self.library_provider(name)) {
+        match parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1])) {
             Some(provider) => {
                 Some(provider.join(format!("{}.sld", parts.join("/")))).filter(|p| p.is_file()).and_then(|p| p.canonicalize().ok())
             }

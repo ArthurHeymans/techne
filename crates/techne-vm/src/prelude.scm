@@ -1227,7 +1227,7 @@ a setting comes from."
   (scope package-scope)
   (module package-module))
 
-(define %packages (make-hash-table eq?))
+(define %packages (make-hash-table equal?))
 
 ;; A declaration owns the identity even between active generations. The
 ;; optional stage wrapper checks registrations before they become visible.
