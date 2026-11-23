@@ -532,4 +532,146 @@ mod tests {
         let err = build_bundle_vfs("app.scm", vec![], None, vec![good_pkg]).unwrap_err();
         assert!(err.contains("without a root package"), "{err}");
     }
+
+    struct DummyAttached;
+    impl crate::Attached for DummyAttached {
+        fn poll(&mut self, _vm: &mut techne_vm::vm::Vm) -> bool {
+            false
+        }
+        fn reap(&mut self, _vm: &mut techne_vm::vm::Vm) {}
+    }
+
+    struct DummyDev;
+    impl Dev for DummyDev {
+        fn publish(&mut self, host: &Host, name: &str, _entry: &Path, deployment: Deployment) -> Result<(), techne_vm::vm::Error> {
+            host.publish_dev(name, deployment, |_| Ok(Box::new(DummyAttached)))
+        }
+        fn connect(&mut self, _stream: tokio::io::DuplexStream, _principal: Option<String>) {}
+    }
+
+    #[test]
+    fn worker_ipc_roundtrips_truncated_stale_holders_and_stays_alive() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (mut supervisor_end, worker_end) = UnixStream::pair().unwrap();
+            let server = tokio::task::spawn_local(async move { serve(worker_end, Some(Box::new(DummyDev))).await });
+
+            // Wait for Ready.
+            let ready = read_frame(&mut supervisor_end).await.unwrap().unwrap();
+            assert!(matches!(FromWorker::from_data(ready).unwrap(), FromWorker::Ready));
+
+            let mut exports = String::new();
+            let mut defs_v1 = String::new();
+            let mut defs_v2 = String::new();
+            let mut vec_items = String::new();
+            for i in 0..270 {
+                exports.push_str(&format!(" f{i}"));
+                defs_v1.push_str(&format!("(define (f{i}) \"v1-{i}\")\n"));
+                defs_v2.push_str(&format!("(define (f{i}) \"v2-{i}\")\n"));
+                vec_items.push_str(&format!(" f{i}"));
+            }
+            let lib_v1 = format!("(define-library (alice many util) (export{exports}) (import (techne)) (begin {defs_v1}))");
+            let lib_v2 = format!("(define-library (alice many util) (export{exports}) (import (techne)) (begin {defs_v2}))");
+
+            let mut pkg_files = vec![
+                (
+                    "app.scm".to_string(),
+                    format!(
+                        "(import (alice many util))\n(define retained (vector{vec_items}))\n(provide fetch)\n(define (fetch req env ctx) (dict 'status 200 'body (f0)))\n"
+                    )
+                    .into_bytes(),
+                ),
+                ("lib/alice/many/util.sld".to_string(), lib_v1.into_bytes()),
+                ("techne-package.scm".to_string(), br#"(package (alice many) (version "0.1.0") (cloud "app.scm"))"#.to_vec()),
+            ];
+            pkg_files.sort_by(|a, b| a.0.cmp(&b.0));
+            let tree_sha = crate::package::canonical_tree_sha256(&pkg_files);
+
+            // Deploy dev bundle over real wire frames.
+            write_frame(
+                &mut supervisor_end,
+                &ToWorker::Deploy {
+                    id: 1,
+                    name: "many@1".into(),
+                    entry: "app.scm".into(),
+                    files: vec![],
+                    wall_ms: 5000,
+                    dev: true,
+                    env: Data::Dict(vec![]),
+                    root_package: Some(("alice".into(), "many".into())),
+                    packages: vec![BundledPackage {
+                        owner: "alice".into(),
+                        pkg: "many".into(),
+                        tree_sha256: tree_sha,
+                        depends: vec![],
+                        files: Arc::new(pkg_files),
+                    }],
+                }
+                .to_data(),
+            )
+            .await
+            .unwrap();
+            let deployed = FromWorker::from_data(read_frame(&mut supervisor_end).await.unwrap().unwrap()).unwrap();
+            assert!(matches!(deployed, FromWorker::Deployed { id: 1, error: None, .. }), "{deployed:?}");
+
+            // Patch library with 270 retained closures (> MAX_STALE_HOLDERS = 256).
+            write_frame(
+                &mut supervisor_end,
+                &ToWorker::PatchLibrary {
+                    id: 7,
+                    name: "many@1".into(),
+                    library: vec!["alice".into(), "many".into(), "util".into()],
+                    code: lib_v2,
+                    check_retained: true,
+                }
+                .to_data(),
+            )
+            .await
+            .unwrap();
+
+            let patched = FromWorker::from_data(read_frame(&mut supervisor_end).await.unwrap().unwrap()).unwrap();
+            match patched {
+                FromWorker::PatchedLibrary { id: 7, result: Ok(report), dirty } => {
+                    assert!(dirty);
+                    assert_eq!(report.patched.len(), 270);
+                    assert!(report.stale_holders_truncated, "expected stale_holders_truncated=true over wire IPC");
+                    assert!(report.stale_holders.len() <= techne_vm::patch::MAX_STALE_HOLDERS);
+                    for h in &report.stale_holders {
+                        assert!(h.chain.len() <= techne_vm::patch::MAX_STALE_CHAIN);
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+
+            // Worker stays alive and serves subsequent requests with v2!
+            write_frame(
+                &mut supervisor_end,
+                &ToWorker::Request {
+                    rid: 1,
+                    name: "many@1".into(),
+                    request: Data::Dict(vec![
+                        (Data::Symbol("method".into()), Data::String("GET".into())),
+                        (Data::Symbol("path".into()), Data::String("/".into())),
+                    ]),
+                    streams: false,
+                    debug: false,
+                }
+                .to_data(),
+            )
+            .await
+            .unwrap();
+            let resp = FromWorker::from_data(read_frame(&mut supervisor_end).await.unwrap().unwrap()).unwrap();
+            match resp {
+                FromWorker::Response { rid: 1, response: Data::Dict(entries), .. } => {
+                    let body = entries.iter().find(|(k, _)| matches!(k, Data::Symbol(s) if s == "body")).map(|(_, v)| v);
+                    assert_eq!(body, Some(&Data::String("v2-0".into())));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+
+            drop(supervisor_end);
+            server.await.unwrap().unwrap();
+        });
+    }
 }

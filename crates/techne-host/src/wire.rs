@@ -1105,4 +1105,60 @@ mod tests {
         ]);
         assert!(FromWorker::from_data(bad_holder).is_err());
     }
+
+    #[test]
+    fn patch_library_wire_clamps_oversized_stale_holders_and_rejects_bad_library_parts() {
+        // 1. Report with > MAX_STALE_HOLDERS entries and > MAX_RETENTION_CHAIN chain depth
+        //    clamps cleanly on encode and roundtrips with stale_holders_truncated == true!
+        let mut big_holders = Vec::new();
+        for i in 0..(techne_vm::patch::MAX_STALE_HOLDERS + 20) {
+            let chain: Vec<String> = (0..(techne_vm::patch::MAX_STALE_CHAIN + 15)).map(|d| format!("step-{d}")).collect();
+            big_holders.push(crate::StaleHolder { binding: format!("f{i}"), chain });
+        }
+        let reply = FromWorker::PatchedLibrary {
+            id: 42,
+            result: Ok(crate::PatchReport {
+                library: vec!["bob".into(), "util".into()],
+                patched: vec!["f0".into()],
+                unchanged: 0,
+                stale_holders: big_holders,
+                stale_holders_truncated: false,
+                source_sha256: "b".repeat(64),
+            }),
+            dirty: true,
+        };
+        let encoded = encode(&reply.to_data());
+        match FromWorker::from_data(decode(&encoded).unwrap()).unwrap() {
+            FromWorker::PatchedLibrary { id, result: Ok(report), dirty } => {
+                assert_eq!(id, 42);
+                assert!(dirty);
+                assert!(report.stale_holders_truncated, "wire clamping must set stale_holders_truncated");
+                assert_eq!(report.stale_holders.len(), techne_vm::patch::MAX_STALE_HOLDERS);
+                for h in &report.stale_holders {
+                    assert_eq!(h.chain.len(), techne_vm::patch::MAX_STALE_CHAIN);
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 2. Over-32-part library name is rejected on ToWorker decode.
+        let over_parts = ToWorker::PatchLibrary {
+            id: 99,
+            name: "app@1".into(),
+            library: vec!["p".into(); techne_vm::patch::MAX_LIBRARY_PARTS + 1],
+            code: "(define-library (a))".into(),
+            check_retained: true,
+        };
+        assert!(ToWorker::from_data(over_parts.to_data()).is_err());
+
+        // 3. Control-character or oversized library part is rejected.
+        let bad_part = ToWorker::PatchLibrary {
+            id: 100,
+            name: "app@1".into(),
+            library: vec!["bad\0part".into()],
+            code: "(define-library (a))".into(),
+            check_retained: true,
+        };
+        assert!(ToWorker::from_data(bad_part.to_data()).is_err());
+    }
 }

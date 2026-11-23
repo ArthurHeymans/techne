@@ -670,3 +670,54 @@ fn techne_patch_library_and_paused_debugger_retry() {
     assert!(!has_status(&done, "eval-error"), "{done:?}");
     assert_eq!(field(&done, "value"), ["42"]);
 }
+
+#[test]
+fn techne_patch_library_bounds_and_dirty_flag() {
+    let server = server();
+    let mut c = Client::connect(&server);
+
+    let lib_v1 = r#"(define-library (demo bounds)
+  (export f)
+  (import (techne))
+  (begin (define (f) 1)))"#;
+    let setup = c.eval(&format!("{lib_v1}\n(import (demo bounds))"));
+    assert!(!has_status(&setup, "eval-error"), "{setup:?}");
+
+    // 1. Over-32-part list library name is rejected with patch-refused/syntax-error without breaking session.
+    let over_list: Vec<B> = (0..=techne_vm::patch::MAX_LIBRARY_PARTS).map(|_| B::str("a")).collect();
+    let r = c.request(vec![("op", B::str("techne-patch-library")), ("library", B::List(over_list)), ("code", B::str(lib_v1))]);
+    assert!(has_status(&r, "error") && has_status(&r, "patch-refused") && has_status(&r, "done"), "{r:?}");
+    assert_eq!(field(&r, "reason"), ["syntax-error"]);
+
+    // 2. Over-32-part string library name is rejected with patch-refused/syntax-error.
+    let over_str = format!("({})", vec!["a"; techne_vm::patch::MAX_LIBRARY_PARTS + 1].join(" "));
+    let r = c.request(vec![("op", B::str("techne-patch-library")), ("library", B::str(&over_str)), ("code", B::str(lib_v1))]);
+    assert!(has_status(&r, "error") && has_status(&r, "patch-refused") && has_status(&r, "done"), "{r:?}");
+    assert_eq!(field(&r, "reason"), ["syntax-error"]);
+
+    // 3. Oversized code (> 4 MiB) is rejected with patch-refused/syntax-error.
+    let oversized = format!("; {}\n{lib_v1}", "x".repeat(techne_vm::patch::MAX_PATCH_BYTES));
+    let r = c.request(vec![("op", B::str("techne-patch-library")), ("library", B::str("(demo bounds)")), ("code", B::str(&oversized))]);
+    assert!(has_status(&r, "error") && has_status(&r, "patch-refused") && has_status(&r, "done"), "{r:?}");
+    assert_eq!(field(&r, "reason"), ["syntax-error"]);
+
+    // 4. No-op patch reports dirty = 0, stale-holders-truncated = 0, patched = [].
+    let r = c.request(vec![
+        ("op", B::str("techne-patch-library")),
+        ("library", B::str("(demo bounds)")),
+        ("code", B::str(format!("; noop\n{lib_v1}"))),
+    ]);
+    assert!(has_status(&r, "done") && !has_status(&r, "error"), "{r:?}");
+    assert_eq!(r[0].get("patched"), Some(&B::List(vec![])));
+    assert_eq!(r[0].get("dirty"), Some(&B::Int(0)));
+    assert_eq!(r[0].get("stale-holders-truncated"), Some(&B::Int(0)));
+
+    // 5. Real patch reports dirty = 1 and updates the live binding.
+    let lib_v2 = lib_v1.replace("(define (f) 1)", "(define (f) 2)");
+    let r = c.request(vec![("op", B::str("techne-patch-library")), ("library", B::str("(demo bounds)")), ("code", B::str(&lib_v2))]);
+    assert!(has_status(&r, "done") && !has_status(&r, "error"), "{r:?}");
+    assert_eq!(r[0].get("patched"), Some(&B::List(vec![B::str("f")])));
+    assert_eq!(r[0].get("dirty"), Some(&B::Int(1)));
+    assert_eq!(r[0].get("stale-holders-truncated"), Some(&B::Int(0)));
+    assert_eq!(field(&c.eval("(f)"), "value"), ["2"]);
+}

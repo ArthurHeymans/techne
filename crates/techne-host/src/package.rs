@@ -979,4 +979,20 @@ mod tests {
             other => panic!("expected Legacy for unrelated file under ancestor manifest, got {other:?}"),
         }
     }
+
+    #[test]
+    fn read_clean_package_tree_rejects_oversized_single_file_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("techne-package.scm"), r#"(package (acme big) (version "0.1.0"))"#).unwrap();
+        // Create a 10 GiB sparse file: reading it unbounded with std::fs::read would OOM,
+        // while metadata + bounded `.take()` rejects it immediately.
+        let huge = dir.path().join("huge.bin");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len(10u64 << 30).unwrap();
+        drop(file);
+
+        let mut total = 0usize;
+        let err = read_clean_package_tree(dir.path(), &mut total, 1024).unwrap_err();
+        assert!(err.contains("exceeds") && err.contains("1024"), "{err}");
+    }
 }

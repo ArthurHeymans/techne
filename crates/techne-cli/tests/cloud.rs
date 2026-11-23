@@ -1100,3 +1100,198 @@ fn cloud_dev_paused_debugger_retry_after_nrepl_patch_library() {
     );
     assert_eq!(answer.join().unwrap(), "patched:42");
 }
+
+fn mint_scoped_token(key_dir: &std::path::Path, project: &str, scopes: &[&str]) -> String {
+    let mut vm = techne_vm::vm::Vm::new();
+    let cloud = techne_vm::library::lisp_dir().join("cloud");
+    let scopes_scm: String = scopes.iter().map(|s| techne_vm::reader::string_repr(s)).collect::<Vec<_>>().join(" ");
+    let val = vm
+        .eval_source(&format!(
+            r#"(require {} {})
+               (let ((k (token-key-in {})))
+                 (make-token k "tester"
+                             #:projects (list {})
+                             #:scopes (list {scopes_scm})
+                             #:expires (+ (current-second) 3600)))"#,
+            techne_vm::reader::string_repr(&cloud.join("auth.scm").display().to_string()),
+            techne_vm::reader::string_repr(&cloud.join("tokens.scm").display().to_string()),
+            techne_vm::reader::string_repr(&key_dir.display().to_string()),
+            techne_vm::reader::string_repr(project),
+        ))
+        .unwrap();
+    vm.get::<String>(&val).unwrap()
+}
+
+fn post_dev_ops(ops_url: &str, token: &str, body: &str) -> (u16, String) {
+    let addr = ops_url.strip_prefix("http://").unwrap();
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(
+        c,
+        "POST /v1/ops HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut answer = String::new();
+    c.read_to_string(&mut answer).unwrap();
+    let status = answer.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let resp_body = answer.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    (status, resp_body)
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Regression tests for Phase 4 hardening in `techne cloud dev`:
+/// - No-op `patch-library` reports `"dirty":false`.
+/// - Redeploying identical bundle bytes (same deployment ID) resets a `dirty`
+///   patched dev world cleanly back to the unpatched snapshot!
+/// - Rolling back to a cached earlier dev generation resets a `dirty` patched
+///   dev world cleanly back to the unpatched snapshot!
+/// - Under `--debug`, `/v1/ops` `patch-library` refuses `deploy`-only and
+///   `eval`-only tokens with `403`, and succeeds with a `prod`-scoped token.
+#[test]
+fn cloud_dev_patch_dirty_reset_on_identical_redeploy_and_rollback_and_debug_prod_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app_dir = tmp.path().join("app");
+    write_pkg_file(&app_dir, "techne-package.scm", r#"(package (demo app) (version "0.1.0") (cloud "app.scm"))"#);
+    let lib_v1 = r#"(define-library (demo app util)
+  (export label)
+  (import (techne))
+  (begin
+    (define counter (vector 0))
+    (define (label)
+      (vector-set! counter 0 (+ (vector-ref counter 0) 1))
+      (string-append "v1#" (number->string (vector-ref counter 0))))))"#;
+    let lib_patched = lib_v1.replace("\"v1#\"", "\"patched#\"");
+    let app_v1 = r#"(import (techne http) (demo app util))
+(provide fetch)
+(define (fetch req env ctx) (response (label)))
+"#;
+    let app_v2 = r#"(import (techne http) (demo app util))
+(provide fetch)
+(define (fetch req env ctx) (response (string-append "gen2:" (label))))
+"#;
+    write_pkg_file(&app_dir, "lib/demo/app/util.sld", lib_v1);
+    write_pkg_file(&app_dir, "app.scm", app_v1);
+
+    // Part A: Dev-only mode (`--nrepl 0 --ops 0`)
+    {
+        let mut child = Killed(
+            Command::new(env!("CARGO_BIN_EXE_techne"))
+                .args(["cloud", "dev", app_dir.to_str().unwrap(), "--port", "0", "--nrepl", "0", "--ops", "0"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let out = lines(child.0.stdout.take().unwrap());
+        let (mut port, mut ops_url) = (None, None);
+        while port.is_none() || ops_url.is_none() {
+            let line = out.recv_timeout(PATIENCE).expect("the ports");
+            if line.starts_with("Serving") {
+                port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+            } else if let Some(url) = line.strip_prefix("Operations on ") {
+                ops_url = Some(url.trim().to_string());
+            }
+        }
+        let (port, ops_url) = (port.unwrap(), ops_url.unwrap());
+        assert_eq!(get(port, "/"), "v1#1");
+
+        let eval_tok = mint_scoped_token(&app_dir.join(".techne"), "dev", &["eval"]);
+        let deploy_tok = mint_scoped_token(&app_dir.join(".techne"), "dev", &["deploy"]);
+
+        // 1. No-op patch via eval-only token succeeds and reports `"dirty":false`.
+        let noop_body =
+            format!(r#"{{"op":"patch-library","library":"(demo app util)","code":{}}}"#, json_str(&format!("; noop\n{lib_v1}")));
+        let (status, reply) = post_dev_ops(&ops_url, &eval_tok, &noop_body);
+        assert_eq!(status, 200, "{reply}");
+        assert!(reply.contains("\"dirty\":false"), "{reply}");
+
+        // 2. Real patch makes dev world dirty (`patched#2`).
+        let patch_body = format!(r#"{{"op":"patch-library","library":"(demo app util)","code":{}}}"#, json_str(&lib_patched));
+        let (status, reply) = post_dev_ops(&ops_url, &eval_tok, &patch_body);
+        assert_eq!(status, 200, "{reply}");
+        assert!(reply.contains("\"dirty\":true"), "{reply}");
+        assert_eq!(get(port, "/"), "patched#2");
+
+        // 3. Redeploying IDENTICAL bundle bytes (same deployment ID!) resets the dirty dev world back to clean `v1#1`!
+        let (status, reply) = post_dev_ops(&ops_url, &deploy_tok, r#"{"op":"deploy"}"#);
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(get(port, "/"), "v1#1");
+
+        // 4. Deploy gen2, patch gen2 so it is dirty (`gen2:patched#2`), then rollback to cached gen1 -> clean `v1#1`!
+        write_pkg_file(&app_dir, "app.scm", app_v2);
+        let (status, reply) = post_dev_ops(&ops_url, &deploy_tok, r#"{"op":"deploy"}"#);
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(get(port, "/"), "gen2:v1#1");
+
+        let (status, reply) = post_dev_ops(&ops_url, &eval_tok, &patch_body);
+        assert_eq!(status, 200, "{reply}");
+        assert!(reply.contains("\"dirty\":true"), "{reply}");
+        assert_eq!(get(port, "/"), "gen2:patched#2");
+
+        let (status, reply) = post_dev_ops(&ops_url, &deploy_tok, r#"{"op":"rollback"}"#);
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(get(port, "/"), "v1#1");
+    }
+
+    // Part B: `--debug` mode (`--nrepl 0 --debug --ops 0`) requires `prod` scope for `patch-library`.
+    {
+        write_pkg_file(&app_dir, "app.scm", app_v1);
+        let mut child = Killed(
+            Command::new(env!("CARGO_BIN_EXE_techne"))
+                .args(["cloud", "dev", app_dir.to_str().unwrap(), "--port", "0", "--nrepl", "0", "--debug", "--ops", "0"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let out = lines(child.0.stdout.take().unwrap());
+        let (mut port, mut ops_url, mut credential) = (None, None, None);
+        while port.is_none() || ops_url.is_none() || credential.is_none() {
+            let line = out.recv_timeout(PATIENCE).expect("the ports and credential");
+            if line.starts_with("Serving") {
+                port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+            } else if let Some(url) = line.strip_prefix("Operations on ") {
+                ops_url = Some(url.trim().to_string());
+            } else if line.starts_with("Debug instance") {
+                credential = line.rsplit(' ').next().map(str::to_string);
+            }
+        }
+        let (port, ops_url, credential) = (port.unwrap(), ops_url.unwrap(), credential.unwrap());
+
+        let deploy_only = mint_scoped_token(&app_dir.join(".techne"), "dev", &["deploy"]);
+        let eval_only = mint_scoped_token(&app_dir.join(".techne"), "dev", &["eval"]);
+        let prod_only = mint_scoped_token(&app_dir.join(".techne"), "dev", &["prod"]);
+
+        let patch_body = format!(r#"{{"op":"patch-library","library":"(demo app util)","code":{}}}"#, json_str(&lib_patched));
+
+        // Deploy-only and eval-only tokens MUST be refused with 403!
+        let (status, reply) = post_dev_ops(&ops_url, &deploy_only, &patch_body);
+        assert_eq!(status, 403, "deploy-only token must be refused under --debug: {reply}");
+        let (status, reply) = post_dev_ops(&ops_url, &eval_only, &patch_body);
+        assert_eq!(status, 403, "eval-only token must be refused under --debug: {reply}");
+
+        // Token with `prod` scope succeeds (200) and patches the debug instance alone.
+        let (status, reply) = post_dev_ops(&ops_url, &prod_only, &patch_body);
+        assert_eq!(status, 200, "{reply}");
+        assert!(reply.contains("\"dirty\":true"), "{reply}");
+        assert_eq!(get_routed(port, "/", &credential).1, "patched#1");
+        assert!(get(port, "/").starts_with("v1#"));
+    }
+}

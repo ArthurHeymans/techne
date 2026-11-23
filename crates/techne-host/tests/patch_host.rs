@@ -274,3 +274,183 @@ fn supervisor_patch_library_ipc_refuses_production_and_unknown() {
         assert!(body_of(&r2.head).starts_with("v1#"), "{}", body_of(&r2.head));
     });
 }
+
+#[test]
+fn deployment_load_bundle_refuses_scheme_patch_library_during_init() {
+    let bob = PackagePrefix::new("bob", "util");
+    let alice = PackagePrefix::new("alice", "app");
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        bob.clone(),
+        BundlePackage {
+            tree_sha256: "b".repeat(64),
+            files: pkg_files(&[(
+                "lib/bob/util.sld",
+                r#"(define-library (bob util) (export f) (import (techne)) (begin (define (f) "v1")))"#,
+            )]),
+            declared_deps: vec![],
+        },
+    );
+    packages.insert(
+        alice.clone(),
+        BundlePackage {
+            tree_sha256: "a".repeat(64),
+            files: pkg_files(&[(
+                "app.scm",
+                r#"(import (bob util))
+(patch-library! '(bob util) "(define-library (bob util) (export f) (import (techne)) (begin (define (f) \"hijacked\")))")
+(provide fetch)
+(define (fetch req env ctx) (dict 'status 200 'body (f)))"#,
+            )]),
+            declared_deps: vec![bob],
+        },
+    );
+    let bundle = Arc::new(BundleVfs::new(BTreeMap::new(), Some(alice), packages).unwrap());
+    let err = Deployment::load_bundle(bundle, "app.scm", Limits::default()).err().expect("bundle init must refuse patch-library!");
+    assert!(err.msg.contains("patching") || err.msg.contains("not granted") || err.msg.contains("capability"), "{err}");
+}
+
+struct PatchOnceAttached {
+    library: Vec<String>,
+    code: String,
+    done: bool,
+}
+
+impl Attached for PatchOnceAttached {
+    fn poll(&mut self, vm: &mut Vm) -> bool {
+        if !self.done {
+            self.done = true;
+            vm.patch_library(&self.library, &self.code, true).unwrap();
+            return true;
+        }
+        false
+    }
+    fn reap(&mut self, _vm: &mut Vm) {}
+}
+
+#[test]
+fn host_dirty_state_noop_nrepl_reset_and_stale_generation_release() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let bundle = make_bundle();
+        let lib = vec!["bob".to_string(), "util".to_string()];
+        let bob_v1 = r#"(define-library (bob util)
+  (export next-label)
+  (import (techne))
+  (begin
+    (define counter (vector 0))
+    (define (next-label)
+      (vector-set! counter 0 (+ (vector-ref counter 0) 1))
+      (string-append "v1#" (number->string (vector-ref counter 0))))))"#;
+
+        let dep1 = Deployment::load_bundle(bundle.clone(), "app.scm", Limits::default()).unwrap();
+        let host = Host::new();
+        host.publish_dev("app", dep1, |_| Ok(Box::new(NoopAttached))).unwrap();
+        let driver = host.clone();
+        let handle = tokio::task::spawn_local(async move { driver.run(None).await });
+
+        // 1. No-op patch MUST leave dirty == false and patch_deltas empty.
+        let noop = host.patch_library("app", &lib, &format!("; noop comment\n{bob_v1}"), true).unwrap();
+        assert!(noop.patched.is_empty());
+        assert!(!host.is_dirty("app"));
+        assert!(host.patch_deltas("app").is_empty());
+
+        // 2. Real patch marks dirty == true; Host::reset_dev_world resets cleanly to v1!
+        let r1 = host.fetch("app", request("/"), None).await.unwrap();
+        assert_eq!(body_of(&r1.head), "v1#1");
+        let report = host.patch_library("app", &lib, BOB_V2, true).unwrap();
+        assert_eq!(report.patched, vec!["next-label"]);
+        assert!(host.is_dirty("app"));
+        let r2 = host.fetch("app", request("/"), None).await.unwrap();
+        assert_eq!(body_of(&r2.head), "v2#2");
+
+        host.reset_dev_world("app", |_| Ok(Box::new(NoopAttached))).unwrap();
+        assert!(!host.is_dirty("app"));
+        assert!(host.patch_deltas("app").is_empty());
+        let r3 = host.fetch("app", request("/"), None).await.unwrap();
+        assert_eq!(body_of(&r3.head), "v1#1");
+
+        // 3. Patch applied inside an Attached driver (like nREPL `techne-patch-library`)
+        //    is immediately reflected in Host::is_dirty and Host::patch_deltas!
+        let dep2 = Deployment::load_bundle(bundle.clone(), "app.scm", Limits::default()).unwrap();
+        let lib_for_attach = lib.clone();
+        host.publish_dev("app", dep2, move |_| {
+            Ok(Box::new(PatchOnceAttached { library: lib_for_attach.clone(), code: BOB_V2.to_string(), done: false }))
+        })
+        .unwrap();
+        // Drive one turn so Attached::poll executes `vm.patch_library`.
+        let r4 = host.fetch("app", request("/"), None).await.unwrap();
+        assert_eq!(body_of(&r4.head), "v2#1");
+        assert!(host.is_dirty("app"), "nREPL/Attached patch must mark Host::is_dirty");
+        assert!(host.patch_deltas("app").contains_key(&lib), "nREPL/Attached patch must populate Host::patch_deltas");
+
+        // 4. Stale-generation request finishing (`Host::release`) MUST NOT wipe a newer dev generation's dirty state!
+        let slow_dir = tempfile::tempdir().unwrap();
+        let slow_entry = slow_dir.path().join("slow.scm");
+        std::fs::write(
+            &slow_entry,
+            r#"(provide fetch)
+               (define (fetch req env ctx)
+                 (sleep 80)
+                 (dict 'status 200 'body "slow-gen1"))"#,
+        )
+        .unwrap();
+        let slow_dep = Deployment::load(&slow_entry, Limits::default()).unwrap();
+        host.publish("slow", slow_dep);
+        let slow_req = host.fetch("slow", request("/"), None);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // Publish a dev generation on "slow" and patch it while gen1's request is still in flight.
+        let dev_dep = Deployment::load_bundle(bundle, "app.scm", Limits::default()).unwrap();
+        host.publish_dev("slow", dev_dep, |_| Ok(Box::new(NoopAttached))).unwrap();
+        host.patch_library("slow", &lib, BOB_V2, true).unwrap();
+        assert!(host.is_dirty("slow"));
+
+        // Wait for gen1's slow request to finish and call `release`.
+        let slow_resp = slow_req.await.unwrap();
+        assert_eq!(body_of(&slow_resp.head), "slow-gen1");
+        assert!(host.is_dirty("slow"), "finishing stale generation must not clear newer generation's dirty flag");
+        assert!(host.patch_deltas("slow").contains_key(&lib));
+
+        handle.abort();
+    });
+}
+
+#[test]
+fn supervisor_rejects_over_32_part_library_without_killing_live_worker() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "techne-package.scm", r#"(package (alice app) (version "0.1.0") (cloud "app.scm"))"#);
+        write_file(
+            dir.path(),
+            "lib/alice/app/util.sld",
+            r#"(define-library (alice app util) (export tag) (import (techne)) (begin (define (tag) "alive")))"#,
+        );
+        write_file(
+            dir.path(),
+            "app.scm",
+            r#"(import (alice app util))
+(provide fetch)
+(define (fetch req env ctx) (dict 'status 200 'body (tag)))"#,
+        );
+
+        let sup = Supervisor::start(worker_options(false)).await.unwrap();
+        let p = sup.prepare_directory("app", dir.path()).await.unwrap();
+        sup.publish("app", &p.id, None).unwrap();
+
+        let r1 = sup.fetch("app", request("/"), None).await.unwrap();
+        assert_eq!(body_of(&r1.head), "alive");
+
+        // Over-32-part library name is rejected at supervisor validation with syntax-error without killing worker.
+        let over_parts = vec!["p".to_string(); techne_vm::patch::MAX_LIBRARY_PARTS + 1];
+        let err = sup.patch_library("app", over_parts, "(define-library (p))".into(), true).await.unwrap_err();
+        assert_eq!(err.reason, "syntax-error");
+
+        // Live worker continues serving requests uninterrupted.
+        let r2 = sup.fetch("app", request("/"), None).await.unwrap();
+        assert_eq!(body_of(&r2.head), "alive");
+    });
+}

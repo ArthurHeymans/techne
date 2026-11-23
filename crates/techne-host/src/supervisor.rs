@@ -2631,4 +2631,153 @@ mod tests {
         let err = Bundle::decode(&tampered_bytes).err().expect("tampered bundle must be rejected");
         assert!(err.contains("tree-sha256 mismatch"), "{err}");
     }
+
+    #[test]
+    fn supervisor_patch_validation_timeout_outcome_unknown_and_late_reply_keep_worker_alive() {
+        // 1. parse_library_arg rejects >32-part string and >32-part list before IPC.
+        let over_str = format!("({})", vec!["a"; techne_vm::patch::MAX_LIBRARY_PARTS + 1].join(" "));
+        assert!(parse_library_arg(&Data::String(over_str)).is_err());
+        let over_list = Data::List(vec![Data::String("a".into()); techne_vm::patch::MAX_LIBRARY_PARTS + 1]);
+        assert!(parse_library_arg(&over_list).is_err());
+        assert_eq!(parse_library_arg(&Data::String("(acme util 1)".into())).unwrap(), vec!["acme", "util", "1"]);
+
+        // 2. Deterministic Supervisor state test with mock worker Link:
+        //    over-32-part validation never touches IPC, timeout returns `outcome-unknown`,
+        //    late PatchedLibrary reply is ignored without killing the worker, fabricated/stale IDs
+        //    are flagged as faults, and closed worker channel fails fast with `outcome-unknown`.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let link = Link { tx, queued: Rc::new(std::cell::Cell::new(0)), over: Rc::new(std::cell::Cell::new(false)) };
+            let dummy_fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+            let mut routes = HashMap::new();
+            routes.insert("app".to_string(), "dep1".to_string());
+            let mut ready = HashMap::new();
+            ready.insert(
+                served("app", "dep1"),
+                Ready {
+                    bundle: Bundle {
+                        name: "app".into(),
+                        id: "dep1".into(),
+                        entry: "app.scm".into(),
+                        files: vec![],
+                        bindings: Bindings::default(),
+                        root_package: None,
+                        packages: vec![],
+                    },
+                    published: true,
+                    since: Instant::now(),
+                    loaded: true,
+                },
+            );
+
+            let sup = Supervisor {
+                options: Rc::new(Options {
+                    program: PathBuf::new(),
+                    args: vec![],
+                    env: vec![],
+                    sandboxing: Sandboxing::Off,
+                    resources: ResourceConfinement::IfAvailable,
+                    cgroup: cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
+                    wall: Duration::from_secs(10),
+                    dev: true,
+                    egress: Default::default(),
+                }),
+                egress: Rc::new(crate::egress::Egress::new(Default::default()).unwrap()),
+                cgroups: Rc::new(None),
+                state: Rc::new(RefCell::new(State {
+                    asleep: false,
+                    waking: false,
+                    deferred: 0,
+                    gate: None,
+                    store_scope: None,
+                    worker: Some(Running { generation: 1, send: link, pidfd: dummy_fd, cgroup: None }),
+                    generation: 1,
+                    next_rid: 0,
+                    pending: HashMap::new(),
+                    next_deploy: 0,
+                    deploys: HashMap::new(),
+                    next_patch: 5,
+                    worker_patch_floor: 5,
+                    patches: HashMap::new(),
+                    ready,
+                    joining: HashMap::new(),
+                    routes,
+                    stores: HashMap::new(),
+                    store: None,
+                    sandbox: false,
+                    started: VecDeque::new(),
+                    repls: HashMap::new(),
+                    next_cid: 0,
+                    fetching: 0,
+                    tree_cache: TreeCache::default(),
+                    on_failure: Box::new(|_| {}),
+                    on_output: Box::new(|_| {}),
+                })),
+                wake: Arc::new(Notify::new()),
+                changed: Rc::new(Notify::new()),
+                woke: Rc::new(Notify::new()),
+                label: Rc::from("test"),
+            };
+
+            // Over-32-part library name is rejected with syntax-error BEFORE sending anything to worker.
+            let over_parts = vec!["x".to_string(); techne_vm::patch::MAX_LIBRARY_PARTS + 1];
+            let err = sup.patch_library("app", over_parts, "(define-library (x))".into(), true).await.unwrap_err();
+            assert_eq!(err.reason, "syntax-error");
+            assert!(rx.try_recv().is_err(), "invalid patch must never be sent over IPC");
+
+            // Timeout returns `outcome-unknown` (not `no-mutable-world`) and sends ToWorker::PatchLibrary.
+            let lib = vec!["alice".into(), "app".into()];
+            let err = sup
+                .patch_library_with_timeout("app", lib.clone(), "(define-library (alice app))".into(), true, Duration::from_millis(15))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason, "outcome-unknown");
+            let sent_bytes = rx.try_recv().expect("expected ToWorker::PatchLibrary frame");
+            let sent_id = match ToWorker::from_data(crate::wire::decode(&sent_bytes).unwrap()).unwrap() {
+                ToWorker::PatchLibrary { id, .. } => id,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(sent_id, 6);
+
+            // Late FromWorker::PatchedLibrary reply for timed-out id=6 is cleanly ignored (`None`).
+            assert!(
+                sup.heard(
+                    1,
+                    FromWorker::PatchedLibrary {
+                        id: sent_id,
+                        result: Ok(PatchReport {
+                            library: lib.clone(),
+                            patched: vec!["f".into()],
+                            unchanged: 0,
+                            stale_holders: vec![],
+                            stale_holders_truncated: false,
+                            source_sha256: "a".repeat(64),
+                        }),
+                        dirty: true,
+                    },
+                )
+                .is_none(),
+                "late reply for timed-out patch must be ignored without killing worker"
+            );
+
+            // Stale ID at/below worker_patch_floor (<= 5) and fabricated future ID (> next_patch) ARE faults.
+            assert!(
+                sup.heard(1, FromWorker::PatchedLibrary { id: 5, result: Err(HostPatchError::syntax_error("old")), dirty: false })
+                    .is_some()
+            );
+            assert!(
+                sup.heard(1, FromWorker::PatchedLibrary { id: 99, result: Err(HostPatchError::syntax_error("future")), dirty: false })
+                    .is_some()
+            );
+
+            // Closed worker channel fails immediately with `outcome-unknown` (no 30s wait).
+            drop(rx);
+            let start = Instant::now();
+            let err = sup.patch_library("app", lib, "(define-library (alice app))".into(), true).await.unwrap_err();
+            assert_eq!(err.reason, "outcome-unknown");
+            assert!(start.elapsed() < Duration::from_secs(1), "send failure must return immediately");
+        });
+    }
 }

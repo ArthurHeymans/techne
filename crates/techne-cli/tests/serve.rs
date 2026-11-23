@@ -931,3 +931,99 @@ fn remote_patch_library_targets_attached_debug_instance_only() {
     }
     assert_eq!(get(port, host, "/"), (200, "prod-v1".into()));
 }
+
+fn mint_serve_token(state: &Path, tenant: &str, scopes: &[&str]) -> String {
+    let mut vm = techne_vm::vm::Vm::new();
+    let cloud = techne_vm::library::lisp_dir().join("cloud");
+    let scopes_scm: String = scopes.iter().map(|s| techne_vm::reader::string_repr(s)).collect::<Vec<_>>().join(" ");
+    let val = vm
+        .eval_source(&format!(
+            r#"(require {} {})
+               (let ((k (token-key-in {})))
+                 (make-token k {}
+                             #:projects (list {})
+                             #:scopes (list {scopes_scm})
+                             #:expires (+ (current-second) 3600)))"#,
+            techne_vm::reader::string_repr(&cloud.join("auth.scm").display().to_string()),
+            techne_vm::reader::string_repr(&cloud.join("tokens.scm").display().to_string()),
+            techne_vm::reader::string_repr(&state.display().to_string()),
+            techne_vm::reader::string_repr(tenant),
+            techne_vm::reader::string_repr(&format!("{tenant}/*")),
+        ))
+        .unwrap();
+    vm.get::<String>(&val).unwrap()
+}
+
+/// On `techne cloud serve`, `/v1/ops` `patch-library` requires `prod` scope:
+/// - a `deploy`-only or `deploy`+`eval` token (without `prod`) is refused with 403
+///   even when a debug instance is attached;
+/// - a `prod`-only token passes the pre-body header gate and succeeds (200),
+///   patching only the attached debug instance.
+#[test]
+fn remote_patch_library_requires_prod_scope() {
+    use techne_node::bencode::B;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let app_dir = tmp.path().join("app");
+
+    write_pkg_file(&app_dir, "techne-package.scm", r#"(package (acme app) (version "0.1.0") (cloud "app.scm"))"#);
+    let lib_v1 = r#"(define-library (acme app util)
+  (export label)
+  (import (techne))
+  (begin (define (label) "prod-v1")))"#;
+    let lib_v2 = lib_v1.replace("\"prod-v1\"", "\"debug-v2\"");
+    write_pkg_file(&app_dir, "lib/acme/app/util.sld", lib_v1);
+    write_pkg_file(
+        &app_dir,
+        "app.scm",
+        r#"(import (techne http) (acme app util))
+(provide fetch)
+(define (fetch request env ctx) (response (label)))
+"#,
+    );
+
+    let acme = cloud(&["invite", "--state", state.to_str().unwrap(), "acme"], None).1.trim().to_string();
+    let (_child, port, ops, nrepl) = serve(&state);
+    let target = ["--to", ops.as_str(), "--tenant", "acme", "--project", "app"];
+    let (ok, said) = cloud(&[&["deploy", app_dir.to_str().unwrap()], &target[..]].concat(), Some(&acme));
+    assert!(ok, "{said}");
+    let host = "app.acme.cloud.test";
+    assert_eq!(get(port, host, "/"), (200, "prod-v1".into()));
+
+    // Attach a debug instance via nREPL.
+    let mut c = TcpStream::connect(("127.0.0.1", nrepl)).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    let opened = ask_repl(
+        &mut c,
+        vec![("op", B::str("authenticate")), ("token", B::str(&acme)), ("project", B::str("acme/app")), ("id", B::str("1"))],
+        "done",
+    )
+    .expect("authenticate reply");
+    let credential = opened.get("techne-debug-route").and_then(B::as_str).expect("debug credential").to_string();
+
+    let deploy_only = mint_serve_token(&state, "acme", &["deploy"]);
+    let deploy_and_eval = mint_serve_token(&state, "acme", &["deploy", "eval"]);
+    let prod_only = mint_serve_token(&state, "acme", &["prod"]);
+
+    let patch_body =
+        format!(r#"{{"op":"patch-library","tenant":"acme","project":"app","library":"(acme app util)","code":{}}}"#, json_str(&lib_v2));
+
+    // 1. Deploy-only and deploy+eval tokens MUST be refused with 403!
+    let (status, body) = post_ops(&ops, &deploy_only, "acme/app", &patch_body);
+    assert_eq!(status, 403, "deploy-only token must be refused for remote patch-library: {body}");
+    let (status, body) = post_ops(&ops, &deploy_and_eval, "acme/app", &patch_body);
+    assert_eq!(status, 403, "deploy+eval token without prod must be refused for remote patch-library: {body}");
+    assert_eq!(get_routed(port, host, "/", &credential).2, "prod-v1");
+
+    // 2. Prod-only token passes the pre-body header gate and patches the debug instance (200)!
+    let (status, body) = post_ops(&ops, &prod_only, "acme/app", &patch_body);
+    assert_eq!(status, 200, "prod-only token must succeed for remote patch-library: {body}");
+    assert!(body.contains("\"dirty\":true") && body.contains("\"label\""), "{body}");
+    assert_eq!(get_routed(port, host, "/", &credential).2, "debug-v2");
+    assert_eq!(get(port, host, "/"), (200, "prod-v1".into()));
+
+    // 3. No-op patch against an already-dirty debug instance still reflects true dirty state (`"dirty":true`).
+    let (status, body) = post_ops(&ops, &prod_only, "acme/app", &patch_body);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"patched\":[]") && body.contains("\"dirty\":true"), "{body}");
+}

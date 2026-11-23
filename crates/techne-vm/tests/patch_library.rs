@@ -617,3 +617,505 @@ fn patch_across_snapshot_bundle_vfs_and_capability_gating() {
     assert_eq!(res, "((\"dev\" \"util\") #(\"greet\") 0 #() #f #t)");
     assert_eq!(eval_str(&mut dev_vm, "(greet \"world\")"), "\"scheme world\"");
 }
+
+#[test]
+fn bundle_initialization_refuses_scheme_patch_library_with_loading_only() {
+    let mut pkgs = BTreeMap::new();
+    let mut bob_files = BTreeMap::new();
+    bob_files.insert(
+        "lib/bob/util.sld".to_string(),
+        Arc::<[u8]>::from(
+            br#"(define-library (bob util)
+  (export greet)
+  (import (techne))
+  (begin
+    (define (greet) "v1")))"#
+                .as_slice(),
+        ),
+    );
+    pkgs.insert(PackagePrefix::new("bob", "util"), BundlePackage { tree_sha256: "b".repeat(64), files: bob_files, declared_deps: vec![] });
+
+    let mut alice_files = BTreeMap::new();
+    alice_files.insert(
+        "app.scm".to_string(),
+        Arc::<[u8]>::from(
+            br#"(import (bob util))
+(patch-library! '(bob util)
+  "(define-library (bob util) (export greet) (import (techne)) (begin (define (greet) \"pwned\")))")"#
+                .as_slice(),
+        ),
+    );
+    pkgs.insert(
+        PackagePrefix::new("alice", "app"),
+        BundlePackage { tree_sha256: "a".repeat(64), files: alice_files, declared_deps: vec![PackagePrefix::new("bob", "util")] },
+    );
+
+    let bundle = Arc::new(BundleVfs::new(BTreeMap::new(), Some(PackagePrefix::new("alice", "app")), pkgs).unwrap());
+
+    // Production bundle loading grants Loading only (never Patching).
+    let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+    vm.install_bundle(bundle.clone());
+    let err = vm.eval_bundle_entry("app.scm").unwrap_err();
+    assert!(err.msg.contains("patching") || err.msg.contains("not granted") || err.msg.contains("capability"), "{err}");
+
+    // Even if Capability::Patching IS granted, `(alice app)` cannot patch `(bob util)` (ownership check).
+    let mut vm_with_patch = Vm::with_grants(Grants::NONE.with(Capability::Loading).with(Capability::Patching));
+    vm_with_patch.install_bundle(bundle);
+    let err = vm_with_patch.eval_bundle_entry("app.scm").unwrap_err();
+    assert!(err.msg.contains("owned by package") || err.msg.contains("not accessible"), "{err}");
+}
+
+#[test]
+fn eval_source_named_vm_helper_cannot_inherit_stdlib_or_package_provenance() {
+    // 1. Tracing `eval-source` puts a `(techne debug)` stdlib frame directly under
+    //    `prelude.scm`'s `eval-source`. Naming the evaluated source `"<vm helper>"`
+    //    must NOT skip that frame to inherit Stdlib provenance.
+    let mut vm = Vm::new();
+    vm.set_locked_libraries(true);
+    let err = vm
+        .eval_source(
+            r#"(import (techne debug))
+               (trace eval-source)
+               (eval-source
+                 "(define-library (techne forged) (export x) (import (techne)) (begin (define x 1)))"
+                 "user"
+                 "<vm helper>")"#,
+        )
+        .unwrap_err();
+    assert!(err.msg.contains("not provided in locked mode") || err.msg.contains("reserved") || err.msg.contains("owned"), "{err}");
+
+    // 2. Inside a bundled package `(alice app)`, calling `eval-source` named `"<vm helper>"`
+    //    must NOT inherit `(alice app)` provenance for defining or patching `(alice app ...)`.
+    let mut pkgs = BTreeMap::new();
+    let mut alice_files = BTreeMap::new();
+    alice_files.insert(
+        "lib/alice/app/util.sld".to_string(),
+        Arc::<[u8]>::from(
+            br#"(define-library (alice app util)
+  (export val)
+  (import (techne))
+  (begin (define (val) 1)))"#
+                .as_slice(),
+        ),
+    );
+    alice_files.insert(
+        "app.scm".to_string(),
+        Arc::<[u8]>::from(
+            br#"(import (alice app util))
+(define (try-forge-define)
+  (eval-source
+    "(define-library (alice app forged) (export x) (import (techne)) (begin (define x 1)))"
+    "user"
+    "<vm helper>"))
+(define (try-forge-patch)
+  (eval-source
+    "(patch-library! '(alice app util) \"(define-library (alice app util) (export val) (import (techne)) (begin (define (val) 2)))\")"
+    "user"
+    "<vm helper>"))"#
+                .as_slice(),
+        ),
+    );
+    pkgs.insert(
+        PackagePrefix::new("alice", "app"),
+        BundlePackage { tree_sha256: "a".repeat(64), files: alice_files, declared_deps: vec![] },
+    );
+    let bundle = Arc::new(BundleVfs::new(BTreeMap::new(), Some(PackagePrefix::new("alice", "app")), pkgs).unwrap());
+    let mut bvm = Vm::with_grants(Grants::NONE.with(Capability::Loading).with(Capability::Patching));
+    bvm.install_bundle(bundle);
+    bvm.eval_bundle_entry("app.scm").unwrap();
+
+    let err = bvm.eval_source("(try-forge-define)").unwrap_err();
+    assert!(err.msg.contains("owned by package") || err.msg.contains("cannot define"), "{err}");
+
+    let err = bvm.eval_source("(try-forge-patch)").unwrap_err();
+    assert!(err.msg.contains("owned by package") || err.msg.contains("not accessible"), "{err}");
+    assert_eq!(eval_str(&mut bvm, "(val)"), "1");
+}
+
+#[test]
+fn patch_compile_error_does_not_leak_forward_globals_or_bindings() {
+    let mut vm = Vm::new();
+    vm.eval_source(
+        r#"
+(define-library (acme clean)
+  (export f g)
+  (import (techne))
+  (begin
+    (define (f x) (+ x 1))
+    (define (g x) (+ x 2))))
+(import (acme clean))
+"#,
+    )
+    .unwrap();
+
+    let before_exports = eval_str(&mut vm, "(length (module-exports \"(acme clean)\"))");
+    let lib = parts(&["acme", "clean"]);
+
+    // Referencing an undefined symbol during patch staging fails compilation without
+    // allocating a forward global slot or mutating `(acme clean)`'s binding table.
+    let bad = r#"
+(define-library (acme clean)
+  (export f g)
+  (import (techne))
+  (begin
+    (define (f x) (+ x never-defined-leaked-sym))
+    (define (g x) (if))))
+"#;
+    let err = vm.patch_library(&lib, bad, true).unwrap_err();
+    assert_eq!(err.reason, PatchRefusal::CompileError);
+    assert_eq!(err.binding.as_deref(), Some("f"));
+
+    // Verify `never-defined-leaked-sym` was NOT leaked into `(acme clean)`'s binding table.
+    let check_bound = vm.eval_source("(eval-source \"never-defined-leaked-sym\" \"(acme clean)\" \"check\")");
+    assert!(check_bound.is_err(), "forward global must not be leaked into module bindings");
+    assert_eq!(eval_str(&mut vm, "(list (f 10) (g 10))"), "(11 12)");
+    assert_eq!(eval_str(&mut vm, "(length (module-exports \"(acme clean)\"))"), before_exports);
+
+    // Confirm a clean patch still works cleanly afterward.
+    let good = r#"
+(define-library (acme clean)
+  (export f g)
+  (import (techne))
+  (begin
+    (define (f x) (+ x 10))
+    (define (g x) (+ x 20))))
+"#;
+    let report = vm.patch_library(&lib, good, true).unwrap();
+    assert_eq!(report.patched, vec!["f", "g"]);
+    assert_eq!(eval_str(&mut vm, "(list (f 10) (g 10))"), "(20 30)");
+}
+
+#[test]
+fn patch_refuses_expression_level_include_and_cond_expand_including_macro_expanded() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("should-never-be-read.scm");
+    std::fs::write(&secret_file, "999999").unwrap();
+    let secret_path = secret_file.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+
+    let mut vm = Vm::new();
+    vm.eval_source(
+        r#"
+(define-library (acme stage)
+  (export f)
+  (import (techne))
+  (begin
+    (define-syntax splice-inc
+      (syntax-rules ()
+        ((_ path) (include path))))
+    (define (f) 1)))
+(import (acme stage))
+"#,
+    )
+    .unwrap();
+    let lib = parts(&["acme", "stage"]);
+
+    // 1. Direct expression-level `include` inside a patched procedure body.
+    let direct_inc = format!(
+        r#"(define-library (acme stage)
+             (export f)
+             (import (techne))
+             (begin
+               (define-syntax splice-inc
+                 (syntax-rules ()
+                   ((_ path) (include path))))
+               (define (f) (include "{secret_path}"))))"#
+    );
+    let err = vm.patch_library(&lib, &direct_inc, true).unwrap_err();
+    assert_eq!(err.reason, PatchRefusal::IncludeNotSupported, "{err:?}");
+
+    // 2. Direct expression-level `include-ci`.
+    let direct_inc_ci = format!(
+        r#"(define-library (acme stage)
+             (export f)
+             (import (techne))
+             (begin
+               (define-syntax splice-inc
+                 (syntax-rules ()
+                   ((_ path) (include path))))
+               (define (f) (include-ci "{secret_path}"))))"#
+    );
+    let err = vm.patch_library(&lib, &direct_inc_ci, true).unwrap_err();
+    assert_eq!(err.reason, PatchRefusal::IncludeNotSupported, "{err:?}");
+
+    // 3. Macro-expanded `include` inside a patched procedure body.
+    let macro_inc = format!(
+        r#"(define-library (acme stage)
+             (export f)
+             (import (techne))
+             (begin
+               (define-syntax splice-inc
+                 (syntax-rules ()
+                   ((_ path) (include path))))
+               (define (f) (splice-inc "{secret_path}"))))"#
+    );
+    let err = vm.patch_library(&lib, &macro_inc, true).unwrap_err();
+    assert_eq!(err.reason, PatchRefusal::IncludeNotSupported, "{err:?}");
+
+    // 4. Expression-level `cond-expand` inside a patched procedure body.
+    let expr_ce = r#"(define-library (acme stage)
+                       (export f)
+                       (import (techne))
+                       (begin
+                         (define-syntax splice-inc
+                           (syntax-rules ()
+                             ((_ path) (include path))))
+                         (define (f) (cond-expand (else 42)))))"#;
+    let err = vm.patch_library(&lib, expr_ce, true).unwrap_err();
+    assert_eq!(err.reason, PatchRefusal::UnsupportedDeclaration, "{err:?}");
+
+    // Live binding was never touched.
+    assert_eq!(eval_str(&mut vm, "(f)"), "1");
+}
+
+#[test]
+fn patch_diff_tightening_state_order_repurposed_slot_shadowed_begin_and_cond_expand() {
+    // 1. Reordered state initializers MUST be refused with StateInitializerChanged.
+    {
+        let mut vm = Vm::new();
+        vm.eval_source(
+            r#"
+(define-library (acme order)
+  (export get-pair)
+  (import (techne))
+  (begin
+    (define a (vector 1))
+    (define b (vector (vector-ref a 0)))
+    (define (get-pair) (list (vector-ref a 0) (vector-ref b 0)))))
+(import (acme order))
+"#,
+        )
+        .unwrap();
+        let reordered = r#"
+(define-library (acme order)
+  (export get-pair)
+  (import (techne))
+  (begin
+    (define b (vector (vector-ref a 0)))
+    (define a (vector 1))
+    (define (get-pair) (list (vector-ref a 0) (vector-ref b 0)))))
+"#;
+        let err = vm.patch_library(&parts(&["acme", "order"]), reordered, true).unwrap_err();
+        assert_eq!(err.reason, PatchRefusal::StateInitializerChanged, "{err:?}");
+        assert_eq!(eval_str(&mut vm, "(get-pair)"), "(1 1)");
+    }
+
+    // 2. Slot repurposed via `set!` (non-procedure OR wrapped closure) is refused instead of overwritten.
+    {
+        let mut vm = Vm::new();
+        vm.eval_source(
+            r#"
+(define-library (acme mutate)
+  (export f g repurpose-f! wrap-g!)
+  (import (techne))
+  (begin
+    (define (f x) (+ x 1))
+    (define (g x) (+ x 1))
+    (define (repurpose-f!) (set! f 42))
+    (define (wrap-g!)
+      (let ((orig g))
+        (set! g (lambda (x) (+ 100 (orig x))))))))
+(import (acme mutate))
+"#,
+        )
+        .unwrap();
+        let lib = parts(&["acme", "mutate"]);
+
+        // First repurpose `f` to a non-procedure (42).
+        vm.eval_source("(repurpose-f!)").unwrap();
+        let patch_f = r#"
+(define-library (acme mutate)
+  (export f g repurpose-f! wrap-g!)
+  (import (techne))
+  (begin
+    (define (f x) (+ x 99))
+    (define (g x) (+ x 1))
+    (define (repurpose-f!) (set! f 42))
+    (define (wrap-g!)
+      (let ((orig g))
+        (set! g (lambda (x) (+ 100 (orig x))))))))
+"#;
+        let err = vm.patch_library(&lib, patch_f, true).unwrap_err();
+        assert_eq!(err.reason, PatchRefusal::StateInitializerChanged, "{err:?}");
+        assert_eq!(err.binding.as_deref(), Some("f"));
+        assert_eq!(eval_str(&mut vm, "f"), "42");
+
+        // Now wrap `g` with another closure via `set!`.
+        vm.eval_source("(wrap-g!)").unwrap();
+        let patch_g = r#"
+(define-library (acme mutate)
+  (export f g repurpose-f! wrap-g!)
+  (import (techne))
+  (begin
+    (define (f x) (+ x 1))
+    (define (g x) (+ x 99))
+    (define (repurpose-f!) (set! f 42))
+    (define (wrap-g!)
+      (let ((orig g))
+        (set! g (lambda (x) (+ 100 (orig x))))))))
+"#;
+        let err = vm.patch_library(&lib, patch_g, true).unwrap_err();
+        assert_eq!(err.reason, PatchRefusal::StateInitializerChanged, "{err:?}");
+        assert_eq!(err.binding.as_deref(), Some("g"));
+        assert_eq!(eval_str(&mut vm, "(g 5)"), "106");
+    }
+
+    // 3. Shadowed `begin` macro is NOT misparsed as top-level procedure definitions.
+    {
+        let mut vm = Vm::new();
+        vm.eval_source(
+            r#"
+(define-library (acme shadow-begin)
+  (export f)
+  (import (techne))
+  (begin
+    (define-syntax begin
+      (syntax-rules ()
+        ((_ body ...) 'shadowed)))
+    (define (f) 1)
+    (begin (define (not-a-top-level) 2))))
+(import (acme shadow-begin))
+"#,
+        )
+        .unwrap();
+        let lib = parts(&["acme", "shadow-begin"]);
+        // Modifying the shadowed `(begin ...)` form must be refused as a top-level expression change,
+        // NOT treated as patching a top-level procedure `not-a-top-level`!
+        let changed_shadow = r#"
+(define-library (acme shadow-begin)
+  (export f)
+  (import (techne))
+  (begin
+    (define-syntax begin
+      (syntax-rules ()
+        ((_ body ...) 'shadowed)))
+    (define (f) 1)
+    (begin (define (not-a-top-level) 999))))
+"#;
+        let err = vm.patch_library(&lib, changed_shadow, true).unwrap_err();
+        assert_eq!(err.reason, PatchRefusal::StateInitializerChanged, "{err:?}");
+
+        // Patching the real top-level procedure `f` while leaving the shadowed `(begin ...)` intact succeeds.
+        let patch_real = r#"
+(define-library (acme shadow-begin)
+  (export f)
+  (import (techne))
+  (begin
+    (define-syntax begin
+      (syntax-rules ()
+        ((_ body ...) 'shadowed)))
+    (define (f) 2)
+    (begin (define (not-a-top-level) 2))))
+"#;
+        let report = vm.patch_library(&lib, patch_real, true).unwrap();
+        assert_eq!(report.patched, vec!["f"]);
+        assert_eq!(eval_str(&mut vm, "(f)"), "2");
+    }
+
+    // 4. Divergent `cond-expand` clause selection in patch source is refused cleanly.
+    {
+        let mut vm = Vm::new();
+        vm.eval_source(
+            r#"
+(define-library (acme ce)
+  (export val)
+  (import (techne))
+  (cond-expand
+    ((library (acme optional-missing))
+     (begin (define (val) 'opt)))
+    (else
+     (begin (define (val) 'fallback)))))
+(import (acme ce))
+"#,
+        )
+        .unwrap();
+        assert_eq!(eval_str(&mut vm, "(val)"), "fallback");
+
+        // Now define `(acme optional-missing)` AFTER `(acme ce)` was loaded.
+        // Re-evaluating `cond-expand` during patching would take clause 0 instead of recorded clause 1!
+        vm.eval_source("(define-library (acme optional-missing) (export) (import (techne)))").unwrap();
+
+        let patch_same = r#"
+(define-library (acme ce)
+  (export val)
+  (import (techne))
+  (cond-expand
+    ((library (acme optional-missing))
+     (begin (define (val) 'opt-v2)))
+    (else
+     (begin (define (val) 'fallback-v2)))))
+"#;
+        let err = vm.patch_library(&parts(&["acme", "ce"]), patch_same, true).unwrap_err();
+        assert_eq!(err.reason, PatchRefusal::UnsupportedDeclaration, "{err:?}");
+        assert_eq!(eval_str(&mut vm, "(val)"), "fallback");
+    }
+}
+
+#[test]
+fn patch_large_stale_holder_graph_is_bounded_and_truncated() {
+    let mut vm = Vm::new();
+
+    // Build a library with 270 procedures (> 256 stale_holders cap) AND retain one of them
+    // at a chain depth > 64 (80 nested cons cells).
+    let mut defs_v1 = String::new();
+    let mut defs_v2 = String::new();
+    let mut exports = String::new();
+    for i in 0..270 {
+        exports.push_str(&format!(" f{i}"));
+        defs_v1.push_str(&format!("(define (f{i}) {i})\n"));
+        defs_v2.push_str(&format!("(define (f{i}) {})\n", i + 1000));
+    }
+    let lib_v1 = format!("(define-library (acme many) (export{exports}) (import (techne)) (begin {defs_v1}))");
+    let lib_v2 = format!("(define-library (acme many) (export{exports}) (import (techne)) (begin {defs_v2}))");
+
+    vm.eval_source(&lib_v1).unwrap();
+    vm.eval_source("(import (acme many))").unwrap();
+
+    // Retain all 270 closures: f0 inside an 80-deep nested cons chain, f1..f269 in a vector.
+    let mut retain_vec = String::from("(define kept-many (vector");
+    for i in 1..270 {
+        retain_vec.push_str(&format!(" f{i}"));
+    }
+    retain_vec.push_str("))");
+    vm.eval_source(&retain_vec).unwrap();
+    vm.eval_source(
+        r#"(define kept-deep
+             (let loop ((n 80) (acc f0))
+               (if (= n 0) acc (loop (- n 1) (cons acc '())))))"#,
+    )
+    .unwrap();
+
+    let report = vm.patch_library(&parts(&["acme", "many"]), &lib_v2, true).unwrap();
+    assert_eq!(report.patched.len(), 270);
+    assert!(report.stale_holders_truncated, "expected stale_holders_truncated=true for 270 holders / deep chain");
+    assert!(report.stale_holders.len() <= techne_vm::patch::MAX_STALE_HOLDERS, "len={}", report.stale_holders.len());
+    for holder in &report.stale_holders {
+        assert!(holder.chain.len() <= techne_vm::patch::MAX_STALE_CHAIN, "chain len={}", holder.chain.len());
+    }
+}
+
+#[test]
+fn non_interning_library_name_parser_enforces_bounds() {
+    use techne_vm::patch::{MAX_LIBRARY_NAME_BYTES, MAX_LIBRARY_PART_BYTES, MAX_LIBRARY_PARTS, parse_library_name, validate_library_parts};
+
+    assert_eq!(parse_library_name("(acme util 2)").unwrap(), vec!["acme", "util", "2"]);
+    assert_eq!(parse_library_name(" ( acme  util-2  007 ) ").unwrap(), vec!["acme", "util-2", "7"]);
+
+    // Reject empty, comments, pipe escapes, >32 parts, oversized part, oversized string, negative int, dotted pair, trailing tokens.
+    assert!(parse_library_name("()").is_err());
+    assert!(parse_library_name("; comment\n(acme util)").is_err());
+    assert!(parse_library_name("(acme |bad|)").is_err());
+    assert!(parse_library_name("(acme -1)").is_err());
+    assert!(parse_library_name("(acme . util)").is_err());
+    assert!(parse_library_name("(acme util) (extra)").is_err());
+
+    let too_many_str = format!("({})", vec!["a"; MAX_LIBRARY_PARTS + 1].join(" "));
+    assert!(parse_library_name(&too_many_str).is_err());
+    assert!(validate_library_parts(&vec!["a".to_string(); MAX_LIBRARY_PARTS + 1]).is_err());
+
+    let huge_part = "a".repeat(MAX_LIBRARY_PART_BYTES + 1);
+    assert!(parse_library_name(&format!("({huge_part})")).is_err());
+    assert!(validate_library_parts(&[huge_part]).is_err());
+
+    let huge_input = format!("({} a)", " ".repeat(MAX_LIBRARY_NAME_BYTES));
+    assert!(parse_library_name(&huge_input).is_err());
+}
