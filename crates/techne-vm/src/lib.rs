@@ -38,6 +38,7 @@ pub(crate) use techne_vm_macros::natives;
 pub mod alloc;
 pub mod api;
 pub(crate) mod builtins;
+pub mod bundle;
 pub(crate) mod bytes;
 pub mod cli;
 pub(crate) mod code;

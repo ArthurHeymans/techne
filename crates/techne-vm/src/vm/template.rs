@@ -110,6 +110,11 @@ impl Vm {
         self.release_unheld_files();
         self.drop_stale_timers();
         self.at_rest().map_err(|e| Error::new(format!("snapshot: {e}")))?;
+        if !self.grants.has(super::Capability::Loading) || self.bundle.is_some() {
+            self.library_providers.clear();
+            self.package_imports.clear();
+            self.reading_root = None;
+        }
         Ok(Snapshot(Rc::new(Vm::freeze(self))))
     }
 
@@ -269,6 +274,7 @@ impl Vm {
             library_providers,
             package_imports,
             locked_libraries,
+            bundle,
             current_module,
             grants,
             reading_root,
@@ -369,6 +375,7 @@ impl Vm {
         vm.library_providers.clone_from(library_providers);
         vm.package_imports.clone_from(package_imports);
         vm.locked_libraries = *locked_libraries;
+        vm.bundle.clone_from(bundle);
         vm.reading_root.clone_from(reading_root);
         vm.current_module = *current_module;
         vm.files.clone_from(files);
@@ -588,5 +595,53 @@ mod tests {
         a.full_collect_raw();
         assert_eq!(eval(&mut a, "(let loop ((i 0) (acc '())) (if (= i 1000) (length acc) (loop (+ i 1) (cons i acc))))"), "1000");
         assert!(a.get_global_in(ROOT_MODULE, "map").is_some());
+    }
+
+    /// Snapshotting without `Capability::Loading` or with an installed `BundleVfs`
+    /// strips host OS path tables (`library_providers`, `package_imports`, `reading_root`).
+    #[test]
+    fn snapshot_clears_os_paths_without_loading_or_with_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+
+        // Case 1: Capability::Loading revoked -> OS path tables stripped from snapshot.
+        let mut vm = Vm::with_grants(Grants::NONE.with(super::super::Capability::Loading));
+        vm.confine_reading(dir.path()).unwrap();
+        vm.provide_libraries("alice", "pkg", &lib).unwrap();
+        vm.declare_imports(dir.path(), ("alice", "pkg"), &[("alice".into(), "pkg".into())]).unwrap();
+        assert!(vm.reading_root.is_some());
+        assert!(!vm.library_providers.is_empty());
+        assert!(!vm.package_imports.is_empty());
+        vm.set_grant(super::super::Capability::Loading, false);
+        let snap = vm.snapshot().unwrap();
+        assert!(snap.0.reading_root.is_none());
+        assert!(snap.0.library_providers.is_empty());
+        assert!(snap.0.package_imports.is_empty());
+        let world = snap.world();
+        assert!(world.reading_root.is_none());
+        assert!(world.library_providers.is_empty());
+        assert!(world.package_imports.is_empty());
+
+        // Case 2: BundleVfs installed (even if Loading is still granted) -> zero OS paths.
+        let mut root_files = std::collections::BTreeMap::new();
+        root_files.insert("app.scm".to_string(), std::sync::Arc::from(&b"(define ok 42)"[..]));
+        let bundle = std::sync::Arc::new(crate::bundle::BundleVfs::from_root_files(root_files).unwrap());
+        let mut bvm = Vm::with_grants(Grants::NONE.with(super::super::Capability::Loading));
+        bvm.confine_reading(dir.path()).unwrap();
+        bvm.provide_libraries("alice", "pkg", &lib).unwrap();
+        bvm.install_bundle(bundle);
+        bvm.eval_bundle_entry("app.scm").unwrap();
+        let bsnap = bvm.snapshot().unwrap();
+        assert!(bsnap.0.reading_root.is_none());
+        assert!(bsnap.0.library_providers.is_empty());
+        assert!(bsnap.0.package_imports.is_empty());
+        assert!(bsnap.0.bundle.is_some());
+        let mut bworld = bsnap.world();
+        assert!(bworld.reading_root.is_none());
+        assert!(bworld.library_providers.is_empty());
+        assert!(bworld.package_imports.is_empty());
+        assert!(bworld.bundle.is_some());
+        assert_eq!(eval(&mut bworld, "ok"), "42");
     }
 }

@@ -17,40 +17,17 @@
 //! (files, the REPL's) also see the root module, imports or not.
 
 use std::{
-    fmt,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
 
+pub use crate::bundle::PackagePrefix;
 use crate::{
     reader::{self, Sexp, display_sexp, intern, strip, symbol_name},
     vm::{Error, Forms, GlobalBinding, ROOT_MODULE, Vm, predeclare},
 };
 
 type R<T> = Result<T, Error>;
-
-/// A canonical 2-part `(owner pkg)` package identity.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct PackagePrefix {
-    pub(crate) owner: Box<str>,
-    pub(crate) name: Box<str>,
-}
-
-impl PackagePrefix {
-    pub(crate) fn new(owner: &str, name: &str) -> Self {
-        Self { owner: owner.into(), name: name.into() }
-    }
-
-    pub(crate) fn matches(&self, owner: &str, name: &str) -> bool {
-        &*self.owner == owner && &*self.name == name
-    }
-}
-
-impl fmt::Display for PackagePrefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "({} {})", self.owner, self.name)
-    }
-}
 
 /// What the files of a package may import (`Vm::declare_imports`).
 #[derive(Clone)]
@@ -224,8 +201,25 @@ pub(crate) fn is_valid_package_component(s: &str) -> bool {
 }
 
 /// Whether `part` is safe as a single path segment in library lookup.
-fn valid_library_part(part: &str) -> bool {
+pub(crate) fn valid_library_part(part: &str) -> bool {
     !part.is_empty() && !part.starts_with('.') && !part.bytes().any(|b| matches!(b, b'/' | b'\\' | b'\0'))
+}
+
+/// Whether `(owner pkg)` collides with Techne's own shipped stdlib libraries.
+pub(crate) fn is_stdlib_package(owner: &str, pkg: &str) -> bool {
+    if owner != "techne" {
+        return false;
+    }
+    if pkg == "editor" {
+        return true;
+    }
+    if valid_library_part(pkg) {
+        let stdlib = lisp_dir().join("techne");
+        if stdlib.join(format!("{pkg}.sld")).is_file() || stdlib.join(pkg).is_dir() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `path` resolves inside Techne's own `lisp_dir()`.
@@ -263,17 +257,9 @@ pub(crate) fn is_stdlib_library(parts: &[String]) -> bool {
         return true;
     }
     if let [owner, pkg, ..] = parts
-        && owner == "techne"
+        && is_stdlib_package(owner, pkg)
     {
-        if pkg == "editor" {
-            return true;
-        }
-        if valid_library_part(pkg) {
-            let stdlib = lisp_dir().join("techne");
-            if stdlib.join(format!("{pkg}.sld")).is_file() || stdlib.join(pkg).is_dir() {
-                return true;
-            }
-        }
+        return true;
     }
     false
 }
@@ -450,6 +436,17 @@ impl Vm {
                 return Ok(());
             }
             return err(format!("{who}: {name} belongs to Techne's own libraries"));
+        }
+        if let Some(bundle) = &self.bundle {
+            if let Some([owner, pkg]) = parts.get(..2)
+                && bundle.has_package(owner, pkg)
+            {
+                if !bundle.owns_library_source(owner, pkg, source_path) {
+                    return err(format!("{who}: {name} is owned by package ({owner} {pkg})"));
+                }
+                return Ok(());
+            }
+            return err(format!("{who}: {name} is not provided in locked mode"));
         }
         if let Some(provider) = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1])) {
             let owned = source_path.is_some_and(|p| p.starts_with(provider));
@@ -677,6 +674,29 @@ impl Vm {
     /// `dir`, with the source file each was read as.
     pub fn include(&mut self, names: &[Sexp], dir: &Path, fold_case: bool) -> R<Vec<(Vec<Sexp>, u32)>> {
         self.check_loading().map_err(|e| Error::new(format!("include: {}", e.msg)))?;
+        if let Some(bundle) = self.bundle.clone() {
+            return names
+                .iter()
+                .map(|n| {
+                    let Sexp::Str(name) = n else { return err("include: expected file names") };
+                    let path = if bundle.is_virtual_dir_path(dir) {
+                        bundle.resolve_relative_from_dir(dir, name, "include")?
+                    } else if is_under_lisp_dir(dir) {
+                        let lisp_root = lisp_dir().canonicalize().map_err(|e| Error::new(format!("include: {e}")))?;
+                        resolve_contained_include(dir, name, &lisp_root)?
+                    } else {
+                        return err(format!("include: cannot resolve {name} outside bundle"));
+                    };
+                    let text =
+                        self.read_file_admitted(&path.to_string_lossy(), 2).map_err(|e| Error::new(format!("include: {}", e.msg)))?;
+                    let meter = crate::vm::meter::Meter::new(self);
+                    let forms = reader::read_metered(&text, fold_case, &meter)
+                        .map_err(|e| meter.error(self).unwrap_or_else(|| Error::new(format!("{}: {}", path.display(), e.message))))?;
+                    let file = self.add_file(&path.to_string_lossy(), &text)?;
+                    Ok((forms, file))
+                })
+                .collect();
+        }
         let containment_root = self.include_containment_root(dir);
         let effective_dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
         names
@@ -761,6 +781,9 @@ impl Vm {
     /// Techne's own libraries, or if one is already loaded from elsewhere.
     pub fn provide_libraries(&mut self, owner: &str, pkg: &str, dir: &Path) -> R<()> {
         self.check_loading()?;
+        if self.bundle.is_some() {
+            return err("provide-libraries: cannot register OS library providers when a bundle is installed");
+        }
         if !is_valid_package_component(owner) || !is_valid_package_component(pkg) {
             return err(format!("invalid package name ({owner} {pkg})"));
         }
@@ -788,6 +811,9 @@ impl Vm {
     /// What makes several packages known at once asks before it changes
     /// anything.
     pub fn library_conflict(&self, owner: &str, pkg: &str, dir: &Path) -> Option<String> {
+        if self.bundle.is_some() {
+            return Some("cannot register OS library providers when a bundle is installed".into());
+        }
         if !is_valid_package_component(owner) || !is_valid_package_component(pkg) {
             return Some(format!("invalid package name ({owner} {pkg})"));
         }
@@ -803,11 +829,8 @@ impl Vm {
         if dir.exists() && !dir.is_dir() {
             return Some(format!("{} is not a directory", dir.display()));
         }
-        if owner == "techne" {
-            let stdlib = lisp_dir().join("techne");
-            if pkg == "editor" || stdlib.join(format!("{pkg}.sld")).is_file() || stdlib.join(pkg).is_dir() {
-                return Some(format!("libraries ({owner} {pkg} ...) are part of Techne's own libraries"));
-            }
+        if is_stdlib_package(owner, pkg) {
+            return Some(format!("libraries ({owner} {pkg} ...) are part of Techne's own libraries"));
         }
         self.library_loaded_outside(owner, pkg, &dir).map(|library| format!("library {library} is loaded from elsewhere already"))
     }
@@ -820,6 +843,9 @@ impl Vm {
     /// Declared again for a directory, this replaces what was declared.
     pub fn declare_imports(&mut self, root: &Path, package: (&str, &str), names: &[(String, String)]) -> R<()> {
         self.check_loading()?;
+        if self.bundle.is_some() {
+            return err("declare-imports: cannot declare OS package imports when a bundle is installed");
+        }
         if !is_valid_package_component(package.0) || !is_valid_package_component(package.1) {
             return err(format!("invalid package name ({} {})", package.0, package.1));
         }
@@ -849,6 +875,23 @@ impl Vm {
     /// is also refused.
     fn check_declared(&self, parts: &[String], dir: &Path) -> R<()> {
         if is_stdlib_library(parts) {
+            return Ok(());
+        }
+        if let Some(bundle) = &self.bundle {
+            let Some([owner, pkg]) = parts.get(..2) else {
+                return err(format!("import: {}: library is not provided in locked mode", module_name(parts)));
+            };
+            if !bundle.has_package(owner, pkg) {
+                return err(format!("import: {}: library is not provided in locked mode", module_name(parts)));
+            }
+            if let Some(importer) = bundle.package_for_dir(dir)
+                && !bundle.package_allows(importer, owner, pkg)
+            {
+                return err(format!(
+                    "import: {}: the package {importer} does not depend on ({owner} {pkg}) (its techne-package.scm says what it depends on)",
+                    module_name(parts),
+                ));
+            }
             return Ok(());
         }
         let provider = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1]));
@@ -889,6 +932,9 @@ impl Vm {
         }
         if is_stdlib_library(parts) {
             return contained_library_file(lisp_dir(), parts);
+        }
+        if let Some(bundle) = &self.bundle {
+            return bundle.library_virtual_path(parts);
         }
         if let Some(provider) = parts.get(..2).and_then(|p| self.library_provider(&p[0], &p[1])) {
             return contained_library_file(provider, parts);

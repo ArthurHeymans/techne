@@ -386,6 +386,25 @@ impl Vm {
     /// a device that never ends, is refused.
     pub(crate) fn read_file_admitted(&mut self, path: &str, factor: usize) -> Result<String, Error> {
         use std::io::Read;
+        if let Some(bundle) = self.bundle.clone() {
+            let p = std::path::Path::new(path);
+            if let Some(bytes) = bundle.read_virtual_path(p) {
+                let len = bytes.len();
+                self.admit_items(len, factor, 0)?;
+                let room = self.room().max(SMALL) / factor.max(1);
+                if len > room {
+                    return Err(self.refusal(len.saturating_mul(factor)));
+                }
+                let text = std::str::from_utf8(bytes).map_err(|e| Error::new(format!("{path}: invalid UTF-8: {e}")))?;
+                return Ok(text.to_owned());
+            }
+            if bundle.is_virtual_file_path(p) {
+                return Err(Error::new(format!("{path}: no such file in bundle")));
+            }
+            if !crate::library::is_under_lisp_dir(p) {
+                return Err(Error::new(format!("{path}: {}", std::io::Error::from(std::io::ErrorKind::NotFound))));
+            }
+        }
         let failed = |e: std::io::Error| Error::new(format!("{path}: {e}"));
         if !self.may_read(std::path::Path::new(path)) {
             return Err(failed(std::io::ErrorKind::NotFound.into()));

@@ -903,6 +903,8 @@ pub struct Vm {
     /// and registered package providers (ignoring `TECHNE_LIBRARY_PATH` and
     /// importing-directory/CWD fallbacks).
     pub(crate) locked_libraries: bool,
+    /// Read-only in-memory deployment filesystem (`BundleVfs`), if installed.
+    pub(crate) bundle: Option<Arc<crate::bundle::BundleVfs>>,
     /// A package generation being loaded: its files load into fresh
     /// modules, kept apart until published.
     staging: Option<Staging>,
@@ -1541,6 +1543,7 @@ impl Vm {
             library_providers: Vec::new(),
             package_imports: Vec::new(),
             locked_libraries: false,
+            bundle: None,
             staging: None,
             staged: None,
             staged_by: None,
@@ -2019,6 +2022,32 @@ impl Vm {
         self.locked_libraries
     }
 
+    /// Install an immutable in-memory [`crate::bundle::BundleVfs`] on this world.
+    ///
+    /// Automatically locks library resolution, disables ambient OS filesystem
+    /// lookups for user/package code, and clears any OS-based provider,
+    /// import-declaration, and reading-root state.
+    pub fn install_bundle(&mut self, bundle: Arc<crate::bundle::BundleVfs>) {
+        self.bundle = Some(bundle);
+        self.locked_libraries = true;
+        self.library_providers.clear();
+        self.package_imports.clear();
+        self.reading_root = None;
+    }
+
+    /// The installed [`crate::bundle::BundleVfs`], if any.
+    pub fn bundle(&self) -> Option<&Arc<crate::bundle::BundleVfs>> {
+        self.bundle.as_ref()
+    }
+
+    /// Resolve a bundle entry relative path to its deterministic virtual path.
+    pub fn bundle_entry_path(&self, entry: &str) -> Result<PathBuf, Error> {
+        let Some(bundle) = &self.bundle else {
+            return Err(Error::new("no bundle installed in this world"));
+        };
+        bundle.entry_virtual_path(entry)
+    }
+
     /// The name of a library loaded whose structured name begins with
     /// `(owner pkg)`, as `(owner pkg)` or `(owner pkg ...)`, from a file not
     /// under `dir`.
@@ -2096,6 +2125,13 @@ impl Vm {
             return Ok(m);
         }
         self.check_loading()?;
+        if let Some(bundle) = self.bundle.clone() {
+            let p = Path::new(name);
+            if bundle.read_virtual_path(p).is_some() {
+                return self.load_module(p).map_err(|e| Error::new(format!("module {name}: {}", e.msg)));
+            }
+            return Err(Error::new(format!("no module {name}")));
+        }
         let path = Path::new(name).canonicalize().map_err(|_| Error::new(format!("no module {name}")))?;
         self.load_module(&path).map_err(|e| Error::new(format!("module {name}: {}", e.msg)))
     }
@@ -2121,8 +2157,14 @@ impl Vm {
         self.reading_root.as_deref()
     }
 
-    /// Whether `path` may be read here (`confine_reading`).
+    /// Whether `path` may be read here (`confine_reading` or installed `BundleVfs`).
     pub fn may_read(&self, path: &Path) -> bool {
+        if let Some(bundle) = &self.bundle {
+            if bundle.is_virtual_file_path(path) {
+                return bundle.read_virtual_path(path).is_some();
+            }
+            return crate::library::is_under_lisp_dir(path);
+        }
         let Some(root) = &self.reading_root else { return true };
         let own = crate::library::lisp_dir().canonicalize();
         path.canonicalize().is_ok_and(|p| p.starts_with(root) || own.is_ok_and(|own| p.starts_with(own)))
@@ -2222,11 +2264,29 @@ impl Vm {
     }
 
     /// Where `from` finds the file `spec` it requires: relative to its own
-    /// file, canonical.
-    fn required_path(&self, from: u32, spec: &str) -> std::io::Result<PathBuf> {
+    /// file, canonical (or virtual path inside an installed `BundleVfs`).
+    fn required_path(&self, from: u32, spec: &str) -> Result<PathBuf, Error> {
+        if let Some(bundle) = &self.bundle {
+            return match self.modules[from as usize].path.as_deref() {
+                Some(p) if bundle.is_virtual_file_path(p) => {
+                    let dir = p.parent().unwrap_or_else(|| Path::new("/bundle"));
+                    bundle.resolve_relative_from_dir(dir, spec, "require")
+                }
+                Some(p) if crate::library::is_under_lisp_dir(p) => {
+                    let dir = p.parent().unwrap_or_else(|| Path::new("."));
+                    let canonical = dir.join(spec).canonicalize().map_err(|e| Error::new(e.to_string()))?;
+                    if !crate::library::is_under_lisp_dir(&canonical) {
+                        return Err(Error::new(format!("require: path escapes stdlib: {spec}")));
+                    }
+                    Ok(canonical)
+                }
+                None => bundle.entry_virtual_path(spec),
+                Some(_) => Err(Error::new(format!("require: cannot resolve {spec} outside bundle"))),
+            };
+        }
         let base =
             self.modules[from as usize].path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
-        base.join(spec).canonicalize()
+        base.join(spec).canonicalize().map_err(|e| Error::new(e.to_string()))
     }
 
     /// Prepare the next top-level form for the Scheme forms loop. Source
@@ -2320,7 +2380,13 @@ impl Vm {
     /// Directory of a form's source, not the module containing it: an
     /// included file may load another include beside itself.
     pub(crate) fn form_source_dir(&self, file: u32) -> PathBuf {
-        Path::new(&*self.files[file as usize].name).parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), Path::to_path_buf)
+        let path = Path::new(&*self.files[file as usize].name);
+        if let Some(bundle) = &self.bundle
+            && bundle.is_virtual_file_path(path)
+        {
+            return path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/bundle"));
+        }
+        path.parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), Path::to_path_buf)
     }
 
     /// Where an `import` in the source `file` looks for libraries, and
@@ -2332,6 +2398,11 @@ impl Vm {
     /// package's files.
     pub(crate) fn import_dir(&self, file: u32) -> PathBuf {
         let path = Path::new(&*self.files[file as usize].name);
+        if let Some(bundle) = &self.bundle
+            && bundle.is_virtual_file_path(path)
+        {
+            return path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/bundle"));
+        }
         match path.parent().filter(|p| p.is_dir()) {
             Some(dir) => dir.to_path_buf(),
             // A file named without a directory is in the working one.
@@ -2340,13 +2411,21 @@ impl Vm {
         }
     }
 
-    /// Canonical path of source `file`, if it corresponds to an actual file on disk.
+    /// Canonical path of source `file`, if it corresponds to an actual file on disk
+    /// (or a virtual file inside an installed `BundleVfs`).
     pub(crate) fn source_file_path(&self, file: u32) -> Option<PathBuf> {
         let name = &*self.files[file as usize].name;
         if name.is_empty() || (name.starts_with('<') && name.ends_with('>')) {
             return None;
         }
-        Path::new(name).canonicalize().ok().filter(|p| p.is_file())
+        let path = Path::new(name);
+        if let Some(bundle) = &self.bundle {
+            if bundle.is_virtual_file_path(path) {
+                return bundle.read_virtual_path(path).is_some().then(|| path.to_path_buf());
+            }
+            return path.canonicalize().ok().filter(|p| p.is_file() && crate::library::is_under_lisp_dir(p));
+        }
+        path.canonicalize().ok().filter(|p| p.is_file())
     }
 
     /// Drop ownership state a killed library loader could not clean up.
@@ -2474,7 +2553,11 @@ impl Vm {
     /// it (`%load-forms`). None if the module is loaded already.
     pub(crate) fn module_forms_from(&mut self, path: &Path, text: String) -> Result<Option<Forms>, Error> {
         self.check_loading()?;
-        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let path = if self.bundle.as_ref().is_some_and(|b| b.is_virtual_file_path(path)) {
+            path.to_path_buf()
+        } else {
+            path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?
+        };
         let loader = Some(self.running_execution());
         match self.begin_module_load_from(&path, loader, Some(text))? {
             ModuleLoad::Loaded(_) => Ok(None),
@@ -2728,7 +2811,7 @@ impl Vm {
         if !path.as_ref().is_ok_and(|p| self.module_paths.contains_key(p)) {
             self.check_loading().map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
         }
-        let path = path.map_err(|e| Error::new(format!("require {spec}: {e}")))?;
+        let path = path.map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
         let m = self.load_module(&path).map_err(|e| match e.msg.as_str() {
             "circular module dependency" => Error::new(format!("require {spec}: circular module dependency")),
             _ => e,

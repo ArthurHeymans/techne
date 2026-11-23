@@ -121,6 +121,23 @@ impl Vm {
         })
     }
 
+    /// Evaluate the entry file `entry` from the installed [`crate::bundle::BundleVfs`]
+    /// as the main user module without touching the host OS filesystem.
+    pub fn eval_bundle_entry(&mut self, entry: &str) -> Result<Value, Error> {
+        self.host_try(|vm| {
+            let vpath = vm.bundle_entry_path(entry)?;
+            let vpath_str = vpath.to_string_lossy().into_owned();
+            let text = vm.read_file_admitted(&vpath_str, 2)?;
+            vm.modules[USER_MODULE as usize].path = Some(vpath.clone());
+            vm.module_paths.insert(vpath, USER_MODULE);
+            if !vm.input_ready() {
+                return vm.eval_in_raw(USER_MODULE, &vpath_str, &text).map(|v| vm.export(v));
+            }
+            let mut module = USER_MODULE;
+            vm.eval_input_source(&mut module, &vpath_str, &text)
+        })
+    }
+
     pub fn eval_interactive(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {
         self.host_try(|vm| {
             if vm.input_ready() {
