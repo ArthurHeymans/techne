@@ -71,6 +71,21 @@
 (test 195 (string-length indexed))
 (collect-garbage 'full)
 (test #\b (string-ref indexed 128))
+;; The index of a string of characters of every width, 1 to 4 bytes, in
+;; an irregular order, after 0 to 3 more bytes: each indexed character
+;; at every stride, whichever byte its 64-byte block starts on.
+(let* ((widths (list #\a #\é #\€ #\😀))
+       (chars (let loop ((i 0) (acc '()))
+                (if (= i 1000)
+                    (reverse acc)
+                    (loop (+ i 1) (cons (list-ref widths (modulo (+ i (quotient i 7)) 4)) acc))))))
+  (for-each
+   (lambda (lead)
+     (let* ((cs (append (string->list lead) chars)) (s (list->string cs)))
+       (test (length cs) (string-length s))
+       (test #t (let loop ((i 0) (cs cs))
+                  (or (null? cs) (and (char=? (car cs) (string-ref s i)) (loop (+ i 1) (cdr cs))))))))
+   '("" "a" "é" "€")))
 ;; Growing, shrinking, and mutation through an existing indirection.
 (string-set! indexed 0 #\😀)
 (string-set! indexed 1 #\é)

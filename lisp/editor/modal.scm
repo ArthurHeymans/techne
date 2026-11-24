@@ -295,10 +295,15 @@ The leader key, SPC, is bound in main.scm.")
     (let ((redo (sget s 'last-change)))
       (if redo
           (begin (sset! s 'replaying #t)
-                 ;; For whoever judges this key's time, as `ran-user-code`
-                 ;; is: it is that of the keys typed again.
-                 (sset! s 'repeated-keys (sget s 'last-change-keys))
-                 (act! s redo)
+                 ;; Refused once, as any edit: else each key typed again
+                 ;; would be refused on its own, an error and its trace each.
+                 (act! s (lambda (s)
+                           (check-editable! (session-view s))
+                           ;; For whoever judges this key's time, as
+                           ;; `ran-user-code` is: it is that of the keys
+                           ;; typed again, if any are.
+                           (sset! s 'repeated-keys (sget s 'last-change-keys))
+                           (redo s)))
                  (sset! s 'replaying #f))
           (message! s "no change to repeat"))))
    (else (message! s (string-append key " is undefined")))))
