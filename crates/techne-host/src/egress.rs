@@ -419,3 +419,130 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn in_v4_cidr(ip: u32, net: u32, prefix: u32) -> bool {
+        let mask = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+        (ip & mask) == (net & mask)
+    }
+
+    fn in_v6_cidr(ip: u128, net: u128, prefix: u32) -> bool {
+        let mask = if prefix == 0 { 0 } else { !0u128 << (128 - prefix) };
+        (ip & mask) == (net & mask)
+    }
+
+    /// Independent u32 CIDR specification of the crate's IPv4 denylist in `special_v4`.
+    fn spec_special_v4(ip: u32) -> bool {
+        // 0.0.0.0/8 ("This network", RFC 1122)
+        in_v4_cidr(ip, 0x0000_0000, 8)
+            // 10.0.0.0/8 (Private-Use, RFC 1918)
+            || in_v4_cidr(ip, 0x0a00_0000, 8)
+            // 100.64.0.0/10 (Shared Address Space / CGNAT, RFC 6598)
+            || in_v4_cidr(ip, 0x6440_0000, 10)
+            // 127.0.0.0/8 (Loopback, RFC 1122)
+            || in_v4_cidr(ip, 0x7f00_0000, 8)
+            // 169.254.0.0/16 (Link-Local, RFC 3927)
+            || in_v4_cidr(ip, 0xa9fe_0000, 16)
+            // 172.16.0.0/12 (Private-Use, RFC 1918)
+            || in_v4_cidr(ip, 0xac10_0000, 12)
+            // 192.0.0.0/24 (IETF Protocol Assignments, RFC 6890)
+            || in_v4_cidr(ip, 0xc000_0000, 24)
+            // 192.0.2.0/24 (TEST-NET-1, RFC 5737)
+            || in_v4_cidr(ip, 0xc000_0200, 24)
+            // 192.88.99.0/24 (6to4 Relay Anycast, RFC 3068 / RFC 7526)
+            || in_v4_cidr(ip, 0xc058_6300, 24)
+            // 192.168.0.0/16 (Private-Use, RFC 1918)
+            || in_v4_cidr(ip, 0xc0a8_0000, 16)
+            // 198.18.0.0/15 (Benchmarking, RFC 2544)
+            || in_v4_cidr(ip, 0xc612_0000, 15)
+            // 198.51.100.0/24 (TEST-NET-2, RFC 5737)
+            || in_v4_cidr(ip, 0xc633_6400, 24)
+            // 203.0.113.0/24 (TEST-NET-3, RFC 5737)
+            || in_v4_cidr(ip, 0xcb00_7100, 24)
+            // 224.0.0.0/4 (Multicast, RFC 5771)
+            || in_v4_cidr(ip, 0xe000_0000, 4)
+            // 240.0.0.0/4 (Reserved for Future Use + 255.255.255.255/32 Limited Broadcast)
+            || in_v4_cidr(ip, 0xf000_0000, 4)
+    }
+
+    /// Independent u128 CIDR specification of the crate's IPv6 denylist in `special_v6`.
+    fn spec_special_v6(ip: u128) -> bool {
+        // ::/96 (Unspecified ::/128, Loopback ::1/128, IPv4-compatible ::/96)
+        in_v6_cidr(ip, 0, 96)
+            // ::ffff:0:0/96 (IPv4-mapped)
+            || in_v6_cidr(ip, 0x0000_0000_0000_0000_0000_ffff_0000_0000, 96)
+            // 64:ff9b::/32 (NAT64 well-known 64:ff9b::/96 & local-use 64:ff9b:1::/48)
+            || in_v6_cidr(ip, 0x0064_ff9b_0000_0000_0000_0000_0000_0000, 32)
+            // 100::/64 (Discard-Only, RFC 6666)
+            || in_v6_cidr(ip, 0x0100_0000_0000_0000_0000_0000_0000_0000, 64)
+            // 2001:0::/32 (Teredo, RFC 4380)
+            || in_v6_cidr(ip, 0x2001_0000_0000_0000_0000_0000_0000_0000, 32)
+            // 2001:db8::/32 (Documentation, RFC 3849)
+            || in_v6_cidr(ip, 0x2001_0db8_0000_0000_0000_0000_0000_0000, 32)
+            // 2002::/16 (6to4, RFC 3056)
+            || in_v6_cidr(ip, 0x2002_0000_0000_0000_0000_0000_0000_0000, 16)
+            // fc00::/7 (Unique-Local, RFC 4193)
+            || in_v6_cidr(ip, 0xfc00_0000_0000_0000_0000_0000_0000_0000, 7)
+            // fe80::/10 (Link-Local, RFC 4291)
+            || in_v6_cidr(ip, 0xfe80_0000_0000_0000_0000_0000_0000_0000, 10)
+            // fec0::/10 (Deprecated Site-Local, RFC 3879)
+            || in_v6_cidr(ip, 0xfec0_0000_0000_0000_0000_0000_0000_0000, 10)
+            // ff00::/8 (Multicast, RFC 4291)
+            || in_v6_cidr(ip, 0xff00_0000_0000_0000_0000_0000_0000_0000, 8)
+    }
+
+    /// Exhaustive over all 2^32 IPv4 addresses: `special_v4` agrees with the crate's
+    /// explicit IPv4 denylist CIDRs.
+    #[kani::proof]
+    fn special_v4_matches_denylist_cidrs_exhaustively() {
+        let bits: u32 = kani::any();
+        let addr = Ipv4Addr::from(bits);
+        assert_eq!(special_v4(addr), spec_special_v4(bits));
+    }
+
+    /// Exhaustive over all 2^128 IPv6 addresses: `special_v6` agrees with the crate's
+    /// explicit IPv6 denylist CIDRs.
+    #[kani::proof]
+    fn special_v6_matches_denylist_cidrs_exhaustively() {
+        let bits: u128 = kani::any();
+        let addr = Ipv6Addr::from(bits);
+        assert_eq!(special_v6(addr), spec_special_v6(bits));
+    }
+
+    /// Exhaustive over the enumerated fixed-prefix IPv4-in-IPv6 translation families
+    /// (IPv4-mapped, IPv4-compatible, well-known and local-use NAT64 prefixes, 6to4,
+    /// and Teredo; does not cover network-specific RFC 6052 prefixes).
+    #[kani::proof]
+    fn special_v6_blocks_enumerated_v4_translation_prefixes() {
+        let v4_bits: u32 = kani::any();
+        let v4 = Ipv4Addr::from(v4_bits);
+        let [a, b, c, d] = v4.octets();
+        let hi = u16::from_be_bytes([a, b]);
+        let lo = u16::from_be_bytes([c, d]);
+
+        // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d).
+        assert!(special_v6(v4.to_ipv6_mapped()));
+        assert!(special_v6(v4.to_ipv6_compatible()));
+
+        // NAT64 well-known (64:ff9b::/96) and local-use (64:ff9b:1::/48, any suffix bits).
+        assert!(special_v6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, hi, lo)));
+        let mid0: u16 = kani::any();
+        let mid1: u16 = kani::any();
+        let mid2: u16 = kani::any();
+        assert!(special_v6(Ipv6Addr::new(0x64, 0xff9b, 1, mid0, mid1, mid2, hi, lo)));
+
+        // 6to4 (2002:aabb:ccdd::/48) with any SLA and interface id.
+        let s3: u16 = kani::any();
+        let s4: u16 = kani::any();
+        let s5: u16 = kani::any();
+        let s6: u16 = kani::any();
+        let s7: u16 = kani::any();
+        assert!(special_v6(Ipv6Addr::new(0x2002, hi, lo, s3, s4, s5, s6, s7)));
+
+        // Teredo (2001:0::/32) with any server, flags, obfuscated port and client.
+        assert!(special_v6(Ipv6Addr::new(0x2001, 0, hi, lo, s4, s5, s6, s7)));
+    }
+}

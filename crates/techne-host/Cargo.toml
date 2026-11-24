@@ -10,7 +10,7 @@ description = "Serving deployments of techne Lisp from worlds: instances from sn
 techne-vm = { path = "../techne-vm" }
 techne-sandbox = { path = "../techne-sandbox" }
 libc = "0.2"
-tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util", "process"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util", "process", "macros"] }
 # Fetching for deployments (`egress`): TLS by rustls on ring, Mozilla's
 # roots, no proxies, no system resolver of its own.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
@@ -33,3 +33,6 @@ tempfile = "3"
 name = "techne-worker"
 path = "src/bin/worker.rs"
 test = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

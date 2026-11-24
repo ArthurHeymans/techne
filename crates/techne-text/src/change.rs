@@ -244,7 +244,7 @@ impl ChangeSet {
             match op {
                 Op::Retain(n) => {
                     if old + n > pos {
-                        return (new + pos - old, false);
+                        return (new + (pos - old), false);
                     }
                     old += n;
                     new += n;
@@ -263,7 +263,7 @@ impl ChangeSet {
                 }
             }
         }
-        (new + pos - old, false)
+        (new + (pos - old), false)
     }
 
     /// Whether both changes, made to the same text, touch the same text: one
@@ -452,5 +452,415 @@ mod tests {
         assert!(!del.conflicts(&ins_edge));
         assert!(!del.conflicts(&del_after));
         assert!(!ins_edge.conflicts(&ChangeSet::from_edits(6, [(4..4, "y")]).unwrap()));
+    }
+}
+
+#[cfg(kani)]
+impl ChangeSet {
+    pub(crate) fn from_canonical_ops(ops: Vec<Op>) -> Self {
+        let (mut before, mut after) = (0usize, 0usize);
+        for op in &ops {
+            match op {
+                Op::Retain(n) => {
+                    before += n;
+                    after += n;
+                }
+                Op::Delete(n) => before += n,
+                Op::Insert(s) => after += s.len(),
+            }
+        }
+        let c = ChangeSet { ops, len_before: before, len_after: after };
+        kani::assume(kani_proofs::is_canonical(&c));
+        c
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    pub(super) fn is_canonical(c: &ChangeSet) -> bool {
+        let (mut before, mut after) = (0usize, 0usize);
+        let mut prev: Option<&Op> = None;
+        for op in &c.ops {
+            match op {
+                Op::Retain(0) | Op::Delete(0) => return false,
+                Op::Insert(s) if s.is_empty() => return false,
+                Op::Retain(n) => {
+                    before += n;
+                    after += n;
+                }
+                Op::Delete(n) => before += n,
+                Op::Insert(s) => after += s.len(),
+            }
+            if let Some(p) = prev {
+                match (p, op) {
+                    (Op::Retain(_), Op::Retain(_))
+                    | (Op::Delete(_), Op::Delete(_))
+                    | (Op::Insert(_), Op::Insert(_))
+                    | (Op::Delete(_), Op::Insert(_)) => return false,
+                    _ => {}
+                }
+            }
+            prev = Some(op);
+        }
+        before == c.len_before && after == c.len_after
+    }
+
+    fn cap_string(s: &str) -> String {
+        let mut out = String::with_capacity(4);
+        out.push_str(s);
+        out
+    }
+
+    fn any_nonempty_op(tag: u8, ins: &str) -> Op {
+        match tag {
+            0 => {
+                let n: usize = kani::any();
+                kani::assume(n >= 1 && n <= 4);
+                Op::Retain(n)
+            }
+            1 => {
+                let n: usize = kani::any();
+                kani::assume(n >= 1 && n <= 4);
+                Op::Delete(n)
+            }
+            _ => Op::Insert(cap_string(ins)),
+        }
+    }
+
+    fn changeset_from_ops(ops: Vec<Op>) -> ChangeSet {
+        let (mut before, mut after) = (0usize, 0usize);
+        for op in &ops {
+            match op {
+                Op::Retain(n) => {
+                    before += n;
+                    after += n;
+                }
+                Op::Delete(n) => before += n,
+                Op::Insert(s) => after += s.len(),
+            }
+        }
+        ChangeSet { ops, len_before: before, len_after: after }
+    }
+
+    fn any_assoc() -> Assoc {
+        if kani::any() { Assoc::Before } else { Assoc::After }
+    }
+
+    fn collect_inserted_bytes(ops: &[Op]) -> ([u8; 4], usize) {
+        let mut buf = [0u8; 4];
+        let mut len = 0usize;
+        for op in ops {
+            if let Op::Insert(s) = op {
+                for &b in s.as_bytes() {
+                    buf[len] = b;
+                    len += 1;
+                }
+            }
+        }
+        (buf, len)
+    }
+
+    fn check_builder_push(ops: Vec<Op>) {
+        let init = changeset_from_ops(ops);
+        kani::assume(is_canonical(&init));
+
+        let (mut exp_bytes, mut exp_bytes_len) = collect_inserted_bytes(&init.ops);
+        let mut b = Builder { ops: init.ops, len_before: init.len_before, len_after: init.len_after };
+        let (mut exp_before, mut exp_after) = (b.len_before, b.len_after);
+
+        let next_tag: u8 = kani::any();
+        kani::assume(next_tag < 3);
+        match next_tag {
+            0 => {
+                let n: usize = kani::any();
+                kani::assume(n <= 4);
+                exp_before += n;
+                exp_after += n;
+                b.push(Op::Retain(n));
+            }
+            1 => {
+                let n: usize = kani::any();
+                kani::assume(n <= 4);
+                exp_before += n;
+                b.push(Op::Delete(n));
+            }
+            _ => {
+                let s = if kani::any() { String::new() } else { cap_string("c") };
+                exp_after += s.len();
+                for &byte in s.as_bytes() {
+                    exp_bytes[exp_bytes_len] = byte;
+                    exp_bytes_len += 1;
+                }
+                b.push(Op::Insert(s));
+            }
+        }
+
+        let c = b.finish();
+        assert!(is_canonical(&c));
+        assert_eq!(c.len_before(), exp_before);
+        assert_eq!(c.len_after(), exp_after);
+        let (got_bytes, got_bytes_len) = collect_inserted_bytes(c.ops());
+        assert_eq!(got_bytes_len, exp_bytes_len);
+        assert_eq!(got_bytes[0], exp_bytes[0]);
+        assert_eq!(got_bytes[1], exp_bytes[1]);
+        assert_eq!(got_bytes[2], exp_bytes[2]);
+        assert_eq!(got_bytes[3], exp_bytes[3]);
+    }
+
+    /// Bounded check that `Builder::push` preserves canonicality, lengths, and
+    /// inserted byte order from canonical prefixes of length 0 and 1 (with
+    /// bounded op sizes and pre-reserved capacities).
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn builder_push_preserves_canonical_prefix_0_1() {
+        let mut ops0 = Vec::with_capacity(4);
+        check_builder_push(ops0);
+
+        let t0: u8 = kani::any();
+        kani::assume(t0 < 3);
+        ops0 = Vec::with_capacity(4);
+        ops0.push(any_nonempty_op(t0, "a"));
+        check_builder_push(ops0);
+    }
+
+    /// Bounded check covering all 2-op canonical suffixes (including
+    /// `[Insert, Delete]` followed by `Insert`) with bounded op sizes and
+    /// pre-reserved capacities: verifies canonicality, lengths, and exact
+    /// inserted byte order across merges and swaps.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn builder_push_preserves_canonical_prefix_2() {
+        let t0: u8 = kani::any();
+        let t1: u8 = kani::any();
+        kani::assume(t0 < 3 && t1 < 3);
+        let mut ops = Vec::with_capacity(4);
+        ops.push(any_nonempty_op(t0, "a"));
+        ops.push(any_nonempty_op(t1, "b"));
+        check_builder_push(ops);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn edits_iterator_matches_ops_semantics() {
+        let t0: u8 = kani::any();
+        let t1: u8 = kani::any();
+        let t2: u8 = kani::any();
+        kani::assume(t0 < 3 && t1 < 3 && t2 < 3);
+        let c = ChangeSet::from_canonical_ops(vec![any_nonempty_op(t0, "a"), any_nonempty_op(t1, "b"), any_nonempty_op(t2, "c")]);
+
+        // Collect independent expected edits directly from the canonical op list.
+        let mut exp_ranges = [(0usize, 0usize); 3];
+        let mut exp_ins = [0u8; 3];
+        let mut exp_ins_len = [0usize; 3];
+        let mut exp_count = 0usize;
+        let mut pos = 0usize;
+        let mut idx = 0usize;
+        while idx < c.ops.len() {
+            match &c.ops[idx] {
+                Op::Retain(n) => {
+                    pos += *n;
+                    idx += 1;
+                }
+                Op::Delete(n) => {
+                    exp_ranges[exp_count] = (pos, pos + *n);
+                    exp_ins_len[exp_count] = 0;
+                    exp_count += 1;
+                    pos += *n;
+                    idx += 1;
+                }
+                Op::Insert(s) => {
+                    let start = pos;
+                    if let Some(Op::Delete(n)) = c.ops.get(idx + 1) {
+                        pos += *n;
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                    exp_ranges[exp_count] = (start, pos);
+                    exp_ins[exp_count] = s.as_bytes()[0];
+                    exp_ins_len[exp_count] = s.len();
+                    exp_count += 1;
+                }
+            }
+        }
+
+        let mut prev_end = 0usize;
+        let mut got_count = 0usize;
+        let mut deleted = 0usize;
+        let mut inserted = 0usize;
+        for (r, s) in c.edits() {
+            assert!(got_count < exp_count);
+            assert_eq!((r.start, r.end), exp_ranges[got_count]);
+            assert_eq!(s.len(), exp_ins_len[got_count]);
+            if !s.is_empty() {
+                assert_eq!(s.as_bytes()[0], exp_ins[got_count]);
+            }
+            assert!(r.start >= prev_end);
+            assert!(r.start <= r.end);
+            assert!(r.end <= c.len_before());
+            assert!(!r.is_empty() || !s.is_empty());
+            prev_end = r.end;
+            deleted += r.end - r.start;
+            inserted += s.len();
+            got_count += 1;
+        }
+        assert_eq!(got_count, exp_count);
+        assert_eq!(c.len_before() - deleted + inserted, c.len_after());
+    }
+
+    #[kani::proof]
+    fn produced_consumed_rest_retain_and_delete() {
+        let n: usize = kani::any();
+        let m: usize = kani::any();
+        kani::assume(m < n);
+        if kani::any() {
+            let op = Op::Retain(n);
+            assert_eq!(produced(&op), n);
+            assert_eq!(consumed(&op), n);
+            assert!(matches!(rest(op, m), Op::Retain(rem) if rem == n - m));
+        } else {
+            let op = Op::Delete(n);
+            assert_eq!(produced(&op), 0);
+            assert_eq!(consumed(&op), n);
+            assert!(matches!(rest(op, m), Op::Delete(rem) if rem == n - m));
+        }
+    }
+
+    /// Caller precondition: `rest` on `Op::Insert` requires `m` to be a UTF-8
+    /// char boundary in `0..=s.len()`. Verify exact suffix bytes for ASCII and
+    /// multibyte UTF-8 splits.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn produced_consumed_rest_insert_ascii() {
+        let op = Op::Insert(String::from("ab"));
+        assert_eq!(produced(&op), 2);
+        assert_eq!(consumed(&op), 0);
+        let Op::Insert(s) = rest(op, 1) else { panic!("expected Insert") };
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.as_bytes()[0], b'b');
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn produced_consumed_rest_insert_multibyte() {
+        let op = Op::Insert(String::from("éc"));
+        assert_eq!(produced(&op), 3);
+        assert_eq!(consumed(&op), 0);
+        let Op::Insert(s) = rest(op, 2) else { panic!("expected Insert") };
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.as_bytes()[0], b'c');
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn map_pos_is_bounded_monotone_and_anchored() {
+        let t0: u8 = kani::any();
+        let t1: u8 = kani::any();
+        let t2: u8 = kani::any();
+        kani::assume(t0 < 3 && t1 < 3 && t2 < 3);
+        let c = ChangeSet::from_canonical_ops(vec![any_nonempty_op(t0, "a"), any_nonempty_op(t1, "b"), any_nonempty_op(t2, "c")]);
+
+        assert_eq!(c.map_pos(0, Assoc::Before), 0);
+        assert_eq!(c.map_pos(c.len_before(), Assoc::After), c.len_after());
+
+        let p1: usize = kani::any();
+        let p2: usize = kani::any();
+        kani::assume(p1 <= p2 && p2 <= c.len_before());
+        let assoc = any_assoc();
+        let m1 = c.map_pos(p1, assoc);
+        let m2 = c.map_pos(p2, assoc);
+        assert!(m1 <= m2);
+        assert!(m2 <= c.len_after());
+        assert!(c.map_pos(p1, Assoc::Before) <= c.map_pos(p1, Assoc::After));
+    }
+
+    /// Full `usize` range check for `ChangeSet::map` on an identity change
+    /// (verifies no intermediate `new + pos` overflow even at `usize::MAX`).
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn identity_map_pos_full_usize_range() {
+        let len: usize = kani::any();
+        let pos: usize = kani::any();
+        kani::assume(pos <= len);
+        let c = if len == 0 {
+            ChangeSet { ops: Vec::new(), len_before: 0, len_after: 0 }
+        } else {
+            ChangeSet { ops: vec![Op::Retain(len)], len_before: len, len_after: len }
+        };
+        let assoc = any_assoc();
+        assert_eq!(c.map(pos, assoc), (pos, false));
+    }
+
+    #[kani::proof]
+    fn overlap_matches_spec_for_all_ranges() {
+        let s0: usize = kani::any();
+        let e0: usize = kani::any();
+        let s1: usize = kani::any();
+        let e1: usize = kani::any();
+        kani::assume(s0 <= e0 && s1 <= e1);
+        let r0 = s0..e0;
+        let r1 = s1..e1;
+        let expected = if r0.is_empty() && r1.is_empty() {
+            false
+        } else if r0.is_empty() {
+            s1 < s0 && s0 < e1
+        } else if r1.is_empty() {
+            s0 < s1 && s1 < e0
+        } else {
+            s0.max(s1) < e0.min(e1)
+        };
+        assert_eq!(overlap(&r0, &r1), expected);
+        assert_eq!(overlap(&r0, &r1), overlap(&r1, &r0));
+    }
+
+    /// Multi-edit `ChangeSet::conflicts` scan: `a` has two disjoint deletions
+    /// (`0..n0` and `n0+n1..len`) and `b` deletes `m0..len`, forcing cursor
+    /// advancement past `a`'s first edit when `n0 <= m0`; compares against an
+    /// independent pairwise overlap oracle.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn conflicts_multi_edit_scan_matches_oracle() {
+        let n0: usize = kani::any();
+        let n1: usize = kani::any();
+        let n2: usize = kani::any();
+        let m0: usize = kani::any();
+        let m1: usize = kani::any();
+        kani::assume(n0 >= 1 && n0 <= 4 && n1 >= 1 && n1 <= 4 && n2 >= 1 && n2 <= 4);
+        kani::assume(m0 >= 1 && m0 <= 8 && m1 >= 1 && m1 <= 8);
+        let len = n0 + n1 + n2;
+        kani::assume(m0 + m1 == len);
+
+        let a = ChangeSet { ops: vec![Op::Delete(n0), Op::Retain(n1), Op::Delete(n2)], len_before: len, len_after: n1 };
+        let b = ChangeSet { ops: vec![Op::Retain(m0), Op::Delete(m1)], len_before: len, len_after: m0 };
+
+        let a0 = 0..n0;
+        let a1 = (n0 + n1)..len;
+        let b0 = m0..len;
+        let expected = overlap(&a0, &b0) || overlap(&a1, &b0);
+        assert_eq!(a.conflicts(&b), expected);
+    }
+
+    /// Pure insertion at `n0` vs deletion `0..m0`: verifies the strict
+    /// interior rule (`0 < n0 < m0`) vs non-conflicting edge (`n0 == m0`) and
+    /// outside (`n0 > m0`).
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn conflicts_interior_insert_vs_delete_matches_oracle() {
+        let n0: usize = kani::any();
+        let n1: usize = kani::any();
+        let m0: usize = kani::any();
+        let m1: usize = kani::any();
+        kani::assume(n0 >= 1 && n0 <= 6 && n1 >= 1 && n1 <= 6);
+        kani::assume(m0 >= 1 && m0 <= 10 && m1 >= 1 && m1 <= 10);
+        let len = n0 + n1;
+        kani::assume(m0 + m1 == len);
+
+        let a = ChangeSet { ops: vec![Op::Retain(n0), Op::Insert(cap_string("a")), Op::Retain(n1)], len_before: len, len_after: len + 1 };
+        let b = ChangeSet { ops: vec![Op::Delete(m0), Op::Retain(m1)], len_before: len, len_after: m1 };
+
+        let expected = n0 < m0;
+        assert_eq!(a.conflicts(&b), expected);
     }
 }

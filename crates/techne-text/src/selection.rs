@@ -145,3 +145,178 @@ mod tests {
         assert_eq!(Range::new(6, 3).map(&gone), Range::caret(1));
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Independent validity oracle (does not call production `Range::overlaps`):
+    /// non-empty, valid primary index, sorted by `(from, to)`, and every
+    /// adjacent pair strictly separated or touching without duplicate carets.
+    fn is_valid_selection(s: &Selection) -> bool {
+        let ranges = s.ranges();
+        if ranges.is_empty() || s.primary_index() >= ranges.len() {
+            return false;
+        }
+        for w in ranges.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if a.from() > b.from() || a.to() > b.from() {
+                return false;
+            }
+            // Touching duplicate carets (`a.from() == a.to() == b.from() == b.to()`) must be merged.
+            if a.from() == a.to() && b.from() == b.to() && a.from() == b.from() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn is_covered(s: &Selection, r: Range) -> bool {
+        s.ranges().iter().any(|out| out.from() <= r.from() && r.to() <= out.to())
+    }
+
+    fn any_range(max: usize) -> Range {
+        let anchor: usize = kani::any();
+        let head: usize = kani::any();
+        kani::assume(anchor <= max && head <= max);
+        Range::new(anchor, head)
+    }
+
+    fn any_nonempty_op(tag: u8, ins: &str) -> crate::change::Op {
+        match tag {
+            0 => {
+                let n: usize = kani::any();
+                kani::assume(n >= 1 && n <= 3);
+                crate::change::Op::Retain(n)
+            }
+            1 => {
+                let n: usize = kani::any();
+                kani::assume(n >= 1 && n <= 3);
+                crate::change::Op::Delete(n)
+            }
+            _ => crate::change::Op::Insert(String::from(ins)),
+        }
+    }
+
+    fn any_changeset() -> ChangeSet {
+        let t0: u8 = kani::any();
+        let t1: u8 = kani::any();
+        let t2: u8 = kani::any();
+        kani::assume(t0 < 3 && t1 < 3 && t2 < 3);
+        ChangeSet::from_canonical_ops(vec![any_nonempty_op(t0, "a"), any_nonempty_op(t1, "b"), any_nonempty_op(t2, "c")])
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn selection_new_maintains_sorted_non_overlapping_primary() {
+        let r0 = any_range(6);
+        let r1 = any_range(6);
+        let r2 = any_range(6);
+        let primary: usize = kani::any();
+        kani::assume(primary < 3);
+        let orig_primary = match primary {
+            0 => r0,
+            1 => r1,
+            _ => r2,
+        };
+
+        let s = Selection::new(vec![r0, r1, r2], primary);
+        assert!(is_valid_selection(&s));
+        let p = s.primary();
+        assert!(p.from() <= orig_primary.from() && orig_primary.to() <= p.to());
+        if !orig_primary.is_empty() {
+            assert_eq!(p.anchor <= p.head, orig_primary.anchor <= orig_primary.head);
+        }
+        assert!(is_covered(&s, r0));
+        assert!(is_covered(&s, r1));
+        assert!(is_covered(&s, r2));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn range_map_preserves_bounds_direction_and_affinity() {
+        let c = any_changeset();
+        let len = c.len_before();
+
+        let r0 = any_range(len);
+        let mapped = r0.map(&c);
+        assert!(mapped.to() <= c.len_after());
+        if r0.is_empty() {
+            assert_eq!(mapped, Range::caret(c.map_pos(r0.head, Assoc::Before)));
+        } else {
+            let exp_from = c.map_pos(r0.from(), Assoc::After);
+            let exp_to = c.map_pos(r0.to(), Assoc::Before).max(exp_from);
+            assert_eq!(mapped.from(), exp_from);
+            assert_eq!(mapped.to(), exp_to);
+            if !mapped.is_empty() {
+                assert_eq!(mapped.anchor <= mapped.head, r0.anchor <= r0.head);
+            }
+        }
+    }
+
+    fn any_changeset_2() -> ChangeSet {
+        let t0: u8 = kani::any();
+        let t1: u8 = kani::any();
+        kani::assume(t0 < 3 && t1 < 3);
+        ChangeSet::from_canonical_ops(vec![any_nonempty_op(t0, "a"), any_nonempty_op(t1, "b")])
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn selection_map_preserves_invariants_and_affinity() {
+        let c = any_changeset_2();
+        let len = c.len_before();
+
+        let r0 = any_range(len);
+        let r1 = any_range(len);
+        kani::assume(r0.to() <= r1.from() && !(r0.is_empty() && r1.is_empty() && r0.from() == r1.from()));
+        let primary = usize::from(kani::any::<bool>());
+        let s = Selection { ranges: vec![r0, r1], primary };
+        assert!(is_valid_selection(&s));
+
+        let m0 = r0.map(&c);
+        let m1 = r1.map(&c);
+        let exp_primary = if primary == 0 { m0 } else { m1 };
+
+        let mapped = s.map(&c);
+        assert!(is_valid_selection(&mapped));
+        assert!(mapped.ranges().iter().all(|x| x.to() <= c.len_after()));
+        assert!(is_covered(&mapped, m0));
+        assert!(is_covered(&mapped, m1));
+        let p = mapped.primary();
+        assert!(p.from() <= exp_primary.from() && exp_primary.to() <= p.to());
+        if !exp_primary.is_empty() {
+            assert_eq!(p.anchor <= p.head, exp_primary.anchor <= exp_primary.head);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn selection_map_own_advances_carets_and_preserves_invariants() {
+        let c = any_changeset_2();
+        let len = c.len_before();
+
+        let r0 = any_range(len);
+        let r1 = any_range(len);
+        kani::assume(r0.to() <= r1.from() && !(r0.is_empty() && r1.is_empty() && r0.from() == r1.from()));
+        let primary = usize::from(kani::any::<bool>());
+        let s = Selection { ranges: vec![r0, r1], primary };
+        assert!(is_valid_selection(&s));
+
+        let map_own_one = |r: Range| if r.is_empty() { Range::caret(c.map_pos(r.head, Assoc::After)) } else { r.map(&c) };
+        let m0 = map_own_one(r0);
+        let m1 = map_own_one(r1);
+        let exp_primary = if primary == 0 { m0 } else { m1 };
+
+        let mapped = s.map_own(&c);
+        assert!(is_valid_selection(&mapped));
+        assert!(mapped.ranges().iter().all(|x| x.to() <= c.len_after()));
+        assert!(is_covered(&mapped, m0));
+        assert!(is_covered(&mapped, m1));
+        let p = mapped.primary();
+        assert!(p.from() <= exp_primary.from() && exp_primary.to() <= p.to());
+        if !exp_primary.is_empty() {
+            assert_eq!(p.anchor <= p.head, exp_primary.anchor <= exp_primary.head);
+        }
+    }
+}

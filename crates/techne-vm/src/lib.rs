@@ -28,6 +28,8 @@
 #![warn(unnameable_types)]
 // A world past its memory ceiling ends by a panic (`alloc::contain_out_of_memory`).
 #![feature(alloc_error_hook)]
+// Kani's bundled nightly predates `allocator_api` stabilization.
+#![cfg_attr(kani, feature(allocator_api))]
 // The macros refer to this crate by name, here as elsewhere.
 extern crate self as techne_vm;
 
