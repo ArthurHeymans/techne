@@ -1190,6 +1190,51 @@ pub fn install(vm: &mut Vm) {
             vm.retire_generation(generation);
             Ok(Value::VOID) };
         "(%package-publish)" => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
+        // Whose libraries are found where (`(techne package)`).
+        "(%provide-libraries! name directory)" => |vm: &mut Vm, a, _| {
+            let name = string(vm, arg(vm, a, 0), "%provide-libraries!")?;
+            let directory = string(vm, arg(vm, a, 1), "%provide-libraries!")?;
+            vm.provide_libraries(&name, std::path::Path::new(&directory))?;
+            Ok(Value::VOID) };
+        // What `(techne package)` reads by the authority to load, which a
+        // world deciding what it loads has, not that over files: a package's
+        // manifest, as (directory text), DIRECTORY resolved and the text of
+        // its `techne-package.scm`, or #f where there is none to read; and
+        // a path resolved, or #f if nothing there may be loaded.
+        "(%package-manifest directory)" => |vm: &mut Vm, a, _| {
+            let directory = string(vm, arg(vm, a, 0), "%package-manifest")?;
+            vm.check_loading()?;
+            let Some(dir) = std::path::Path::new(&directory).canonicalize().ok() else { return Ok(Value::FALSE) };
+            let file = dir.join("techne-package.scm");
+            if !file.is_file() || !vm.may_read(&file) {
+                return Ok(Value::FALSE);
+            }
+            let text = vm.read_file_admitted(&file.to_string_lossy(), 2)?;
+            let rooted: Vec<_> = [dir.display().to_string(), text].iter().map(|s| { let v = vm.make_string_raw(s); vm.root(v) }).collect();
+            let values: Vec<Value> = rooted.iter().map(|r| r.get()).collect();
+            Ok(vm.make_list_raw(&values)) };
+        "(%loadable-path path)" => |vm: &mut Vm, a, _| {
+            let path = string(vm, arg(vm, a, 0), "%loadable-path")?;
+            vm.check_loading()?;
+            match std::path::Path::new(&path).canonicalize().ok().filter(|p| vm.may_read(p)) {
+                Some(p) => Ok(vm.make_string_raw(&p.display().to_string())),
+                None => Ok(Value::FALSE),
+            } };
+        // Why NAME's libraries cannot be provided from DIRECTORY, or #f.
+        "(%library-conflict name directory)" => |vm: &mut Vm, a, _| {
+            let name = string(vm, arg(vm, a, 0), "%library-conflict")?;
+            let directory = string(vm, arg(vm, a, 1), "%library-conflict")?;
+            vm.check_loading()?;
+            match vm.library_conflict(&name, std::path::Path::new(&directory)) {
+                Some(conflict) => Ok(vm.make_string_raw(&conflict)),
+                None => Ok(Value::FALSE),
+            } };
+        "(%library-provider name)" => |vm: &mut Vm, a, _| {
+            let name = string(vm, arg(vm, a, 0), "%library-provider")?;
+            match vm.library_provider(&name).map(|dir| dir.display().to_string()) {
+                Some(dir) => Ok(vm.make_string_raw(&dir)),
+                None => Ok(Value::FALSE),
+            } };
         "(%package-discard)" => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
         // The names a module sees, for completion: a list of (name kind),
         // the name a string, the kind `syntax`, `macro`, `procedure` or

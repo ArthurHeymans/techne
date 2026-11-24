@@ -1,5 +1,5 @@
 ;;; Shared, entirely synthetic cache for editor, terminal and window navigation.
-(import (scheme base) (srfi 1) (techne editor) (techne mail store))
+(import (scheme base) (srfi 1) (techne editor) (mail store))
 (provide mail-test-seed-navigation!)
 
 (define (mail-test-seed-navigation! path count)

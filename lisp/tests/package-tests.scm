@@ -1,0 +1,151 @@
+;;; Package directories: manifests read as data, the libraries a package
+;;; provides and those of the packages it depends on, without the editor.
+(import (techne) (techne package) (techne path) (techne uuid))
+(require "../test.scm")
+
+(define root (string-append (or (get-environment-variable "TMPDIR") "/tmp") "/techne-package-" (uuid-v4)))
+(define (at . parts) (apply path-join root parts))
+(define (write-file! file . forms)
+  (make-directory (path-directory file))
+  (call-with-output-file file (lambda (port) (for-each (lambda (f) (write f port) (newline port)) forms))))
+(define (package! name . clauses)
+  (write-file! (at (symbol->string name) "techne-package.scm") `(package ,name ,@clauses)))
+(define (library! package name . body)
+  (write-file! (at (symbol->string package) "lib" (symbol->string package) (string-append (symbol->string name) ".sld"))
+               `(define-library (,package ,name) ,@body)))
+(define (why thunk) (guard (e (#t (condition/report-string e))) (thunk) #f))
+(define (failed? thunk) (and (why thunk) #t))
+
+;; A manifest is data: its clauses, and the form it was first written in.
+(write-file! (at "editing" "entry.scm") '(define loaded #t))
+(package! 'editing
+          '(depends (alpha (path "../alpha")))
+          '(editor "entry.scm" (commands (edit "Edit it.")) (options (edit-count 2 integer "How often."))))
+(let ((m (read-package-manifest (at "editing"))))
+  (check "name" 'editing (manifest-name m))
+  (check "directory" (file-truename (at "editing")) (manifest-directory m))
+  (check "dependencies, by directory" (list (cons 'alpha (path-join (file-truename (at "editing")) "../alpha")))
+         (manifest-dependencies m))
+  (check "editor entry, commands and options"
+         (list (file-truename (at "editing" "entry.scm")) '((edit "Edit it.")) '((edit-count 2 integer "How often.")))
+         (manifest-editor m)))
+(write-file! (at "first" "entry.scm") '(define loaded #t))
+(write-file! (at "first" "techne-package.scm") '(package first "entry.scm" ((go "Go.")) ((speed 3 integer "How fast."))))
+(let ((m (read-package-manifest (at "first"))))
+  (check "the first form is an editor clause"
+         (list (file-truename (at "first" "entry.scm")) '((go "Go.")) '((speed 3 integer "How fast.")))
+         (manifest-editor m))
+  (check "and depends on nothing" '() (manifest-dependencies m)))
+(package! 'plain)
+(check "a package of libraries only" #f (manifest-editor (read-package-manifest (at "plain"))))
+(for-each
+ (lambda (case)
+   (apply package! 'broken (cdr case))
+   (check (car case) #t (failed? (lambda () (read-package-manifest (at "broken"))))))
+ '(("an unknown clause" (version "1"))
+   ("a clause twice" (depends) (depends))
+   ("an entry outside the package" (editor "../editing/entry.scm" (commands (x "X."))))
+   ("an entry that is missing" (editor "absent.scm" (commands (x "X."))))
+   ("no commands" (editor "entry.scm" (commands)))
+   ("a default its schema refuses" (editor "entry.scm" (commands (x "X.")) (options (n "two" integer "N."))))
+   ("an absolute dependency" (depends (alpha (path "/alpha"))))
+   ("itself as a dependency" (depends (broken (path "../broken"))))
+   ("a dependency twice" (depends (alpha (path "../alpha")) (alpha (path "../other"))))))
+(check "no manifest" #t (failed? (lambda () (read-package-manifest root))))
+
+;; Using a package finds its libraries and those of what it depends on,
+;; under their `lib` directories, and loads nothing.
+(package! 'alpha)
+(library! 'alpha 'greet '(export greet loads) '(import (scheme base))
+          '(begin (define loads (list 'loaded)) (define (greet who) (string-append "hello, " who))))
+(package! 'beta '(depends (alpha (path "../alpha"))))
+(library! 'beta 'twice '(export twice) '(import (scheme base) (alpha greet))
+          '(begin (define (twice who) (string-append (greet who) " and " (greet who)))))
+(package! 'gamma '(depends (beta (path "../beta"))))
+(check "before, nothing is found" #t (failed? (lambda () (eval '(import (beta twice))))))
+(check "use returns the manifest" 'gamma (manifest-name (use-package-directory! (at "gamma"))))
+(check "the same one again" #t (eq? (use-package-directory! (at "gamma")) (use-package-directory! (at "gamma"))))
+(check "its dependency's libraries" (file-truename (at "beta" "lib")) (%library-provider "beta"))
+(check "and that one's" (file-truename (at "alpha" "lib")) (%library-provider "alpha"))
+(check "a package without libraries provides none" #f (%library-provider "gamma"))
+(define (loaded? name) (and (member name (loaded-modules)) #t))
+(check "nothing was loaded" #f (loaded? "(alpha greet)"))
+(import (beta twice) (alpha greet))
+(check "an import loads it" #t (loaded? "(alpha greet)"))
+(check "a library importing its dependency's" "hello, you and hello, you" (twice "you"))
+;; One instance, whoever imports it.
+(check "shared" #t (eq? loads (eval 'loads (environment '(alpha greet)))))
+
+;; What a package provides is the world's, not a generation's: the package
+;; reloaded or unloaded, the others keep the same library, and so does it.
+(package! 'delta)
+(library! 'delta 'state '(export token) '(import (scheme base)) '(begin (define token (list 'instance))))
+(write-file! (at "delta" "entry.scm") '(import (delta state)) '(define (mine) token))
+(use-package-directory! (at "delta"))
+(define (delta-token) ((eval 'mine (package-module (find-package 'delta)))))
+(load-package 'delta (at "delta" "entry.scm"))
+(define first-token (delta-token))
+(check "another importer shares it" #t (eq? first-token (eval 'token (environment '(delta state)))))
+(load-package 'delta (at "delta" "entry.scm"))
+(check "the next generation keeps it" #t (eq? first-token (delta-token)))
+(unload-package 'delta)
+(check "unloaded, it is there still" #t (eq? first-token (eval 'token (environment '(delta state)))))
+
+;; A name belongs to one directory: its libraries are found there only.
+(write-file! (at "elsewhere" "alpha" "other.sld") '(define-library (alpha other) (export x) (import (scheme base)) (begin (define x 1))))
+(write-file! (at "elsewhere" "main.scm") '(import (alpha other)))
+(check "not beside the importer" #t (failed? (lambda () (load (at "elsewhere" "main.scm")))))
+(write-file! (at "copy" "alpha" "techne-package.scm") '(package alpha))
+(check "not in another directory" #t (failed? (lambda () (use-package-directory! (at "copy" "alpha")))))
+(package! 'techne)
+(check "not Techne's own" #t (failed? (lambda () (use-package-directory! (at "techne")))))
+
+;; A set of packages that cannot be used leaves nothing of itself.
+(package! 'lost '(depends (nowhere (path "../nowhere"))))
+(check "a dependency that is missing" #t (failed? (lambda () (use-package-directory! (at "lost")))))
+(package! 'misnamed '(depends (delta (path "../plain"))))
+(check "a dependency of another name" #t (failed? (lambda () (use-package-directory! (at "misnamed")))))
+(package! 'ring-a '(depends (ring-b (path "../ring-b"))))
+(package! 'ring-b '(depends (ring-a (path "../ring-a"))))
+(library! 'ring-a 'x '(export x) '(import (scheme base)) '(begin (define x 1)))
+(check "a circle" #t (failed? (lambda () (use-package-directory! (at "ring-a")))))
+(check "provides nothing" #f (%library-provider "ring-a"))
+(package! 'ring-b)
+(check "mended, it is used" 'ring-a (manifest-name (use-package-directory! (at "ring-a"))))
+(check "and provides" (file-truename (at "ring-a" "lib")) (%library-provider "ring-a"))
+
+;; Packages of one name in two directories, one depending on the other
+;; through a third: the first is not made known yet when the second is met.
+(package! 'twin '(depends (between (path "../between"))))
+(package! 'between '(depends (twin (path "../far/twin"))))
+(write-file! (at "far" "twin" "techne-package.scm") '(package twin))
+(library! 'between 'x '(export x) '(import (scheme base)) '(begin (define x 1)))
+(check "a name met again below itself" #t
+       (and (string-contains (or (why (lambda () (use-package-directory! (at "twin")))) "") "Another directory holds") #t))
+(check "leaves nothing" #f (%library-provider "between"))
+
+;; What cannot be provided is found before anything changes: libraries
+;; provided from elsewhere, loaded from elsewhere already, or a `lib` that
+;; is no directory, each in the package another one depends on.
+(define (left-whole? name dependency reason)
+  (package! name `(depends (,dependency (path ,(string-append "../" (symbol->string dependency))))))
+  (library! name 'x '(export x) '(import (scheme base)) '(begin (define x 1)))
+  (list (and (string-contains (or (why (lambda () (use-package-directory! (at (symbol->string name))))) "") reason) #t)
+        (%library-provider (symbol->string name))))
+(make-directory (at "taken"))
+(%provide-libraries! "omega" (at "taken"))
+(package! 'omega)
+(library! 'omega 'x '(export x) '(import (scheme base)) '(begin (define x 1)))
+(check "libraries provided from elsewhere" '(#t #f) (left-whole? 'zeta 'omega "are provided from"))
+(write-file! (at "loose" "early" "x.sld") '(define-library (early x) (export x) (import (scheme base)) (begin (define x 1))))
+(write-file! (at "loose" "main.scm") '(import (early x)))
+(load-package 'loose (at "loose" "main.scm"))
+(package! 'early)
+(library! 'early 'x '(export x) '(import (scheme base)) '(begin (define x 2)))
+(check "a library loaded from elsewhere" '(#t #f) (left-whole? 'eta 'early "library (early x) is loaded from elsewhere"))
+(package! 'flat)
+(write-file! (at "flat" "lib") 'not-a-directory)
+(check "a lib that is no directory" '(#t #f) (left-whole? 'theta 'flat "is not a directory"))
+
+(delete-path root #t)
+(test-summary)

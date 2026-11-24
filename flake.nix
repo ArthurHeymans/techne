@@ -31,8 +31,9 @@
       # Libraries the editor window (crates/techne-window) loads at run time.
       windowLibsOf = pkgs: with pkgs; [ vulkan-loader libxkbcommon wayland libGL libx11 libxcursor libxi libxrandr ];
     in {
-      # The `techne` binary, with Techne's Lisp and the manual in
-      # share/techne, where it looks for them (techne_vm::library::lisp_dir).
+      # The `techne` binary, with Techne's Lisp, the packages it ships and
+      # the manual in share/techne, where it looks for them
+      # (techne_vm::library::lisp_dir; the packages are beside the Lisp).
       packages = forAll (pkgs:
         let
           toolchain = toolchainOf pkgs;
@@ -48,6 +49,7 @@
             postInstall = ''
               mkdir -p $out/share/techne/doc
               cp -r lisp $out/share/techne/lisp
+              cp -r packages $out/share/techne/packages
               cp doc/manual.org $out/share/techne/doc/
             '';
             # The window opens these with dlopen.
