@@ -19,6 +19,8 @@
 (check "title" "Agenda fixture" (org-file-title org))
 (check "todo states" '("TODO" "NEXT" "WAIT") (org-file-todo-states org))
 (check "done states" '("DONE" "CANCELLED") (org-file-done-states org))
+(check "mixed-case TODO directive after short and unrelated lines" '("待つ" "NEXT")
+       (org-file-todo-states (parse-org '("#+" "#+todo" "#+TITLE: notes" "#+ToDo: 待つ NEXT | DONE"))))
 (check "top-level count" 9 (length (org-file-headings org)))
 (check "all headings" 12 (length (all-headings org)))
 (let ((h (find-heading "Write report")))
