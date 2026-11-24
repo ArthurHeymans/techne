@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795528362100,
+  "lastUpdate": 1795528363785,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -62300,6 +62300,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 626899410,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104432,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a2a8446193a797e67c25f3cf9fdb28d14e77700d",
+          "message": "Merge pull request #373 from ArthurHeymans/perf/org-scan-and-probes\n\nAvoid uppercasing every line when scanning Org TODO directives",
+          "timestamp": "2026-11-24T14:46:23+01:00",
+          "tree_id": "a9b2a0c6d376310ea83d88af8496530e1f8aa0de",
+          "url": "https://github.com/ArthurHeymans/techne/commit/a2a8446193a797e67c25f3cf9fdb28d14e77700d"
+        },
+        "date": 1795528363727,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 693203296,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 626903885,
             "unit": "instructions"
           },
           {
