@@ -305,3 +305,133 @@ mod tests {
         assert!(!Value::both_int(Value::int_unchecked(3), Value::float(1.0)));
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Exhaustive over all 2^64 bit patterns: the Value tag predicates partition the
+    /// entire 64-bit representation into 9 mutually exclusive, collectively exhaustive
+    /// categories, and truthiness agrees with `!= Value::FALSE`.
+    #[kani::proof]
+    fn tag_partition_is_exhaustive_and_disjoint() {
+        let bits: u64 = kani::any();
+        let v = Value::from_bits(bits);
+
+        let count = usize::from(v.is_float())
+            + usize::from(v.is_int())
+            + usize::from(v.is_ptr())
+            + usize::from(v.is_char())
+            + usize::from(v.is_symbol())
+            + usize::from(v.is_native())
+            + usize::from(v.is_keyword())
+            + usize::from(v.is_cursor())
+            + usize::from(v.as_special().is_some());
+        assert!(count == 1);
+
+        assert!(v.is_false() == (v == Value::FALSE));
+        assert!(v.is_truthy() == !v.is_false());
+
+        let b: bool = kani::any();
+        let bv = Value::bool(b);
+        assert!(bv.is_truthy() == b);
+        assert!(bv.is_false() == !b);
+        assert!(bv.as_special() == Some(if b { Special::True } else { Special::False }));
+    }
+
+    /// Exhaustive over all 2^64 IEEE-754 f64 bit patterns: every NaN (including negative
+    /// quiet/signaling NaNs in 0xFFF8..=0xFFFF) canonicalizes to `CANONICAL_NAN`, every
+    /// non-NaN preserves its exact bits (including -0.0, subnormals, and infinities), and
+    /// no boxed float ever collides with any tagged non-float category.
+    #[kani::proof]
+    fn float_canonicalizes_nans_and_preserves_non_nans() {
+        let bits: u64 = kani::any();
+        let f = f64::from_bits(bits);
+        let v = Value::float(f);
+
+        assert!(v.is_float());
+        assert!(!v.is_int() && !v.is_ptr() && !v.is_char() && !v.is_symbol() && !v.is_native() && !v.is_keyword() && !v.is_cursor());
+        assert!(v.as_special().is_none());
+
+        if f.is_nan() {
+            assert!(v.bits() == CANONICAL_NAN);
+            assert!(v.as_float().is_nan());
+        } else {
+            assert!(v.bits() == bits);
+            assert!(v.as_float().to_bits() == bits);
+        }
+    }
+
+    /// Exhaustive over all 2^64 signed integers and all pairs of 64-bit values:
+    /// `Value::fixnum` succeeds iff the value lies in `FIXNUM_MIN..=FIXNUM_MAX`, round-trips
+    /// with sign extension through `as_int`, matches `int_unchecked`, and `both_int` agrees
+    /// with checking `is_int` on each operand.
+    #[kani::proof]
+    fn fixnum_roundtrip_range_and_both_int() {
+        let i: i64 = kani::any();
+        match Value::fixnum(i) {
+            Some(v) => {
+                assert!(i >= FIXNUM_MIN && i <= FIXNUM_MAX);
+                assert!(v.is_int());
+                assert!(!v.is_float());
+                assert!(v.as_int() == i);
+                assert!(Value::int_unchecked(i) == v);
+            }
+            None => {
+                assert!(i < FIXNUM_MIN || i > FIXNUM_MAX);
+            }
+        }
+
+        let a = Value::from_bits(kani::any());
+        let b = Value::from_bits(kani::any());
+        assert!(Value::both_int(a, b) == (a.is_int() && b.is_int()));
+    }
+
+    /// Exhaustive over all `char`, `u32` ids, in-range cursor offsets, and `Special`
+    /// constants: every immediate constructor produces the exact documented NaN-boxed word
+    /// and round-trips its payload.
+    #[kani::proof]
+    fn immediates_roundtrip_all_payloads() {
+        let c: char = kani::any();
+        let vc = Value::char(c);
+        assert!(vc.bits() == (0xFFFB_u64 << 48) | (c as u64));
+        assert!(vc.is_char() && !vc.is_float() && vc.as_char() == c);
+
+        let id: u32 = kani::any();
+        let vs = Value::symbol(id);
+        assert!(vs.bits() == (0xFFFC_u64 << 48) | (id as u64));
+        assert!(vs.is_symbol() && !vs.is_float() && vs.as_symbol() == id);
+
+        let vk = Value::keyword(id);
+        assert!(vk.bits() == (0xFFFF_u64 << 48) | (id as u64));
+        assert!(vk.is_keyword() && !vk.is_float() && vk.as_keyword() == id);
+
+        let vn = Value::native(id);
+        assert!(vn.bits() == (0xFFFE_u64 << 48) | (id as u64));
+        assert!(vn.is_native() && !vn.is_float() && vn.as_native() == id as usize);
+
+        let off: usize = kani::any();
+        kani::assume((off as u64) < CURSOR);
+        let vcur = Value::cursor(off);
+        assert!(vcur.bits() == (0xFFFD_u64 << 48) | (1u64 << 47) | (off as u64));
+        assert!(vcur.is_cursor() && !vcur.is_float() && vcur.as_special().is_none() && vcur.as_cursor() == off);
+
+        let special_idx: u8 = kani::any();
+        kani::assume(special_idx < 8);
+        let (sp, constant) = match special_idx {
+            0 => (Special::Nil, Value::NIL),
+            1 => (Special::False, Value::FALSE),
+            2 => (Special::True, Value::TRUE),
+            3 => (Special::Void, Value::VOID),
+            4 => (Special::Eof, Value::EOF),
+            5 => (Special::Undefined, Value::UNDEFINED),
+            6 => (Special::Empty, Value::EMPTY),
+            _ => (Special::Unset, Value::UNSET),
+        };
+        let vsp = Value::special(sp);
+        assert!(vsp.bits() == (0xFFFD_u64 << 48) | (sp as u64));
+        assert!(vsp == constant);
+        assert!(!vsp.is_cursor() && !vsp.is_float());
+        assert!(vsp.as_special() == Some(sp));
+    }
+}

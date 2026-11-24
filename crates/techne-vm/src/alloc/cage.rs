@@ -123,20 +123,117 @@ pub(crate) struct Cage {
     spans: RefCell<Spans>,
 }
 
-struct Spans {
+trait SpanMap: Default {
+    fn first_fit(&self, len: usize) -> Option<(usize, usize)>;
+    fn prev_before(&self, off: usize) -> Option<(usize, usize)>;
+    fn insert_span(&mut self, off: usize, len: usize);
+    fn remove_span(&mut self, off: usize) -> Option<usize>;
+    fn max_len(&self) -> usize;
+    fn sum_len(&self) -> usize;
+}
+
+impl SpanMap for BTreeMap<usize, usize> {
+    fn first_fit(&self, len: usize) -> Option<(usize, usize)> {
+        self.iter().find(|&(_, &l)| l >= len).map(|(&o, &l)| (o, l))
+    }
+
+    fn prev_before(&self, off: usize) -> Option<(usize, usize)> {
+        self.range(..off).next_back().map(|(&o, &l)| (o, l))
+    }
+
+    fn insert_span(&mut self, off: usize, len: usize) {
+        self.insert(off, len);
+    }
+
+    fn remove_span(&mut self, off: usize) -> Option<usize> {
+        self.remove(&off)
+    }
+
+    fn max_len(&self) -> usize {
+        self.values().copied().max().unwrap_or(0)
+    }
+
+    fn sum_len(&self) -> usize {
+        self.values().sum()
+    }
+}
+
+struct Spans<M = BTreeMap<usize, usize>> {
     /// Everything from here on is untouched.
     top: usize,
     /// Free spans below `top` by offset, none adjacent to another or to `top`.
-    free: BTreeMap<usize, usize>,
+    free: M,
     /// Their bytes.
     free_bytes: usize,
+}
+
+impl<M: SpanMap> Spans<M> {
+    fn new() -> Self {
+        Spans { top: START, free: M::default(), free_bytes: 0 }
+    }
+
+    fn largest(&self, cap: usize) -> usize {
+        let rest = cap - self.top;
+        // No free span is larger than all of them together.
+        if rest >= self.free_bytes { rest } else { self.free.max_len().max(rest) }
+    }
+
+    fn used(&self) -> usize {
+        debug_assert_eq!(self.free_bytes, self.free.sum_len());
+        self.top - START - self.free_bytes
+    }
+
+    fn alloc_offset(&mut self, len: usize, cap: usize) -> Option<usize> {
+        let len = len.next_multiple_of(PAGE);
+        let fit = self.free.first_fit(len);
+        let off = match fit {
+            Some((o, l)) => {
+                self.free.remove_span(o);
+                if l > len {
+                    self.free.insert_span(o + len, l - len);
+                }
+                self.free_bytes -= len;
+                o
+            }
+            None => {
+                let o = self.top;
+                if cap - o < len {
+                    return None;
+                }
+                self.top = o + len;
+                o
+            }
+        };
+        Some(off)
+    }
+
+    fn free_offset(&mut self, mut off: usize, len: usize) {
+        let mut len = len.next_multiple_of(PAGE);
+        // Counted free again as it merges; what reaches `top` is not.
+        self.free_bytes += len;
+        if let Some(l) = self.free.remove_span(off + len) {
+            len += l;
+        }
+        if let Some((o, l)) = self.free.prev_before(off)
+            && o + l == off
+        {
+            self.free.remove_span(o);
+            (off, len) = (o, len + l);
+        }
+        if off + len == self.top {
+            self.top = off;
+            self.free_bytes -= len;
+        } else {
+            self.free.insert_span(off, len);
+        }
+    }
 }
 
 impl Cage {
     /// A cage of its own: a pooled region, else one reserved now.
     pub(crate) fn new() -> Rc<Cage> {
         let base = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop().map_or_else(os::reserve, |r| r.0);
-        Rc::new(Cage { base, spans: RefCell::new(Spans { top: START, free: BTreeMap::new(), free_bytes: 0 }) })
+        Rc::new(Cage { base, spans: RefCell::new(Spans::new()) })
     }
 
     /// Its base, which every address in it shares.
@@ -160,17 +257,12 @@ impl Cage {
     /// larger than every piece of its room does not fit, whatever their
     /// total (`room`).
     pub(crate) fn largest(&self) -> usize {
-        let s = self.spans.borrow();
-        let rest = capacity() - s.top;
-        // No free span is larger than all of them together.
-        if rest >= s.free_bytes { rest } else { s.free.values().copied().max().unwrap_or(0).max(rest) }
+        self.spans.borrow().largest(capacity())
     }
 
     /// Bytes its heap holds of it, whether touched or not.
     pub(crate) fn used(&self) -> usize {
-        let s = self.spans.borrow();
-        debug_assert_eq!(s.free_bytes, s.free.values().sum::<usize>());
-        s.top - START - s.free_bytes
+        self.spans.borrow().used()
     }
 }
 
@@ -322,56 +414,19 @@ pub(crate) fn contains(p: *const u64) -> bool {
 
 impl Cage {
     fn alloc(&self, len: usize) -> Option<NonNull<u8>> {
-        let len = len.next_multiple_of(PAGE);
-        let mut s = self.spans.borrow_mut();
-        let fit = s.free.iter().find(|&(_, &l)| l >= len).map(|(&o, &l)| (o, l));
-        let off = match fit {
-            Some((o, l)) => {
-                s.free.remove(&o);
-                if l > len {
-                    s.free.insert(o + len, l - len);
-                }
-                s.free_bytes -= len;
-                o
-            }
-            None => {
-                let o = s.top;
-                if capacity() - o < len {
-                    return None;
-                }
-                s.top = o + len;
-                o
-            }
-        };
-        // SAFETY: `off + len` is within the cage.
+        let off = self.spans.borrow_mut().alloc_offset(len, capacity())?;
+        // SAFETY: `off + len.next_multiple_of(PAGE)` is within the cage.
         Some(unsafe { self.base.add(off) })
     }
 
     /// # Safety
     /// `p` was returned by `alloc(len)` and is not used again.
     unsafe fn free(&self, p: NonNull<u8>, len: usize) {
-        let mut len = len.next_multiple_of(PAGE);
+        let rounded = len.next_multiple_of(PAGE);
         // SAFETY: forwarded from the caller.
-        unsafe { os::release(p, len) };
-        let mut off = p.as_ptr().addr() - self.base.as_ptr().addr();
-        let mut s = self.spans.borrow_mut();
-        // Counted free again as it merges; what reaches `top` is not.
-        s.free_bytes += len;
-        if let Some(l) = s.free.remove(&(off + len)) {
-            len += l;
-        }
-        if let Some((&o, &l)) = s.free.range(..off).next_back()
-            && o + l == off
-        {
-            s.free.remove(&o);
-            (off, len) = (o, len + l);
-        }
-        if off + len == s.top {
-            s.top = off;
-            s.free_bytes -= len;
-        } else {
-            s.free.insert(off, len);
-        }
+        unsafe { os::release(p, rounded) };
+        let off = p.as_ptr().addr() - self.base.as_ptr().addr();
+        self.spans.borrow_mut().free_offset(off, len);
     }
 }
 
@@ -634,5 +689,469 @@ mod tests {
         assert!(v.try_reserve_exact(1 << 20).is_err());
         drop(v);
         assert_eq!(budget.held(), 0);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Exhaustive over all cage-aligned non-null 64-bit bases, all offsets within the cage,
+    /// and all arbitrary 64-bit addresses (using synthetic provenance-free pointers to verify
+    /// address arithmetic, not dereference or provenance safety): `confine` and `near` always
+    /// land inside the cage, align to 8 bytes, agree with each other, and satisfy `contains`
+    /// while rejecting null or other-cage addresses.
+    #[kani::proof]
+    fn confine_near_and_contains_enforce_cage_bounds() {
+        let base_addr: usize = kani::any();
+        kani::assume(base_addr != 0 && (base_addr & MASK) == 0);
+        let addr: usize = kani::any();
+        let near_off: usize = kani::any();
+        kani::assume(near_off <= MASK);
+
+        let base = std::ptr::without_provenance_mut::<u8>(base_addr);
+        let p = confine(base, addr);
+
+        assert!(p.addr() & !MASK == base_addr);
+        assert!(p.addr() & 7 == 0);
+        assert!(p.addr() - base_addr == (addr & MASK & !7));
+        assert!(confine(base, p.addr()) == p);
+
+        let near_ptr = std::ptr::without_provenance_mut::<u64>(base_addr | near_off);
+        let q = near(near_ptr, addr);
+        assert!(q.addr() == p.addr());
+
+        // With no cage entered (null BASE), `contains` rejects every pointer.
+        BASE.set(std::ptr::null_mut());
+        assert!(!contains(p));
+        assert!(!contains(std::ptr::without_provenance::<u64>(addr)));
+
+        // With `base` entered, `contains` holds iff the pointer's high bits match `base_addr`.
+        BASE.set(base);
+        assert!(contains(p));
+        assert!(contains(q));
+        let probe = std::ptr::without_provenance::<u64>(addr);
+        assert!(contains(probe) == ((addr & !MASK) == base_addr));
+        BASE.set(std::ptr::null_mut());
+    }
+
+    /// Sorted fixed-capacity ordered map modeling `BTreeMap<usize, usize>`'s `SpanMap`
+    /// contract without `std::collections::BTreeMap`'s internal node-rebalancing pointer
+    /// machinery, allowing CBMC to verify production `Spans` logic directly.
+    struct ArraySpanMap<const N: usize> {
+        entries: [(usize, usize); N],
+        len: usize,
+    }
+
+    impl<const N: usize> Default for ArraySpanMap<N> {
+        fn default() -> Self {
+            Self { entries: [(0, 0); N], len: 0 }
+        }
+    }
+
+    impl<const N: usize> ArraySpanMap<N> {
+        fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        fn len(&self) -> usize {
+            self.len
+        }
+    }
+
+    impl<const N: usize> SpanMap for ArraySpanMap<N> {
+        fn first_fit(&self, len: usize) -> Option<(usize, usize)> {
+            for i in 0..N {
+                if i < self.len && self.entries[i].1 >= len {
+                    return Some(self.entries[i]);
+                }
+            }
+            None
+        }
+
+        fn prev_before(&self, off: usize) -> Option<(usize, usize)> {
+            let mut prev = None;
+            for i in 0..N {
+                if i < self.len && self.entries[i].0 < off {
+                    prev = Some(self.entries[i]);
+                }
+            }
+            prev
+        }
+
+        fn insert_span(&mut self, off: usize, len: usize) {
+            let mut pos = self.len;
+            for i in 0..N {
+                if i < self.len {
+                    if self.entries[i].0 == off {
+                        self.entries[i].1 = len;
+                        return;
+                    }
+                    if self.entries[i].0 > off && pos == self.len {
+                        pos = i;
+                    }
+                }
+            }
+            assert!(self.len < N, "ArraySpanMap capacity exceeded");
+            let mut k = N - 1;
+            while k > 0 {
+                if k <= self.len && k > pos {
+                    self.entries[k] = self.entries[k - 1];
+                }
+                k -= 1;
+            }
+            self.entries[pos] = (off, len);
+            self.len += 1;
+        }
+
+        fn remove_span(&mut self, off: usize) -> Option<usize> {
+            let mut pos = N;
+            for i in 0..N {
+                if i < self.len && self.entries[i].0 == off {
+                    pos = i;
+                    break;
+                }
+            }
+            if pos == N {
+                return None;
+            }
+            let removed = self.entries[pos].1;
+            for i in 0..N {
+                if i >= pos && i + 1 < self.len {
+                    self.entries[i] = self.entries[i + 1];
+                }
+            }
+            self.len -= 1;
+            Some(removed)
+        }
+
+        fn max_len(&self) -> usize {
+            let mut m = 0;
+            for i in 0..N {
+                if i < self.len && self.entries[i].1 > m {
+                    m = self.entries[i].1;
+                }
+            }
+            m
+        }
+
+        fn sum_len(&self) -> usize {
+            let mut s = 0usize;
+            for i in 0..N {
+                if i < self.len {
+                    s += self.entries[i].1;
+                }
+            }
+            s
+        }
+    }
+
+    fn assert_spans_invariants<const N: usize>(spans: &Spans<ArraySpanMap<N>>, cap: usize, expected_used: usize, live: &[(usize, usize)]) {
+        assert!(spans.top >= START && spans.top <= cap);
+        assert!(spans.top % PAGE == 0);
+        assert!(spans.used() == expected_used);
+
+        let mut live_sum = 0usize;
+        for (i, &(lo, ll)) in live.iter().enumerate() {
+            if ll > 0 {
+                assert!(lo >= START && lo + ll <= spans.top);
+                assert!(lo % PAGE == 0);
+                assert!(ll % PAGE == 0);
+                // Live spans are pairwise disjoint, so their lengths sum to what they cover.
+                for &(lo2, ll2) in &live[i + 1..] {
+                    if ll2 > 0 {
+                        assert!(lo + ll <= lo2 || lo2 + ll2 <= lo);
+                    }
+                }
+                live_sum += ll;
+            }
+        }
+        assert!(live_sum == expected_used);
+
+        let mut sum = 0usize;
+        let mut max_hole = 0usize;
+        let mut prev_end: Option<usize> = None;
+        for i in 0..N {
+            if i < spans.free.len {
+                let (o, l) = spans.free.entries[i];
+                assert!(o >= START);
+                assert!(l > 0);
+                assert!(o % PAGE == 0);
+                assert!(l % PAGE == 0);
+                // Every free span stays strictly below `top` (never adjacent to `top`).
+                assert!(o + l < spans.top);
+                // Adjacent free spans must always have been coalesced.
+                if let Some(pe) = prev_end {
+                    assert!(pe < o);
+                }
+                // Every free hole must be disjoint from every live allocation.
+                for &(lo, ll) in live {
+                    if ll > 0 {
+                        assert!(o + l <= lo || lo + ll <= o);
+                    }
+                }
+                prev_end = Some(o + l);
+                sum += l;
+                if l > max_hole {
+                    max_hole = l;
+                }
+            }
+        }
+        assert!(sum == spans.free_bytes);
+        // Live spans + free holes partition `START..spans.top` with zero overlap and zero gap.
+        assert!(live_sum + sum == spans.top - START);
+        assert!(spans.largest(cap) == max_hole.max(cap - spans.top));
+    }
+
+    /// Bounded check of production `Spans` (parameterized over `ArraySpanMap`, with a
+    /// companion `BTreeMap` unit test covering the production adapter) for 3 symbolic
+    /// page-rounded allocations (`1..=2 * PAGE` each) and all 6 free orders: spans are
+    /// disjoint and page-aligned inside `START..cap`, live spans and free holes partition
+    /// `START..top` exactly, left/right/top coalescing maintains strict non-adjacency and
+    /// `free_bytes`/`used`/`largest` conservation, and freeing all allocations returns `top`
+    /// to `START` with an empty free map.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn spans_three_alloc_all_free_orders_preserve_invariants() {
+        let len0: usize = kani::any();
+        let len1: usize = kani::any();
+        let len2: usize = kani::any();
+        kani::assume((1..=2 * PAGE).contains(&len0));
+        kani::assume((1..=2 * PAGE).contains(&len1));
+        kani::assume((1..=2 * PAGE).contains(&len2));
+        let r0 = len0.next_multiple_of(PAGE);
+        let r1 = len1.next_multiple_of(PAGE);
+        let r2 = len2.next_multiple_of(PAGE);
+
+        let cap = START + 6 * PAGE;
+        let mut spans = Spans::<ArraySpanMap<3>>::new();
+        let mut live = [(0usize, 0usize); 3];
+        assert_spans_invariants(&spans, cap, 0, &live);
+
+        let o0 = spans.alloc_offset(len0, cap).unwrap();
+        assert!(o0 == START);
+        live[0] = (o0, r0);
+        assert_spans_invariants(&spans, cap, r0, &live);
+
+        let o1 = spans.alloc_offset(len1, cap).unwrap();
+        assert!(o1 == START + r0);
+        live[1] = (o1, r1);
+        assert_spans_invariants(&spans, cap, r0 + r1, &live);
+
+        let o2 = spans.alloc_offset(len2, cap).unwrap();
+        assert!(o2 == START + r0 + r1);
+        live[2] = (o2, r2);
+        assert_spans_invariants(&spans, cap, r0 + r1 + r2, &live);
+
+        let allocs = [(o0, len0, r0), (o1, len1, r1), (o2, len2, r2)];
+        let perm: usize = kani::any();
+        kani::assume(perm < 6);
+        let order: [usize; 3] = match perm {
+            0 => [0, 1, 2],
+            1 => [0, 2, 1],
+            2 => [1, 0, 2],
+            3 => [1, 2, 0],
+            4 => [2, 0, 1],
+            _ => [2, 1, 0],
+        };
+
+        let mut expected_used = r0 + r1 + r2;
+        for &idx in &order {
+            let (off, len, rounded) = allocs[idx];
+            spans.free_offset(off, len);
+            live[idx] = (0, 0);
+            expected_used -= rounded;
+            assert_spans_invariants(&spans, cap, expected_used, &live);
+        }
+
+        assert!(spans.top == START);
+        assert!(spans.free.is_empty());
+        assert!(spans.free_bytes == 0);
+        assert!(spans.largest(cap) == cap - START);
+    }
+
+    /// Bounded check of production `Spans` (over `ArraySpanMap`) covering multi-hole
+    /// first-fit lowest-offset selection, both-side coalescing below `top`, exact hole-map
+    /// ranges on reuse (split and exact match), bump fallback when a request exceeds the
+    /// hole, and snapshotted free-map preservation on capacity refusal.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn spans_both_side_coalesce_and_first_fit_split_preserve_invariants() {
+        // 4 live spans of 1 page each, plus 4 pages of headroom above `top`.
+        let cap = START + 8 * PAGE;
+        let mut spans = Spans::<ArraySpanMap<3>>::new();
+
+        let o0 = spans.alloc_offset(1, cap).unwrap();
+        let o1 = spans.alloc_offset(PAGE, cap).unwrap();
+        let o2 = spans.alloc_offset(PAGE - 1, cap).unwrap();
+        let o3 = spans.alloc_offset(PAGE, cap).unwrap();
+        assert!(o0 == START && o1 == START + PAGE && o2 == START + 2 * PAGE && o3 == START + 3 * PAGE);
+        let mut live = [(o0, PAGE), (o1, PAGE), (o2, PAGE), (o3, PAGE)];
+        assert_spans_invariants(&spans, cap, 4 * PAGE, &live);
+
+        // Free 0 and 2 (leaving 1 and 3 live): two non-adjacent 1-page holes below `top`.
+        spans.free_offset(o0, 1);
+        live[0] = (0, 0);
+        assert_spans_invariants(&spans, cap, 3 * PAGE, &live);
+        spans.free_offset(o2, PAGE - 1);
+        live[2] = (0, 0);
+        assert_spans_invariants(&spans, cap, 2 * PAGE, &live);
+        assert!(spans.free.len() == 2);
+        assert!(spans.free.entries[0] == (o0, PAGE));
+        assert!(spans.free.entries[1] == (o2, PAGE));
+
+        // Free 1: must coalesce with BOTH left (o0) and right (o2) into one 3-page hole.
+        spans.free_offset(o1, PAGE);
+        live[1] = (0, 0);
+        assert_spans_invariants(&spans, cap, PAGE, &live);
+        assert!(spans.free.len() == 1);
+        assert!(spans.free.entries[0] == (o0, 3 * PAGE));
+        assert!(spans.largest(cap) == 4 * PAGE);
+
+        // Allocate symbolic `len_d` in `1..=5 * PAGE`:
+        // - 1..=2 pages splits the 3-page hole at `o0`
+        // - 3 pages consumes the 3-page hole at `o0` exactly
+        // - 4 pages exceeds the hole and falls back to bumping from `top`
+        // - 5 pages cannot fit in either the 3-page hole or the 4-page tail => `None`
+        let snap_top = spans.top;
+        let snap_free_bytes = spans.free_bytes;
+        let snap_free_len = spans.free.len;
+        let snap_free_entries = spans.free.entries;
+
+        let len_d: usize = kani::any();
+        kani::assume((1..=5 * PAGE).contains(&len_d));
+        let r_d = len_d.next_multiple_of(PAGE);
+        let res = spans.alloc_offset(len_d, cap);
+        if r_d < 3 * PAGE {
+            let od = res.unwrap();
+            assert!(od == o0);
+            live[0] = (od, r_d);
+            assert_spans_invariants(&spans, cap, PAGE + r_d, &live);
+            assert!(spans.free.len() == 1);
+            assert!(spans.free.entries[0] == (o0 + r_d, 3 * PAGE - r_d));
+            spans.free_offset(od, len_d);
+            live[0] = (0, 0);
+            assert_spans_invariants(&spans, cap, PAGE, &live);
+            assert!(spans.free.len() == 1 && spans.free.entries[0] == (o0, 3 * PAGE));
+        } else if r_d == 3 * PAGE {
+            let od = res.unwrap();
+            assert!(od == o0);
+            live[0] = (od, r_d);
+            assert_spans_invariants(&spans, cap, PAGE + r_d, &live);
+            assert!(spans.free.is_empty());
+            spans.free_offset(od, len_d);
+            live[0] = (0, 0);
+            assert_spans_invariants(&spans, cap, PAGE, &live);
+            assert!(spans.free.len() == 1 && spans.free.entries[0] == (o0, 3 * PAGE));
+        } else if r_d == 4 * PAGE {
+            let od = res.unwrap();
+            assert!(od == START + 4 * PAGE);
+            live[0] = (od, r_d);
+            assert_spans_invariants(&spans, cap, PAGE + r_d, &live);
+            assert!(spans.free.len() == 1 && spans.free.entries[0] == (o0, 3 * PAGE));
+            spans.free_offset(od, len_d);
+            live[0] = (0, 0);
+            assert_spans_invariants(&spans, cap, PAGE, &live);
+            assert!(spans.free.len() == 1 && spans.free.entries[0] == (o0, 3 * PAGE));
+        } else {
+            assert!(res.is_none());
+            assert!(spans.top == snap_top);
+            assert!(spans.free_bytes == snap_free_bytes);
+            assert!(spans.free.len == snap_free_len);
+            assert!(spans.free.entries == snap_free_entries);
+            assert_spans_invariants(&spans, cap, PAGE, &live);
+        }
+
+        // Free the top anchor `o3`: the 3-page hole and `o3` collapse `top` back to `START`.
+        spans.free_offset(o3, PAGE);
+        live[3] = (0, 0);
+        assert_spans_invariants(&spans, cap, 0, &live);
+        assert!(spans.top == START);
+        assert!(spans.free.is_empty());
+    }
+
+    /// Bounded check of production `Spans` (over `ArraySpanMap`, paired with the
+    /// `BTreeMap` unit test `spans_btreemap_adapter_first_fit_coalescing_and_refusal`)
+    /// with two non-adjacent free holes of symbolic sizes (`1` or `2` pages each) and
+    /// symbolic allocation request (`1..=3` pages): distinguishes first-fit from last-fit
+    /// by asserting lowest-offset selection when both holes fit, skipping the lower hole
+    /// when only the upper hole fits, and exact snapshotted state preservation on refusal.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn spans_multi_hole_first_fit_selects_lowest_offset() {
+        let h0_pages: usize = if kani::any() { 1 } else { 2 };
+        let h2_pages: usize = if kani::any() { 1 } else { 2 };
+        let r0 = h0_pages * PAGE;
+        let r2 = h2_pages * PAGE;
+        let top_init = START + r0 + PAGE + r2 + PAGE;
+        // Leave exactly 2 pages of tail room above `top_init`.
+        let cap = top_init + 2 * PAGE;
+
+        let mut spans = Spans::<ArraySpanMap<3>>::new();
+        let o0 = spans.alloc_offset(r0, cap).unwrap();
+        let o1 = spans.alloc_offset(PAGE, cap).unwrap();
+        let o2 = spans.alloc_offset(r2, cap).unwrap();
+        let o3 = spans.alloc_offset(PAGE, cap).unwrap();
+        let mut live = [(o0, r0), (o1, PAGE), (o2, r2), (o3, PAGE)];
+
+        spans.free_offset(o0, r0);
+        live[0] = (0, 0);
+        spans.free_offset(o2, r2);
+        live[2] = (0, 0);
+        assert_spans_invariants(&spans, cap, 2 * PAGE, &live);
+        assert!(spans.free.len() == 2);
+        assert!(spans.free.entries[0] == (o0, r0));
+        assert!(spans.free.entries[1] == (o2, r2));
+
+        let snap_top = spans.top;
+        let snap_free_bytes = spans.free_bytes;
+        let snap_free_len = spans.free.len;
+        let snap_free_entries = spans.free.entries;
+
+        let req: usize = kani::any();
+        kani::assume((1..=3 * PAGE).contains(&req));
+        let r_req = req.next_multiple_of(PAGE);
+        let res = spans.alloc_offset(req, cap);
+
+        if r_req <= r0 {
+            // Lowest fitting hole `o0` must be chosen even when `o2` also fits.
+            let got = res.unwrap();
+            assert!(got == o0);
+            live[0] = (got, r_req);
+            assert_spans_invariants(&spans, cap, 2 * PAGE + r_req, &live);
+            if r_req < r0 {
+                assert!(spans.free.len() == 2);
+                assert!(spans.free.entries[0] == (o0 + r_req, r0 - r_req));
+                assert!(spans.free.entries[1] == (o2, r2));
+            } else {
+                assert!(spans.free.len() == 1);
+                assert!(spans.free.entries[0] == (o2, r2));
+            }
+        } else if r_req <= r2 {
+            // Only the second hole `o2` fits: `o0` remains untouched and `o2` is selected.
+            let got = res.unwrap();
+            assert!(got == o2);
+            live[2] = (got, r_req);
+            assert_spans_invariants(&spans, cap, 2 * PAGE + r_req, &live);
+            assert!(spans.free.len() == 1);
+            assert!(spans.free.entries[0] == (o0, r0));
+        } else if r_req <= cap - top_init {
+            // Neither hole fits, tail fits: bump from `top_init`.
+            let got = res.unwrap();
+            assert!(got == top_init);
+            live[0] = (got, r_req);
+            assert_spans_invariants(&spans, cap, 2 * PAGE + r_req, &live);
+            assert!(spans.free.len() == 2);
+            assert!(spans.free.entries[0] == (o0, r0));
+            assert!(spans.free.entries[1] == (o2, r2));
+        } else {
+            // 3 pages exceeds both holes and the 2-page tail => refusal leaves state unchanged.
+            assert!(res.is_none());
+            assert!(spans.top == snap_top);
+            assert!(spans.free_bytes == snap_free_bytes);
+            assert!(spans.free.len == snap_free_len);
+            assert!(spans.free.entries == snap_free_entries);
+            assert_spans_invariants(&spans, cap, 2 * PAGE, &live);
+        }
     }
 }

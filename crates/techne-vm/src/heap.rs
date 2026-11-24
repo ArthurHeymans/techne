@@ -321,24 +321,37 @@ struct Classes {
     of: Vec<u8>,
 }
 
+fn next_class_words(w: usize, max_small: usize) -> usize {
+    (w + w.div_ceil(8)).min(max_small)
+}
+
+fn build_class_words(max_small: usize) -> Vec<usize> {
+    let mut words: Vec<usize> = Vec::with_capacity(64);
+    words.extend(2..=16.min(max_small));
+    while *words.last().unwrap() < max_small {
+        let w = *words.last().unwrap();
+        words.push(next_class_words(w, max_small));
+    }
+    words
+}
+
+fn build_classes_up_to(max_small: usize) -> Classes {
+    let words = build_class_words(max_small);
+    let mut of = vec![0u8; max_small + 1];
+    let mut c = 0;
+    for (size, slot) in of.iter_mut().enumerate() {
+        if words[c] < size {
+            c += 1;
+        }
+        debug_assert!(words[c] >= size);
+        *slot = c as u8;
+    }
+    Classes { words, of }
+}
+
 fn classes() -> &'static Classes {
     static C: OnceLock<Classes> = OnceLock::new();
-    C.get_or_init(|| {
-        let mut words: Vec<usize> = (2..=16).collect();
-        while *words.last().unwrap() < MAX_SMALL {
-            let w = *words.last().unwrap();
-            words.push((w + w.div_ceil(8)).min(MAX_SMALL));
-        }
-        let mut of = vec![0u8; MAX_SMALL + 1];
-        let mut c = 0;
-        for (size, slot) in of.iter_mut().enumerate() {
-            while words[c] < size {
-                c += 1;
-            }
-            *slot = c as u8;
-        }
-        Classes { words, of }
-    })
+    C.get_or_init(|| build_classes_up_to(MAX_SMALL))
 }
 
 struct Block {
@@ -1758,17 +1771,19 @@ pub(crate) fn word(obj: *mut u64, k: usize) -> *mut u64 {
     obj.with_addr((at & !CAGE_MASK) | (at.wrapping_add(k.wrapping_mul(8)) & CAGE_MASK))
 }
 
+#[inline(always)]
+fn try_bytes_at(obj: *mut u64, at: usize, len: usize) -> Option<*mut u8> {
+    // `at` and `len` are below 2^35 (lengths are bounded by the cage), so
+    // their sum does not overflow.
+    let left = crate::alloc::CAGE_MASK + 1 - (obj.addr() & crate::alloc::CAGE_MASK);
+    (at + len <= left).then(|| obj.cast::<u8>().wrapping_add(at))
+}
+
 /// `len` bytes from `at` bytes past object `obj`, which must end in its
 /// cage, else the heap is corrupt: what a slice of them may be made from.
 #[inline(always)]
 pub(crate) fn bytes_at(obj: *mut u64, at: usize, len: usize) -> *mut u8 {
-    // `at` and `len` are below 2^35 (lengths are bounded by the cage), so
-    // their sum does not overflow.
-    let left = crate::alloc::CAGE_MASK + 1 - (obj.addr() & crate::alloc::CAGE_MASK);
-    if at + len > left {
-        corrupt("an object runs past its cage");
-    }
-    obj.cast::<u8>().wrapping_add(at)
+    try_bytes_at(obj, at, len).unwrap_or_else(|| corrupt("an object runs past its cage"))
 }
 
 /// A string's bytes as text: checked, as a world may have changed them to
@@ -1800,15 +1815,17 @@ pub(crate) unsafe fn len_of(obj: *mut u64) -> usize {
     unsafe { checked_field_len(obj, *obj) }
 }
 
+#[inline(always)]
+fn try_checked_field_len(obj: *mut u64, h: u64) -> Option<usize> {
+    let len = header_len(h);
+    (len < (crate::alloc::CAGE_MASK - (obj.addr() & crate::alloc::CAGE_MASK)) / 8).then_some(len)
+}
+
 /// The same extent check for an already loaded header. Even a fixed-size
 /// pair must pass it before its raw field addresses are formed.
 #[inline(always)]
 fn checked_field_len(obj: *mut u64, h: u64) -> usize {
-    let len = header_len(h);
-    if len >= (crate::alloc::CAGE_MASK - (obj.addr() & crate::alloc::CAGE_MASK)) / 8 {
-        corrupt("an object runs past its cage");
-    }
-    len
+    try_checked_field_len(obj, h).unwrap_or_else(|| corrupt("an object runs past its cage"))
 }
 
 /// The length in bytes of string or bytevector `obj` holding its bytes
@@ -2483,5 +2500,249 @@ mod tests {
         assert_eq!(bytes_at(last, 0, 8), last.cast());
         let past = std::panic::catch_unwind(|| bytes_at(last, 8, 1));
         assert!(past.is_err(), "bytes past the cage are corruption");
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::alloc::CAGE_MASK;
+
+    /// Exhaustive over all 18 `Kind` variants, all cage-bounded lengths, all 8-bit header
+    /// flags, all 256 kind bytes, and all 2^64 arbitrary header words: verifies header
+    /// round-tripping, `Kind::of` disjointness from sentinel tags (`FREE`, `FORWARDED`),
+    /// `base_words`/`object_words`/`is_traced` consistency, and `bytevector_words`/`string_words`
+    /// exact coverage without overflow.
+    #[kani::proof]
+    fn header_roundtrip_kind_and_sizing_invariants() {
+        const ALL_KINDS: [Kind; 18] = [
+            Kind::Pair,
+            Kind::Vector,
+            Kind::Closure,
+            Kind::Box,
+            Kind::Table,
+            Kind::Record,
+            Kind::Rtd,
+            Kind::Ephemerons,
+            Kind::Ratio,
+            Kind::Complex,
+            Kind::Code,
+            Kind::Dict,
+            Kind::Set,
+            Kind::Node,
+            Kind::String,
+            Kind::BigInt,
+            Kind::Foreign,
+            Kind::Bytevector,
+        ];
+
+        let kind_idx: usize = kani::any();
+        kani::assume(kind_idx < ALL_KINDS.len());
+        let kind = ALL_KINDS[kind_idx];
+        let len: usize = kani::any();
+        kani::assume(len <= CAGE_MASK);
+        let flag_byte: u8 = kani::any();
+        let flags = u64::from(flag_byte) << 8;
+
+        let h = header(kind, len, flags);
+        assert!(header_kind(h) == kind as u8);
+        assert!(Kind::of(header_kind(h)) == Some(kind));
+        assert!(header_len(h) == len);
+        assert!((h & 0xFF00) == flags);
+
+        // Exact `Kind::of` domain over all 256 bytes: never collides with 0, 15, FREE, FORWARDED.
+        let byte: u8 = kani::any();
+        let expected_valid = (1..=14).contains(&byte) || (16..=19).contains(&byte);
+        assert!(Kind::of(byte).is_some() == expected_valid);
+        assert!(Kind::of(0).is_none());
+        assert!(Kind::of(FREE as u8).is_none());
+        assert!(Kind::of(FORWARDED as u8).is_none());
+
+        // Bytevector and string word sizing over all cage-bounded byte lengths.
+        let bv_words = bytevector_words(len);
+        assert!(bv_words >= 1);
+        let payload_bytes = (bv_words - 1) * 8;
+        assert!(payload_bytes >= len && payload_bytes < len + 8);
+        assert!(string_words(len, true) == bv_words);
+        let non_ascii_words = string_words(len, false);
+        if len < STRING_INDEX_STRIDE {
+            assert!(non_ascii_words == bv_words);
+        } else {
+            assert!(non_ascii_words == bv_words + 1 + len / STRING_INDEX_STRIDE);
+        }
+
+        // Arbitrary 64-bit header invariants (e.g. forged or stale headers).
+        let raw_h: u64 = kani::any();
+        let raw_len = header_len(raw_h);
+        assert!(raw_len <= CAGE_MASK);
+        let k = header_kind(raw_h);
+        let expected_base = if k < Kind::String as u8 || (raw_h & INDIRECT != 0) {
+            1 + raw_len
+        } else if k == Kind::String as u8 {
+            string_words(raw_len, raw_h & STRING_INDEXED == 0)
+        } else if k == Kind::Bytevector as u8 {
+            bytevector_words(raw_len)
+        } else if k == Kind::BigInt as u8 {
+            1 + raw_len
+        } else {
+            2
+        };
+        let bw = base_words(raw_h);
+        assert!(bw == expected_base);
+        assert!(bw >= 1);
+        assert!(object_words(raw_h) == expected_base + usize::from(raw_h & HASH_STORED != 0));
+        let expected_traced =
+            (k < Kind::String as u8 && !(k == Kind::Vector as u8 && raw_h & VECTOR_FIXNUM != 0)) || (raw_h & INDIRECT != 0);
+        assert!(is_traced(raw_h) == expected_traced);
+    }
+
+    /// Exhaustive over all cage-aligned bases, word-aligned offsets, and arbitrary 64-bit word
+    /// indices `k` (using synthetic provenance-free pointers to verify address arithmetic, not
+    /// dereference or provenance safety): `word(obj, k)` stays inside the cage, preserves 8-byte
+    /// alignment, wraps modulo cage size, and is periodic with period `(CAGE_MASK + 1) / 8`.
+    #[kani::proof]
+    fn word_wraps_within_cage_and_preserves_alignment() {
+        let base_addr: usize = kani::any();
+        kani::assume(base_addr != 0 && (base_addr & CAGE_MASK) == 0);
+        let off: usize = kani::any();
+        kani::assume(off <= CAGE_MASK && (off & 7) == 0);
+        let k: usize = kani::any();
+
+        let obj = std::ptr::without_provenance_mut::<u64>(base_addr | off);
+        let w = word(obj, k);
+
+        assert!(w.addr() & !CAGE_MASK == base_addr);
+        assert!(w.addr() & 7 == 0);
+        assert!((w.addr() & CAGE_MASK) == (off.wrapping_add(k.wrapping_mul(8)) & CAGE_MASK));
+        assert!(word(obj, (CAGE_MASK + 1) / 8) == obj);
+    }
+
+    /// Exhaustive over all cage-aligned bases, word-aligned offsets, and arbitrary 64-bit
+    /// headers: `try_checked_field_len` (whose `None` branch `checked_field_len` maps
+    /// unconditionally to `corrupt`) returns `Some(header_len(h))` iff the header, all
+    /// `len` fields, and one trailing word (stored identity hash) fit inside the cage,
+    /// and returns `None` for every out-of-cage header.
+    #[kani::proof]
+    fn checked_field_len_matches_exact_cage_extent() {
+        let base_addr: usize = kani::any();
+        kani::assume(base_addr != 0 && (base_addr & CAGE_MASK) == 0);
+        let off: usize = kani::any();
+        kani::assume(off <= CAGE_MASK && (off & 7) == 0);
+        let h: u64 = kani::any();
+
+        let obj = std::ptr::without_provenance_mut::<u64>(base_addr | off);
+        let cage_size = CAGE_MASK + 1;
+        let len = header_len(h);
+        // Header + `len` fields + 1 trailing identity-hash word must all fit in the cage.
+        let fits = off + (2 + len) * 8 <= cage_size;
+
+        match try_checked_field_len(obj, h) {
+            Some(got) => {
+                assert!(fits);
+                assert!(got == len);
+                assert!(checked_field_len(obj, h) == len);
+            }
+            None => {
+                assert!(!fits);
+            }
+        }
+    }
+
+    /// Exhaustive over all cage-aligned bases satisfying CBMC's 48-bit pointer-offset model
+    /// (`base_addr + cage_size < 2^48`, excluding the cage ending at exactly `2^48`; uses
+    /// synthetic provenance-free pointers to verify address arithmetic, not dereference or
+    /// provenance safety), byte offsets in the cage, and `(at, len)` pairs satisfying the
+    /// documented `< 2^35` precondition: `try_bytes_at` (whose `None` branch `bytes_at` maps
+    /// unconditionally to `corrupt`) returns `Some(base + off + at)` iff `[off + at, off + at + len)`
+    /// lies within the cage, and `None` for every out-of-cage range.
+    #[kani::proof]
+    fn bytes_at_matches_exact_cage_bounds() {
+        let cage_size = CAGE_MASK + 1;
+        let base_addr: usize = kani::any();
+        kani::assume(base_addr != 0 && (base_addr & CAGE_MASK) == 0 && base_addr < (1usize << 48) - cage_size);
+        let off: usize = kani::any();
+        kani::assume(off <= CAGE_MASK);
+        let at: usize = kani::any();
+        let len: usize = kani::any();
+        kani::assume(at < (1usize << 35) && len < (1usize << 35));
+
+        let obj = std::ptr::without_provenance_mut::<u64>(base_addr | off);
+        let fits = off + at + len <= cage_size;
+
+        match try_bytes_at(obj, at, len) {
+            Some(p) => {
+                assert!(fits);
+                assert!(p.addr() == (base_addr | off) + at);
+                assert!(bytes_at(obj, at, len) == p);
+            }
+            None => {
+                assert!(!fits);
+            }
+        }
+    }
+
+    /// Verifies `kb_words` overflow/clamping over all `usize` inputs, the shared
+    /// `next_class_words` step over all `w in 16..MAX_SMALL`, and the full production
+    /// `build_class_words(MAX_SMALL)` sequence (all 61 classes up to 4096 words).
+    #[kani::proof]
+    #[kani::unwind(66)]
+    fn kb_words_and_production_class_words_invariants() {
+        let kb: usize = kani::any();
+        match kb_words(kb) {
+            Some(w) => {
+                assert!(kb <= usize::MAX / 128);
+                assert!(w == (kb * 128).min(NURSERY_WORDS_MAX));
+                assert!(w <= NURSERY_WORDS_MAX);
+            }
+            None => {
+                assert!(kb > usize::MAX / 128);
+            }
+        }
+
+        // Shared growth helper is strictly increasing, bounded by MAX_SMALL, and <= 12.5% + 1.
+        let w: usize = kani::any();
+        kani::assume((16..MAX_SMALL).contains(&w));
+        let next = next_class_words(w, MAX_SMALL);
+        assert!(next > w);
+        assert!(next <= MAX_SMALL);
+        assert!(next <= w + w / 8 + 1);
+
+        // Production class word table up to MAX_SMALL (4096): fits in u8 indices, strictly
+        // increasing, exact 2..=16 prefix, terminates at MAX_SMALL.
+        let words = build_class_words(MAX_SMALL);
+        assert!(words[0] == 2);
+        assert!(*words.last().unwrap() == MAX_SMALL);
+        assert!(words.len() <= u8::MAX as usize + 1);
+        let mut i = 1;
+        while i < words.len() {
+            assert!(words[i] > words[i - 1]);
+            if i < 15 {
+                assert!(words[i] == i + 2);
+            } else {
+                assert!(words[i] == next_class_words(words[i - 1], MAX_SMALL));
+            }
+            i += 1;
+        }
+    }
+
+    /// Verifies end-to-end `build_classes_up_to(32)` lookup table minimality across all three
+    /// regimes (exact `2..=16`, rounding 12.5% growth, and clamping to `max_small`) for every
+    /// `size <= 32`.
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn build_classes_lookup_table_is_minimal_up_to_32() {
+        const SMALL: usize = 32;
+        let table = build_classes_up_to(SMALL);
+        assert!(table.words[0] == 2);
+        assert!(*table.words.last().unwrap() == SMALL);
+        assert!(table.words.len() <= u8::MAX as usize + 1);
+        let size: usize = kani::any();
+        kani::assume(size <= SMALL);
+        let c = table.of[size] as usize;
+        assert!(c < table.words.len());
+        assert!(table.words[c] >= size);
+        if c > 0 {
+            assert!(table.words[c - 1] < size);
+        }
     }
 }

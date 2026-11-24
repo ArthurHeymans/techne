@@ -271,7 +271,7 @@ impl ToWorker {
             "repl-open" => ToWorker::ReplOpen { cid: p.uint()?, principal: p.failure()?, target: p.failure()? },
             "repl-data" => ToWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => ToWorker::ReplClose { cid: p.uint()? },
-            other => return Err(bad(&format!("no message {other}"))),
+            other => return Err(bad_message(other)),
         })
     }
 }
@@ -330,7 +330,7 @@ impl FromWorker {
             "fetch" => FromWorker::Fetch { rid: p.uint()?, fid: p.uint()?, service: p.string()?, request: p.any()? },
             "repl-data" => FromWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => FromWorker::ReplClose { cid: p.uint()? },
-            other => return Err(bad(&format!("no message {other}"))),
+            other => return Err(bad_message(other)),
         })
     }
 }
@@ -411,7 +411,17 @@ impl Parts {
 }
 
 fn bad(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("malformed message: {what}"))
+    let mut msg = String::with_capacity("malformed message: ".len() + what.len());
+    msg.push_str("malformed message: ");
+    msg.push_str(what);
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+fn bad_message(other: &str) -> io::Error {
+    let mut msg = String::with_capacity("malformed message: no message ".len() + other.len());
+    msg.push_str("malformed message: no message ");
+    msg.push_str(other);
+    io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
 const BOOL_FALSE: u8 = 0;
@@ -480,75 +490,81 @@ pub fn encode(d: &Data) -> Vec<u8> {
     out
 }
 
-/// The data `bytes` encode, all of them, within `MAX_DEPTH` and
-/// `MAX_PARTS`: no count or length is believed past the bytes left.
-pub fn decode(bytes: &[u8]) -> io::Result<Data> {
-    struct Reader<'a> {
-        bytes: &'a [u8],
-        parts: usize,
+struct Reader<'a> {
+    bytes: &'a [u8],
+    parts: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
+        if n > self.bytes.len() {
+            return Err("ends early");
+        }
+        let (head, rest) = self.bytes.split_at(n);
+        self.bytes = rest;
+        Ok(head)
     }
-    impl Reader<'_> {
-        fn take(&mut self, n: usize) -> io::Result<&[u8]> {
-            if n > self.bytes.len() {
-                return Err(bad("ends early"));
-            }
-            let (head, rest) = self.bytes.split_at(n);
-            self.bytes = rest;
-            Ok(head)
-        }
-        fn u32(&mut self) -> io::Result<usize> {
-            Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as usize)
-        }
-        fn u64(&mut self) -> io::Result<u64> {
-            Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
-        }
-        fn text(&mut self) -> io::Result<String> {
-            let n = self.u32()?;
-            String::from_utf8(self.take(n)?.to_vec()).map_err(|_| bad("text that is no UTF-8"))
-        }
-        /// A count of parts, each a byte at least: no more than are left.
-        fn count(&mut self) -> io::Result<usize> {
-            let n = self.u32()?;
-            if n > self.bytes.len() { Err(bad("more parts than bytes")) } else { Ok(n) }
-        }
-        fn data(&mut self, depth: usize) -> io::Result<Data> {
-            self.parts += 1;
-            if depth > MAX_DEPTH || self.parts > MAX_PARTS {
-                return Err(bad("too deep, or too many parts"));
-            }
-            let tag = self.take(1)?[0];
-            Ok(match tag {
-                BOOL_FALSE => Data::Bool(false),
-                BOOL_TRUE => Data::Bool(true),
-                INT => Data::Int(self.u64()? as i64),
-                FLOAT => Data::Float(f64::from_bits(self.u64()?)),
-                CHAR => Data::Char(char::from_u32(self.u32()? as u32).ok_or_else(|| bad("a char"))?),
-                STRING => Data::String(self.text()?),
-                SYMBOL => Data::Symbol(self.text()?),
-                KEYWORD => Data::Keyword(self.text()?),
-                BYTES => {
-                    let n = self.u32()?;
-                    Data::Bytes(self.take(n)?.to_vec())
-                }
-                LIST | VECTOR => {
-                    let n = self.count()?;
-                    let items = (0..n).map(|_| self.data(depth + 1)).collect::<io::Result<Vec<_>>>()?;
-                    if tag == LIST { Data::List(items) } else { Data::Vector(items) }
-                }
-                DICT => {
-                    let n = self.count()?;
-                    Data::Dict((0..n).map(|_| Ok((self.data(depth + 1)?, self.data(depth + 1)?))).collect::<io::Result<_>>()?)
-                }
-                _ => return Err(bad("no such part")),
-            })
-        }
+    fn u32(&mut self) -> Result<usize, &'static str> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as usize)
     }
+    fn u64(&mut self) -> Result<u64, &'static str> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn text(&mut self) -> Result<&'a str, &'static str> {
+        let n = self.u32()?;
+        std::str::from_utf8(self.take(n)?).map_err(|_| "text that is no UTF-8")
+    }
+    /// A count of parts, each a byte at least: no more than are left.
+    fn count(&mut self) -> Result<usize, &'static str> {
+        let n = self.u32()?;
+        if n > self.bytes.len() { Err("more parts than bytes") } else { Ok(n) }
+    }
+    fn data(&mut self, depth: usize) -> Result<Data, &'static str> {
+        self.parts += 1;
+        if depth > MAX_DEPTH || self.parts > MAX_PARTS {
+            return Err("too deep, or too many parts");
+        }
+        let tag = self.take(1)?[0];
+        Ok(match tag {
+            BOOL_FALSE => Data::Bool(false),
+            BOOL_TRUE => Data::Bool(true),
+            INT => Data::Int(self.u64()? as i64),
+            FLOAT => Data::Float(f64::from_bits(self.u64()?)),
+            CHAR => Data::Char(char::from_u32(self.u32()? as u32).ok_or("a char")?),
+            STRING => Data::String(self.text()?.to_owned()),
+            SYMBOL => Data::Symbol(self.text()?.to_owned()),
+            KEYWORD => Data::Keyword(self.text()?.to_owned()),
+            BYTES => {
+                let n = self.u32()?;
+                Data::Bytes(self.take(n)?.to_vec())
+            }
+            LIST | VECTOR => {
+                let n = self.count()?;
+                let items = (0..n).map(|_| self.data(depth + 1)).collect::<Result<Vec<_>, _>>()?;
+                if tag == LIST { Data::List(items) } else { Data::Vector(items) }
+            }
+            DICT => {
+                let n = self.count()?;
+                Data::Dict((0..n).map(|_| Ok((self.data(depth + 1)?, self.data(depth + 1)?))).collect::<Result<_, &'static str>>()?)
+            }
+            _ => return Err("no such part"),
+        })
+    }
+}
+
+fn decode_checked(bytes: &[u8]) -> Result<Data, &'static str> {
     let mut r = Reader { bytes, parts: 0 };
     let d = r.data(0)?;
     if !r.bytes.is_empty() {
-        return Err(bad("bytes after the message"));
+        return Err("bytes after the message");
     }
     Ok(d)
+}
+
+/// The data `bytes` encode, all of them, within `MAX_DEPTH` and
+/// `MAX_PARTS`: no count or length is believed past the bytes left.
+pub fn decode(bytes: &[u8]) -> io::Result<Data> {
+    decode_checked(bytes).map_err(bad)
 }
 
 /// Write `message` as a frame.
@@ -613,5 +629,219 @@ mod tests {
         assert!(decode(&[BOOL_TRUE, BOOL_TRUE]).is_err());
         assert!(decode(&[99]).is_err());
         assert!(FromWorker::from_data(Data::List(vec![Data::Symbol("response".into()), Data::Int(-1), Data::Int(0)])).is_err());
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Exhaustive over all `bool`, `i64`, `f64` bit patterns (including all NaNs), and `char`.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn encode_decode_roundtrip_scalars() {
+        let kind: u8 = kani::any();
+        kani::assume(kind < 4);
+        match kind {
+            0 => {
+                let b: bool = kani::any();
+                match decode_checked(&encode(&Data::Bool(b))) {
+                    Ok(Data::Bool(got)) => {
+                        assert!(got == b);
+                    }
+                    _ => panic!("expected Bool"),
+                }
+            }
+            1 => {
+                let n: i64 = kani::any();
+                match decode_checked(&encode(&Data::Int(n))) {
+                    Ok(Data::Int(got)) => {
+                        assert!(got == n);
+                    }
+                    _ => panic!("expected Int"),
+                }
+            }
+            2 => {
+                let f_bits: u64 = kani::any();
+                match decode_checked(&encode(&Data::Float(f64::from_bits(f_bits)))) {
+                    Ok(Data::Float(got)) => {
+                        assert!(got.to_bits() == f_bits);
+                    }
+                    _ => panic!("expected Float"),
+                }
+            }
+            _ => {
+                let c: char = kani::any();
+                match decode_checked(&encode(&Data::Char(c))) {
+                    Ok(Data::Char(got)) => {
+                        assert!(got == c);
+                    }
+                    _ => panic!("expected Char"),
+                }
+            }
+        }
+    }
+
+    /// `Reader` framing primitives (`take`, `u32`, `u64`, `count`) never panic on arbitrary
+    /// bytes up to 12 bytes and never trust a length or count past the remaining bytes.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn reader_framing_primitives_enforce_bounds() {
+        let buf: [u8; 12] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let slice = &buf[..len];
+
+        // `take` never panics for any `n: usize` and consumes exact prefix iff `n <= len`.
+        let n: usize = kani::any();
+        let mut r_take = Reader { bytes: slice, parts: 0 };
+        match r_take.take(n) {
+            Ok(head) => {
+                assert!(n <= len);
+                assert!(head.len() == n);
+                assert!(r_take.bytes.len() == len - n);
+            }
+            Err(_) => {
+                assert!(n > len);
+                assert!(r_take.bytes.len() == len);
+            }
+        }
+
+        // `u64` succeeds iff `len >= 8` and decodes big-endian bytes.
+        let mut r_u64 = Reader { bytes: slice, parts: 0 };
+        match r_u64.u64() {
+            Ok(v) => {
+                assert!(len >= 8);
+                assert!(v == u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]));
+                assert!(r_u64.bytes.len() == len - 8);
+            }
+            Err(_) => {
+                assert!(len < 8);
+            }
+        }
+
+        // `count` never trusts a big-endian u32 count larger than the remaining bytes.
+        let mut r_cnt = Reader { bytes: slice, parts: 0 };
+        match r_cnt.count() {
+            Ok(c) => {
+                assert!(len >= 4);
+                let expected = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                assert!(c == expected);
+                assert!(c <= len - 4);
+                assert!(r_cnt.bytes.len() == len - 4);
+            }
+            Err(_) => {
+                assert!(len < 4 || (u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize) > len - 4);
+            }
+        }
+    }
+
+    /// `Reader::text` enforces length bounds and valid UTF-8 on arbitrary byte slices up to
+    /// 7 bytes (4-byte length prefix + 0..=3 payload bytes).
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn reader_text_enforces_bounds_and_utf8() {
+        let buf: [u8; 7] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let slice = &buf[..len];
+
+        let mut r_txt = Reader { bytes: slice, parts: 0 };
+        match r_txt.text() {
+            Ok(s) => {
+                assert!(len >= 4);
+                let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                assert!(n <= len - 4);
+                assert!(s.len() == n);
+                assert!(s.as_bytes() == &slice[4..4 + n]);
+                assert!(r_txt.bytes.len() == len - 4 - n);
+            }
+            Err(_) => {
+                if len >= 4 {
+                    let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                    assert!(n > len - 4 || std::str::from_utf8(&slice[4..4 + n]).is_err());
+                }
+            }
+        }
+    }
+
+    /// Any single trailing byte after an encoded scalar is rejected.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn decode_rejects_trailing_byte_after_scalar() {
+        let kind: u8 = kani::any();
+        kani::assume(kind < 4);
+        let extra: u8 = kani::any();
+        let res = match kind {
+            0 => {
+                let b: bool = kani::any();
+                decode_checked(&[if b { BOOL_TRUE } else { BOOL_FALSE }, extra])
+            }
+            1 => {
+                let nb = kani::any::<i64>().to_be_bytes();
+                decode_checked(&[INT, nb[0], nb[1], nb[2], nb[3], nb[4], nb[5], nb[6], nb[7], extra])
+            }
+            2 => {
+                let fb = kani::any::<u64>().to_be_bytes();
+                decode_checked(&[FLOAT, fb[0], fb[1], fb[2], fb[3], fb[4], fb[5], fb[6], fb[7], extra])
+            }
+            _ => {
+                let cb = (kani::any::<char>() as u32).to_be_bytes();
+                decode_checked(&[CHAR, cb[0], cb[1], cb[2], cb[3], extra])
+            }
+        };
+        assert!(res.is_err());
+    }
+
+    /// `Reader::data` enforces `MAX_DEPTH` and `MAX_PARTS` boundaries for all out-of-range
+    /// `(depth, parts)` pairs without consuming input bytes, and accepts a scalar at the
+    /// exact `(MAX_DEPTH, MAX_PARTS - 1)` limit.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn reader_enforces_depth_and_parts_limits() {
+        let depth: usize = kani::any();
+        let parts: usize = kani::any();
+        kani::assume(parts < usize::MAX);
+        kani::assume(depth > MAX_DEPTH || parts >= MAX_PARTS);
+        let mut r = Reader { bytes: &[BOOL_TRUE], parts };
+        assert!(r.data(depth).is_err());
+        assert!(r.bytes.len() == 1);
+
+        let mut at_limit = Reader { bytes: &[BOOL_TRUE], parts: MAX_PARTS - 1 };
+        assert!(matches!(at_limit.data(MAX_DEPTH), Ok(Data::Bool(true))));
+        assert!(at_limit.bytes.is_empty());
+        assert!(at_limit.parts == MAX_PARTS);
+    }
+
+    /// `decode_checked` rejects every unknown tag (`> DICT`) and every invalid Unicode scalar
+    /// value for `CHAR`, while accepting every valid `CHAR` scalar value, and `bad` maps errors
+    /// to `io::ErrorKind::InvalidData`.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn decode_validates_tags_and_char_scalars() {
+        let check_char: bool = kani::any();
+        if check_char {
+            let raw: u32 = kani::any();
+            let rb = raw.to_be_bytes();
+            match decode_checked(&[CHAR, rb[0], rb[1], rb[2], rb[3]]) {
+                Ok(Data::Char(c)) => {
+                    assert!(c as u32 == raw);
+                }
+                Err(msg) => {
+                    assert!(char::from_u32(raw).is_none());
+                    assert!(bad(msg).kind() == io::ErrorKind::InvalidData);
+                }
+                Ok(_) => panic!("CHAR tag must decode to Data::Char"),
+            }
+        } else {
+            let bad_tag: u8 = kani::any();
+            kani::assume(bad_tag > DICT);
+            match decode_checked(&[bad_tag]) {
+                Err(msg) => {
+                    assert!(bad(msg).kind() == io::ErrorKind::InvalidData);
+                }
+                Ok(_) => panic!("unknown tag must be rejected"),
+            }
+        }
     }
 }

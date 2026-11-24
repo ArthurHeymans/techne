@@ -159,6 +159,41 @@ unsafe fn find(mut n: *mut u64, key: Value, hash: u32, s: usize) -> Option<(*mut
     }
 }
 
+/// Worst-case words `pair` can allocate when splitting two colliding entries
+/// starting below `shift` (which enters `pair` at `shift + BITS`).
+#[inline]
+fn pair_words_bound(shift: u32, s: usize) -> usize {
+    ((HASH_BITS - shift) / BITS + 2) as usize * pair_leaf_words(s)
+}
+
+/// Words allocated by a single-subnode branch created inside `pair` (header + 3 fields).
+const PAIR_BRANCH_WORDS: usize = 1 + 3;
+
+/// Words allocated by a two-entry or collision leaf created inside `pair` (header + 2 + 2*s fields).
+#[inline(always)]
+const fn pair_leaf_words(s: usize) -> usize {
+    1 + 2 + 2 * s
+}
+
+/// One step of `pair`: either a collision leaf, a shared-bit branch descending one level,
+/// or a two-entry leaf splitting at distinct bits `bit_a` and `bit_b`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairStep {
+    Collision,
+    Branch(u32),
+    Split { bit_a: u32, bit_b: u32 },
+}
+
+#[inline(always)]
+fn pair_step(hash_a: u32, hash_b: u32, shift: u32) -> PairStep {
+    if shift >= HASH_BITS {
+        PairStep::Collision
+    } else {
+        let (bit_a, bit_b) = (bit(hash_a, shift), bit(hash_b, shift));
+        if bit_a == bit_b { PairStep::Branch(bit_a) } else { PairStep::Split { bit_a, bit_b } }
+    }
+}
+
 /// The words an update of `key` allocates at most: a copy of each node on
 /// its path, an entry larger, and with `grow` the nodes that may separate
 /// it from the key already where it goes.
@@ -179,7 +214,7 @@ unsafe fn path_words(mut n: *mut u64, hash: u32, s: usize, grow: bool) -> usize 
                 continue;
             }
             if grow && dm & b != 0 {
-                words += ((HASH_BITS - shift) / BITS + 2) as usize * (3 + 2 * s);
+                words += pair_words_bound(shift, s);
             }
             return words;
         }
@@ -259,18 +294,25 @@ unsafe fn put(vm: &mut Vm, sp: Space, n: *mut u64, key: Value, val: Value, hash:
 unsafe fn pair(vm: &mut Vm, sp: Space, a: (Value, Value, u32), b: (Value, Value, u32), shift: u32, s: usize) -> Value {
     let entry = |e: (Value, Value, u32)| [e.0, e.1].into_iter().take(s);
     unsafe {
-        if shift >= HASH_BITS {
-            let fs: Vec<Value> = [int(-(s as i64)), int(a.2 as i64)].into_iter().chain(entry(a)).chain(entry(b)).collect();
-            return node(vm, sp, &fs);
+        match pair_step(a.2, b.2, shift) {
+            PairStep::Collision => {
+                let fs: Vec<Value> = [int(-(s as i64)), int(a.2 as i64)].into_iter().chain(entry(a)).chain(entry(b)).collect();
+                debug_assert_eq!(1 + fs.len(), pair_leaf_words(s));
+                node(vm, sp, &fs)
+            }
+            PairStep::Branch(bit_a) => {
+                let sub = pair(vm, sp, a, b, shift + BITS, s);
+                let fs = [int(0), int(bit_a as i64), sub];
+                debug_assert_eq!(1 + fs.len(), PAIR_BRANCH_WORDS);
+                node(vm, sp, &fs)
+            }
+            PairStep::Split { bit_a, bit_b } => {
+                let (first, second) = if bit_a < bit_b { (a, b) } else { (b, a) };
+                let fs: Vec<Value> = [int((bit_a | bit_b) as i64), int(0)].into_iter().chain(entry(first)).chain(entry(second)).collect();
+                debug_assert_eq!(1 + fs.len(), pair_leaf_words(s));
+                node(vm, sp, &fs)
+            }
         }
-        let (bit_a, bit_b) = (bit(a.2, shift), bit(b.2, shift));
-        if bit_a == bit_b {
-            let sub = pair(vm, sp, a, b, shift + BITS, s);
-            return node(vm, sp, &[int(0), int(bit_a as i64), sub]);
-        }
-        let (first, second) = if bit_a < bit_b { (a, b) } else { (b, a) };
-        let fs: Vec<Value> = [int((bit_a | bit_b) as i64), int(0)].into_iter().chain(entry(first)).chain(entry(second)).collect();
-        node(vm, sp, &fs)
     }
 }
 
@@ -372,11 +414,16 @@ fn empty(vm: &mut Vm, sp: Space, kind: Kind) -> Value {
     wrap(vm, sp, kind, 0, root)
 }
 
+/// Words reserved in `make_room` for an update of `d` at `key` (path + wrapper).
+fn update_words(d: Value, hash: u32, grow: bool) -> usize {
+    3 + unsafe { path_words(root(d), hash, stride_of(d), grow) }
+}
+
 /// Where the nodes of an update of `d` at `key` go, collecting first if
 /// the nursery lacks the room; `d`, `key` and `val` again, as they may
 /// have moved.
 fn make_room(vm: &mut Vm, d: Value, key: Value, val: Value, hash: u32, grow: bool) -> (Space, Value, Value, Value) {
-    let words = unsafe { path_words(root(d), hash, stride_of(d), grow) } + 3;
+    let words = update_words(d, hash, grow);
     if words > vm.heap.nursery_capacity() / 2 {
         return (Space::Old, d, key, val);
     }
@@ -417,6 +464,11 @@ pub(crate) fn remove(vm: &mut Vm, d: Value, key: Value) -> Value {
         return d;
     }
     let (sp, d, key, _) = make_room(vm, d, key, Value::VOID, hash, false);
+    remove_in(vm, sp, d, key, hash)
+}
+
+fn remove_in(vm: &mut Vm, sp: Space, d: Value, key: Value, hash: u32) -> Value {
+    let s = stride_of(d);
     let kind = if s == 2 { Kind::Dict } else { Kind::Set };
     match unsafe { cut(vm, sp, root(d), key, hash, 0, s, true) } {
         Cut::Node(r) => {
@@ -834,5 +886,172 @@ mod tests {
     #[test]
     fn deep_paths() {
         check(Some(deep));
+    }
+
+    /// Compare `update_words` (the `make_room` / `path_words` allowance) against actual
+    /// nursery words consumed by `insert_in` and `remove_in` across real, colliding, and
+    /// deep-path hash distributions for both dicts (`s == 2`) and sets (`s == 1`).
+    #[test]
+    fn path_words_bounds_actual_nursery_consumption() {
+        for hasher in [None, Some(colliding as Hasher), Some(deep as Hasher)] {
+            FAKE.with(|f| f.set(hasher));
+            let mut vm = Vm::new();
+            // `TECHNE_GC_STRESS` collects on every allocation, resetting the
+            // nursery between the samples below: measure within one epoch.
+            vm.set_gc_stress(false, false);
+            let _world = vm.enter_account();
+            for empty_expr in ["(dict)", "(set)"] {
+                let mut d = vm.eval_source_raw(empty_expr).unwrap();
+                let root_handle = vm.root(d);
+                let mut young_inserts = 0usize;
+                let mut young_removes = 0usize;
+                for i in 0..64i64 {
+                    let key = int(i);
+                    let val = int(i * 3 + 1);
+                    let h = key_hash(&mut vm, key);
+                    let (sp, cur, k, v) = make_room(&mut vm, root_handle.get(), key, val, h, true);
+                    let allowance = update_words(cur, h, true);
+                    let before = vm.heap.nursery_used();
+                    d = insert_in(&mut vm, sp, cur, k, v, h);
+                    if matches!(sp, Space::Young) {
+                        young_inserts += 1;
+                        let used_bytes = vm.heap.nursery_used() - before;
+                        assert_eq!(used_bytes % 8, 0);
+                        let used_words = used_bytes / 8;
+                        assert!(used_words <= allowance, "{empty_expr} insert step {i}: used {used_words} words > allowance {allowance}");
+                    }
+                    root_handle.set(d);
+                }
+                for i in 0..64i64 {
+                    let key = int(i);
+                    let h = key_hash(&mut vm, key);
+                    let (sp, cur, k, _) = make_room(&mut vm, root_handle.get(), key, Value::VOID, h, false);
+                    let allowance = update_words(cur, h, false);
+                    let before = vm.heap.nursery_used();
+                    d = remove_in(&mut vm, sp, cur, k, h);
+                    if matches!(sp, Space::Young) {
+                        young_removes += 1;
+                        let used_bytes = vm.heap.nursery_used() - before;
+                        assert_eq!(used_bytes % 8, 0);
+                        let used_words = used_bytes / 8;
+                        assert!(used_words <= allowance, "{empty_expr} remove step {i}: used {used_words} words > allowance {allowance}");
+                    }
+                    root_handle.set(d);
+                }
+                assert!(young_inserts > 0 && young_removes > 0);
+            }
+            FAKE.with(|f| f.set(None));
+        }
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Exhaustive over all 32-bit hashes, all 7 valid HAMT trie levels (`shift` in
+    /// `{0, 5, 10, 15, 20, 25, 30}`), all 32-bit bitmaps, and all independent bit
+    /// positions `0..32`: `bit` extracts the exact 5-bit hash digit at `shift` as a
+    /// single-bit mask (confined to bits `0..4` at `shift == 30`), and `index` is a
+    /// strictly monotone, in-bounds bijection from set bits of `map` to `0..popcount`.
+    #[kani::proof]
+    fn bit_and_index_invariants() {
+        let level: u32 = kani::any();
+        kani::assume(level <= 6);
+        let shift = level * BITS;
+        let h: u32 = kani::any();
+        let b = bit(h, shift);
+
+        let expected_digit = (h >> shift) & 0x1f;
+        assert!(b.is_power_of_two());
+        assert!(b.trailing_zeros() == expected_digit);
+        assert!(b == (1u32 << expected_digit));
+        if shift == 30 {
+            assert!(expected_digit < 4);
+            assert!(b <= (1 << 3));
+        }
+
+        // Check `index` over arbitrary 32-bit bitmaps and independent symbolic bit
+        // positions `0..32` (so every position is verified regardless of `shift`).
+        let map: u32 = kani::any();
+        let pos1: u32 = kani::any();
+        let pos2: u32 = kani::any();
+        kani::assume(pos1 < 32 && pos2 < 32);
+        let m1 = 1u32 << pos1;
+        let m2 = 1u32 << pos2;
+
+        let pop = map.count_ones() as usize;
+        let idx1 = index(map, m1);
+        let idx2 = index(map, m2);
+
+        assert!(idx1 <= pop);
+        assert!(idx2 <= pop);
+        if map & m1 != 0 {
+            assert!(idx1 < pop);
+        }
+        // Toggling `m1` itself does not affect the count of lower bits.
+        assert!(index(map | m1, m1) == idx1);
+        assert!(index(map ^ m1, m1) == idx1);
+
+        if pos1 == pos2 {
+            assert!(idx1 == idx2);
+        } else if pos1 < pos2 {
+            if map & m1 != 0 && map & m2 != 0 {
+                assert!(idx1 < idx2);
+            } else {
+                assert!(idx1 <= idx2);
+            }
+        }
+    }
+
+    /// Exhaustive over all pairs of 32-bit hashes `(h0, h1)`, all 7 entry levels
+    /// `shift` in `{0, 5, 10, 15, 20, 25, 30}` where `put` calls `pair(..., shift + BITS, s)`,
+    /// and both strides `s` in `{1, 2}`: driving the shared production `pair_step` decision
+    /// function and node-word sizes (`PAIR_BRANCH_WORDS`, `pair_leaf_words`) terminates
+    /// within `7 - level` steps, stays within the `deeper_than_hashes` guard
+    /// (`cur_shift <= HASH_BITS + BITS`), collides iff `h0 == h1`, and allocates at most
+    /// `pair_words_bound(shift, s)` words.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn pair_allocation_bounded_by_path_words_allowance() {
+        let level: u32 = kani::any();
+        kani::assume(level <= 6);
+        let shift = level * BITS;
+        let s: usize = kani::any();
+        kani::assume(s == 1 || s == 2);
+        let h0: u32 = kani::any();
+        let h1: u32 = kani::any();
+        // `put` only calls `pair` when the entries already agreed on bits `0..shift + BITS`.
+        let agreed_bits = shift + BITS;
+        let prefix_mask = if agreed_bits >= HASH_BITS { u32::MAX } else { (1u32 << agreed_bits) - 1 };
+        kani::assume((h0 & prefix_mask) == (h1 & prefix_mask));
+
+        let mut cur_shift = shift + BITS;
+        let mut words = 0usize;
+        let mut steps = 0u32;
+        let collided = loop {
+            steps += 1;
+            match pair_step(h0, h1, cur_shift) {
+                PairStep::Collision => {
+                    words += pair_leaf_words(s);
+                    break true;
+                }
+                PairStep::Branch(_) => {
+                    words += PAIR_BRANCH_WORDS;
+                    cur_shift += BITS;
+                }
+                PairStep::Split { bit_a, bit_b } => {
+                    assert!(bit_a != bit_b);
+                    words += pair_leaf_words(s);
+                    break false;
+                }
+            }
+        };
+        let bound = pair_words_bound(shift, s);
+
+        assert!(steps <= 7 - level);
+        assert!(shift + steps * BITS <= HASH_BITS + BITS);
+        assert!(collided == (h0 == h1));
+        assert!(words <= bound);
     }
 }

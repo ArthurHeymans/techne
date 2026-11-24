@@ -309,8 +309,12 @@ fn extended(layout: Layout) -> Option<(usize, Layout)> {
     // No overflow: a layout's size is at most `isize::MAX`.
     let at = layout.size().next_multiple_of(std::mem::align_of::<u32>());
     let align = layout.align().max(std::mem::align_of::<u32>());
-    // What `Layout` requires of the size, its alignment being valid already.
-    (at <= isize::MAX as usize - TRAILER - (align - 1)).then(|| (at, unsafe { Layout::from_size_align_unchecked(at + TRAILER, align) }))
+    // What `Layout` requires of the size, its alignment being valid already
+    // (at most `isize::MAX + 1`, which leaves no room for the trailer).
+    (isize::MAX as usize - (align - 1))
+        .checked_sub(TRAILER)
+        .is_some_and(|most| at <= most)
+        .then(|| (at, unsafe { Layout::from_size_align_unchecked(at + TRAILER, align) }))
 }
 
 /// `extended` of a layout that was extended before (a live block's).
@@ -398,12 +402,14 @@ fn add(tag: Tag, bytes: isize) {
     if slot == 0 || bytes == 0 {
         return;
     }
+    // The count wraps as its packed word does: a credit of `isize::MIN`
+    // (a budget giving back `1 << 63` bytes) must not overflow on the way.
     let updated = TABLE[slot as usize]
-        .try_update(Relaxed, Relaxed, |w| (generation_of(w) == generation).then(|| word(generation, count_of(w) + bytes)));
+        .try_update(Relaxed, Relaxed, |w| (generation_of(w) == generation).then(|| word(generation, count_of(w).wrapping_add(bytes))));
     if let Ok(w) = updated
         && bytes > 0
     {
-        check(tag, count_of(w) + bytes);
+        check(tag, count_of(w).saturating_add(bytes));
     }
 }
 
@@ -615,5 +621,77 @@ impl Drop for Entered {
         debug_assert!(matches!(current(), t if t == self.entered || t == 0), "accounts left in the order entered");
         flush();
         switch(self.previous);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Exhaustive over all valid `Layout`s on 64-bit targets: `extended` never overflows,
+    /// produces a valid `Layout` when returning `Some`, aligns the trailer minimally to
+    /// `align_of::<u32>()`, and returns `None` iff adding the aligned trailer would exceed
+    /// `Layout`'s maximum representable size.
+    #[kani::proof]
+    fn extended_layout_matches_spec_and_fits_trailer() {
+        let align_shift: u32 = kani::any();
+        kani::assume(align_shift < usize::BITS);
+        let align = 1usize << align_shift;
+        let max_valid_size = (isize::MAX as usize) - (align - 1);
+        let size: usize = kani::any();
+        kani::assume(size <= max_valid_size);
+
+        let layout = Layout::from_size_align(size, align).unwrap();
+        let expected_align = align.max(std::mem::align_of::<u32>());
+        let expected_at = size.next_multiple_of(std::mem::align_of::<u32>());
+        let expected_layout = expected_at.checked_add(TRAILER).and_then(|s| Layout::from_size_align(s, expected_align).ok());
+
+        match extended(layout) {
+            Some((at, ext)) => {
+                assert!(at == expected_at);
+                assert!(at >= size);
+                assert!(at % std::mem::align_of::<u32>() == 0);
+                assert!(at - size < std::mem::align_of::<u32>());
+                assert!(ext.align() == expected_align);
+                assert!(ext.size() == at + TRAILER);
+                assert!(expected_layout == Some(ext));
+            }
+            None => {
+                assert!(expected_layout.is_none());
+            }
+        }
+    }
+
+    /// Exhaustive over all 16-bit generations, all signed 48-bit byte counts, all `usize`
+    /// byte limits, and all `(slot: u32, generation: u16)` pairs: `word`, `generation_of`,
+    /// `count_of`, `limit_word`, and `tag` match the exact bit layout and clamp without overlap.
+    #[kani::proof]
+    fn word_limit_word_and_tag_bitpacking() {
+        const MAX_SIGNED_48: usize = (1usize << 47) - 1;
+        let generation: u16 = kani::any();
+        let min_count: isize = -(1isize << 47);
+        let max_count: isize = MAX_SIGNED_48 as isize;
+        let count: isize = kani::any();
+        kani::assume(count >= min_count && count <= max_count);
+
+        let w = word(generation, count);
+        assert!(w == ((generation as u64) << 48) | ((count as u64) & ((1u64 << 48) - 1)));
+        assert!(generation_of(w) == generation);
+        assert!(count_of(w) == count);
+
+        let bytes: usize = kani::any();
+        let lw = limit_word(generation, bytes);
+        let expected_limit = bytes.min(MAX_SIGNED_48);
+        assert!(lw == ((generation as u64) << 48) | (expected_limit as u64));
+        assert!(generation_of(lw) == generation);
+        assert!(count_of(lw) == expected_limit as isize);
+        assert!(count_of(lw) >= 0);
+
+        let slot: u32 = kani::any();
+        let t = tag(slot, generation);
+        assert!(t == (slot as u64) | ((generation as u64) << 32));
+        assert!(t as u32 == slot);
+        assert!((t >> 32) as u16 == generation);
+        assert!((t >> 48) == 0);
     }
 }

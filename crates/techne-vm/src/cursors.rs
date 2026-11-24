@@ -41,16 +41,19 @@ impl<'a> Text<'a> {
         at == self.len() || self.0.get(at).is_some_and(|&b| (b as i8) >= -0x40)
     }
 
-    /// The character at `at` and its length in bytes; none at the end.
-    fn char_at(self, at: usize) -> Option<(char, usize)> {
+    /// Decode the character at `at` and its length in bytes: `None` at or past
+    /// the end, `Some(Ok((c, len)))` on valid UTF-8, `Some(Err(()))` if the bytes
+    /// at `at` are not valid UTF-8.
+    fn try_char_at(self, at: usize) -> Option<Result<(char, usize), ()>> {
         let rest = self.0.get(at..).filter(|r| !r.is_empty())?;
         let window = &rest[..rest.len().min(4)];
-        let valid = match std::str::from_utf8(window) {
-            Ok(s) => s,
-            Err(e) => heap::utf8(&window[..e.valid_up_to()]),
-        };
-        let c = valid.chars().next().unwrap_or_else(|| heap::corrupt("a string's bytes are no UTF-8"));
-        Some((c, c.len_utf8()))
+        let valid = window.utf8_chunks().next().map_or("", |chunk| chunk.valid());
+        Some(valid.chars().next().map(|c| (c, c.len_utf8())).ok_or(()))
+    }
+
+    /// The character at `at` and its length in bytes; none at the end.
+    fn char_at(self, at: usize) -> Option<(char, usize)> {
+        Some(self.try_char_at(at)?.unwrap_or_else(|()| heap::corrupt("a string's bytes are no UTF-8")))
     }
 
     /// The text of bytes `a..b`, checked.
@@ -231,5 +234,181 @@ pub fn install(vm: &mut Vm) {
         "(string-copy/cursors string [start] [end])" => |vm: &mut Vm, a, n| { let (x, y) = range(vm, a, n, 0, 1, "string-copy/cursors")?; copy(vm, a, x, y) };
         "(%string-contains/cursor string1 string2 [start1] [end1] [start2] [end2])" => |vm: &mut Vm, a, n| contains(vm, a, n, false, "string-contains");
         "(%string-contains-right/cursor string1 string2 [start1] [end1] [start2] [end2])" => |vm: &mut Vm, a, n| contains(vm, a, n, true, "string-contains-right");
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Exhaustive over arbitrary byte slices up to 8 bytes (possibly invalid UTF-8) and
+    /// all 64-bit offsets `at`: `Text::is_boundary` never panics, always returns `false`
+    /// past `len`, and on valid UTF-8 slices up to 4 bytes matches `str::is_char_boundary`.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn text_is_boundary_matches_utf8_and_handles_arbitrary_bytes() {
+        let check_utf8: bool = kani::any();
+        if check_utf8 {
+            let buf: [u8; 4] = kani::any();
+            let len: usize = kani::any();
+            kani::assume(len <= buf.len());
+            let Ok(s) = std::str::from_utf8(&buf[..len]) else {
+                return;
+            };
+            let t = Text(s.as_bytes());
+            let at: usize = kani::any();
+            assert!(t.is_boundary(at) == s.is_char_boundary(at));
+        } else {
+            let buf: [u8; 8] = kani::any();
+            let len: usize = kani::any();
+            kani::assume(len <= buf.len());
+            let t = Text(&buf[..len]);
+            let at: usize = kani::any();
+            let res = t.is_boundary(at);
+            if at > len {
+                assert!(!res);
+            } else if at == len {
+                assert!(res);
+            } else {
+                // UTF-8 continuation bytes have top two bits `10` (0x80..=0xBF).
+                assert!(res == !(0x80..=0xBF).contains(&buf[at]));
+            }
+        }
+    }
+
+    /// Exhaustive over all arbitrary byte windows up to 4 bytes (valid and malformed UTF-8,
+    /// including invalid lead bytes, lone continuations, overlong sequences, surrogates, and
+    /// truncated multibyte scalars) and offsets `at in 0..=5`: `Text::try_char_at` (using
+    /// `utf8_chunks`) returns the exact same `Option<Result<(char, usize), ()>>` as the
+    /// original `std::str::from_utf8` valid-prefix rule.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn text_try_char_at_matches_from_utf8_on_arbitrary_bytes() {
+        let buf: [u8; 4] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let at: usize = kani::any();
+        kani::assume(at <= 5);
+
+        let slice = &buf[..len];
+        let actual = Text(slice).try_char_at(at);
+        let expected = slice.get(at..).filter(|r| !r.is_empty()).map(|rest| {
+            let window = &rest[..rest.len().min(4)];
+            let valid = match std::str::from_utf8(window) {
+                Ok(s) => s,
+                Err(e) => std::str::from_utf8(&window[..e.valid_up_to()]).unwrap(),
+            };
+            valid.chars().next().map(|c| (c, c.len_utf8())).ok_or(())
+        });
+
+        assert!(actual == expected);
+    }
+
+    /// Exhaustive over all pairs of Unicode scalar values `(c0, c1)` (1-, 2-, 3-, and 4-byte
+    /// UTF-8), both standalone `c0` and `c0` followed by `c1` (exercising every 4-byte window
+    /// truncation combination inside `Text::char_at`): `Text::char_at` decodes `(c0, w0)` at
+    /// offset 0 and `(c1, w1)` at the nonzero offset `w0`, returns `None` at the end, and
+    /// `Text::is_boundary` holds at character boundaries and fails on every interior
+    /// continuation byte.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn text_char_at_decodes_all_unicode_scalars_and_truncated_windows() {
+        let c0: char = kani::any();
+        let with_trailer: bool = kani::any();
+        let mut buf = [0u8; 8];
+        let w0 = c0.encode_utf8(&mut buf).len();
+        let (len, trailer) = if with_trailer {
+            let c1: char = kani::any();
+            let w1 = c1.encode_utf8(&mut buf[w0..]).len();
+            (w0 + w1, Some((c1, w1)))
+        } else {
+            (w0, None)
+        };
+        let t = Text(&buf[..len]);
+
+        assert!(t.is_boundary(0));
+        assert!(t.is_boundary(w0));
+        assert!(t.is_boundary(len));
+        for i in 1..4 {
+            if i < w0 {
+                assert!(!t.is_boundary(i));
+            }
+        }
+        assert!(t.char_at(0) == Some((c0, w0)));
+        if let Some((c1, w1)) = trailer {
+            assert!(t.char_at(w0) == Some((c1, w1)));
+        }
+        assert!(t.char_at(len).is_none());
+    }
+
+    /// Exhaustive over all 1,112,064 Unicode scalar values `c` (1-, 2-, 3-, and 4-byte UTF-8):
+    /// `Text::forward(0, 1)` advances to `c.len_utf8()`, `Text::back(w, 1)` returns `Some(0)`,
+    /// zero-step calls are identities, and stepping past either end returns `None`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn text_single_step_forward_and_back_all_unicode_scalars() {
+        let c: char = kani::any();
+        let mut buf = [0u8; 4];
+        let w = c.encode_utf8(&mut buf).len();
+        let t = Text(&buf[..w]);
+
+        assert!(t.forward(0, 0) == Some(0));
+        assert!(t.forward(w, 0) == Some(w));
+        assert!(t.back(0, 0) == Some(0));
+        assert!(t.back(w, 0) == Some(w));
+        assert!(t.back(0, 1).is_none());
+        assert!(t.forward(w, 1).is_none());
+
+        let check_back: bool = kani::any();
+        if check_back {
+            assert!(t.back(w, 1) == Some(0));
+        } else {
+            assert!(t.forward(0, 1) == Some(w));
+        }
+    }
+
+    /// Helper building a 2-character UTF-8 buffer from two arbitrary Unicode scalars
+    /// (covering all 1,112,064 × 1,112,064 pairs across 1-, 2-, 3-, and 4-byte encodings).
+    fn two_scalar_sample() -> ([u8; 8], [usize; 3]) {
+        let c0: char = kani::any();
+        let c1: char = kani::any();
+        let mut buf = [0u8; 8];
+        let w0 = c0.encode_utf8(&mut buf).len();
+        let w1 = c1.encode_utf8(&mut buf[w0..]).len();
+        (buf, [0, w0, w0 + w1])
+    }
+
+    /// Exhaustive over all pairs of Unicode scalars `(c0, c1)` (1-, 2-, 3-, and 4-byte UTF-8),
+    /// every character boundary `idx in 0..=2`, and every step count `n in 0..=3`:
+    /// `Text::forward` lands on exact character boundaries and returns `None` iff `idx + n > 2`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn text_multi_step_forward_two_scalars() {
+        let (buf, bounds) = two_scalar_sample();
+        let t = Text(&buf[..bounds[2]]);
+        let idx: usize = kani::any();
+        kani::assume(idx <= 2);
+        let n: usize = kani::any();
+        kani::assume(n <= 3);
+
+        let expected = (idx + n <= 2).then(|| bounds[idx + n]);
+        assert!(t.forward(bounds[idx], n) == expected);
+    }
+
+    /// Exhaustive over all pairs of Unicode scalars `(c0, c1)` (1-, 2-, 3-, and 4-byte UTF-8),
+    /// every character boundary `idx in 0..=2`, and every step count `n in 0..=3`:
+    /// `Text::back` lands on exact character boundaries and returns `None` iff `n > idx`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn text_multi_step_back_two_scalars() {
+        let (buf, bounds) = two_scalar_sample();
+        let t = Text(&buf[..bounds[2]]);
+        let idx: usize = kani::any();
+        kani::assume(idx <= 2);
+        let n: usize = kani::any();
+        kani::assume(n <= 3);
+
+        let expected = (n <= idx).then(|| bounds[idx - n]);
+        assert!(t.back(bounds[idx], n) == expected);
     }
 }

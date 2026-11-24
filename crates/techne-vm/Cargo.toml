@@ -122,3 +122,6 @@ required-features = ["counting-allocator"]
 missing_safety_doc = "allow"
 not_unsafe_ptr_arg_deref = "allow"
 too_many_arguments = "allow"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
