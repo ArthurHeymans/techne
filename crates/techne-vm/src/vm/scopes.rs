@@ -22,6 +22,10 @@ use crate::{
     vm::{Error, SpecialObj, Vm},
 };
 
+/// Task-local keys of `current-scope` and `%staging-scope`.
+pub(crate) const CURRENT_SCOPE_KEY: i64 = -3;
+pub(crate) const STAGING_SCOPE_KEY: i64 = -4;
+
 /// The fields of a scope's record. The prelude keeps a package
 /// generation's held-back registrations in `pending`, and the scope it
 /// succeeds in `predecessor`.
@@ -214,6 +218,73 @@ impl Vm {
         }
         failure
     }
+
+    /// Move everything owned by `child_slot` (resources and child scopes) into
+    /// `parent_slot` without running cleanups, and retire `child_slot`. Returns
+    /// the moved resource values (oldest first) so Scheme can update `%owners`.
+    fn adopt_scope(&mut self, child_slot: usize, parent_slot: usize) -> Result<Value, Error> {
+        if child_slot == parent_slot {
+            return Ok(Value::NIL);
+        }
+        let child = self.scopes[child_slot].take().ok_or_else(|| Error::new("%scope-adopt!: child scope is shut down"))?;
+        self.free_scopes.push(child_slot);
+        unsafe { set_field(child.record.as_ptr(), SLOT, Value::FALSE) };
+        if let Some(p) = child.parent
+            && let Some(parent) = self.scopes[p].as_mut()
+        {
+            parent.children.retain(|&c| c != child_slot);
+        }
+        let parent_record = self.scope(parent_slot).record;
+        for &c in &child.children {
+            let c_record = {
+                let cs = self.scope_mut(c);
+                cs.parent = Some(parent_slot);
+                cs.record
+            };
+            unsafe { set_field(c_record.as_ptr(), PARENT, parent_record) };
+            self.write_barrier(c_record.as_ptr(), parent_record);
+        }
+        let moved: Vec<Root> = child.owned.iter().map(|o| self.root(o.value)).collect();
+        {
+            let parent = self.scope_mut(parent_slot);
+            // Keep newest-first child order: child's children were created after older siblings.
+            let mut children = child.children;
+            children.extend(parent.children.iter().copied());
+            parent.children = children;
+            parent.owned.extend(child.owned);
+        }
+        Ok(list_of(self, moved.iter().map(Root::get).collect()))
+    }
+
+    /// Run `f` with `current-scope` set to `%root-scope` when `module` belongs
+    /// to the world while a package is staged here, or to `%staging-scope` when
+    /// `module` belongs to the staged package (matching `%load-forms` for the
+    /// synchronous Rust load fallbacks).
+    pub(crate) fn in_module_load_scope<T>(&mut self, module: u32, f: impl FnOnce(&mut Self) -> T) -> T {
+        if self.staging_here().is_none() {
+            return f(self);
+        }
+        let target = if self.modules[module as usize].generation == 0 {
+            self.scopes.first().and_then(|s| s.as_ref()).map(|s| s.record)
+        } else {
+            self.locals.get(&STAGING_SCOPE_KEY).map(Root::get).filter(|v| v.is_truthy())
+        };
+        let Some(target) = target else {
+            return f(self);
+        };
+        let target_root = self.root(target);
+        let prev = self.locals.insert(CURRENT_SCOPE_KEY, target_root);
+        let out = f(self);
+        match prev {
+            Some(old) => {
+                self.locals.insert(CURRENT_SCOPE_KEY, old);
+            }
+            None => {
+                self.locals.remove(&CURRENT_SCOPE_KEY);
+            }
+        }
+        out
+    }
 }
 
 /// The failure to report of `first` and `later`: the first, unless only
@@ -286,6 +357,8 @@ fn scope_shutdown(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
 
 pub fn install(vm: &mut Vm) {
     crate::natives! { vm;
+        "(%current-scope-key)" => |_: &mut Vm, _, _| Ok(Value::int_unchecked(CURRENT_SCOPE_KEY));
+        "(%staging-scope-key)" => |_: &mut Vm, _, _| Ok(Value::int_unchecked(STAGING_SCOPE_KEY));
         "(%make-scope name parent)" => |vm: &mut Vm, a, _| vm.make_scope(arg(vm, a, 0), arg(vm, a, 1));
         /// Return #t if OBJ is a scope.
         "(scope? obj)" => |vm: &mut Vm, a, _| {
@@ -320,7 +393,7 @@ pub fn install(vm: &mut Vm) {
             Ok(arg(vm, a, 1))
         };
         "(%scope-disown! s resource)" => |vm: &mut Vm, a, _| {
-            let Some(slot) = vm.scope_slot(arg(vm, a, 0), "scope-disown!")? else { return Ok(Value::FALSE) };
+            let Some(slot) = vm.scope_slot(arg(vm, a, 0), "%scope-disown!")? else { return Ok(Value::FALSE) };
             let r = arg(vm, a, 1);
             let Some(i) = vm.scope(slot).owned.iter().position(|o| o.value == r) else { return Ok(Value::FALSE) };
             let o = vm.scope_mut(slot).owned.remove(i);
@@ -328,6 +401,11 @@ pub fn install(vm: &mut Vm) {
             vm.regs[a] = o.cleanup;
             vm.regs[a + 1] = o.done;
             Ok(vm.alloc_pair_raw(arg(vm, a, 0), arg(vm, a, 1)))
+        };
+        "(%scope-adopt! child parent)" => |vm: &mut Vm, a, _| {
+            let child = vm.live_scope(arg(vm, a, 0), "%scope-adopt!")?;
+            let parent = vm.live_scope(arg(vm, a, 1), "%scope-adopt!")?;
+            vm.adopt_scope(child, parent)
         };
         "(%scope-shutdown! s)" => scope_shutdown;
     }

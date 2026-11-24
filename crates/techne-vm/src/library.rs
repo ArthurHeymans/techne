@@ -357,23 +357,23 @@ impl Vm {
         // A compiler/host fallback: it must return with the library loaded
         // before the enclosing form can compile. The Scheme forms loop uses
         // library_forms instead, so its bodies can wait without Rust nesting.
-        let result = (|| {
+        let result = self.in_module_load_scope(m, |vm| {
             let mut imports = Vec::new();
             let mut body = Vec::new();
-            self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body)?;
+            vm.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body)?;
             for (form, file) in imports {
-                let dir = self.import_dir(file);
-                self.import(m, &form.list().unwrap()[1..], &dir)?;
+                let dir = vm.import_dir(file);
+                vm.import(m, &form.list().unwrap()[1..], &dir)?;
             }
             for (form, _) in &body {
-                predeclare(self, m, form);
+                predeclare(vm, m, form);
             }
             for (form, file) in &body {
-                self.eval_form(m, *file, form)?;
+                vm.eval_form(m, *file, form)?;
             }
-            self.exported(m, &self.modules[m as usize].name)?;
+            vm.exported(m, &vm.modules[m as usize].name)?;
             Ok(())
-        })();
+        });
         match result {
             Ok(()) => self.end_module_load(m),
             Err(_) => self.abort_library(m),

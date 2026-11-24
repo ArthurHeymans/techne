@@ -95,9 +95,25 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
          (%forms-evaluated forms)
          value))
      (lambda () (%leave-module) (%module-loaded forms))))
-  (if (%forms-of-world? forms)
-      (%call-in-scope %root-scope load)
-      (load)))
+  (cond ((%forms-of-world? forms)
+         ;; Run world-module initialization in a temporary child of %root-scope:
+         ;; failure shuts it down (cancelling tasks and removing registrations),
+         ;; while success adopts its resources and child scopes into %root-scope.
+         (let ((tmp (make-scope 'world-load #:parent %root-scope))
+               (ok #f))
+           (dynamic-wind
+            (lambda () #f)
+            (lambda ()
+              (let ((value (%call-in-scope tmp load)))
+                (set! ok #t)
+                value))
+            (lambda ()
+              (if ok
+                  (for-each (lambda (r) (hash-table-set! %owners r %root-scope))
+                            (%scope-adopt! tmp %root-scope))
+                  (scope-shutdown! tmp))))))
+        ((%staging-scope) => (lambda (s) (%call-in-scope s load)))
+        (else (load))))
 
 (define (eval-source source module file)
   "Evaluate the forms of the string SOURCE in MODULE.
@@ -960,8 +976,10 @@ ms body ...); only that one's operation happens, then its body runs."
 
 (define %root-scope (%make-scope 'root #f))
 
-(define current-scope (make-parameter %root-scope)
+(define current-scope (%make-parameter-with-key (%current-scope-key) %root-scope (lambda (x) x))
   "Return the scope owning what is made now, a parameter.")
+
+(define %staging-scope (%make-parameter-with-key (%staging-scope-key) #f (lambda (x) x)))
 
 (define (make-scope [name #f] #:parent [parent (current-scope)])
   "Return a new scope called NAME, owned by PARENT.
@@ -1279,7 +1297,8 @@ visible changes."
     (%set-scope-pending! s '())
     (when old (%set-scope-predecessor! s (package-scope old)))
     (let* ((staged (guard (e (#t (%package-discard) (scope-shutdown! s) (raise e)))
-                     (with-scope s (if declaration ((cdr declaration) (lambda () (%package-stage path))) (%package-stage path)))))
+                     (parameterize ((%staging-scope s))
+                       (with-scope s (if declaration ((cdr declaration) (lambda () (%package-stage path))) (%package-stage path))))))
            (module (car staged)))
       ;; Publish: modules, then the held-back registrations, in order.
       (%package-publish)

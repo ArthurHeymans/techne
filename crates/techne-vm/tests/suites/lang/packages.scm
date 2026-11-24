@@ -199,6 +199,75 @@
 (for-each (lambda (name) (delete-file (package-main name))) '(starts joins))
 (delete-file worker)
 
+;; A world module that fails while a package stages it leaves neither its
+;; tasks nor its registrations behind in the root scope.
+(define failing-world (string-append path ".failing-world.scm"))
+(eval '(define leaked-task #f) "root")
+(write-forms! failing-world
+              '(eval '(set! leaked-task (spawn (lambda () (let loop () (sleep 1) (loop))))) "root")
+              '(registry-add! demo-commands 'leaked-reg (lambda () 'bad))
+              '(error "world init failed"))
+(make-directory (package-dir 'fails-world))
+(write-forms! (package-main 'fails-world) `(require ,failing-world))
+(test-error (load-package 'fails-world (package-main 'fails-world)))
+(sleep 5)
+(test #t (task-done? (eval 'leaked-task "root")))
+(test #f (command 'leaked-reg))
+(delete-file (package-main 'fails-world))
+(delete-file failing-world)
+
+;; A package-owned file required by a world module still loads in the
+;; staged package's scope so unloading the package cleans it up.
+(define world-bridge (string-append path ".world-bridge.scm"))
+(make-directory (package-dir 'bridged))
+(define bridged-helper (string-append (package-dir 'bridged) "helper.scm"))
+(write-forms! bridged-helper
+              '(provide bridged-task)
+              '(define bridged-task (spawn (lambda () (let loop () (sleep 1) (loop)))))
+              '(registry-add! demo-commands 'bridged-helper (lambda () bridged-task)))
+(write-forms! world-bridge `(require ,bridged-helper))
+(write-forms! (package-main 'bridged) `(require ,world-bridge))
+(load-package 'bridged (package-main 'bridged))
+(define b-task (command 'bridged-helper))
+(test #f (task-done? b-task))
+(unload-package 'bridged)
+(sleep 5)
+(test #t (task-done? b-task))
+(test #f (command 'bridged-helper))
+(delete-file bridged-helper)
+(delete-file (package-main 'bridged))
+(delete-file world-bridge)
+
+;; A shared library loaded via the synchronous compiler fallback (e.g. eval)
+;; while a package is staged still owns its tasks/registrations in root scope.
+(define sync-lib-dir (string-append path ".sync-lib"))
+(make-directory sync-lib-dir)
+(make-directory (string-append sync-lib-dir "/synclib"))
+(define sync-lib-file (string-append sync-lib-dir "/synclib/shared.sld"))
+(write-forms! sync-lib-file
+              '(define-library (synclib shared)
+                 (export sync-worker)
+                 (import (techne))
+                 (begin
+                   (define sync-worker (spawn (lambda () (let loop () (sleep 1) (loop)))))
+                   (registry-add! (eval 'demo-commands "root") 'from-sync-lib (lambda () sync-worker)))))
+(%provide-libraries! "synclib" sync-lib-dir)
+(make-directory (package-dir 'sync-pkg))
+(write-forms! (package-main 'sync-pkg)
+              '(eval '(import (synclib shared)))
+              '(registry-add! demo-commands 'sync-pkg (lambda () 'ok)))
+(load-package 'sync-pkg (package-main 'sync-pkg))
+(define sw (command 'from-sync-lib))
+(test #f (task-done? sw))
+(unload-package 'sync-pkg)
+(sleep 5)
+(test #f (task-done? sw))
+(test #t (eq? sw (command 'from-sync-lib)))
+(task-kill sw)
+(registry-remove! demo-commands 'from-sync-lib)
+(delete-file (package-main 'sync-pkg))
+(delete-file sync-lib-file)
+
 ;; Primitives are sealed: shadowed by a definition, never changed.
 (test-error (eval '(set! car cdr)))
 (test 'shadowed (eval '(begin (define (car x) 'shadowed) (car '(1)))))

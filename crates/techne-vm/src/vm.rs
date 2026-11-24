@@ -2096,12 +2096,14 @@ impl Vm {
                 // From the idle host (`find_module`, `require`), the body is
                 // an input, which can wait; from a native, it nests.
                 let name = path.to_string_lossy();
-                let result = if self.input_ready() {
-                    let mut module = m;
-                    self.eval_input_source(&mut module, &name, &text).map(drop)
-                } else {
-                    self.eval_in_raw(m, &name, &text).map(drop)
-                };
+                let result = self.in_module_load_scope(m, |vm| {
+                    if vm.input_ready() {
+                        let mut module = m;
+                        vm.eval_input_source(&mut module, &name, &text).map(drop)
+                    } else {
+                        vm.eval_in_raw(m, &name, &text).map(drop)
+                    }
+                });
                 self.end_module_load(m);
                 result.map(|()| m)
             }
