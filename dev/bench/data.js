@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795545500167,
+  "lastUpdate": 1795545501807,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -62996,6 +62996,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 628529949,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104639,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1904b102288980d47e156baa89fc2e81e74cebf6",
+          "message": "Merge pull request #406 from ArthurHeymans/verify/kani-proofs\n\nVerify core text, network, and VM invariants with Kani",
+          "timestamp": "2026-11-24T19:28:26+01:00",
+          "tree_id": "3e9687fdbf981fc98da76b468b0de602dd085aa2",
+          "url": "https://github.com/ArthurHeymans/techne/commit/1904b102288980d47e156baa89fc2e81e74cebf6"
+        },
+        "date": 1795545501753,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697538353,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 631166669,
             "unit": "instructions"
           },
           {
