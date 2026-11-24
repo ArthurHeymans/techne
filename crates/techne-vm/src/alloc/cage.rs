@@ -852,9 +852,17 @@ mod kani_proofs {
         assert!(spans.used() == expected_used);
 
         let mut live_sum = 0usize;
-        for &(lo, ll) in live {
+        for (i, &(lo, ll)) in live.iter().enumerate() {
             if ll > 0 {
                 assert!(lo >= START && lo + ll <= spans.top);
+                assert!(lo % PAGE == 0);
+                assert!(ll % PAGE == 0);
+                // Live spans are pairwise disjoint, so their lengths sum to what they cover.
+                for &(lo2, ll2) in &live[i + 1..] {
+                    if ll2 > 0 {
+                        assert!(lo + ll <= lo2 || lo2 + ll2 <= lo);
+                    }
+                }
                 live_sum += ll;
             }
         }

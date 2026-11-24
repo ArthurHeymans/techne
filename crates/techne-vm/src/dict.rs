@@ -896,6 +896,9 @@ mod tests {
         for hasher in [None, Some(colliding as Hasher), Some(deep as Hasher)] {
             FAKE.with(|f| f.set(hasher));
             let mut vm = Vm::new();
+            // `TECHNE_GC_STRESS` collects on every allocation, resetting the
+            // nursery between the samples below: measure within one epoch.
+            vm.set_gc_stress(false, false);
             let _world = vm.enter_account();
             for empty_expr in ["(dict)", "(set)"] {
                 let mut d = vm.eval_source_raw(empty_expr).unwrap();

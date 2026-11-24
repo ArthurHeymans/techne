@@ -309,8 +309,12 @@ fn extended(layout: Layout) -> Option<(usize, Layout)> {
     // No overflow: a layout's size is at most `isize::MAX`.
     let at = layout.size().next_multiple_of(std::mem::align_of::<u32>());
     let align = layout.align().max(std::mem::align_of::<u32>());
-    // What `Layout` requires of the size, its alignment being valid already.
-    (at <= isize::MAX as usize - TRAILER - (align - 1)).then(|| (at, unsafe { Layout::from_size_align_unchecked(at + TRAILER, align) }))
+    // What `Layout` requires of the size, its alignment being valid already
+    // (at most `isize::MAX + 1`, which leaves no room for the trailer).
+    (isize::MAX as usize - (align - 1))
+        .checked_sub(TRAILER)
+        .is_some_and(|most| at <= most)
+        .then(|| (at, unsafe { Layout::from_size_align_unchecked(at + TRAILER, align) }))
 }
 
 /// `extended` of a layout that was extended before (a live block's).
@@ -398,12 +402,14 @@ fn add(tag: Tag, bytes: isize) {
     if slot == 0 || bytes == 0 {
         return;
     }
+    // The count wraps as its packed word does: a credit of `isize::MIN`
+    // (a budget giving back `1 << 63` bytes) must not overflow on the way.
     let updated = TABLE[slot as usize]
-        .try_update(Relaxed, Relaxed, |w| (generation_of(w) == generation).then(|| word(generation, count_of(w) + bytes)));
+        .try_update(Relaxed, Relaxed, |w| (generation_of(w) == generation).then(|| word(generation, count_of(w).wrapping_add(bytes))));
     if let Ok(w) = updated
         && bytes > 0
     {
-        check(tag, count_of(w) + bytes);
+        check(tag, count_of(w).saturating_add(bytes));
     }
 }
 
@@ -629,7 +635,7 @@ mod kani_proofs {
     #[kani::proof]
     fn extended_layout_matches_spec_and_fits_trailer() {
         let align_shift: u32 = kani::any();
-        kani::assume(align_shift < 63);
+        kani::assume(align_shift < usize::BITS);
         let align = 1usize << align_shift;
         let max_valid_size = (isize::MAX as usize) - (align - 1);
         let size: usize = kani::any();

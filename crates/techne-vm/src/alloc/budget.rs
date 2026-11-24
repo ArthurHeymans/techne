@@ -450,6 +450,23 @@ mod tests {
         assert_eq!(b.held(), held_b);
     }
 
+    /// A credit of the sign bit reaches the account as `isize::MIN`, which
+    /// its packed count takes wrapping rather than overflowing.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn an_account_takes_back_a_sign_bit_reservation() {
+        let account = Account::new().unwrap();
+        let held = account.held();
+        let budget = Budget::for_account(account.reference());
+        budget.set_limit(usize::MAX);
+        let sign_bit = budget.reserve(1 << (usize::BITS - 1)).unwrap();
+        let more = budget.reserve(1 << 47).unwrap();
+        drop(sign_bit);
+        drop(more);
+        assert_eq!(budget.held(), 0);
+        assert_eq!(account.held(), held);
+    }
+
     #[test]
     fn credit_delta_handles_sign_bit_without_negation_overflow() {
         let sign_bit = 1usize << (usize::BITS - 1);
