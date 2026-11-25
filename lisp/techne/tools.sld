@@ -413,8 +413,12 @@ must take no arguments; successful values should themselves be bounded."
               ((and deadline (>= (current-milliseconds) deadline)) #f)
               (else (sleep (if deadline (max 1 (min 50 (- deadline (current-milliseconds)))) 50)) (loop)))))
 
-    (define (%seconds n who)
-      (unless (and (real? n) (> n 0) (<= n 86400)) (error who "seconds must be more than 0, at most 86400" n))
+    ;; WHAT names the keyword and UNSET says what leaving it out does:
+    ;; #t is a natural guess where the editor's own #:wait is a flag.
+    (define (%seconds n who what unset)
+      (unless (and (real? n) (> n 0) (<= n 86400))
+        (error (string-append who ": " what " must be seconds, more than 0 and at most 86400, not "
+                              (%written n) "; leave it out " unset)))
       (exact (ceiling (* 1000 n))))
 
     ;; Both streams at their limit, four bytes a character, take half the
@@ -459,7 +463,7 @@ TIMEOUT, seconds up to a day, kills its process group if it has not
 exited by then; its result says timed-out."
       (%count retain 16000 "tool-run" "#:retain")
       (when keep (%count keep %keep-limit "tool-run" "#:keep"))
-      (when timeout (%seconds timeout "tool-run"))
+      (when timeout (%seconds timeout "tool-run" "#:timeout" "for no timeout"))
       (unless (and (list? environment)
                    (every (lambda (entry)
                             (and (pair? entry) (string? (car entry)) (string? (cdr entry))
@@ -476,7 +480,7 @@ exited by then; its result says timed-out."
              (wait (spawn (lambda () (process-wait p))))
              (job (%job program p out err stdout stderr wait project keep #f #f)))
         (when timeout
-          (let ((deadline (+ (current-milliseconds) (%seconds timeout "tool-run"))))
+          (let ((deadline (+ (current-milliseconds) (%seconds timeout "tool-run" "#:timeout" "for no timeout"))))
             (spawn (lambda ()
                      ;; The job, not its leader: what it started holds its streams.
                      (unless (%wait-until (lambda () (tool-process-done? job)) deadline)
@@ -490,7 +494,8 @@ exited by then; its result says timed-out."
 
     (define (tool-process-result job #:chars [chars 2000] #:wait [wait #f] #:head [head #f])
       "Wait for JOB and return its status and bounded stdout and stderr.
-CHARS is 1 to 8000 characters per stream. Characters counts all text
+CHARS is 1 to 8000 characters per stream; more shows 8000, the reply
+saying what it left out. Characters counts all text
 seen; retained counts the saved tail. Dropped reports retention loss,
 clipped a smaller report window, and truncated either kind of omission.
 This is a tail, not parsed diagnostics. Repeated reads are safe.
@@ -499,9 +504,10 @@ HEAD #t reports each stream's start instead, the first of the text
 first, the top of a report; the stream says head #t.
 A stream kept with `tool-run` #:keep has a handle besides, for
 `tool-expand` (from #:offset 0, the start) and `tool-find`.
-WAIT, seconds, waits at most that long: if JOB still runs, the result
-has running #t, status #f and the output so far, and JOB goes on; ask
-again, or cancel it. Timed-out says its own timeout killed it."
+Without WAIT this waits until JOB ends. WAIT, seconds, waits at most
+that long: if JOB still runs, the result has running #t, status #f and
+the output so far, and JOB goes on; ask again, or cancel it. Timed-out
+says its own timeout killed it."
       (define (snapshot name state)
         (let* ((text (apply string-append (reverse (vector-ref state 2))))
                (s (%snapshot (%repository-nonce) (string-append "<" name " of " (%job-program job) ">")
@@ -515,9 +521,11 @@ again, or cancel it. Timed-out says its own timeout killed it."
             (clipped ,(> n chars)) (truncated ,(> seen (min n chars)))
             ,@(if head '((head #t)) '())
             ,@(if kept `((handle ,(car kept)) (kept ,(cadr kept))) '()))))
+      (set! chars (%at-most chars 8000))
       (%count chars 8000 "tool-process-result" "#:chars")
       (if (and wait (not (%wait-until (lambda () (tool-process-done? job))
-                                      (+ (current-milliseconds) (%seconds wait "tool-process-result")))))
+                                      (+ (current-milliseconds)
+                                         (%seconds wait "tool-process-result" "#:wait" "to wait until JOB ends")))))
           `((program ,(%job-program job)) (status #f) (running #t) (timed-out #f)
             (stdout ,(stream (%job-out job) #f)) (stderr ,(stream (%job-err job) #f)))
       (let ((status (task-join (%job-wait job))))

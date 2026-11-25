@@ -60,7 +60,16 @@
     (expect "tool-run: #:keep must be an integer from 1 to 1048576, not 20000000"
             (message (lambda () (tool-run p "true" '() #:keep 20000000))))
     (expect "tool-process-result: #:chars must be an integer from 1 to 8000, not 0"
-            (message (lambda () (tool-process-result job #:chars 0))))))
+            (message (lambda () (tool-process-result job #:chars 0))))
+    ;; A window wider than its bound is the bound, as tool-read's: one
+    ;; wide request does not lose the other answers of its batch.
+    (expect (tool-process-result job #:chars 8000) (tool-process-result job #:chars 12000))
+    ;; Seconds name their keyword and what leaving it out does: the
+    ;; editor's #:wait is a flag, so #t is a natural guess here.
+    (expect "tool-process-result: #:wait must be seconds, more than 0 and at most 86400, not #t; leave it out to wait until JOB ends"
+            (message (lambda () (tool-process-result job #:wait #t))))
+    (expect "tool-run: #:timeout must be seconds, more than 0 and at most 86400, not 0; leave it out for no timeout"
+            (message (lambda () (tool-run p "true" '() #:timeout 0))))))
 
 (with-tool-project "the start of long output is one keyword away" (quote ())
   (lambda (root p)
