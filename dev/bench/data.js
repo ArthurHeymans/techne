@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795629681718,
+  "lastUpdate": 1795629683943,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -64040,6 +64040,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 631163508,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104639,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "167bd58bf0514c98d90cc5f94de3fd670d9ff593",
+          "message": "Merge pull request #409 from ArthurHeymans/dependabot/cargo/rusqlite-0.43.0\n\ndeps: bump rusqlite from 0.41.1 to 0.43.0",
+          "timestamp": "2026-11-25T18:32:52+01:00",
+          "tree_id": "f77ae1847108c3c508d17302af50f96d7638987e",
+          "url": "https://github.com/ArthurHeymans/techne/commit/167bd58bf0514c98d90cc5f94de3fd670d9ff593"
+        },
+        "date": 1795629683890,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697539081,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 631217895,
             "unit": "instructions"
           },
           {
