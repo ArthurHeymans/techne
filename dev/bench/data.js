@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795628536281,
+  "lastUpdate": 1795628537994,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -63692,6 +63692,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 631162669,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104639,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "58fd40af45757af64a31f8664505d1afc47fd552",
+          "message": "Merge pull request #408 from ArthurHeymans/dependabot/cargo/jiff-1.0.2\n\ndeps: bump jiff from 0.2.40 to 1.0.2",
+          "timestamp": "2026-11-25T18:32:43+01:00",
+          "tree_id": "7682cdb2a7b1780394a93252b9b1261ae3a827ba",
+          "url": "https://github.com/ArthurHeymans/techne/commit/58fd40af45757af64a31f8664505d1afc47fd552"
+        },
+        "date": 1795628537901,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697536377,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 631163508,
             "unit": "instructions"
           },
           {
