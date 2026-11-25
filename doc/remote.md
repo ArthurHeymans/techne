@@ -9,14 +9,15 @@ reporting their facts, and their file operations (`crates/techne-node`,
 opened, saved against their revision and journaled here
 (`techne-text`'s `Place::Remote`); `find-file`, the shell commands,
 `project-root` and `vc-status` on remote locations; browsing remote
-locations in Dired (names only, no file management). Tested over a pipe
+locations in Dired (names only, no file management); project search using
+`rg` on the endpoint's PATH. Tested over a pipe
 in CI (`crates/techne-cli/tests/remote.rs`), and over ssh to a real
 machine when `TECHNE_REMOTE_TEST` names one. Not yet: the protocol's
 second version as specified below (its envelope, features, pushed
 streams, structured errors and cancellation: version 2 so far adds the
 facts and file operations to the first), the shared engine with
 tramp-rpc, askpass (ssh and sudo must not ask), deploying the node,
-services on endpoints, remote search and Dired file management, documents recognised
+services on endpoints, Dired file management, documents recognised
 across routes, and narrowed endpoint capabilities. It implements REQUIREMENTS.md,
 "Remote operation is part of the runtime" and "Remote state: ownership,
 not a shared heap", and PLAN.md, "Remote execution without

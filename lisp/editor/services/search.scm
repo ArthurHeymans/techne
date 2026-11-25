@@ -14,6 +14,19 @@
         (hash-table-set! %files root files)
         files)))
 
+(define (search-open argument snapshots)
+  "Search SNAPSHOTS only. ARGUMENT is (parts limit paths), in snapshot order."
+  (let ((parts (car argument)) (limit (cadr argument)))
+    (let loop ((ps (caddr argument)) (ss snapshots) (left limit) (found '()))
+      (if (or (null? ss) (zero? left))
+          (reverse found)
+          (let* ((s (car ss)) (lines (search-snapshot s parts left)))
+            (loop (cdr ps) (cdr ss) (- left (length lines))
+                  (fold (lambda (l found)
+                          (cons (list (car ps) (car ps) (car l) (cadr l) (caddr l)
+                                      (snapshot-id s) (snapshot-revision s)) found))
+                        found lines)))))))
+
 (define (search argument snapshots)
   "Search the files under a root for the lines with every part of a pattern.
 ARGUMENT is (root parts limit paths fresh): PATHS are the files of

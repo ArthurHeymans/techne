@@ -13,7 +13,7 @@
       "is_macro": false
     },
     "act-on!": {
-      "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:745\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
+      "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:794\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
       "is_macro": false
     },
     "actions-for": {
@@ -41,7 +41,7 @@
       "is_macro": false
     },
     "async-source": {
-      "description": "(async-source produce #:min-input (min-input 3))  procedure, @lisp@/editor/minibuffer.scm:112\n\nReturn a source of candidates for `completing-read` that come later.\n(PRODUCE input) returns the candidates for the input, as a list; it\nruns in a task, so it can wait, for a service's answer say. The input\nchanging cancels it, for the new input. An input shorter than\nMIN-INPUT has no candidates. Until they come, those for the input\nbefore are shown.",
+      "description": "(async-source produce #:min-input (min-input 3) #:fresh-only (fresh-only #f))  procedure, @lisp@/editor/minibuffer.scm:113\n\nReturn a source of candidates for `completing-read` that come later.\n(PRODUCE input) returns the candidates for the input, as a list; it\nruns in a task, so it can wait, for a service's answer say. The input\nchanging cancels it, for the new input. An input shorter than\nMIN-INPUT has no candidates. Until they come, those for the input\nbefore are shown unless FRESH-ONLY is true.",
       "is_macro": false
     },
     "buffer-document": {
@@ -209,7 +209,7 @@
       "is_macro": false
     },
     "completing-read": {
-      "description": "(completing-read s prompt source #:accept (accept take-target) #:preview (preview #f) #:initial (initial \"\") #:pattern (pattern (lambda (input) input)) #:require-match (require-match #t) #:abort (abort #f) #:keymap (keymap #f) #:select-input (select-input #f) #:history (history #f) #:remember (remember (quote choice)))  procedure, @lisp@/editor/minibuffer.scm:198\n\nRead a choice in the minibuffer of session S with PROMPT and INITIAL.\nSOURCE is a list of candidates (strings or `candidate`s), a\n`candidate-table` (for many), a procedure from the input to a list,\nor an `async-source`.\nOn \\[minibuffer-accept],\n(ACCEPT session candidate) is called with the selected candidate, or\none made of the input when nothing matches and REQUIRE-MATCH is false\n(\\[minibuffer-accept-input] takes the input as it is); by default,\nthe default action on the candidate's target is done. PREVIEW, if\ngiven, is called the same way for each candidate selected while\nreading; \\[minibuffer-abort] undoes what it did to the panes, and\ncalls ABORT, if given, for what else they did. PATTERN gives the part\nof the input candidates are matched against (the file name after its\ndirectory). KEYMAP, if given, holds the keys of what is being read\n(a file name's, say): it is looked up before `minibuffer-map`.\nSELECT-INPUT, if given, is a procedure (input) saying when the input\nitself is selected first rather than the first candidate, as vertico\nselects an existing directory's name. HISTORY, if given, is the name\nof the history \\[minibuffer-previous-history] and\n\\[minibuffer-next-history] go through, a symbol; what is taken is\nremembered there: the input completed with the candidate taken, or,\nwith REMEMBER `input`, the input as typed (a search's words, not the\nline found). REMEMBER can also be a procedure (entry candidate)\nreturning what to remember of the candidate taken instead of ENTRY,\nthe input completed with it, or #f for nothing (a directory gone\ninto). The procedures run in the scope this is called in, as the\ncommand calling it does, and in its operation: it is held while the\nminibuffer is open, and aborting cancels it.",
+      "description": "(completing-read s prompt source #:accept (accept take-target) #:preview (preview #f) #:export (export #f) #:submit (submit #f) #:invalidate (invalidate #f) #:initial (initial \"\") #:pattern (pattern (lambda (input) input)) #:require-match (require-match #t) #:abort (abort #f) #:keymap (keymap #f) #:select-input (select-input #f) #:history (history #f) #:remember (remember (quote choice)))  procedure, @lisp@/editor/minibuffer.scm:203\n\nRead a choice in the minibuffer of session S with PROMPT and INITIAL.\nSOURCE is a list of candidates (strings or `candidate`s), a\n`candidate-table` (for many), a procedure from the input to a list,\nor an `async-source`.\nOn \\[minibuffer-accept],\n(ACCEPT session candidate) is called with the selected candidate, or\none made of the input when nothing matches and REQUIRE-MATCH is false\n(\\[minibuffer-accept-input] takes the input as it is); by default,\nthe default action on the candidate's target is done. PREVIEW, if\ngiven, is called the same way for each candidate selected while\nreading; \\[minibuffer-abort] undoes what it did to the panes, and\ncalls ABORT, if given, for what else they did. EXPORT, if given, is\ncalled with the session instead of the default export. SUBMIT, if given,\nreceives the session, chosen candidate and a continuation accepting a\nprepared candidate; the prompt closes only when it calls the continuation.\nINVALIDATE, if given, is called before an async source is asked for new\ninput and on close, to cancel related work. PATTERN gives the part\nof the input candidates are matched against (the file name after its\ndirectory). KEYMAP, if given, holds the keys of what is being read\n(a file name's, say): it is looked up before `minibuffer-map`.\nSELECT-INPUT, if given, is a procedure (input) saying when the input\nitself is selected first rather than the first candidate, as vertico\nselects an existing directory's name. HISTORY, if given, is the name\nof the history \\[minibuffer-previous-history] and\n\\[minibuffer-next-history] go through, a symbol; what is taken is\nremembered there: the input completed with the candidate taken, or,\nwith REMEMBER `input`, the input as typed (a search's words, not the\nline found). REMEMBER can also be a procedure (entry candidate)\nreturning what to remember of the candidate taken instead of ENTRY,\nthe input completed with it, or #f for nothing (a directory gone\ninto). The procedures run in the scope this is called in, as the\ncommand calling it does, and in its operation: it is held while the\nminibuffer is open, and aborting cancels it.",
       "is_macro": false
     },
     "condition-choices": {
@@ -973,7 +973,7 @@
       "is_macro": false
     },
     "minibuffer-history": {
-      "description": "(minibuffer-history name)  procedure, @lisp@/editor/minibuffer.scm:565\n\nReturn the entries of the minibuffer history NAME, newest first.",
+      "description": "(minibuffer-history name)  procedure, @lisp@/editor/minibuffer.scm:614\n\nReturn the entries of the minibuffer history NAME, newest first.",
       "is_macro": false
     },
     "minibuffer-map": {
@@ -1417,7 +1417,7 @@
       "is_macro": false
     },
     "project-root": {
-      "description": "(project-root dir)  procedure, @lisp@/editor/projects.scm:19\n\nReturn the root of the project the directory DIR is in.\nThat is the nearest directory up from DIR with a .jj or .git in it,\nelse DIR itself; with a slash, as DIR has. DIR may be on another\nmachine: its endpoint looks, in one request.",
+      "description": "(project-root dir)  procedure, @lisp@/editor/projects.scm:20\n\nReturn the root of the project the directory DIR is in.\nThat is the nearest directory up from DIR with a .jj or .git in it,\nelse DIR itself; with a slash, as DIR has. DIR may be on another\nmachine: its endpoint looks, in one request.",
       "is_macro": false
     },
     "proposal-accept!": {
@@ -1997,7 +1997,7 @@
       "is_macro": false
     },
     "take-target": {
-      "description": "(take-target s c)  procedure, @lisp@/editor/minibuffer.scm:738\n\nDo the default action on the target of candidate C in session S.\nThis is how `completing-read` accepts by default.",
+      "description": "(take-target s c)  procedure, @lisp@/editor/minibuffer.scm:787\n\nDo the default action on the target of candidate C in session S.\nThis is how `completing-read` accepts by default.",
       "is_macro": false
     },
     "take-violations!": {

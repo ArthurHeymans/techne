@@ -13,6 +13,7 @@
 (require "remote.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
+(require "project-remote-search.scm")
 
 (provide project-root search-project)
 
@@ -63,9 +64,16 @@ The project is the version-control root above the focused file (see
 `project-root`). The lines with every word of the input are found as
 you type, from three characters on; open files are searched as they
 are, unsaved edits and all."
-  (when (remote-path? (default-directory s))
-    (error "Searching a project on another machine is not supported yet"))
-  (let* ((root (project-root (default-directory s)))
+  (let ((dir (default-directory s)))
+    (if (remote-path? dir)
+        (read-remote-project-search s dir project-root
+                                    (lambda (parts limit paths docs)
+                                      (service-call (search-service) "search-open" (list parts limit paths) docs))
+                                    match-candidate search-limit)
+        (read-local-project-search s dir))))
+
+(define (read-local-project-search s dir)
+  (let* ((root (project-root dir))
          (documents (filter document-path (map buffer-document (buffer-list))))
          ;; The files are listed again for each search, not each key.
          (fresh #t))

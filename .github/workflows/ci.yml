@@ -72,6 +72,7 @@ jobs:
       # does not know: lifted, so that the sandbox's tests run, not skip.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         shell: bash
+      - run: sudo apt-get install -y ripgrep
       - run: cargo nextest run --release --no-fail-fast
         env:
           TECHNE_TEST_MODES: default
