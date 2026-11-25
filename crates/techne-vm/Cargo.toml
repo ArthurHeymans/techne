@@ -36,7 +36,7 @@ num-rational = { version = "0.4", default-features = false, features = ["num-big
 num-traits = "0.2"
 # These exchange Rust types and must be upgraded together.
 cranelift-codegen = "0.137"
-cranelift-frontend = "0.137"
+cranelift-frontend = "0.138"
 cranelift-jit = "0.137"
 cranelift-module = "0.137"
 cranelift-native = "0.137"
