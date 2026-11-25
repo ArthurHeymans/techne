@@ -78,12 +78,21 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
             ((procedure? next) (loop (next)))
             (else (%load-forms next) (loop last))))))
 
+;; Finish a temporary world-module load scope: adopt into %root-scope on
+;; success (updating %owners and forwarding the temporary scope record so
+;; captured `scope-procedure`s stay live), or shut down on failure.
+(define (%finish-world-load-scope! tmp ok)
+  (if ok
+      (for-each (lambda (r) (hash-table-set! %owners r %root-scope))
+                (%scope-adopt! tmp %root-scope))
+      (scope-shutdown! tmp)))
+
 ;; The forms of a module loading, evaluated in it. One that is the
-;; world's, loading because a package being staged needs it (a file from
-;; outside its directory, a library a package provides), is evaluated in
-;; the root scope: the tasks it starts and what it registers are the
-;; world's as it is, not the package's that loads it first, whose
-;; unloading would take them from every other importer.
+;; world's (a file from outside a package's directory, a library a package
+;; provides, or any world module loaded from a package's scope) is
+;; evaluated in a temporary child of %root-scope: the tasks it starts and
+;; what it registers are the world's, not the package's that loads it
+;; first, whose unloading would take them from every other importer.
 (define (%load-forms forms)
   (define (load)
     (dynamic-wind
@@ -95,11 +104,11 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
          (%forms-evaluated forms)
          value))
      (lambda () (%leave-module) (%module-loaded forms))))
-  (cond ((%forms-of-world? forms)
-         ;; Run world-module initialization in a temporary child of %root-scope:
-         ;; failure shuts it down (cancelling tasks and removing registrations),
-         ;; while success adopts its resources and child scopes into %root-scope.
-         (let ((tmp (make-scope 'world-load #:parent %root-scope))
+  (cond ((%forms-of-staging? forms)
+         (let ((s (%staging-scope)))
+           (if s (%call-in-scope s load) (load))))
+        ((%forms-of-world? forms)
+         (let ((tmp (make-scope 'root #:parent %root-scope))
                (ok #f))
            (dynamic-wind
             (lambda () #f)
@@ -108,11 +117,7 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
                 (set! ok #t)
                 value))
             (lambda ()
-              (if ok
-                  (for-each (lambda (r) (hash-table-set! %owners r %root-scope))
-                            (%scope-adopt! tmp %root-scope))
-                  (scope-shutdown! tmp))))))
-        ((%staging-scope) => (lambda (s) (%call-in-scope s load)))
+              (%finish-world-load-scope! tmp ok)))))
         (else (load))))
 
 (define (eval-source source module file)
@@ -989,7 +994,7 @@ PARENT is the current scope by default; shutting it shuts the new one."
 ;; As (parameterize ((current-scope s)) body ...), cheaper to expand: it is
 ;; used in every procedure handed over (scope-procedure).
 (define (%call-in-scope s thunk)
-  (let ((key (%parameter-key current-scope)) (old (current-scope)))
+  (let ((s (or (%scope-target s) s)) (key (%parameter-key current-scope)) (old (current-scope)))
     (dynamic-wind (lambda () (%task-local-set! key s)) thunk (lambda () (%task-local-set! key old)))))
 
 (define-syntax with-scope
@@ -998,12 +1003,13 @@ PARENT is the current scope by default; shutting it shuts the new one."
     ((_ s body ...) (%call-in-scope s (lambda () body ...)))))
 
 (define (%scope-add! s resource cleanup done?)
-  ;; Owned again by the same scope: the new cleanup replaces the old.
-  (when (eq? (hash-table-ref/default %owners resource #f) s)
-    (%scope-disown! s resource))
-  (%scope-own! s resource cleanup done?)
-  (hash-table-set! %owners resource s)
-  resource)
+  (let ((s (or (%scope-target s) s)))
+    ;; Owned again by the same scope: the new cleanup replaces the old.
+    (when (eq? (hash-table-ref/default %owners resource #f) s)
+      (%scope-disown! s resource))
+    (%scope-own! s resource cleanup done?)
+    (hash-table-set! %owners resource s)
+    resource))
 
 (define (scope-own! resource cleanup [done? (lambda (r) #f)])
   "Let the current scope own RESOURCE, and return RESOURCE.
@@ -1071,13 +1077,14 @@ process) run at once; the others run in a task stopped past
 cannot wait (under a native calling back into Scheme). A failing
 cleanup does not stop the others; the first failure is raised at the
 end."
-  (when (scope-live? s)
-    (let* ((shut (%scope-shutdown! s)) (entries (caddr shut)))
-      (for-each (lambda (r) (hash-table-delete! %owners r)) (cadr shut))
-      ;; The Lisp cleanups run whatever the native ones did.
-      (let* ((lisp (and (pair? entries) (%run-cleanups entries)))
-             (failure (or (car shut) lisp)))
-        (when failure (raise failure))))))
+  (let ((shut (%scope-shutdown! s)))
+    (when shut
+      (let ((entries (caddr shut)))
+        (for-each (lambda (r) (hash-table-delete! %owners r)) (cadr shut))
+        ;; The Lisp cleanups run whatever the native ones did.
+        (let* ((lisp (and (pair? entries) (%run-cleanups entries)))
+               (failure (or (car shut) lisp)))
+          (when failure (raise failure)))))))
 
 (define (scope-procedure proc)
   "Return PROC bound to the current scope.
@@ -1089,7 +1096,9 @@ work they start belongs to whoever handed them over, not to whoever
 calls them, and a late call cannot reach state the scope's replacement
 owns now."
   (let ((s (current-scope)))
-    (lambda args (and (scope-live? s) (%call-in-scope s (lambda () (apply proc args)))))))
+    (lambda args
+      (let ((target (%scope-target s)))
+        (and target (%call-in-scope target (lambda () (apply proc args))))))))
 
 (define %spawn spawn)
 (define (spawn thunk #:child [child #f])

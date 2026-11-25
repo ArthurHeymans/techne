@@ -94,12 +94,36 @@ struct Taken {
 const PRUNE: usize = 64;
 
 impl Vm {
-    fn scope_slot(&self, v: Value, who: &str) -> Result<Option<usize>, Error> {
+    fn scope_slot(&self, mut v: Value, who: &str) -> Result<Option<usize>, Error> {
+        let rtd = self.special(SpecialObj::ScopeRtd);
+        loop {
+            if !(is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == rtd) {
+                return Err(type_error(who, "scope", v));
+            }
+            let slot = unsafe { field(v.as_ptr(), SLOT) };
+            if slot.is_int() {
+                return Ok(Some(slot.as_int() as usize));
+            }
+            if slot == Value::FALSE {
+                return Ok(None);
+            }
+            // Adopted into another scope: follow the forwarding record.
+            v = slot;
+        }
+    }
+
+    /// The slot owned directly by `v`, without following adoption forwarding.
+    /// Shutting an adopted child record must not shut the scope that adopted it.
+    fn own_scope_slot(&self, v: Value, who: &str) -> Result<Option<usize>, Error> {
         if !(is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == self.special(SpecialObj::ScopeRtd)) {
             return Err(type_error(who, "scope", v));
         }
         let slot = unsafe { field(v.as_ptr(), SLOT) };
         Ok(slot.is_int().then(|| slot.as_int() as usize))
+    }
+
+    fn scope_target(&self, v: Value, who: &str) -> Result<Value, Error> {
+        Ok(self.scope_slot(v, who)?.map_or(Value::FALSE, |slot| self.scope(slot).record))
     }
 
     fn live_scope(&self, v: Value, who: &str) -> Result<usize, Error> {
@@ -119,14 +143,17 @@ impl Vm {
 
     fn make_scope(&mut self, name: Value, parent: Value) -> Result<Value, Error> {
         // Only the root scope has none: nothing would shut another.
-        let parent_slot = match parent {
-            Value::FALSE if self.scopes.is_empty() => None,
+        let (parent_slot, parent_record) = match parent {
+            Value::FALSE if self.scopes.is_empty() => (None, Value::FALSE),
             Value::FALSE => return Err(Error::new("make-scope: a scope needs a parent scope")),
-            _ => Some(self.live_scope(parent, "make-scope")?),
+            _ => {
+                let p = self.live_scope(parent, "make-scope")?;
+                (Some(p), self.scope(p).record)
+            }
         };
         let slot = self.free_scopes.pop().unwrap_or(self.scopes.len());
         let rtd = self.special(SpecialObj::ScopeRtd);
-        let record = self.make_record(rtd, &[Value::int_unchecked(slot as i64), name, parent, Value::FALSE, Value::FALSE]);
+        let record = self.make_record(rtd, &[Value::int_unchecked(slot as i64), name, parent_record, Value::FALSE, Value::FALSE]);
         let scope = Scope { record, parent: parent_slot, children: Vec::new(), owned: Vec::new(), added: 0 };
         if slot == self.scopes.len() {
             self.scopes.push(Some(scope));
@@ -220,21 +247,24 @@ impl Vm {
     }
 
     /// Move everything owned by `child_slot` (resources and child scopes) into
-    /// `parent_slot` without running cleanups, and retire `child_slot`. Returns
-    /// the moved resource values (oldest first) so Scheme can update `%owners`.
+    /// `parent_slot` without running cleanups, and forward `child`'s record to
+    /// `parent`'s record so procedures that captured `child` stay live under
+    /// `parent`. Returns the moved resource values (oldest first) so Scheme can
+    /// update `%owners`.
     fn adopt_scope(&mut self, child_slot: usize, parent_slot: usize) -> Result<Value, Error> {
         if child_slot == parent_slot {
             return Ok(Value::NIL);
         }
+        let parent_record = self.scope(parent_slot).record;
         let child = self.scopes[child_slot].take().ok_or_else(|| Error::new("%scope-adopt!: child scope is shut down"))?;
         self.free_scopes.push(child_slot);
-        unsafe { set_field(child.record.as_ptr(), SLOT, Value::FALSE) };
+        unsafe { set_field(child.record.as_ptr(), SLOT, parent_record) };
+        self.write_barrier(child.record.as_ptr(), parent_record);
         if let Some(p) = child.parent
             && let Some(parent) = self.scopes[p].as_mut()
         {
             parent.children.retain(|&c| c != child_slot);
         }
-        let parent_record = self.scope(parent_slot).record;
         for &c in &child.children {
             let c_record = {
                 let cs = self.scope_mut(c);
@@ -256,25 +286,7 @@ impl Vm {
         Ok(list_of(self, moved.iter().map(Root::get).collect()))
     }
 
-    /// Run `f` with `current-scope` set to `%root-scope` when `module` belongs
-    /// to the world while a package is staged here, or to `%staging-scope` when
-    /// `module` belongs to the staged package (matching `%load-forms` for the
-    /// synchronous Rust load fallbacks).
-    pub(crate) fn in_module_load_scope<T>(&mut self, module: u32, f: impl FnOnce(&mut Self) -> T) -> T {
-        if self.staging_here().is_none() {
-            return f(self);
-        }
-        let target = if self.modules[module as usize].generation == 0 {
-            self.scopes.first().and_then(|s| s.as_ref()).map(|s| s.record)
-        } else {
-            self.locals.get(&STAGING_SCOPE_KEY).map(Root::get).filter(|v| v.is_truthy())
-        };
-        let Some(target) = target else {
-            return f(self);
-        };
-        let target_root = self.root(target);
-        let prev = self.locals.insert(CURRENT_SCOPE_KEY, target_root);
-        let out = f(self);
+    fn restore_current_scope(&mut self, prev: Option<Root>) {
         match prev {
             Some(old) => {
                 self.locals.insert(CURRENT_SCOPE_KEY, old);
@@ -282,6 +294,51 @@ impl Vm {
             None => {
                 self.locals.remove(&CURRENT_SCOPE_KEY);
             }
+        }
+    }
+
+    /// Run `f` in the scope appropriate for loading `module`:
+    /// - A staged package module (`generation != 0` while this execution stages)
+    ///   runs in `%staging-scope`.
+    /// - A world module (`generation == 0`) runs in a temporary child of
+    ///   `%root-scope`: success adopts its resources into `%root-scope` (with
+    ///   forwarding so captured `scope-procedure`s stay live), while failure
+    ///   shuts the temporary scope down so neither tasks nor registrations leak.
+    pub(crate) fn in_module_load_scope<T>(&mut self, module: u32, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        if self.modules[module as usize].generation != 0 {
+            let target = self.staging_here().and_then(|_| self.locals.get(&STAGING_SCOPE_KEY).map(Root::get).filter(|v| v.is_truthy()));
+            let Some(target) = target else {
+                return f(self);
+            };
+            let target_root = self.root(target);
+            let prev = self.locals.insert(CURRENT_SCOPE_KEY, target_root);
+            let out = f(self);
+            self.restore_current_scope(prev);
+            return out;
+        }
+        let Some(root_record) = self.scopes.first().and_then(|s| s.as_ref()).map(|s| s.record) else {
+            return f(self);
+        };
+        let Some(finish) = self.get_global_in_raw(crate::vm::ROOT_MODULE, "%finish-world-load-scope!") else {
+            return f(self);
+        };
+        let finish_root = self.root(finish);
+        let name = Value::symbol(crate::reader::intern("root"));
+        let tmp = self.make_scope(name, root_record)?;
+        let tmp_root = self.root(tmp);
+        let prev = self.locals.insert(CURRENT_SCOPE_KEY, tmp_root.clone());
+        let out = f(self);
+        self.restore_current_scope(prev);
+        let ok = out.is_ok();
+        if !out.as_ref().is_err_and(Error::reaches_host) {
+            if let Err(e) = self.as_execution(|vm| vm.call_running(finish_root.get(), &[tmp_root.get(), Value::bool(ok)]))
+                && (e.reaches_host() || out.is_ok())
+            {
+                return Err(e);
+            }
+        } else if let Ok(Some(slot)) = self.own_scope_slot(tmp_root.get(), "%scope-shutdown!") {
+            let (mut released, mut lisp) = (Vec::new(), Vec::new());
+            let _ = self.shut_scope(slot, &mut released, &mut lisp);
         }
         out
     }
@@ -321,7 +378,7 @@ fn list_of(vm: &mut Vm, items: Vec<Value>) -> Value {
 }
 
 fn scope_shutdown(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
-    let Some(slot) = vm.scope_slot(arg(vm, args, 0), "%scope-shutdown!")? else { return Ok(Value::FALSE) };
+    let Some(slot) = vm.own_scope_slot(arg(vm, args, 0), "%scope-shutdown!")? else { return Ok(Value::FALSE) };
     let (mut released, mut lisp) = (Vec::new(), Vec::new());
     let failure = vm.shut_scope(slot, &mut released, &mut lisp);
     // An exit or a kill goes on to the host as itself (the table is
@@ -367,6 +424,7 @@ pub fn install(vm: &mut Vm) {
         };
         /// Return #t if the scope S is not shut down.
         "(scope-live? s)" => |vm: &mut Vm, a, _| Ok(Value::bool(vm.scope_slot(arg(vm, a, 0), "scope-live?")?.is_some()));
+        "(%scope-target s)" => |vm: &mut Vm, a, _| vm.scope_target(arg(vm, a, 0), "%scope-target");
         /// Return the name the scope S was made with.
         "(scope-name s)" => |vm: &mut Vm, a, _| scope_field(vm, a, NAME, "scope-name");
         /// Return the scope that owns the scope S, or #f for the root scope.

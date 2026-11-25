@@ -1048,11 +1048,13 @@ pub fn install(vm: &mut Vm) {
                         let forms = forms_arg(vm, arg(vm, a, 0), "%module-loaded")?;
             vm.end_forms_load(&forms);
             Ok(Value::VOID) };
-        // Whether FORMS, a module's, load into the world while a package
-        // is staged here (`Vm::forms_of_world`).
+        // Whether FORMS belong to the world or to the actively staged package.
         "(%forms-of-world? forms)" => |vm: &mut Vm, a, _| {
             let forms = forms_arg(vm, arg(vm, a, 0), "%forms-of-world?")?;
             Ok(Value::bool(vm.forms_of_world(&forms))) };
+        "(%forms-of-staging? forms)" => |vm: &mut Vm, a, _| {
+            let forms = forms_arg(vm, arg(vm, a, 0), "%forms-of-staging?")?;
+            Ok(Value::bool(vm.forms_of_staging(&forms))) };
         "(%package-begin path)" => |vm: &mut Vm, a, _| {
             let path = string(vm, arg(vm, a, 0), "load-package")?;
             let (forms, _) = vm.begin_package(std::path::Path::new(&path))?;

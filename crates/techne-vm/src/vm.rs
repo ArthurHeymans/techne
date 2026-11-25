@@ -2482,12 +2482,18 @@ impl Vm {
         }
     }
 
-    /// Whether `forms` are those of a module that is the world's, loading
-    /// while this execution stages a package: a file or library from
-    /// outside its directory, or one a package provides. What it starts
-    /// and registers as it loads is the world's with it (`%load-forms`).
+    /// Whether `forms` are those of a module that is the world's (not a
+    /// staged package generation's): a file or library loaded once into the
+    /// world, whose tasks and registrations belong to the world rather than
+    /// whichever package or scope happened to load it first (`%load-forms`).
     pub(crate) fn forms_of_world(&self, forms: &Forms) -> bool {
-        self.staging_here().is_some() && self.modules[forms.module as usize].generation == 0
+        self.modules[forms.module as usize].generation == 0
+    }
+
+    /// Whether `forms` belong to the package generation this execution is
+    /// actively staging (`%load-forms`).
+    pub(crate) fn forms_of_staging(&self, forms: &Forms) -> bool {
+        self.staging_here().is_some() && self.modules[forms.module as usize].generation != 0
     }
 
     /// Whether a module of the file at `path` is the staged package's own:

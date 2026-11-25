@@ -268,6 +268,122 @@
 (delete-file (package-main 'sync-pkg))
 (delete-file sync-lib-file)
 
+;; A `scope-procedure` registered by a world module stays live after the
+;; temporary world-load scope is adopted into `%root-scope`, and runs in
+;; `%root-scope` even after the first importer unloads. A `scope-procedure`
+;; captured by a world module that fails mid-load becomes dead.
+(define cb-world (string-append path ".cb-world.scm"))
+(write-forms! cb-world
+              '(provide cb-proc)
+              '(define cb-proc (scope-procedure (lambda () (cons 'alive (eq? (current-scope) %root-scope)))))
+              '(registry-add! demo-commands 'world-cb cb-proc))
+(make-directory (package-dir 'cb-pkg))
+(write-forms! (package-main 'cb-pkg) `(require ,cb-world))
+(load-package 'cb-pkg (package-main 'cb-pkg))
+(test '(alive . #t) (command 'world-cb))
+(unload-package 'cb-pkg)
+(test '(alive . #t) (command 'world-cb))
+(registry-remove! demo-commands 'world-cb)
+(delete-file (package-main 'cb-pkg))
+(delete-file cb-world)
+
+(define fail-cb-world (string-append path ".fail-cb-world.scm"))
+(eval '(define dead-cb (box #f)) "root")
+(write-forms! fail-cb-world
+              '(set-box! (eval 'dead-cb "root") (scope-procedure (lambda () 'should-not-run)))
+              '(error "fail after capture"))
+(make-directory (package-dir 'fail-cb-pkg))
+(write-forms! (package-main 'fail-cb-pkg) `(require ,fail-cb-world))
+(test-error (load-package 'fail-cb-pkg (package-main 'fail-cb-pkg)))
+(test #f ((unbox (eval 'dead-cb "root"))))
+(delete-file (package-main 'fail-cb-pkg))
+(delete-file fail-cb-world)
+
+;; A task spawned during staging keeps its inherited `%staging-scope`. If it
+;; later loads a world module after staging ends (whether in its inherited
+;; package scope or in `%root-scope`), that module keeps world ownership and
+;; survives unloading the package.
+(define late-world (string-append path ".late-world.scm"))
+(write-forms! late-world
+              '(provide late-task)
+              '(define late-task (spawn (lambda () (let loop () (sleep 1) (loop)))))
+              '(registry-add! demo-commands 'from-late-world (lambda () late-task)))
+(define late-world-root (string-append path ".late-world-root.scm"))
+(write-forms! late-world-root
+              '(provide late-root-task)
+              '(define late-root-task (spawn (lambda () (let loop () (sleep 1) (loop)))))
+              '(registry-add! demo-commands 'from-late-world-root (lambda () late-root-task)))
+(eval '(define late-go (make-channel)) "root")
+(eval '(define late-done (make-channel)) "root")
+(make-directory (package-dir 'late-pkg))
+(write-forms! (package-main 'late-pkg)
+              `(scope-transfer!
+                (spawn (lambda ()
+                         (channel-recv late-go)
+                         (eval '(require ,late-world))
+                         (with-scope %root-scope (eval '(require ,late-world-root)))
+                         (channel-send late-done #t)))
+                keeper))
+(load-package 'late-pkg (package-main 'late-pkg))
+(channel-send late-go #t)
+(channel-recv late-done)
+(define lt (command 'from-late-world))
+(define ltr (command 'from-late-world-root))
+(test #f (task-done? lt))
+(test #f (task-done? ltr))
+(unload-package 'late-pkg)
+(sleep 5)
+(test #f (task-done? lt))
+(test #f (task-done? ltr))
+(test #t (eq? lt (command 'from-late-world)))
+(test #t (eq? ltr (command 'from-late-world-root)))
+(task-kill lt)
+(task-kill ltr)
+(registry-remove! demo-commands 'from-late-world)
+(registry-remove! demo-commands 'from-late-world-root)
+(delete-file (package-main 'late-pkg))
+(delete-file late-world)
+(delete-file late-world-root)
+
+;; A synchronous library load (via `eval`) that fails mid-load rolls back the
+;; tasks and registrations it created in the root scope, and a retry succeeds.
+(define fail-sync-file (string-append sync-lib-dir "/synclib/flaky.sld"))
+(eval '(define flaky-task (box #f)) "root")
+(write-forms! fail-sync-file
+              '(define-library (synclib flaky)
+                 (export flaky-worker)
+                 (import (techne))
+                 (begin
+                   (define flaky-worker (spawn (lambda () (let loop () (sleep 1) (loop)))))
+                   (set-box! (eval 'flaky-task "root") flaky-worker)
+                   (registry-add! (eval 'demo-commands "root") 'from-flaky-lib (lambda () flaky-worker))
+                   (error "sync library init failed"))))
+(make-directory (package-dir 'flaky-pkg))
+(write-forms! (package-main 'flaky-pkg) '(eval '(import (synclib flaky))))
+(test-error (load-package 'flaky-pkg (package-main 'flaky-pkg)))
+(sleep 5)
+(test #t (task-done? (unbox (eval 'flaky-task "root"))))
+(test #f (command 'from-flaky-lib))
+;; Once fixed, the library loads cleanly on retry and outlives the package.
+(write-forms! fail-sync-file
+              '(define-library (synclib flaky)
+                 (export flaky-worker)
+                 (import (techne))
+                 (begin
+                   (define flaky-worker (spawn (lambda () (let loop () (sleep 1) (loop)))))
+                   (registry-add! (eval 'demo-commands "root") 'from-flaky-lib (lambda () flaky-worker)))))
+(load-package 'flaky-pkg (package-main 'flaky-pkg))
+(define fw (command 'from-flaky-lib))
+(test #f (task-done? fw))
+(unload-package 'flaky-pkg)
+(sleep 5)
+(test #f (task-done? fw))
+(test #t (eq? fw (command 'from-flaky-lib)))
+(task-kill fw)
+(registry-remove! demo-commands 'from-flaky-lib)
+(delete-file (package-main 'flaky-pkg))
+(delete-file fail-sync-file)
+
 ;; Primitives are sealed: shadowed by a definition, never changed.
 (test-error (eval '(set! car cdr)))
 (test 'shadowed (eval '(begin (define (car x) 'shadowed) (car '(1)))))
