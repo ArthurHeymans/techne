@@ -1,0 +1,37 @@
+;;; Committed text (a browser's paste or input method) goes where keys go.
+(require "../../test.scm")
+(require "../main.scm")
+(require "../modes.scm")
+(require "../session.scm")
+(require "../commands.scm")
+
+(define s (start-session (make-view (make-document "") "user") "emacs"))
+(define b (current-buffer s))
+(define (text) (document-string (buffer-document b)))
+
+(editor-insert-text! s "héllo")
+(check "inserts at the selection" "héllo" (text))
+(check "leaves the kill ring" '() (kill-ring s))
+
+(define typed '())
+(sset! s 'private-key (cons (lambda (key) (set! typed (cons key typed))) (lambda () #f)))
+(editor-insert-text! s "a b")
+(check "a private prompt takes typed characters" '("a" "SPC" "b") (reverse typed))
+(check "and the buffer does not" "héllo" (text))
+(sset! s 'private-key #f)
+
+(define taken #f)
+(register-mode! 'text-taker "Takes text." #:text (lambda (s t) (set! taken t) #t))
+(set-buffer-mode! b 'text-taker)
+(editor-insert-text! s "paste")
+(check "a mode's text handler takes it" "paste" taken)
+(check "instead of an edit" "héllo" (text))
+(register-mode! 'text-taker "Declines text." #:text (lambda (s t) #f))
+(editor-insert-text! s "!")
+(check "a declined text is inserted" "héllo!" (text))
+
+(sset! s 'transient (lambda (s key) #t))
+(editor-insert-text! s "x")
+(check "a transient refuses it" "héllo!" (text))
+(sset! s 'transient #f)
+(test-failures)

@@ -40,7 +40,7 @@
          find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
-         buffer-directory buffer-input buffer-display-options)
+         buffer-directory buffer-input buffer-text-input buffer-display-options)
 
 ;;; Buffers
 
@@ -178,10 +178,16 @@ STATE is `chord` (the default) or `normal`."
   "Return the direct key handler for buffer B, or #f."
   (and b (any (lambda (m) (registry-ref %mode-inputs (mode-name m))) (mode-chain (buffer-mode b)))))
 
+(define %mode-texts (make-registry 'mode-texts))
+
+(define (buffer-text-input b)
+  "Return the committed-text handler for buffer B, or #f."
+  (and b (any (lambda (m) (registry-ref %mode-texts (mode-name m))) (mode-chain (buffer-mode b)))))
+
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
                         #:complete [complete #f] #:indent [indent #f] #:directory [directory #f] #:options [options '()]
-                        #:projections [projections #f] #:input [input #f])
+                        #:projections [projections #f] #:input [input #f] #:text [text #f])
   "Define the major mode NAME, documented by DOC, extending PARENT.
 It has PARENT's keys, layers and options, and its own: KEYS and NORMAL
 are (key-description command) bindings for chords and for modal normal
@@ -197,12 +203,15 @@ an alist of (option . value) set in the mode, FILES the file name
 suffixes it is for, PROJECTIONS a procedure (document from to) giving
 how the text is laid out (`buffer-projections'). It defines the command
 NAME, which gives the focused buffer this mode. INPUT is a procedure
-(session key) returning true if it handled the key before the profile."
+(session key) returning true if it handled the key before the profile;
+TEXT a procedure (session text) returning true if it took committed text
+(a paste or an input method's) instead of an edit at the selection."
   (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete indent directory
              options files)
   (projections! name projections)
   ;; INPUT gets (session key) and returns true if it consumed the key.
   (registry-add! %mode-inputs name (and input (scope-procedure input)))
+  (registry-add! %mode-texts name (and text (scope-procedure text)))
   (register-command! name doc (lambda (s n)
                                 (set-buffer-mode! (or (current-buffer s) (error "No buffer")) name)
                                 (message! s (symbol->string name))))

@@ -11,13 +11,16 @@ name = "techne"
 path = "src/main.rs"
 
 [features]
-default = ["window", "term"]
+default = ["window", "term", "web"]
 # The editor's frontends. A server builds without them: the window pulls in
 # a GPU stack and windowing libraries.
 window = ["dep:techne-window", "dep:techne-editor"]
 term = ["dep:techne-term", "dep:techne-editor"]
+# The browser's gateway is Scheme (lisp/web); Rust attaches it to the editor.
+web = ["dep:techne-editor", "dep:serde_json", "tokio/sync"]
 
 [dependencies]
+serde_json = { version = "1", optional = true }
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 # Their own binaries, which their tests run, are built with the counting
 # allocator only: turning it on here builds them in a workspace build.

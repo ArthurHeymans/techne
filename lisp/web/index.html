@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Techne</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main id="frame" aria-label="Techne editor">
+    <div id="panes" aria-label="Editor panes"></div>
+    <section id="minibuffer" aria-label="Minibuffer" hidden>
+      <div id="prompt-line"><span id="prompt"></span><span id="command" role="textbox" aria-readonly="true" aria-label="Minibuffer input"></span></div>
+      <div id="choices" role="listbox" aria-label="Command suggestions" hidden></div>
+    </section>
+    <div id="hints" aria-label="Key hints" hidden></div>
+    <div id="echo" role="status"></div>
+    <div id="completion" role="listbox" aria-label="Completions" hidden></div>
+    <textarea id="keys" aria-label="Editor keyboard input" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+    <div id="connection"><span id="connection-message" role="status">Connecting…</span> <button id="reconnect" type="button">Reconnect</button></div>
+  </main>
+</body>
+</html>
