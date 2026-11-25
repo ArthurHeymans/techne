@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795616276691,
+  "lastUpdate": 1795616278276,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -63344,6 +63344,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 631166669,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104639,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "689af4993f9c2329726b6d9b45a1da785b4107f5",
+          "message": "Merge pull request #415 from ArthurHeymans/tools/process-argument-errors\n\nSay which process argument is wrong, and treat a wide output window as its bound",
+          "timestamp": "2026-11-25T15:00:19+01:00",
+          "tree_id": "1bda4af5d7b974036183e084900004dd4a57447e",
+          "url": "https://github.com/ArthurHeymans/techne/commit/689af4993f9c2329726b6d9b45a1da785b4107f5"
+        },
+        "date": 1795616278227,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697538374,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 631162669,
             "unit": "instructions"
           },
           {
