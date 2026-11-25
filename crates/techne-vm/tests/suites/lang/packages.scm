@@ -384,6 +384,57 @@
 (delete-file (package-main 'flaky-pkg))
 (delete-file fail-sync-file)
 
+;; A world module shadowing an existing root-scope registry entry restores the
+;; old entry on failure, retires the shadowed root entry on success (keeping one
+;; root entry per key), and lets tasks spawned during the load replace/remove
+;; root entries without duplicating them. A resource transferred away during
+;; world load keeps its transferred owner on commit.
+(define shadow-fail-world (string-append path ".shadow-fail-world.scm"))
+(define shadow-ok-world (string-append path ".shadow-ok-world.scm"))
+(eval '(define shadow-go (make-channel)) "root")
+(eval '(define shadow-done (make-channel)) "root")
+(eval '(define shadow-transferred (box #f)) "root")
+(registry-add! demo-commands 'shadowed-root (lambda () 'root-v1))
+;; Failing shadow restores root-v1.
+(write-forms! shadow-fail-world
+              '(registry-add! demo-commands 'shadowed-root (lambda () 'world-fail))
+              '(error "shadow load failed"))
+(make-directory (package-dir 'shadow-fail-pkg))
+(write-forms! (package-main 'shadow-fail-pkg) `(require ,shadow-fail-world))
+(test-error (load-package 'shadow-fail-pkg (package-main 'shadow-fail-pkg)))
+(test 'root-v1 (command 'shadowed-root))
+;; Succeeding shadow retires root-v1; a task spawned during load inherits the
+;; forwarded temp scope and still replaces/removes the root entry cleanly; a
+;; resource transferred to `keeper` during load stays owned by `keeper`.
+(write-forms! shadow-ok-world
+              '(registry-add! demo-commands 'shadowed-root (lambda () 'world-v2))
+              '(let ((r (list 'xfer)))
+                 (scope-own! r (lambda (_) #f))
+                 (scope-transfer! r keeper)
+                 (set-box! (eval 'shadow-transferred "root") r))
+              '(spawn (lambda ()
+                        (channel-recv shadow-go)
+                        (registry-add! demo-commands 'shadowed-root (lambda () 'world-v3))
+                        (channel-send shadow-done #t))))
+(make-directory (package-dir 'shadow-pkg))
+(write-forms! (package-main 'shadow-pkg) `(require ,shadow-ok-world))
+(load-package 'shadow-pkg (package-main 'shadow-pkg))
+(test 'world-v2 (command 'shadowed-root))
+(test #t (eq? keeper (scope-of (unbox (eval 'shadow-transferred "root")))))
+(scope-disown! (unbox (eval 'shadow-transferred "root")))
+;; Task spawned during world load updates the root entry via its forwarded scope.
+(channel-send shadow-go #t)
+(channel-recv shadow-done)
+(test 'world-v3 (command 'shadowed-root))
+;; Only one root entry exists: a single registry-remove! clears it completely.
+(registry-remove! demo-commands 'shadowed-root)
+(test #f (command 'shadowed-root))
+(unload-package 'shadow-pkg)
+(delete-file (package-main 'shadow-fail-pkg))
+(delete-file (package-main 'shadow-pkg))
+(delete-file shadow-fail-world)
+(delete-file shadow-ok-world)
+
 ;; Primitives are sealed: shadowed by a definition, never changed.
 (test-error (eval '(set! car cdr)))
 (test 'shadowed (eval '(begin (define (car x) 'shadowed) (car '(1)))))

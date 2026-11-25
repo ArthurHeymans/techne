@@ -79,12 +79,14 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
             (else (%load-forms next) (loop last))))))
 
 ;; Finish a temporary world-module load scope: adopt into %root-scope on
-;; success (updating %owners and forwarding the temporary scope record so
-;; captured `scope-procedure`s stay live), or shut down on failure.
+;; success (updating %owners, forwarding tmp so captured `scope-procedure`s
+;; stay live, and retiring shadowed root entries), or shut down on failure.
 (define (%finish-world-load-scope! tmp ok)
   (if ok
-      (for-each (lambda (r) (hash-table-set! %owners r %root-scope))
-                (%scope-adopt! tmp %root-scope))
+      (let ((res (%scope-adopt! tmp %root-scope)))
+        (for-each (lambda (r) (when (eq? (scope-of r) tmp) (hash-table-set! %owners r %root-scope))) (car res))
+        (when (pair? (cdr res))
+          (for-each (lambda (p) (%registry-dedupe-root! (car p) (cdr p))) (cdr res))))
       (scope-shutdown! tmp)))
 
 ;; The forms of a module loading, evaluated in it. One that is the
@@ -96,7 +98,7 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
 (define (%load-forms forms)
   (define (load)
     (dynamic-wind
-        (lambda () (%enter-module forms))
+     (lambda () (%enter-module forms))
      (lambda ()
        (let ((value (%eval-forms forms)))
          ;; Only this successful path publishes a library. The wind's
@@ -105,19 +107,13 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
          value))
      (lambda () (%leave-module) (%module-loaded forms))))
   (cond ((%forms-of-staging? forms)
-         (let ((s (%staging-scope)))
-           (if s (%call-in-scope s load) (load))))
+         (let ((s (%staging-scope))) (if s (%call-in-scope s load) (load))))
         ((%forms-of-world? forms)
-         (let ((tmp (make-scope 'root #:parent %root-scope))
-               (ok #f))
+         (let ((tmp (%make-world-load-scope)) (key (%parameter-key current-scope)) (old (current-scope)) (ok #f))
            (dynamic-wind
-            (lambda () #f)
-            (lambda ()
-              (let ((value (%call-in-scope tmp load)))
-                (set! ok #t)
-                value))
-            (lambda ()
-              (%finish-world-load-scope! tmp ok)))))
+            (lambda () (%task-local-set! key tmp))
+            (lambda () (let ((v (load))) (set! ok #t) v))
+            (lambda () (%task-local-set! key old) (%finish-world-load-scope! tmp ok)))))
         (else (load))))
 
 (define (eval-source source module file)
@@ -994,7 +990,7 @@ PARENT is the current scope by default; shutting it shuts the new one."
 ;; As (parameterize ((current-scope s)) body ...), cheaper to expand: it is
 ;; used in every procedure handed over (scope-procedure).
 (define (%call-in-scope s thunk)
-  (let ((s (or (%scope-target s) s)) (key (%parameter-key current-scope)) (old (current-scope)))
+  (let ((s (%scope-resolve s)) (key (%parameter-key current-scope)) (old (current-scope)))
     (dynamic-wind (lambda () (%task-local-set! key s)) thunk (lambda () (%task-local-set! key old)))))
 
 (define-syntax with-scope
@@ -1003,7 +999,7 @@ PARENT is the current scope by default; shutting it shuts the new one."
     ((_ s body ...) (%call-in-scope s (lambda () body ...)))))
 
 (define (%scope-add! s resource cleanup done?)
-  (let ((s (or (%scope-target s) s)))
+  (let ((s (%scope-resolve s)))
     ;; Owned again by the same scope: the new cleanup replaces the old.
     (when (eq? (hash-table-ref/default %owners resource #f) s)
       (%scope-disown! s resource))
@@ -1016,7 +1012,7 @@ PARENT is the current scope by default; shutting it shuts the new one."
 Shutting the scope calls (CLEANUP RESOURCE), unless (DONE? RESOURCE)
 says it has ended already. A long-lived scope forgets what ended by
 itself now and then, when DONE? is a native such as `task-done?`."
-  (%scope-add! (current-scope) resource cleanup done?))
+  (%scope-add! (%current-scope) resource cleanup done?))
 
 (define (scope-of resource)
   "Return the scope that owns RESOURCE, or #f."
@@ -1143,9 +1139,9 @@ at all, for a registry whose entries are read together."
 (define (registry-add! reg key value)
   "Map KEY to VALUE in REG, owned by the current scope; return VALUE.
 While a package generation loads, the entry waits until it is published."
-  (let* ((s (current-scope)) (pending (%scope-pending s)))
+  (let* ((s (%current-scope)) (pending (%scope-pending s)))
     (if pending
-        (%set-scope-pending! s (cons (lambda () (%registry-add! reg key value (current-scope))) pending))
+        (%set-scope-pending! s (cons (lambda () (%registry-add! reg key value (%current-scope))) pending))
         (%registry-add! reg key value s)))
   value)
 
@@ -1156,14 +1152,23 @@ effect again. While a package generation loads, this waits until it is
 published."
   (%registry-staged
    (lambda ()
-     (let* ((stack (hash-table-ref/default (%registry-table reg) key '()))
-            (r (or (find (lambda (r) (eq? (scope-of r) (current-scope))) stack) (and (pair? stack) (car stack)))))
+     (let* ((s (%current-scope))
+            (stack (hash-table-ref/default (%registry-table reg) key '()))
+            (r (or (find (lambda (r) (eq? (scope-of r) s)) stack) (and (pair? stack) (car stack)))))
        (when r (%registry-swap! reg key r #f #t))))))
 
 ;; Do CHANGE now, or when the package generation loading is published.
 (define (%registry-staged change)
-  (let ((s (current-scope)))
+  (let ((s (%current-scope)))
     (if (%scope-pending s) (%set-scope-pending! s (cons change (%scope-pending s))) (change))))
+
+;; Keep only the topmost %root-scope entry for KEY in REG.
+(define (%registry-dedupe-root! reg key)
+  (let loop ((xs (hash-table-ref/default (%registry-table reg) key '())) (seen #f))
+    (when (pair? xs)
+      (if (eq? (scope-of (car xs)) %root-scope)
+          (begin (when seen (%registry-swap! reg key (car xs) #f #t)) (loop (cdr xs) #t))
+          (loop (cdr xs) seen)))))
 
 ;; The current scope's entry replaces its own or its predecessor's: in
 ;; place while a generation succeeds another (it keeps the place its
@@ -1188,6 +1193,8 @@ published."
     (if old (%registry-swap! reg key old entry p)
         (begin
           (hash-table-set! (%registry-table reg) key (cons entry stack))
+          (%scope-note-dedupe! s reg key)
+          (for-each (lambda (r) (%scope-note-dedupe! (scope-of r) reg key)) stack)
           (let ((changed (%registry-changed reg))) (when changed (changed key value)))))))
 
 (define (%registration-ended? entry) #f)
