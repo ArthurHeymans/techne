@@ -18,7 +18,8 @@
 (require "../schema.scm")
 
 (provide press press-keys type-text command-doc
-         define-command register-command! register-command-package! command command-names run-command command-joins! message!
+         define-command register-command! register-command-package! activate-command-package!
+         command command-names run-command command-joins! message!
          invoke make-contract command-contract command-code contract? contract-params contract-entries contract-read
          contract-effects contract-expose contract-available contract-stageable contract-result contract-hash
          contract-argument-schema contract-sensitive set-command-acquirer! contract-conform-argument ->data error-text messages-document message-log-max
@@ -163,6 +164,7 @@ Records of its runs keep the number of theirs (`record-code`)."
   (package offer-package) (doc offer-doc) (activate offer-activate)
   (impl offer-impl) (proxy offer-proxy))
 (define %offers (make-registry 'command-offers))
+(define %package-activators (make-registry 'command-package-activators))
 (define %offered-generation (make-parameter #f))
 
 (define (register-command-package! package path commands)
@@ -194,6 +196,7 @@ the declarations. A failed load can be retried."
               (for-each (lambda (c) (unless (hash-table-ref/default seen (car c) #f)
                                       (error "Package did not define advertised command" package (car c)))) commands)
               generation)))))
+    (registry-add! %package-activators package activate)
     (for-each (lambda (c)
                 (let* ((name (car c)) (proxy (lambda args (apply (caddr (resolve-command name)) args)))
                        ;; The bootstrap can reload independently of the implementation.
@@ -201,6 +204,12 @@ the declarations. A failed load can be retried."
                        (old (registry-ref %offers name)) (impl (if old (offer-impl old) (make-registry package)))
                        (offer (make-offer package (cadr c) activate impl proxy)))
                   (registry-add! %offers name offer) (registry-add! %commands name offer))) commands)))
+
+(define (activate-command-package! package)
+  "Activate the lazily registered command package PACKAGE."
+  (let ((act (registry-ref %package-activators package)))
+    (unless act (error "No command package registered" package))
+    (act)))
 
 (define (command-entry name)
   (let ((c (registry-ref %commands name)))
@@ -505,11 +514,26 @@ STARTED, if given, is called with its record before the command runs."
     (let ((why (if (contract-available contract) ((contract-available contract) s) #t)))
       (unless (eq? why #t)
         (error (string-append (symbol->string name) " is not available: " (if (string? why) why "not here")))))
-    (let* ((done (contract-conform contract args name))
+    (let* ((focused (view-document (session-view s)))
+           (done (contract-conform contract args name))
            (vals (map (lambda (k) (dict-ref done k #f)) (contract-params contract)))
+           (private-context?
+            (or (private-document? focused)
+                (any (lambda (v) (and (guard (e (#t #f)) (document-id v)) (private-document? v))) vals)))
+           (private-redact?
+            (lambda (e v)
+              (or (entry-flag? e #:sensitive)
+                  (and private-context?
+                       (not (or (boolean? v) (number? v) (symbol? v) (null? v)
+                                (guard (ex (#t #f)) (and (document-id v) #t))))))))
            (effects (let ((e (contract-effects contract))) (if (procedure? e) (apply e vals) e)))
-           (secrets (filter-map (lambda (ev) (and (entry-flag? (car ev) #:sensitive) (cdr ev))) (map cons (contract-entries contract) vals)))
-           (kept (map (lambda (e v) (cons (car e) (argument-data e v))) (contract-entries contract) vals))
+           (secrets (filter-map (lambda (ev) (and (private-redact? (car ev) (cdr ev)) (cdr ev)))
+                                (map cons (contract-entries contract) vals)))
+           (kept (map (lambda (e v)
+                        (if (private-redact? e v)
+                            (list (car e) "<redacted>" #f)
+                            (cons (car e) (argument-data e v))))
+                      (contract-entries contract) vals))
            (data (map (lambda (k) (cons (car k) (cadr k))) kept))
            (unavailable (let loop ((es (contract-entries contract)) (ks kept) (acc '()))
                           (if (null? es)
@@ -523,7 +547,7 @@ STARTED, if given, is called with its record before the command runs."
       (case mode
         ((check) #t)
         ((apply stage)
-         (let* ((d (view-document (session-view s)))
+         (let* ((d focused)
                 (r (start-invocation! name s (command-code-id c) (document-id d) (document-revision d)
                                       data principal effects (contract-hash contract) secrets #:parent parent #:mode mode #:unavailable unavailable))
                 (result (guard (e ((and (pair? secrets) (error-object? e))

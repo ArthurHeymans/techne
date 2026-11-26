@@ -39,8 +39,11 @@
 (require "staging.scm")
 (require "shell.scm")
 (require "remote.scm")
+(require "direnv.scm")
 (require "syntax.scm")
 (require "rpc.scm")
+(require "project-settings-bridge.scm")
+(require "project-settings.scm")
 (require "lsp.scm")
 (require "rich.scm")
 (require "markdown.scm")
@@ -53,7 +56,9 @@
          command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
          mode-name mode-doc mode-parent mode-chain derived-mode? mode-for-file register-mode-line-segment!
-          define-option register-option! find-option set-option! unset-option! option explain-option
+         define-option register-option! find-option option-user-only? option-directory-safe option-merge
+         set-option! unset-option! option option-json-overlay explain-option
+         add-option-changed-hook! remove-option-changed-hook!
          define-face register-face! find-face face-names face-doc set-face! unset-face! explain-face face-attributes
          set-palette! palette-color load-theme unload-theme
          define-language register-language! find-language language-names language-generation buffer-language path-language
@@ -65,7 +70,7 @@
          doc ranges point move! check-editable! edit! insert-text! search! region-text replace-region! search-all goto-next!
          set-indent! indent-lines! line-starts indentation lisp-indent
          kill-ring kill-save! yank-text current-prefix
-         file-document show-document! show-buffer! visit! buffer-list add-buffer! eval-region!
+         file-document show-document! show-buffer! visit! file-visit! cancel-file-visit! file-visit-pending? save-document-in-session! buffer-list add-buffer! eval-region!
          completing-read async-source candidate candidate-text candidate-annotation candidate-target take-target candidate-table minibuffer-history
          target target? target-kind target-value target-at define-action actions-for act-on!
          location file-location location? location-document location-position line-candidate
@@ -97,11 +102,37 @@
          make-listing-buffer! listing-redisplay! listing-row listing-mark listing-marked listing-targets
          listing-key-at listing-goto! listing-get listing-set! listing?
          save-document! reload-document! directory-entries path-exists?
+         document-codec document-codec-envelope document-private? document-logical-path document-save-description
+         codec? codec-name codec-doc codec-private? codec-priority
+         codec-result? make-codec-result codec-result-text codec-result-envelope
+         register-codec! define-codec find-codec codec-names
+         codec-for-path codecs-for-path path-private-by-codec? codec-logical-path codec-init-envelope
+         codec-decode codec-encode codec-save-description
+         default-codec-max-bytes default-codec-timeout default-gzip-program
+         default-gpg-program default-gpg-homedir default-gpg-recipients default-gpg-id-roots
+         default-gpg-trust-file-recipients default-gpg-armor default-gpg-batch default-gpg-timeout
+         default-age-program default-age-identities default-age-recipients default-age-recipients-file
+         default-age-recipient-roots default-age-armor default-age-timeout
          remote-path? location-route location-path location-prefix location-at define-method method-names
          hop? hop-method hop-user hop-host hop-port
          location-endpoint remote-endpoints call-with-process-at
+         execution-site? execution-site-for
+         execution-site-route execution-site-directory
+         env-snapshot-status
+         execution-site-env-snapshot execution-site-cached-snapshot
+         execution-site-resolved-environment execution-site-find-program
+         execution-site-needs-eval? execution-site-watched-path?
+         execution-site-invalidate!
+         spawn-at-site call-with-process-at-site
          rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting rpc-unsupported rpc-timeout
          define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc lsp-attach! lsp-buffer-sessions
+         lsp-session-env-id lsp-effective-settings lsp-refresh-configuration!
+         make-settings-context settings-context? json-unset json-unset? json-object-overlay json-object-compose-overlays
+         project-settings-load! project-settings-cached-snapshot project-settings-invalidate! project-settings-invalidate-ancestors!
+         default-trust-store-path project-trust-verdict project-trust-entries project-trust-clear-memory!
+         project-settings-approve! project-settings-deny! project-settings-revoke!
+         add-project-settings-changed-hook! remove-project-settings-changed-hook!
+         buffer-project-settings-pending buffer-project-settings-diagnostics
          rich-present! rich-splice! rich-units make-rich-buffer! rich-code-language markdown->rich markdown-render! markdown-escape buffer-projections)
 
 (%name-library '(techne editor))

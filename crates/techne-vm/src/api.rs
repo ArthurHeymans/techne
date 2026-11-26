@@ -887,6 +887,7 @@ impl_into_native!(A, B, C);
 impl_into_native!(A, B, C, D);
 impl_into_native!(A, B, C, D, E);
 impl_into_native!(A, B, C, D, E, G);
+impl_into_native!(A, B, C, D, E, G, H);
 
 /// Whether any value of `F` is any other: `F` holds nothing (a closure
 /// capturing nothing, a function), and dropping one does nothing. Then a

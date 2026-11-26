@@ -129,7 +129,7 @@ fn write_file(root: &str, name: &str, expected: &str, source: &str) -> R<String>
     if hex(&old) != expected {
         return Err("tool-edit!: stale revision; read again".into());
     }
-    let rev = fs::write(p.as_os_str().as_encoded_bytes(), source.as_bytes(), Expect::Hash(old))
+    let rev = fs::write(p.as_os_str().as_encoded_bytes(), source.as_bytes(), Expect::Hash(old), false)
         .map_err(|e| e.to_string())?
         .map_err(|_| "tool-edit!: stale revision; read again")?;
     Ok(hex(&rev))

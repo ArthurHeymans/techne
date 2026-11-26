@@ -71,27 +71,88 @@ fn journal_dir(state: &Path) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+fn state_dir() -> std::io::Result<PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .ok_or_else(|| std::io::Error::other("no XDG_STATE_HOME or HOME"))
+}
+
+fn journal_named_in(state: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let hash = techne_text::journal::hash(path.as_os_str().as_encoded_bytes());
+    let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
+    Ok(journal_dir(state)?.join(format!("{name}.journal")))
+}
+
 /// The journal of the file whose true name is `path`, which may not
 /// exist yet (`journal_for`).
 pub fn journal_named(path: &Path) -> std::io::Result<PathBuf> {
+    journal_named_in(&state_dir()?, path)
+}
+
+/// Unsaved edits of a file are journaled under the state directory, named by
+/// a hash of the file's absolute path.
+pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = techne_text::document::file_path(path)?;
+    let abs = std::path::absolute(path)?;
+    journal_for_pinned(&canonical, (abs != canonical).then_some(abs.as_path()))
+}
+
+fn journal_for_pinned_in(state: &Path, canonical: &Path, alias: Option<&Path>) -> std::io::Result<PathBuf> {
+    let target = journal_named_in(state, canonical)?;
+    if let Some(extra) = alias
+        && extra != canonical
+    {
+        let legacy = journal_named_in(state, extra)?;
+        if legacy != target && legacy.try_exists()? {
+            techne_text::journal::migrate(&legacy, &target)?;
+        }
+    }
+    Ok(target)
+}
+
+/// Compute the journal path for a pinned canonical local file `canonical`,
+/// migrating any legacy journal stored under `alias` without re-resolving
+/// either path on disk.
+pub fn journal_for_pinned(canonical: &Path, alias: Option<&Path>) -> std::io::Result<PathBuf> {
+    journal_for_pinned_in(&state_dir()?, canonical, alias)
+}
+
+/// Compute the journal path for `path` without creating the journal directory
+/// or migrating any legacy journal. Used for read-only fail-closed checks
+/// before opening a file under `Retention::None`.
+pub fn journal_path_ro(path: &Path) -> std::io::Result<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .ok_or_else(|| std::io::Error::other("no XDG_STATE_HOME or HOME"))?;
     let hash = techne_text::journal::hash(path.as_os_str().as_encoded_bytes());
     let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
-    Ok(journal_dir(&state)?.join(format!("{name}.journal")))
+    Ok(state.join("techne/journals").join(format!("{name}.journal")))
 }
 
-/// Unsaved edits of a file are journaled under the state directory, named by
-/// a hash of the file's absolute path.
-pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
-    let canonical = journal_named(&techne_text::document::file_path(path)?)?;
-    let legacy = journal_named(&std::path::absolute(path)?)?;
-    if legacy != canonical && legacy.try_exists()? {
-        techne_text::journal::migrate(&legacy, &canonical)?;
+/// Fail closed if a journal (canonical or legacy) already exists on disk or
+/// is locked by another process for pinned canonical local `canonical` (and
+/// optional `alias`), without re-resolving or creating any directory, journal,
+/// or lock file.
+pub(crate) fn check_no_existing_journal(canonical: &Path, alias: Option<&Path>) -> Result<(), String> {
+    let canonical_j = journal_path_ro(canonical).map_err(|e| format!("{}: {e}", canonical.display()))?;
+    techne_text::journal::check_no_journal(&canonical_j).map_err(|e| format!("{}: {e}", canonical.display()))?;
+    if let Some(extra) = alias
+        && extra != canonical
+    {
+        let legacy_j = journal_path_ro(extra).map_err(|e| format!("{}: {e}", extra.display()))?;
+        if legacy_j != canonical_j {
+            techne_text::journal::check_no_journal(&legacy_j).map_err(|e| format!("{}: {e}", extra.display()))?;
+        }
     }
-    Ok(canonical)
+    Ok(())
+}
+
+/// As `check_no_existing_journal`, for a remote location `name`.
+pub(crate) fn check_no_existing_remote_journal(name: &str) -> Result<(), String> {
+    let j = journal_path_ro(Path::new(name)).map_err(|e| format!("{name}: {e}"))?;
+    techne_text::journal::check_no_journal(&j).map_err(|e| format!("{name}: {e}"))
 }
 
 /// How far past a pane's scroll anchor layers are asked for highlights:
@@ -195,12 +256,17 @@ pub struct Runtime {
     vm: Vm,
     /// The documents of files, by path, shared by all the sessions.
     documents: crate::Documents,
+    /// The recovery result of the most recently opened decoded document,
+    /// so `attach` can report replayed edits for codec-backed journaled files.
+    last_recovery: crate::LastRecovery,
     /// The document the runtime was opened with.
     doc: Option<Rc<RefCell<Document>>>,
     clients: BTreeMap<Client, Attached>,
     /// The frontend whose session Lisp is called for.
     serving: Client,
     next_id: u64,
+    /// Programs whose async open (`Msg::Open`) is still in flight: `(wait, reply)`.
+    opening: HashMap<usize, (bool, mpsc::Sender<Reply>)>,
     /// The programs waiting until a file they opened is done with, by the
     /// id of their request, which Lisp knows them by (`Msg::Open`).
     waiting: HashMap<usize, mpsc::Sender<Reply>>,
@@ -467,7 +533,7 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 44] = [
+const PROCS: [&str; 47] = [
     "editor-pointer!",
     "editor-focus-event!",
     "editor-cancel-capture!",
@@ -478,7 +544,10 @@ const PROCS: [&str; 44] = [
     "editor-take-captures!",
     "editor-captured!",
     "editor-open!",
+    "%attach-file-visit!",
     "keep-histories!",
+    "editor-take-opened!",
+    "editor-take-failed!",
     "editor-take-done!",
     "editor-forget!",
     "editor-detach!",
@@ -551,9 +620,10 @@ impl Runtime {
     /// A runtime whose world is granted only `grants`.
     pub fn granted(grants: Grants) -> Result<Runtime, Error> {
         let documents = crate::Documents::default();
+        let last_recovery = crate::LastRecovery::default();
         let syntax = crate::syntax::Shared::default();
         let mut vm = Vm::with_grants(grants);
-        crate::install_with(&mut vm, documents.clone(), syntax.clone());
+        crate::install_with(&mut vm, documents.clone(), last_recovery.clone(), syntax.clone());
         techne_node::install(&mut vm)?;
         techne_net::install(&mut vm)?;
         load_lisp(&mut vm)?;
@@ -569,10 +639,12 @@ impl Runtime {
         Ok(Runtime {
             vm,
             documents,
+            last_recovery,
             doc: None,
             clients: BTreeMap::new(),
             serving: Client::FIRST,
             next_id: 0,
+            opening: HashMap::new(),
             waiting: HashMap::new(),
             captures: HashMap::new(),
             outstanding_frames: HashSet::new(),
@@ -586,12 +658,97 @@ impl Runtime {
         })
     }
 
+    /// Inspect `f` for canonical path, codec match (on canonical or raw path),
+    /// and private profile requirement. Fails closed on unrepresentable
+    /// non-UTF-8 paths or any matcher error.
+    fn inspect_attach_file(&mut self, f: &File) -> Result<(PathBuf, String, String, bool, bool), String> {
+        let canonical = techne_text::document::file_path(&f.path).map_err(|e| format!("{}: {e}", f.path.display()))?;
+        let path_str = canonical
+            .clone()
+            .into_os_string()
+            .into_string()
+            .map_err(|_| format!("{}: canonical path is not valid UTF-8", f.path.display()))?;
+        let raw_str = std::path::absolute(&f.path)
+            .map_err(|e| format!("{}: {e}", f.path.display()))?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| format!("{}: path is not valid UTF-8", f.path.display()))?;
+        let has_codec = if self.vm.get_global("codec-for-path").is_some() {
+            let canon_codec = self
+                .call_within("codec-for-path", &[Arg::Str(path_str.clone())], OPEN_DEADLINE)
+                .map_err(|e| format!("{}: codec matcher failed: {e}", f.path.display()))?
+                .is_truthy();
+            let raw_codec = if !canon_codec && raw_str != path_str {
+                self.call_within("codec-for-path", &[Arg::Str(raw_str.clone())], OPEN_DEADLINE)
+                    .map_err(|e| format!("{}: codec matcher failed: {e}", f.path.display()))?
+                    .is_truthy()
+            } else {
+                false
+            };
+            canon_codec || raw_codec
+        } else {
+            false
+        };
+        let is_private = if self.vm.get_global("private-path?").is_some() {
+            let canon_priv = self
+                .call_within("private-path?", &[Arg::Str(path_str.clone())], OPEN_DEADLINE)
+                .map_err(|e| format!("{}: privacy check failed: {e}", f.path.display()))?
+                .is_truthy();
+            let raw_priv = if !canon_priv && raw_str != path_str {
+                self.call_within("private-path?", &[Arg::Str(raw_str.clone())], OPEN_DEADLINE)
+                    .map_err(|e| format!("{}: privacy check failed: {e}", f.path.display()))?
+                    .is_truthy()
+            } else {
+                false
+            };
+            canon_priv || raw_priv
+        } else {
+            false
+        };
+        Ok((canonical, path_str, raw_str, has_codec, is_private))
+    }
+
     /// Attach a frontend as `client`, its keys read by `profile`: its
     /// session shows `file`, opened with its journal unless it is open
     /// already, and without one what the current session shows. Returns
     /// what was recovered from the journal when the file was opened.
     pub fn attach(&mut self, client: Client, file: Option<&File>, profile: &str) -> Result<Option<Recovery>, String> {
-        let opened = file.map(|f| crate::open_shared(&self.documents, &f.path, || Ok(f.journal.clone()))).transpose()?;
+        let opened = match file {
+            None => None,
+            Some(f) => {
+                let (canonical, canon_str, abs_str, has_codec, is_private) = self.inspect_attach_file(f)?;
+                if has_codec || is_private {
+                    self.last_recovery.borrow_mut().take();
+                    let alias_arg = if abs_str != canon_str { Arg::Str(abs_str) } else { Arg::Bool(false) };
+                    let journal_arg = if !is_private && !f.journal.as_os_str().is_empty() {
+                        let journal_str =
+                            f.journal.to_str().ok_or_else(|| format!("{}: journal path is not valid UTF-8", f.journal.display()))?;
+                        Arg::Str(journal_str.to_string())
+                    } else {
+                        Arg::Bool(false)
+                    };
+                    let val = if self.vm.get_global("%attach-file-document").is_some() {
+                        self.call_within("%attach-file-document", &[Arg::Str(canon_str), journal_arg, alias_arg], OPEN_DEADLINE)
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        self.call_within("file-document", &[Arg::Str(canon_str)], OPEN_DEADLINE).map_err(|e| e.to_string())?
+                    };
+                    let doc: Foreign<RefCell<Document>> = self.vm.get(&val).map_err(|e| e.to_string())?;
+                    let recovery = self.last_recovery.borrow_mut().take().filter(|(id, _)| *id == doc.0.borrow().id()).map(|(_, r)| r);
+                    Some((doc.0, recovery))
+                } else {
+                    let abs = std::path::absolute(&f.path).ok();
+                    let alias = abs.as_deref().filter(|a| *a != canonical.as_path());
+                    Some(crate::open_shared_pinned(&self.documents, &canonical, || {
+                        if f.journal.as_os_str().is_empty() {
+                            journal_for_pinned(&canonical, alias).map_err(|e| format!("{}: {e}", canonical.display()))
+                        } else {
+                            Ok(f.journal.clone())
+                        }
+                    })?)
+                }
+            }
+        };
         if let Some((doc, _)) = &opened
             && self.doc.is_none()
         {
@@ -603,6 +760,31 @@ impl Runtime {
             self.message(&format!("Recovered {transactions} unsaved edits from the journal")).map_err(|e| e.to_string())?;
         }
         Ok(recovery)
+    }
+
+    /// Attach a frontend inside `serve` (`Msg::Attach`): fast non-codec files
+    /// attach synchronously as `attach` does, while codec-backed files start
+    /// the session immediately and return `(canonical, journal_arg, alias_arg)`
+    /// to launch asynchronously via `%attach-file-visit!` without blocking the
+    /// daemon or re-resolving the classified path.
+    fn attach_live(&mut self, client: Client, file: Option<&File>, profile: &str) -> Result<Option<(String, Arg, Arg)>, String> {
+        if let Some(f) = file {
+            let (_canonical, canon_str, abs_str, has_codec, is_private) = self.inspect_attach_file(f)?;
+            if has_codec {
+                let alias_arg = if abs_str != canon_str { Arg::Str(abs_str) } else { Arg::Bool(false) };
+                let journal_arg = if !is_private && !f.journal.as_os_str().is_empty() {
+                    let journal_str =
+                        f.journal.to_str().ok_or_else(|| format!("{}: journal path is not valid UTF-8", f.journal.display()))?;
+                    Arg::Str(journal_str.to_string())
+                } else {
+                    Arg::Bool(false)
+                };
+                self.start_session(client, None, profile).map_err(|e| e.to_string())?;
+                return Ok(Some((canon_str, journal_arg, alias_arg)));
+            }
+        }
+        self.attach(client, file, profile)?;
+        Ok(None)
     }
 
     fn start_session(&mut self, client: Client, view: Option<View>, profile: &str) -> Result<(), Error> {
@@ -857,12 +1039,21 @@ impl Runtime {
                     Msg::CaptureCancelled => {}
                     Msg::Wake => woken.store(false, Ordering::Release),
                     Msg::Stop => return,
-                    Msg::Attach { client, file, profile, state, interrupts } => match self.attach(client, file.as_ref(), &profile) {
-                        Ok(_) => {
+                    Msg::Attach { client, file, profile, state, interrupts } => match self.attach_live(client, file.as_ref(), &profile) {
+                        Ok(pending_open) => {
                             interrupts.0.lock().expect("the gate").stop = Some(stop.clone());
                             self.set_interrupts(client, interrupts);
                             if let Some(e) = state.and_then(|s| self.restore(&s).err()) {
                                 let _ = self.message(&format!("The session could not be restored: {e}"));
+                            }
+                            if let Some((canon_str, journal_arg, alias_arg)) = pending_open
+                                && let Err(e) = self.call_within(
+                                    "%attach-file-visit!",
+                                    &[Arg::Session, Arg::Str(canon_str), journal_arg, alias_arg],
+                                    OPEN_DEADLINE,
+                                )
+                            {
+                                let _ = self.message(&e.to_string());
                             }
                             greet.push(client);
                         }
@@ -933,7 +1124,9 @@ impl Runtime {
                         }
                     }
                     Msg::Gone(id) => {
-                        if self.waiting.remove(&id).is_some() {
+                        let was_opening = self.opening.remove(&id).is_some();
+                        let was_waiting = self.waiting.remove(&id).is_some();
+                        if was_opening || was_waiting {
                             let _ = self.call("editor-forget!", &[Arg::Int(id)]);
                         }
                     }
@@ -998,13 +1191,21 @@ impl Runtime {
 
     /// Show the file at `path` for another program (`Msg::Open`).
     fn open_for(&mut self, id: usize, path: &Path, wait: bool, reply: mpsc::Sender<Reply>) {
-        let id = wait.then_some(id);
-        let args = [Arg::Str(path.display().to_string()), id.map_or(Arg::Bool(false), Arg::Int)];
+        let Some(path_str) = path.to_str() else {
+            let _ = reply.send(Reply::Failed("path is not valid UTF-8".into()));
+            return;
+        };
+        let args = [Arg::Str(path_str.to_string()), Arg::Int(id), Arg::Bool(wait)];
         match self.call_within("editor-open!", &args, OPEN_DEADLINE) {
-            Ok(_) => {
-                let _ = reply.send(Reply::Opened);
-                if let Some(id) = id {
-                    self.waiting.insert(id, reply);
+            Ok(v) => {
+                let pending = self.vm.get::<String>(&v).is_ok_and(|s| s == "pending");
+                if pending {
+                    self.opening.insert(id, (wait, reply));
+                } else {
+                    let _ = reply.send(Reply::Opened);
+                    if wait {
+                        self.waiting.insert(id, reply);
+                    }
                 }
             }
             Err(e) => {
@@ -1048,6 +1249,26 @@ impl Runtime {
     /// since, with the bindings too; detach those whose session quit. Tell
     /// the programs waiting for files done with since.
     fn answer(&mut self, greet: &mut Vec<Client>, send: &impl Fn(Client, Output)) {
+        let opened = self.call("editor-take-opened!", &[]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
+        for id in opened {
+            if let Some((wait, reply)) = self.opening.remove(&id) {
+                let _ = reply.send(Reply::Opened);
+                if wait {
+                    self.waiting.insert(id, reply);
+                }
+            }
+        }
+        let failed = self.call("editor-take-failed!", &[]).and_then(|v| self.vm.get::<Vec<Vec<String>>>(&v)).unwrap_or_default();
+        for pair in failed {
+            if let Some(id) = pair.first().and_then(|s| s.parse::<usize>().ok()) {
+                let msg = pair.get(1).cloned().unwrap_or_else(|| "open failed".into());
+                if let Some((_, reply)) = self.opening.remove(&id) {
+                    let _ = reply.send(Reply::Failed(msg));
+                } else if let Some(reply) = self.waiting.remove(&id) {
+                    let _ = reply.send(Reply::Failed(msg));
+                }
+            }
+        }
         let done = self.call("editor-take-done!", &[]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
         for id in done {
             if let Some(reply) = self.waiting.remove(&id) {
@@ -1886,5 +2107,35 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(mode(&journal_dir(state.path()).unwrap()), 0o700);
+    }
+
+    #[test]
+    fn journal_for_pinned_migrates_legacy_alias_without_resolving() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let target = root.join("target.txt");
+        let alias = root.join("alias.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        // Create a legacy journal keyed by `alias` containing an unsaved edit.
+        let legacy_j = journal_named_in(state.path(), &alias).unwrap();
+        {
+            let (mut doc, _) = Document::open_pinned(&target, &legacy_j).unwrap();
+            let tx = doc.edit(&Arc::from("me"), [(5..5, " world".to_string())]).unwrap();
+            doc.apply(tx).unwrap();
+        }
+        assert!(legacy_j.exists());
+
+        // Even with no symlink (or a retargeted/removed alias), `journal_for_pinned`
+        // migrates `legacy_j` -> `journal_named_in(state, target)` without re-resolving.
+        let migrated = journal_for_pinned_in(state.path(), &target, Some(&alias)).unwrap();
+        assert_eq!(migrated, journal_named_in(state.path(), &target).unwrap());
+        assert!(!legacy_j.exists(), "legacy alias journal should be migrated away");
+        assert!(migrated.exists(), "canonical journal should exist after migration");
+
+        let (recovered, rec) = Document::open_pinned(&target, &migrated).unwrap();
+        assert!(matches!(rec, techne_text::Recovery::Replayed { transactions: 1, torn: false }));
+        assert_eq!(recovered.text().to_string(), "hello world");
     }
 }

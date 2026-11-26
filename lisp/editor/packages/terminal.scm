@@ -393,8 +393,12 @@ Press Return to send it; Escape or control-G cancels it."
                                 "techne-terminal" (number->string (terminal-rows t))
                                 (number->string (terminal-columns t)) program)
                           args)))
-    (call-with-process "sh" command (lambda (p) (read p host)) #:pty #t #:node node #:directory (location-path dir)
-                       #:environment '(("TERM" . "xterm-256color") ("COLORTERM" . "truecolor") ("TERM_PROGRAM" . "techne")))))
+    (call-with-process-at-site
+     (execution-site-for dir #:policy 'project)
+     "sh" command
+     (lambda (p) (read p host))
+     #:pty #t
+     #:environment '(("TERM" . "xterm-256color") ("COLORTERM" . "truecolor") ("TERM_PROGRAM" . "techne")))))
 
 (define (start-terminal! s dir program args #:interactive [interactive #f])
   (let* ((name (let loop ((i 1))

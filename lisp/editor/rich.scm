@@ -511,6 +511,8 @@ source of the text there."
 
 (define-action url (browse-url s u)
   "Open the address in the web browser."
-  (spawn (lambda () (call-with-process-at (default-directory s) "xdg-open" (list u) (lambda (p) (process-wait p))))))
+  (spawn (lambda () (call-with-process-at (default-directory s) "xdg-open" (list u)
+                      (lambda (p) (process-wait p))
+                      #:policy 'user-trusted))))
 
 (define-action url (copy-url s u) "Save the address as a kill." (kill-save! s u #f #f))

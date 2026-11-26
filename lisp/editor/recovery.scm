@@ -25,6 +25,8 @@
 (require "diff.scm")
 (require "operations.scm")
 (require "operation-views.scm")
+(require "requests.scm")
+(require "remote.scm")
 
 (provide decisions recover recovery-note pending-decisions choice-applicable choose-recovery! dismiss-decision!
          overwrite-file revert-buffer diff-buffer-with-file)
@@ -167,6 +169,10 @@ application adds it to failures' messages (main.scm)."
 
 ;;; What a refused save offers
 
+(define (async-recovery-document? document)
+  (let ((path (document-path document)))
+    (and path (or (document-codec document) (remote-path? path)) #t)))
+
 (define-command (overwrite-file s document)
   "Write DOCUMENT to its file, replacing what the file has now.
 What changed in the file since it was read is lost. Chosen after a
@@ -174,8 +180,7 @@ save was refused, it writes the text the buffer had then; refused
 once the buffer has changed since."
   #:arguments '((document document #:doc "The document to write; with a revision, as it was then."))
   #:effects '(external)
-  (save-document! document #:overwrite #t)
-  (message! s (string-append "Wrote " (document-path document))))
+  (save-document-in-session! s document 'overwrite-file #:overwrite #t))
 
 (define-command (revert-buffer s document)
   "Replace DOCUMENT's text with its file's, unsaved edits too.
@@ -183,9 +188,49 @@ It is one edit, which undo takes back. Chosen after a save was refused,
 it is refused once the buffer has changed since."
   #:arguments '((document document #:doc "The document to revert; with a revision, as it was then."))
   #:effects '(edit)
-  (message! s (if (revert-document! document)
-                  (string-append "Reverted to " (document-path document) " (undo takes it back)")
-                  "The buffer has the file's text already")))
+  (if (not (async-recovery-document? document))
+      (message! s (if (revert-document! document)
+                      (string-append "Reverted to " (document-path document) " (undo takes it back)")
+                      "The buffer has the file's text already"))
+      (let* ((op (current-operation))
+             (attached-at-start? (and (memq s (attached-sessions)) #t))
+             (valid? (lambda () (or (not attached-at-start?) (and (memq s (attached-sessions)) #t)))))
+        (when (valid?)
+          (message! s (string-append (if (document-private? document) "Decrypting " "Reading ")
+                                     (abbreviate-path (document-path document)) "...")))
+        (spawn-held
+         (lambda ()
+           (guard (e ((cancelled-condition? e)
+                      (when (valid?) (message! s "Revert cancelled"))
+                      (raise e))
+                     (#t
+                      (when op (operation-failed! op e))
+                      (when (valid?) (failed! s 'revert-buffer e))))
+             (let ((changed (revert-document! document)))
+               (when (valid?)
+                 (message! s (if changed
+                                 (string-append "Reverted to " (document-path document) " (undo takes it back)")
+                                 "The buffer has the file's text already"))))))))))
+
+(define (show-diff-against-file! s document file-contents)
+  (let* ((path (document-path document))
+         (priv? (document-private? document))
+         (text (unified-diff file-contents (document-string document)
+                             #:from (string-append path " (file)") #:to (string-append path " (buffer)")))
+         (existing (buffer-named "*diff*"))
+         (b (cond (priv?
+                   (let ((doc (make-document "")))
+                     (mark-document-private! doc)
+                     (make-generated-buffer! "*diff*" doc 'diff-mode)))
+                  ((and existing (not (document-private? (buffer-document existing))))
+                   existing)
+                  (else
+                   (make-generated-buffer! "*diff*" (make-document "") 'diff-mode))))
+         (d (buffer-document b)))
+    ;; The editor's own text, as *Messages*: changed in no operation.
+    (without-operation
+     (lambda () (view-edit! (make-view d "diff") (list (list 0 (document-length d) (if (string=? text "") "No differences.\n" text))) "new")))
+    (display-buffer! s d)))
 
 (define-command (diff-buffer-with-file s document)
   "Show what differs between DOCUMENT's text and its file's.
@@ -193,12 +238,23 @@ In *diff* beside the focused pane: lines with - are the file's, with +
 the buffer's."
   #:arguments '((document document #:doc "The document to compare with its file."))
   #:effects '(read)
-  (let* ((path (document-path document))
-         (text (unified-diff (file-text document) (document-string document)
-                             #:from (string-append path " (file)") #:to (string-append path " (buffer)")))
-         (b (or (buffer-named "*diff*") (make-generated-buffer! "*diff*" (make-document "") 'diff-mode)))
-         (d (buffer-document b)))
-    ;; The editor's own text, as *Messages*: changed in no operation.
-    (without-operation
-     (lambda () (view-edit! (make-view d "diff") (list (list 0 (document-length d) (if (string=? text "") "No differences.\n" text))) "new")))
-    (display-buffer! s d)))
+  (if (not (async-recovery-document? document))
+      (show-diff-against-file! s document (file-text document))
+      (let* ((op (current-operation))
+             (attached-at-start? (and (memq s (attached-sessions)) #t))
+             (valid? (lambda () (or (not attached-at-start?) (and (memq s (attached-sessions)) #t)))))
+        (when (valid?)
+          (message! s (string-append (if (document-private? document) "Decrypting " "Reading ")
+                                     (abbreviate-path (document-path document)) "...")))
+        (spawn-held
+         (lambda ()
+           (guard (e ((cancelled-condition? e)
+                      (when (valid?) (message! s "Compare cancelled"))
+                      (raise e))
+                     (#t
+                      (when op (operation-failed! op e))
+                      (when (valid?) (failed! s 'diff-buffer-with-file e))))
+             (let ((contents (file-text document)))
+               (when (valid?)
+                 (show-diff-against-file! s document contents)
+                 (message! s (string-append "Compared " (abbreviate-path (document-path document))))))))))))

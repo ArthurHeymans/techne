@@ -98,10 +98,10 @@ impl Save {
             }
         };
         let result = match written {
-            Ok(_) => match self.document.upgrade() {
+            Ok(written_hash) => match self.document.upgrade() {
                 Some(doc) => doc
                     .borrow_mut()
-                    .end_save(save.take().expect("a pending save"))
+                    .end_save_with_hash(save.take().expect("a pending save"), written_hash)
                     .map_err(|e| format!("saved, but the journal did not start again: {e}")),
                 // The journal's Saving record lets a later open recognize
                 // the acknowledged write; there is no live document to settle.
@@ -136,11 +136,11 @@ impl Saves {
         self.settle_location(&location(doc)?)
     }
 
-    fn generation_location(&self, location: &str) -> u64 {
+    pub(crate) fn generation_location(&self, location: &str) -> u64 {
         self.0.borrow().generations.get(location).copied().unwrap_or(0)
     }
 
-    fn settle_location(&self, location: &str) -> Outcome {
+    pub(crate) fn settle_location(&self, location: &str) -> Outcome {
         let Some(save) = self.0.borrow().entries.get(location).cloned() else { return Ok(()) };
         if let State::Unknown(reason) = &save.borrow().state {
             return Err(reason.clone());
@@ -170,6 +170,12 @@ impl Saves {
     ) -> Result<Rc<RefCell<Document>>, String> {
         let key = PathBuf::from(name);
         if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+            if doc.borrow().is_decoded() {
+                return Err(format!("{name}: already open through a codec"));
+            }
+            if !doc.borrow().has_journal() {
+                return Err(format!("{name}: already open without a journal"));
+            }
             return Ok(doc);
         }
         self.settle_location(name)?;
@@ -178,6 +184,12 @@ impl Saves {
         // Another task may have opened it while this one read. Returning
         // its document does not rebuild a journal or consume stale bytes.
         if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+            if doc.borrow().is_decoded() {
+                return Err(format!("{name}: already open through a codec"));
+            }
+            if !doc.borrow().has_journal() {
+                return Err(format!("{name}: already open without a journal"));
+            }
             return Ok(doc);
         }
         self.settle_location(name)?;
@@ -190,14 +202,110 @@ impl Saves {
         Ok(doc)
     }
 
+    /// Finish opening a remote document whose bytes were already read and
+    /// decoded after `settle_location(name)` and `generation_location(name)`.
+    /// When `journal` is `None`, the document is opened privately without a journal.
+    pub(crate) fn finish_open_decoded(
+        &self,
+        documents: &crate::Documents,
+        name: &str,
+        generation: u64,
+        raw_bytes: Option<&[u8]>,
+        text: String,
+        journal: Option<impl FnOnce() -> Result<PathBuf, String>>,
+    ) -> Result<Rc<RefCell<Document>>, String> {
+        let require_private = journal.is_none();
+        let key = PathBuf::from(name);
+        if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+            if !doc.borrow().is_decoded() {
+                return Err(format!("{name}: already open without a codec"));
+            }
+            if require_private && doc.borrow().has_journal() {
+                return Err(format!("{name}: already open with a journal"));
+            }
+            if !require_private && !doc.borrow().has_journal() {
+                return Err(format!("{name}: already open without a journal"));
+            }
+            return Ok(doc);
+        }
+        self.settle_location(name)?;
+        if self.generation_location(name) != generation {
+            return Err("the file was saved while it was read; open it again".into());
+        }
+        let journal_path = match journal {
+            None => {
+                crate::runtime::check_no_existing_remote_journal(name)?;
+                None
+            }
+            Some(journal) => Some(journal()?),
+        };
+        let (doc, _) = Document::open_decoded(techne_text::Place::Remote(name.to_string()), raw_bytes, text, journal_path.as_deref())
+            .map_err(|e| format!("{name}: {e}"))?;
+        let doc = Rc::new(RefCell::new(doc));
+        documents.borrow_mut().insert(key, Rc::downgrade(&doc));
+        Ok(doc)
+    }
+
+    /// Finish opening a remote document with `Retention::None` (no codec, no
+    /// journal) after `settle_location(name)` and `generation_location(name)`.
+    pub(crate) fn finish_open_without_journal(
+        &self,
+        documents: &crate::Documents,
+        name: &str,
+        generation: u64,
+        raw_bytes: Option<Vec<u8>>,
+    ) -> Result<Rc<RefCell<Document>>, String> {
+        let key = PathBuf::from(name);
+        if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+            if doc.borrow().is_decoded() {
+                return Err(format!("{name}: already open through a codec"));
+            }
+            if doc.borrow().has_journal() {
+                return Err(format!("{name}: already open with a journal"));
+            }
+            return Ok(doc);
+        }
+        self.settle_location(name)?;
+        if self.generation_location(name) != generation {
+            return Err("the file was saved while it was read; open it again".into());
+        }
+        crate::runtime::check_no_existing_remote_journal(name)?;
+        let doc = Document::open_remote_without_journal(name, raw_bytes).map_err(|e| format!("{name}: {e}"))?;
+        let doc = Rc::new(RefCell::new(doc));
+        documents.borrow_mut().insert(key, Rc::downgrade(&doc));
+        Ok(doc)
+    }
+
     pub(crate) fn start<F: Future<Output = Reply> + 'static>(
         &self,
         doc: &Rc<RefCell<Document>>,
         write: impl FnOnce(&PendingSave) -> F,
     ) -> Result<Waiter, String> {
         self.settle(doc)?;
-        let location = location(doc)?;
         let pending = doc.borrow_mut().begin_save().map_err(|e| e.to_string())?;
+        self.start_pending(doc, pending, write)
+    }
+
+    pub(crate) fn start_encoded<F: Future<Output = Reply> + 'static>(
+        &self,
+        doc: &Rc<RefCell<Document>>,
+        revision: techne_text::Revision,
+        encoded_bytes: Vec<u8>,
+        write: impl FnOnce(&PendingSave) -> F,
+    ) -> Result<Waiter, String> {
+        self.settle(doc)?;
+        let pending = doc.borrow_mut().begin_save_encoded(revision, encoded_bytes).map_err(|e| e.to_string())?;
+        self.start_pending(doc, pending, write)
+    }
+
+    fn start_pending<F: Future<Output = Reply> + 'static>(
+        &self,
+        doc: &Rc<RefCell<Document>>,
+        pending: PendingSave,
+        write: impl FnOnce(&PendingSave) -> F,
+    ) -> Result<Waiter, String> {
+        let location = location(doc)?;
+        doc.borrow().check_fence().map_err(|e| e.to_string())?;
         let reply = Box::pin(write(&pending));
         let save = Rc::new(RefCell::new(Save {
             document: Rc::downgrade(doc),

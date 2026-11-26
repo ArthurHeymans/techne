@@ -26,6 +26,7 @@
 (require "minibuffer.scm")
 (require "targets.scm")
 (require "faces.scm")
+(require "files.scm")
 (require "requests.scm")
 
 (provide define-language register-language! find-language language-names language-generation language-grammar language-files
@@ -118,8 +119,8 @@ That is the language with the longest file suffix PATH has."
 
 (define (buffer-language b)
   "Return the name of buffer B's language, or #f.
-Its `syntax-language' option says, else its file's name."
-  (and b (let ((l (or (option b 'syntax-language) (path-language (document-path (buffer-document b))))))
+Its `syntax-language' option says, else its file's logical name."
+  (and b (let ((l (or (option b 'syntax-language) (path-language (document-logical-path (buffer-document b))))))
            (and l (find-language l) l))))
 
 ;;; Nodes

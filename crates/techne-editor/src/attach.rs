@@ -53,7 +53,7 @@ use crate::{
     host::{BACKLOG_BYTES, BACKLOG_INPUTS, BUSY_AFTER, Event, Host, Shared},
     images::{Image, ImageData},
     present::{CapturedFrame, Input, Output, Snapshot},
-    runtime::{File, journal_for, weight},
+    runtime::{File, weight},
     server::{OpenError, Request},
 };
 
@@ -230,13 +230,7 @@ pub(crate) fn serve(shared: &Arc<Mutex<Shared>>, mut stream: UnixStream, profile
         let _ = write_frame(&mut stream, &Down::Failed(why));
         return;
     }
-    let file = match path.map(|path| journal_for(&path).map(|journal| File { path, journal })).transpose() {
-        Ok(file) => file,
-        Err(e) => {
-            let _ = write_frame(&mut stream, &Down::Failed(format!("journal: {e}")));
-            return;
-        }
-    };
+    let file = path.map(|path| File { path, journal: PathBuf::new() });
     let (Ok(out), Ok(connection)) = (stream.try_clone(), stream.try_clone()) else { return };
     let waiting = Waiting::default();
     let closing = CloseOnDrop(waiting.clone());
