@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795683140856,
+  "lastUpdate": 1795683142469,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -64393,6 +64393,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 104639,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "13aacd485c0c2fdbb389717712e6bef918631e68",
+          "message": "Merge pull request #392 from ArthurHeymans/packages/repository-packages\n\nHold packages to their declared dependencies, and install from repositories of several",
+          "timestamp": "2026-11-26T09:42:22+01:00",
+          "tree_id": "4208d1aea5ab65d0e8ba18ddf941f55997c075cb",
+          "url": "https://github.com/ArthurHeymans/techne/commit/13aacd485c0c2fdbb389717712e6bef918631e68"
+        },
+        "date": 1795683142399,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 696539151,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 631593912,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104930,
             "unit": "data"
           }
         ]
