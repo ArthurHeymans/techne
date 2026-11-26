@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795694717229,
+  "lastUpdate": 1795694719052,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -64741,6 +64741,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 104930,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0ab862d3ed5dc5c0f5fe371819e829518f6350d7",
+          "message": "Merge pull request #403 from ArthurHeymans/editor/project-settings-lsp\n\nApply per-project .editorconfig and .techne.scm settings and update LSP live",
+          "timestamp": "2026-11-26T12:50:25+01:00",
+          "tree_id": "c794de360ada5f01bef43614fbead50a53fa0c4e",
+          "url": "https://github.com/ArthurHeymans/techne/commit/0ab862d3ed5dc5c0f5fe371819e829518f6350d7"
+        },
+        "date": 1795694718965,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 689027530,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 625179848,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 102445,
             "unit": "data"
           }
         ]
