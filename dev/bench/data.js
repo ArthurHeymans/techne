@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795711931263,
+  "lastUpdate": 1795711932842,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -65084,6 +65084,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 625179848,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 102445,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "10bf956ce5fd2fc419c5efe81df35784f7ccbdf0",
+          "message": "Merge pull request #416 from ArthurHeymans/dependabot/cargo/minor-and-patch-41607ed473\n\ndeps: bump the minor-and-patch group across 1 directory with 6 updates",
+          "timestamp": "2026-11-26T17:44:22+01:00",
+          "tree_id": "31f349bc83e37b68e93cbae10eca6c81962230ba",
+          "url": "https://github.com/ArthurHeymans/techne/commit/10bf956ce5fd2fc419c5efe81df35784f7ccbdf0"
+        },
+        "date": 1795711932788,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 691423463,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 627541860,
             "unit": "instructions"
           },
           {
