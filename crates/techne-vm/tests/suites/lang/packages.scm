@@ -171,6 +171,270 @@
 (delete-file own-library)
 (delete-file (package-main 'own))
 
+;; What a file from elsewhere starts and registers as it loads is the
+;; world's too, as the file is: not the package's that happened to load it
+;; first, whose unloading would stop it for the others.
+(define worker (string-append path ".worker.scm"))
+(write-forms! worker
+              '(provide worker-task)
+              '(define worker-task (spawn (lambda () (let loop () (sleep 1) (loop)))))
+              '(registry-add! demo-commands 'from-elsewhere (lambda () 'elsewhere)))
+(define (write-worker-user! name)
+  (make-directory (package-dir name))
+  (write-forms! (package-main name) `(require ,worker) `(registry-add! demo-commands ',name (lambda () worker-task))))
+(for-each write-worker-user! '(starts joins))
+(load-package 'starts (package-main 'starts))
+(load-package 'joins (package-main 'joins))
+(define the-worker (command 'starts))
+(test #t (eq? the-worker (command 'joins)))
+(unload-package 'starts)
+(sleep 5)
+(test #f (task-done? the-worker))
+(test 'elsewhere (command 'from-elsewhere))
+(test #f (command 'starts))
+(unload-package 'joins)
+(task-kill the-worker)
+(registry-remove! demo-commands 'from-elsewhere)
+(test '() (registry-keys demo-commands))
+(for-each (lambda (name) (delete-file (package-main name))) '(starts joins))
+(delete-file worker)
+
+;; A world module that fails while a package stages it leaves neither its
+;; tasks nor its registrations behind in the root scope.
+(define failing-world (string-append path ".failing-world.scm"))
+(eval '(define leaked-task #f) "root")
+(write-forms! failing-world
+              '(eval '(set! leaked-task (spawn (lambda () (let loop () (sleep 1) (loop))))) "root")
+              '(registry-add! demo-commands 'leaked-reg (lambda () 'bad))
+              '(error "world init failed"))
+(make-directory (package-dir 'fails-world))
+(write-forms! (package-main 'fails-world) `(require ,failing-world))
+(test-error (load-package 'fails-world (package-main 'fails-world)))
+(sleep 5)
+(test #t (task-done? (eval 'leaked-task "root")))
+(test #f (command 'leaked-reg))
+(delete-file (package-main 'fails-world))
+(delete-file failing-world)
+
+;; A package-owned file required by a world module still loads in the
+;; staged package's scope so unloading the package cleans it up.
+(define world-bridge (string-append path ".world-bridge.scm"))
+(make-directory (package-dir 'bridged))
+(define bridged-helper (string-append (package-dir 'bridged) "helper.scm"))
+(write-forms! bridged-helper
+              '(provide bridged-task)
+              '(define bridged-task (spawn (lambda () (let loop () (sleep 1) (loop)))))
+              '(registry-add! demo-commands 'bridged-helper (lambda () bridged-task)))
+(write-forms! world-bridge `(require ,bridged-helper))
+(write-forms! (package-main 'bridged) `(require ,world-bridge))
+(load-package 'bridged (package-main 'bridged))
+(define b-task (command 'bridged-helper))
+(test #f (task-done? b-task))
+(unload-package 'bridged)
+(sleep 5)
+(test #t (task-done? b-task))
+(test #f (command 'bridged-helper))
+(delete-file bridged-helper)
+(delete-file (package-main 'bridged))
+(delete-file world-bridge)
+
+;; A shared library loaded via the synchronous compiler fallback (e.g. eval)
+;; while a package is staged still owns its tasks/registrations in root scope.
+(define sync-lib-dir (string-append path ".sync-lib"))
+(make-directory sync-lib-dir)
+(make-directory (string-append sync-lib-dir "/synclib"))
+(define sync-lib-file (string-append sync-lib-dir "/synclib/shared.sld"))
+(write-forms! sync-lib-file
+              '(define-library (synclib shared)
+                 (export sync-worker)
+                 (import (techne))
+                 (begin
+                   (define sync-worker (spawn (lambda () (let loop () (sleep 1) (loop)))))
+                   (registry-add! (eval 'demo-commands "root") 'from-sync-lib (lambda () sync-worker)))))
+(%provide-libraries! "synclib" sync-lib-dir)
+(make-directory (package-dir 'sync-pkg))
+(write-forms! (package-main 'sync-pkg)
+              '(eval '(import (synclib shared)))
+              '(registry-add! demo-commands 'sync-pkg (lambda () 'ok)))
+(load-package 'sync-pkg (package-main 'sync-pkg))
+(define sw (command 'from-sync-lib))
+(test #f (task-done? sw))
+(unload-package 'sync-pkg)
+(sleep 5)
+(test #f (task-done? sw))
+(test #t (eq? sw (command 'from-sync-lib)))
+(task-kill sw)
+(registry-remove! demo-commands 'from-sync-lib)
+(delete-file (package-main 'sync-pkg))
+(delete-file sync-lib-file)
+
+;; A `scope-procedure` registered by a world module stays live after the
+;; temporary world-load scope is adopted into `%root-scope`, and runs in
+;; `%root-scope` even after the first importer unloads. A `scope-procedure`
+;; captured by a world module that fails mid-load becomes dead.
+(define cb-world (string-append path ".cb-world.scm"))
+(write-forms! cb-world
+              '(provide cb-proc)
+              '(define cb-proc (scope-procedure (lambda () (cons 'alive (eq? (current-scope) %root-scope)))))
+              '(registry-add! demo-commands 'world-cb cb-proc))
+(make-directory (package-dir 'cb-pkg))
+(write-forms! (package-main 'cb-pkg) `(require ,cb-world))
+(load-package 'cb-pkg (package-main 'cb-pkg))
+(test '(alive . #t) (command 'world-cb))
+(unload-package 'cb-pkg)
+(test '(alive . #t) (command 'world-cb))
+(registry-remove! demo-commands 'world-cb)
+(delete-file (package-main 'cb-pkg))
+(delete-file cb-world)
+
+(define fail-cb-world (string-append path ".fail-cb-world.scm"))
+(eval '(define dead-cb (box #f)) "root")
+(write-forms! fail-cb-world
+              '(set-box! (eval 'dead-cb "root") (scope-procedure (lambda () 'should-not-run)))
+              '(error "fail after capture"))
+(make-directory (package-dir 'fail-cb-pkg))
+(write-forms! (package-main 'fail-cb-pkg) `(require ,fail-cb-world))
+(test-error (load-package 'fail-cb-pkg (package-main 'fail-cb-pkg)))
+(test #f ((unbox (eval 'dead-cb "root"))))
+(delete-file (package-main 'fail-cb-pkg))
+(delete-file fail-cb-world)
+
+;; A task spawned during staging keeps its inherited `%staging-scope`. If it
+;; later loads a world module after staging ends (whether in its inherited
+;; package scope or in `%root-scope`), that module keeps world ownership and
+;; survives unloading the package.
+(define late-world (string-append path ".late-world.scm"))
+(write-forms! late-world
+              '(provide late-task)
+              '(define late-task (spawn (lambda () (let loop () (sleep 1) (loop)))))
+              '(registry-add! demo-commands 'from-late-world (lambda () late-task)))
+(define late-world-root (string-append path ".late-world-root.scm"))
+(write-forms! late-world-root
+              '(provide late-root-task)
+              '(define late-root-task (spawn (lambda () (let loop () (sleep 1) (loop)))))
+              '(registry-add! demo-commands 'from-late-world-root (lambda () late-root-task)))
+(eval '(define late-go (make-channel)) "root")
+(eval '(define late-done (make-channel)) "root")
+(make-directory (package-dir 'late-pkg))
+(write-forms! (package-main 'late-pkg)
+              `(scope-transfer!
+                (spawn (lambda ()
+                         (channel-recv late-go)
+                         (eval '(require ,late-world))
+                         (with-scope %root-scope (eval '(require ,late-world-root)))
+                         (channel-send late-done #t)))
+                keeper))
+(load-package 'late-pkg (package-main 'late-pkg))
+(channel-send late-go #t)
+(channel-recv late-done)
+(define lt (command 'from-late-world))
+(define ltr (command 'from-late-world-root))
+(test #f (task-done? lt))
+(test #f (task-done? ltr))
+(unload-package 'late-pkg)
+(sleep 5)
+(test #f (task-done? lt))
+(test #f (task-done? ltr))
+(test #t (eq? lt (command 'from-late-world)))
+(test #t (eq? ltr (command 'from-late-world-root)))
+(task-kill lt)
+(task-kill ltr)
+(registry-remove! demo-commands 'from-late-world)
+(registry-remove! demo-commands 'from-late-world-root)
+(delete-file (package-main 'late-pkg))
+(delete-file late-world)
+(delete-file late-world-root)
+
+;; A synchronous library load (via `eval`) that fails mid-load rolls back the
+;; tasks and registrations it created in the root scope, and a retry succeeds.
+(define fail-sync-file (string-append sync-lib-dir "/synclib/flaky.sld"))
+(eval '(define flaky-task (box #f)) "root")
+(write-forms! fail-sync-file
+              '(define-library (synclib flaky)
+                 (export flaky-worker)
+                 (import (techne))
+                 (begin
+                   (define flaky-worker (spawn (lambda () (let loop () (sleep 1) (loop)))))
+                   (set-box! (eval 'flaky-task "root") flaky-worker)
+                   (registry-add! (eval 'demo-commands "root") 'from-flaky-lib (lambda () flaky-worker))
+                   (error "sync library init failed"))))
+(make-directory (package-dir 'flaky-pkg))
+(write-forms! (package-main 'flaky-pkg) '(eval '(import (synclib flaky))))
+(test-error (load-package 'flaky-pkg (package-main 'flaky-pkg)))
+(sleep 5)
+(test #t (task-done? (unbox (eval 'flaky-task "root"))))
+(test #f (command 'from-flaky-lib))
+;; Once fixed, the library loads cleanly on retry and outlives the package.
+(write-forms! fail-sync-file
+              '(define-library (synclib flaky)
+                 (export flaky-worker)
+                 (import (techne))
+                 (begin
+                   (define flaky-worker (spawn (lambda () (let loop () (sleep 1) (loop)))))
+                   (registry-add! (eval 'demo-commands "root") 'from-flaky-lib (lambda () flaky-worker)))))
+(load-package 'flaky-pkg (package-main 'flaky-pkg))
+(define fw (command 'from-flaky-lib))
+(test #f (task-done? fw))
+(unload-package 'flaky-pkg)
+(sleep 5)
+(test #f (task-done? fw))
+(test #t (eq? fw (command 'from-flaky-lib)))
+(task-kill fw)
+(registry-remove! demo-commands 'from-flaky-lib)
+(delete-file (package-main 'flaky-pkg))
+(delete-file fail-sync-file)
+
+;; A world module shadowing an existing root-scope registry entry restores the
+;; old entry on failure, retires the shadowed root entry on success (keeping one
+;; root entry per key), and lets tasks spawned during the load replace/remove
+;; root entries without duplicating them. A resource transferred away during
+;; world load keeps its transferred owner on commit.
+(define shadow-fail-world (string-append path ".shadow-fail-world.scm"))
+(define shadow-ok-world (string-append path ".shadow-ok-world.scm"))
+(eval '(define shadow-go (make-channel)) "root")
+(eval '(define shadow-done (make-channel)) "root")
+(eval '(define shadow-transferred (box #f)) "root")
+(registry-add! demo-commands 'shadowed-root (lambda () 'root-v1))
+;; Failing shadow restores root-v1.
+(write-forms! shadow-fail-world
+              '(registry-add! demo-commands 'shadowed-root (lambda () 'world-fail))
+              '(error "shadow load failed"))
+(make-directory (package-dir 'shadow-fail-pkg))
+(write-forms! (package-main 'shadow-fail-pkg) `(require ,shadow-fail-world))
+(test-error (load-package 'shadow-fail-pkg (package-main 'shadow-fail-pkg)))
+(test 'root-v1 (command 'shadowed-root))
+;; Succeeding shadow retires root-v1; a task spawned during load inherits the
+;; forwarded temp scope and still replaces/removes the root entry cleanly; a
+;; resource transferred to `keeper` during load stays owned by `keeper`.
+(write-forms! shadow-ok-world
+              '(registry-add! demo-commands 'shadowed-root (lambda () 'world-v2))
+              '(let ((r (list 'xfer)))
+                 (scope-own! r (lambda (_) #f))
+                 (scope-transfer! r keeper)
+                 (set-box! (eval 'shadow-transferred "root") r))
+              '(spawn (lambda ()
+                        (channel-recv shadow-go)
+                        (registry-add! demo-commands 'shadowed-root (lambda () 'world-v3))
+                        (channel-send shadow-done #t))))
+(make-directory (package-dir 'shadow-pkg))
+(write-forms! (package-main 'shadow-pkg) `(require ,shadow-ok-world))
+(load-package 'shadow-pkg (package-main 'shadow-pkg))
+(test 'world-v2 (command 'shadowed-root))
+(test #t (eq? keeper (scope-of (unbox (eval 'shadow-transferred "root")))))
+(scope-disown! (unbox (eval 'shadow-transferred "root")))
+;; Task spawned during world load updates the root entry via its forwarded scope.
+(channel-send shadow-go #t)
+(channel-recv shadow-done)
+(test 'world-v3 (command 'shadowed-root))
+;; Only one root entry exists: a single registry-remove! clears it completely.
+(registry-remove! demo-commands 'shadowed-root)
+(test #f (command 'shadowed-root))
+(unload-package 'shadow-pkg)
+(delete-file (package-main 'shadow-fail-pkg))
+(delete-file (package-main 'shadow-pkg))
+(delete-file shadow-fail-world)
+(delete-file shadow-ok-world)
+
 ;; Primitives are sealed: shadowed by a definition, never changed.
 (test-error (eval '(set! car cdr)))
 (test 'shadowed (eval '(begin (define (car x) 'shadowed) (car '(1)))))

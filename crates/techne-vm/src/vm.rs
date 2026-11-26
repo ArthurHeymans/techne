@@ -890,6 +890,8 @@ pub struct Vm {
     /// Whose libraries are found where (`provide_libraries`): the first
     /// part of their names, and the directory their files are under.
     pub(crate) library_providers: Vec<(Box<str>, PathBuf)>,
+    /// What the files of each package may import (`declare_imports`).
+    pub(crate) package_imports: Vec<crate::library::PackageImports>,
     /// A package generation being loaded: its files load into fresh
     /// modules, kept apart until published.
     staging: Option<Staging>,
@@ -1526,6 +1528,7 @@ impl Vm {
             generations: 0,
             module_paths: FxHashMap::default(),
             library_providers: Vec::new(),
+            package_imports: Vec::new(),
             staging: None,
             staged: None,
             staged_by: None,
@@ -2093,12 +2096,14 @@ impl Vm {
                 // From the idle host (`find_module`, `require`), the body is
                 // an input, which can wait; from a native, it nests.
                 let name = path.to_string_lossy();
-                let result = if self.input_ready() {
-                    let mut module = m;
-                    self.eval_input_source(&mut module, &name, &text).map(drop)
-                } else {
-                    self.eval_in_raw(m, &name, &text).map(drop)
-                };
+                let result = self.in_module_load_scope(m, |vm| {
+                    if vm.input_ready() {
+                        let mut module = m;
+                        vm.eval_input_source(&mut module, &name, &text).map(drop)
+                    } else {
+                        vm.eval_in_raw(m, &name, &text).map(drop)
+                    }
+                });
                 self.end_module_load(m);
                 result.map(|()| m)
             }
@@ -2219,7 +2224,10 @@ impl Vm {
                     forms.forms.borrow_mut().pop_front();
                     return Ok(Some(library));
                 }
-                "import" => return self.pinning(|vm| vm.next_imported(specs, &dir)),
+                "import" => {
+                    let dir = self.import_dir(file);
+                    return self.pinning(|vm| vm.next_imported(specs, &dir));
+                }
                 "require" => break (head, specs.to_vec()),
                 _ => return Ok(None),
             };
@@ -2265,6 +2273,23 @@ impl Vm {
     /// included file may load another include beside itself.
     pub(crate) fn form_source_dir(&self, file: u32) -> PathBuf {
         Path::new(&*self.files[file as usize].name).parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), Path::to_path_buf)
+    }
+
+    /// Where an `import` in the source `file` looks for libraries, and
+    /// whose it is (`check_declared`): its file's directory, as
+    /// `form_source_dir`, but empty for what comes from no file (the REPL,
+    /// `eval`, an environment). That finds libraries from the working
+    /// directory all the same, and is no package's: the directory a
+    /// program happens to run in does not make its evaluations a
+    /// package's files.
+    pub(crate) fn import_dir(&self, file: u32) -> PathBuf {
+        let path = Path::new(&*self.files[file as usize].name);
+        match path.parent().filter(|p| p.is_dir()) {
+            Some(dir) => dir.to_path_buf(),
+            // A file named without a directory is in the working one.
+            None if path.is_file() => ".".into(),
+            None => PathBuf::new(),
+        }
     }
 
     /// Drop ownership state a killed library loader could not clean up.
@@ -2455,6 +2480,20 @@ impl Vm {
                 Err(e)
             }
         }
+    }
+
+    /// Whether `forms` are those of a module that is the world's (not a
+    /// staged package generation's): a file or library loaded once into the
+    /// world, whose tasks and registrations belong to the world rather than
+    /// whichever package or scope happened to load it first (`%load-forms`).
+    pub(crate) fn forms_of_world(&self, forms: &Forms) -> bool {
+        self.modules[forms.module as usize].generation == 0
+    }
+
+    /// Whether `forms` belong to the package generation this execution is
+    /// actively staging (`%load-forms`).
+    pub(crate) fn forms_of_staging(&self, forms: &Forms) -> bool {
+        self.staging_here().is_some() && self.modules[forms.module as usize].generation != 0
     }
 
     /// Whether a module of the file at `path` is the staged package's own:

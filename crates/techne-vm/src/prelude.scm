@@ -78,17 +78,43 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
             ((procedure? next) (loop (next)))
             (else (%load-forms next) (loop last))))))
 
-;; The forms of a module loading, evaluated in it.
+;; Finish a temporary world-module load scope: adopt into %root-scope on
+;; success (updating %owners, forwarding tmp so captured `scope-procedure`s
+;; stay live, and retiring shadowed root entries), or shut down on failure.
+(define (%finish-world-load-scope! tmp ok)
+  (if ok
+      (let ((res (%scope-adopt! tmp %root-scope)))
+        (for-each (lambda (r) (when (eq? (scope-of r) tmp) (hash-table-set! %owners r %root-scope))) (car res))
+        (when (pair? (cdr res))
+          (for-each (lambda (p) (%registry-dedupe-root! (car p) (cdr p))) (cdr res))))
+      (scope-shutdown! tmp)))
+
+;; The forms of a module loading, evaluated in it. One that is the
+;; world's (a file from outside a package's directory, a library a package
+;; provides, or any world module loaded from a package's scope) is
+;; evaluated in a temporary child of %root-scope: the tasks it starts and
+;; what it registers are the world's, not the package's that loads it
+;; first, whose unloading would take them from every other importer.
 (define (%load-forms forms)
-  (dynamic-wind
-      (lambda () (%enter-module forms))
-   (lambda ()
-     (let ((value (%eval-forms forms)))
-       ;; Only this successful path publishes a library. The wind's
-       ;; cleanup also runs on failure, and unregisters it then.
-       (%forms-evaluated forms)
-       value))
-   (lambda () (%leave-module) (%module-loaded forms))))
+  (define (load)
+    (dynamic-wind
+     (lambda () (%enter-module forms))
+     (lambda ()
+       (let ((value (%eval-forms forms)))
+         ;; Only this successful path publishes a library. The wind's
+         ;; cleanup also runs on failure, and unregisters it then.
+         (%forms-evaluated forms)
+         value))
+     (lambda () (%leave-module) (%module-loaded forms))))
+  (cond ((%forms-of-staging? forms)
+         (let ((s (%staging-scope))) (if s (%call-in-scope s load) (load))))
+        ((%forms-of-world? forms)
+         (let ((tmp (%make-world-load-scope)) (key (%parameter-key current-scope)) (old (current-scope)) (ok #f))
+           (dynamic-wind
+            (lambda () (%task-local-set! key tmp))
+            (lambda () (let ((v (load))) (set! ok #t) v))
+            (lambda () (%task-local-set! key old) (%finish-world-load-scope! tmp ok)))))
+        (else (load))))
 
 (define (eval-source source module file)
   "Evaluate the forms of the string SOURCE in MODULE.
@@ -951,8 +977,10 @@ ms body ...); only that one's operation happens, then its body runs."
 
 (define %root-scope (%make-scope 'root #f))
 
-(define current-scope (make-parameter %root-scope)
+(define current-scope (%make-parameter-with-key (%current-scope-key) %root-scope (lambda (x) x))
   "Return the scope owning what is made now, a parameter.")
+
+(define %staging-scope (%make-parameter-with-key (%staging-scope-key) #f (lambda (x) x)))
 
 (define (make-scope [name #f] #:parent [parent (current-scope)])
   "Return a new scope called NAME, owned by PARENT.
@@ -962,7 +990,7 @@ PARENT is the current scope by default; shutting it shuts the new one."
 ;; As (parameterize ((current-scope s)) body ...), cheaper to expand: it is
 ;; used in every procedure handed over (scope-procedure).
 (define (%call-in-scope s thunk)
-  (let ((key (%parameter-key current-scope)) (old (current-scope)))
+  (let ((s (%scope-resolve s)) (key (%parameter-key current-scope)) (old (current-scope)))
     (dynamic-wind (lambda () (%task-local-set! key s)) thunk (lambda () (%task-local-set! key old)))))
 
 (define-syntax with-scope
@@ -971,19 +999,20 @@ PARENT is the current scope by default; shutting it shuts the new one."
     ((_ s body ...) (%call-in-scope s (lambda () body ...)))))
 
 (define (%scope-add! s resource cleanup done?)
-  ;; Owned again by the same scope: the new cleanup replaces the old.
-  (when (eq? (hash-table-ref/default %owners resource #f) s)
-    (%scope-disown! s resource))
-  (%scope-own! s resource cleanup done?)
-  (hash-table-set! %owners resource s)
-  resource)
+  (let ((s (%scope-resolve s)))
+    ;; Owned again by the same scope: the new cleanup replaces the old.
+    (when (eq? (hash-table-ref/default %owners resource #f) s)
+      (%scope-disown! s resource))
+    (%scope-own! s resource cleanup done?)
+    (hash-table-set! %owners resource s)
+    resource))
 
 (define (scope-own! resource cleanup [done? (lambda (r) #f)])
   "Let the current scope own RESOURCE, and return RESOURCE.
 Shutting the scope calls (CLEANUP RESOURCE), unless (DONE? RESOURCE)
 says it has ended already. A long-lived scope forgets what ended by
 itself now and then, when DONE? is a native such as `task-done?`."
-  (%scope-add! (current-scope) resource cleanup done?))
+  (%scope-add! (%current-scope) resource cleanup done?))
 
 (define (scope-of resource)
   "Return the scope that owns RESOURCE, or #f."
@@ -1044,13 +1073,14 @@ process) run at once; the others run in a task stopped past
 cannot wait (under a native calling back into Scheme). A failing
 cleanup does not stop the others; the first failure is raised at the
 end."
-  (when (scope-live? s)
-    (let* ((shut (%scope-shutdown! s)) (entries (caddr shut)))
-      (for-each (lambda (r) (hash-table-delete! %owners r)) (cadr shut))
-      ;; The Lisp cleanups run whatever the native ones did.
-      (let* ((lisp (and (pair? entries) (%run-cleanups entries)))
-             (failure (or (car shut) lisp)))
-        (when failure (raise failure))))))
+  (let ((shut (%scope-shutdown! s)))
+    (when shut
+      (let ((entries (caddr shut)))
+        (for-each (lambda (r) (hash-table-delete! %owners r)) (cadr shut))
+        ;; The Lisp cleanups run whatever the native ones did.
+        (let* ((lisp (and (pair? entries) (%run-cleanups entries)))
+               (failure (or (car shut) lisp)))
+          (when failure (raise failure)))))))
 
 (define (scope-procedure proc)
   "Return PROC bound to the current scope.
@@ -1062,7 +1092,9 @@ work they start belongs to whoever handed them over, not to whoever
 calls them, and a late call cannot reach state the scope's replacement
 owns now."
   (let ((s (current-scope)))
-    (lambda args (and (scope-live? s) (%call-in-scope s (lambda () (apply proc args)))))))
+    (lambda args
+      (let ((target (%scope-target s)))
+        (and target (%call-in-scope target (lambda () (apply proc args))))))))
 
 (define %spawn spawn)
 (define (spawn thunk #:child [child #f])
@@ -1107,9 +1139,9 @@ at all, for a registry whose entries are read together."
 (define (registry-add! reg key value)
   "Map KEY to VALUE in REG, owned by the current scope; return VALUE.
 While a package generation loads, the entry waits until it is published."
-  (let* ((s (current-scope)) (pending (%scope-pending s)))
+  (let* ((s (%current-scope)) (pending (%scope-pending s)))
     (if pending
-        (%set-scope-pending! s (cons (lambda () (%registry-add! reg key value (current-scope))) pending))
+        (%set-scope-pending! s (cons (lambda () (%registry-add! reg key value (%current-scope))) pending))
         (%registry-add! reg key value s)))
   value)
 
@@ -1120,14 +1152,23 @@ effect again. While a package generation loads, this waits until it is
 published."
   (%registry-staged
    (lambda ()
-     (let* ((stack (hash-table-ref/default (%registry-table reg) key '()))
-            (r (or (find (lambda (r) (eq? (scope-of r) (current-scope))) stack) (and (pair? stack) (car stack)))))
+     (let* ((s (%current-scope))
+            (stack (hash-table-ref/default (%registry-table reg) key '()))
+            (r (or (find (lambda (r) (eq? (scope-of r) s)) stack) (and (pair? stack) (car stack)))))
        (when r (%registry-swap! reg key r #f #t))))))
 
 ;; Do CHANGE now, or when the package generation loading is published.
 (define (%registry-staged change)
-  (let ((s (current-scope)))
+  (let ((s (%current-scope)))
     (if (%scope-pending s) (%set-scope-pending! s (cons change (%scope-pending s))) (change))))
+
+;; Keep only the topmost %root-scope entry for KEY in REG.
+(define (%registry-dedupe-root! reg key)
+  (let loop ((xs (hash-table-ref/default (%registry-table reg) key '())) (seen #f))
+    (when (pair? xs)
+      (if (eq? (scope-of (car xs)) %root-scope)
+          (begin (when seen (%registry-swap! reg key (car xs) #f #t)) (loop (cdr xs) #t))
+          (loop (cdr xs) seen)))))
 
 ;; The current scope's entry replaces its own or its predecessor's: in
 ;; place while a generation succeeds another (it keeps the place its
@@ -1152,6 +1193,8 @@ published."
     (if old (%registry-swap! reg key old entry p)
         (begin
           (hash-table-set! (%registry-table reg) key (cons entry stack))
+          (%scope-note-dedupe! s reg key)
+          (for-each (lambda (r) (%scope-note-dedupe! (scope-of r) reg key)) stack)
           (let ((changed (%registry-changed reg))) (when changed (changed key value)))))))
 
 (define (%registration-ended? entry) #f)
@@ -1270,7 +1313,8 @@ visible changes."
     (%set-scope-pending! s '())
     (when old (%set-scope-predecessor! s (package-scope old)))
     (let* ((staged (guard (e (#t (%package-discard) (scope-shutdown! s) (raise e)))
-                     (with-scope s (if declaration ((cdr declaration) (lambda () (%package-stage path))) (%package-stage path)))))
+                     (parameterize ((%staging-scope s))
+                       (with-scope s (if declaration ((cdr declaration) (lambda () (%package-stage path))) (%package-stage path))))))
            (module (car staged)))
       ;; Publish: modules, then the held-back registrations, in order.
       (%package-publish)

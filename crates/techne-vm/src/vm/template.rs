@@ -267,6 +267,7 @@ impl Vm {
             generations,
             module_paths,
             library_providers,
+            package_imports,
             current_module,
             grants,
             reading_root,
@@ -365,6 +366,7 @@ impl Vm {
         vm.generations = *generations;
         vm.module_paths.clone_from(module_paths);
         vm.library_providers.clone_from(library_providers);
+        vm.package_imports.clone_from(package_imports);
         vm.reading_root.clone_from(reading_root);
         vm.current_module = *current_module;
         vm.files.clone_from(files);

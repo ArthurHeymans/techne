@@ -140,7 +140,7 @@ fn syntax_rules_doc(items: &[Syntax]) -> Option<String> {
     (head(items).as_deref() == Some("syntax-rules")).then(|| items.get(after).and_then(string_lit)).flatten()
 }
 
-fn string_lit(e: &Syntax) -> Option<String> {
+pub fn string_lit(e: &Syntax) -> Option<String> {
     match &e.kind {
         SyntaxKind::Atom(Sexp::Str(s)) => Some(s.to_string()),
         _ => None,

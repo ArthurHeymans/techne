@@ -1048,6 +1048,13 @@ pub fn install(vm: &mut Vm) {
                         let forms = forms_arg(vm, arg(vm, a, 0), "%module-loaded")?;
             vm.end_forms_load(&forms);
             Ok(Value::VOID) };
+        // Whether FORMS belong to the world or to the actively staged package.
+        "(%forms-of-world? forms)" => |vm: &mut Vm, a, _| {
+            let forms = forms_arg(vm, arg(vm, a, 0), "%forms-of-world?")?;
+            Ok(Value::bool(vm.forms_of_world(&forms))) };
+        "(%forms-of-staging? forms)" => |vm: &mut Vm, a, _| {
+            let forms = forms_arg(vm, arg(vm, a, 0), "%forms-of-staging?")?;
+            Ok(Value::bool(vm.forms_of_staging(&forms))) };
         "(%package-begin path)" => |vm: &mut Vm, a, _| {
             let path = string(vm, arg(vm, a, 0), "load-package")?;
             let (forms, _) = vm.begin_package(std::path::Path::new(&path))?;
@@ -1195,6 +1202,15 @@ pub fn install(vm: &mut Vm) {
             let name = string(vm, arg(vm, a, 0), "%provide-libraries!")?;
             let directory = string(vm, arg(vm, a, 1), "%provide-libraries!")?;
             vm.provide_libraries(&name, std::path::Path::new(&directory))?;
+            Ok(Value::VOID) };
+        // What the files of the package PACKAGE, in ROOT, import among the
+        // libraries packages provide: those of the packages NAMES, strings.
+        "(%package-imports! root package names)" => |vm: &mut Vm, a, _| {
+            let root = string(vm, arg(vm, a, 0), "%package-imports!")?;
+            let package = string(vm, arg(vm, a, 1), "%package-imports!")?;
+            let items = crate::builtins::list_values(arg(vm, a, 2)).ok_or_else(|| Error::new("%package-imports!: expected a list of names"))?;
+            let names = items.into_iter().map(|name| string(vm, name, "%package-imports!")).collect::<Result<Vec<_>, _>>()?;
+            vm.declare_imports(std::path::Path::new(&root), &package, &names)?;
             Ok(Value::VOID) };
         // What `(techne package)` reads by the authority to load, which a
         // world deciding what it loads has, not that over files: a package's
