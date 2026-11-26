@@ -178,8 +178,28 @@ jobs:
             TECHNE_SERVE=$PWD/target/release/examples/serve TECHNE_COMPILE=$PWD/target/release/examples/compile \
             target/release/techne run runtime/bench/icount.scm icount.json footprint.json 2> table.txt || status=$?
           cat table.txt
-          { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
           exit "$status"
+      # Report before the benchmark action publishes this run. Keep the raw
+      # data, alert threshold and PR comments under the existing action.
+      - name: Summarize benchmark changes
+        continue-on-error: true
+        run: |
+          target/release/techne run runtime/bench/report.scm --test
+          history="$RUNNER_TEMP/techne-bench-history.js"
+          if ! git fetch --no-tags --depth=1 origin refs/heads/gh-pages ||
+             ! git show FETCH_HEAD:dev/bench/data.js > "$history"; then
+            printf '## Benchmark changes\n\nPublished benchmark history is unavailable.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          report=$(target/release/techne run runtime/bench/report.scm "$history" icount.json)
+          if [ -n "$report" ]; then
+            printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '## Benchmark changes\n\nNo changes at the displayed ratio precision.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
       # Wall time on a shared runner: shown, not compared.
       - run: |
           target/release/examples/keys > keys.txt
@@ -198,7 +218,7 @@ jobs:
           fail-on-alert: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'accepted-regression') }}
           comment-on-alert: true
           comment-always: ${{ github.event_name == 'pull_request' }}
-          summary-always: true
+          summary-always: false
       # What the editor loads grows with what it ships: charted, held to
       # the startup budget by icount.scm, never compared.
       - uses: benchmark-action/github-action-benchmark@v1
