@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795715900999,
+  "lastUpdate": 1795715902660,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -65432,6 +65432,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 627541860,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 102445,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d693bb4a245e52a996dca093b8d91214303ab905",
+          "message": "Merge pull request #417 from ArthurHeymans/deps/cranelift-0.138\n\ndeps: bump cranelift from 0.137 to 0.138",
+          "timestamp": "2026-11-26T18:43:02+01:00",
+          "tree_id": "c08fb4259763946667af6e8a2fdfffdbd4c614f5",
+          "url": "https://github.com/ArthurHeymans/techne/commit/d693bb4a245e52a996dca093b8d91214303ab905"
+        },
+        "date": 1795715902571,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 692347758,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 627475369,
             "unit": "instructions"
           },
           {
