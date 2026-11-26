@@ -32,8 +32,8 @@ use crate::{
     Text, View,
     faces::{FaceRange, Faces},
     present::{
-        Block, Color, Completion, CursorShape, Display, Hang, Inlay, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place,
-        Recenter, Row, Run, Slant, Snapshot, Style, Underline, ViewRequest, Weight,
+        Block, Color, Completion, Conceal, CursorShape, Display, Fold, Hang, Inlay, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane,
+        Place, Recenter, Row, Run, Slant, Snapshot, Style, Underline, ViewRequest, Weight,
     },
     server::Reply,
 };
@@ -533,7 +533,7 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 47] = [
+const PROCS: [&str; 48] = [
     "editor-pointer!",
     "editor-focus-event!",
     "editor-cancel-capture!",
@@ -564,6 +564,7 @@ const PROCS: [&str; 47] = [
     "pane-layers",
     "pane-inlays",
     "pane-projections",
+    "pane-folds",
     "face-table",
     "face-generation",
     "cursor-shape",
@@ -1575,7 +1576,18 @@ impl Runtime {
                 let mut v = view.borrow_mut();
                 (v.text().revision(), v.scroll(), v.text().len())
             };
-            let end = scroll.saturating_add(LAYER_WINDOW).min(len);
+            // Fetch the view's full fold set BEFORE picking the layer window so
+            // visible lines after large folds still get highlights and inlays.
+            let raw_folds =
+                self.call("pane-folds", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, fold_ranges));
+            let raw_folds = self.noted("pane-folds", raw_folds).unwrap_or_default();
+            let mut end = scroll.saturating_add(LAYER_WINDOW).min(len);
+            for &(f, t) in &raw_folds {
+                if f < end && t > scroll {
+                    let hidden = t.min(len).saturating_sub(f.max(scroll));
+                    end = end.saturating_add(hidden).min(len);
+                }
+            }
             let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
             let layers = self.call("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights));
             let layers = self.noted("pane-layers", layers);
@@ -1594,7 +1606,7 @@ impl Runtime {
             let projections = self.noted("pane-projections", projections).unwrap_or_default();
             let mut v = view.borrow_mut();
             if v.text().revision() == revision && v.scroll() == scroll {
-                found = Some((revision, scroll, layers, (inlays, projections)));
+                found = Some((revision, scroll, layers, (inlays, projections, raw_folds)));
                 break;
             }
         }
@@ -1620,8 +1632,8 @@ impl Runtime {
         // Projections on character boundaries, in order: a hang's line at
         // a line's start.
         let boundary = |at: usize| at <= len && rope.try_byte_to_char(at).is_ok_and(|c| rope.char_to_byte(c) == at);
-        let (mut hangs, mut blocks) = (Vec::new(), Vec::new());
-        for p in found.as_ref().map(|(_, _, _, (_, p))| p.as_slice()).unwrap_or_default() {
+        let (mut hangs, mut blocks, mut raw_conceals) = (Vec::new(), Vec::new(), Vec::new());
+        for p in found.as_ref().map(|(_, _, _, (_, p, _))| p.as_slice()).unwrap_or_default() {
             match p {
                 Projection::Hang(line, at) if boundary(*line) && boundary(*at) && line <= at => {
                     let start = rope.line_to_byte(rope.byte_to_line(*line));
@@ -1630,15 +1642,53 @@ impl Runtime {
                     }
                 }
                 Projection::Block(at, image, grid) if boundary(*at) => blocks.push(Block { at: *at, image: image.clone(), grid: *grid }),
+                Projection::Conceal(from, to)
+                    if *from < *to
+                        && *to <= len
+                        && boundary(*from)
+                        && boundary(*to)
+                        && rope.byte_to_line(*from) == rope.byte_to_line(*to) =>
+                {
+                    raw_conceals.push(Conceal { from: *from, to: *to });
+                }
                 _ => {}
             }
         }
         hangs.sort_by_key(|h| h.line);
         hangs.dedup_by_key(|h| h.line);
         blocks.sort_by_key(|b| b.at);
+        raw_conceals.sort_by_key(|c| (c.from, c.to));
+        let mut conceals: Vec<Conceal> = Vec::with_capacity(raw_conceals.len());
+        for c in raw_conceals {
+            if let Some(last) = conceals.last_mut().filter(|last| c.from <= last.to) {
+                last.to = last.to.max(c.to);
+            } else {
+                conceals.push(c);
+            }
+        }
+        let line_start = |at: usize| at == 0 || (at <= len && rope.byte(at - 1) == b'\n');
+        let line_end = |at: usize| at == len || line_start(at);
+        let mut raw_folds: Vec<Fold> = found
+            .as_ref()
+            .map(|(_, _, _, (_, _, fs))| {
+                fs.iter()
+                    .filter(|(f, t)| *f < *t && *t <= len && boundary(*f) && boundary(*t) && line_start(*f) && line_end(*t))
+                    .map(|(f, t)| Fold { from: *f, to: *t })
+                    .collect()
+            })
+            .unwrap_or_default();
+        raw_folds.sort_by_key(|f| (f.from, f.to));
+        let mut folds: Vec<Fold> = Vec::with_capacity(raw_folds.len());
+        for f in raw_folds {
+            if let Some(last) = folds.last_mut().filter(|last| f.from <= last.to) {
+                last.to = last.to.max(f.to);
+            } else {
+                folds.push(f);
+            }
+        }
         let mut inlays: Vec<Inlay> = found
             .as_ref()
-            .map(|(_, _, _, (inlays, _))| {
+            .map(|(_, _, _, (inlays, _, _))| {
                 inlays
                     .iter()
                     .filter(|(at, text, _)| {
@@ -1709,6 +1759,8 @@ impl Runtime {
             inlays,
             hangs,
             blocks,
+            folds,
+            conceals,
             default,
             place: Place::WHOLE,
             display,
@@ -1909,6 +1961,18 @@ fn inlays(v: Val<'_>) -> Result<Vec<(usize, String, Rc<str>)>, Error> {
 enum Projection {
     Hang(usize, usize),
     Block(usize, crate::images::Image, Option<(usize, usize, usize)>),
+    Conceal(usize, usize),
+}
+
+/// Fold ranges from Lisp: each (from to) in UTF-8 bytes.
+fn fold_ranges(v: Val<'_>) -> Result<Vec<(usize, usize)>, Error> {
+    list(v)?
+        .into_iter()
+        .map(|f| match list(f)?.as_slice() {
+            [from, to] => Ok((usize::from_arg(*from)?, usize::from_arg(*to)?)),
+            _ => Err(f.type_error("(from to)")),
+        })
+        .collect()
 }
 
 /// Projections from Lisp: each (hang line at) or (block at image).
@@ -1929,7 +1993,10 @@ fn projections(v: Val<'_>) -> Result<Vec<Projection>, Error> {
                         (usize::from_arg(*column)?.min(512), usize::from_arg(*cols)?.clamp(1, 512), usize::from_arg(*rows)?.clamp(1, 256));
                     Ok(Projection::Block(usize::from_arg(*at)?, (*image).clone(), Some(grid)))
                 }
-                _ => Err(Error::new("a projection is (hang line at), (block at image), or (grid-image at column cols rows image)")),
+                (Some("conceal"), [from, to]) => Ok(Projection::Conceal(usize::from_arg(*from)?, usize::from_arg(*to)?)),
+                _ => Err(Error::new(
+                    "a projection is (hang line at), (block at image), (grid-image at column cols rows image), or (conceal from to)",
+                )),
             }
         })
         .collect()

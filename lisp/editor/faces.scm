@@ -423,3 +423,4 @@ percentage of the frontend's size; an attribute not set is #f."
 (define-face warning "What is wrong, but not fatal." #:fg 'yellow #:weight 'bold)
 (define-face warning.stale "An excerpt whose source changed since it was shown.")
 (define-face error "What failed." #:fg 'red #:weight 'bold)
+(define-face fold.ellipsis "Ellipsis shown after a folded header line." #:fg 'overlay)

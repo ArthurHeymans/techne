@@ -116,9 +116,25 @@ GROUP is `new` or `extend`, as `view-edit!` takes it."
         (sset! s 'goal c)
         c)))
 
-(define line-next (make-motion (lambda (s p n) (line-down (doc s) p n (goal-column s p))) 'linewise)
+;; Move N visible logical lines down (or up when N < 0), skipping folds in S's view.
+(define (visible-line-down s p n col)
+  (let ((d (doc s)) (folds (buffer-folds (session-view s))))
+    (if (null? folds)
+        (line-down d p n col)
+        (let ((step (if (>= n 0) 1 -1)) (len (document-length d)))
+          (let loop ((cur p) (rem (abs n)))
+            (if (<= rem 0)
+                cur
+                (let* ((raw (line-down d cur step col))
+                       (f (find (lambda (f) (and (<= (car f) raw) (< raw (cadr f)))) folds)))
+                  (cond ((not f) (loop raw (- rem 1)))
+                        ((> step 0) (if (>= (cadr f) len) cur (loop (line-down d (cadr f) 0 col) (- rem 1))))
+                        ((<= (car f) 0) cur)
+                        (else (loop (line-down d (line-start d (- (car f) 1)) 0 col) (- rem 1)))))))))))
+
+(define line-next (make-motion (lambda (s p n) (visible-line-down s p n (goal-column s p))) 'linewise)
   "The motion to the next line, keeping the goal column.")
-(define line-previous (make-motion (lambda (s p n) (line-down (doc s) p (- n) (goal-column s p))) 'linewise)
+(define line-previous (make-motion (lambda (s p n) (visible-line-down s p (- n) (goal-column s p))) 'linewise)
   "The motion to the previous line, keeping the goal column.")
 
 (define (motion-extent s m pos n)
