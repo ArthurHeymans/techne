@@ -35,11 +35,11 @@ num-integer = "0.1"
 num-rational = { version = "0.4", default-features = false, features = ["num-bigint", "std"] }
 num-traits = "0.2"
 # These exchange Rust types and must be upgraded together.
-cranelift-codegen = "0.137"
-cranelift-frontend = "0.137"
-cranelift-jit = "0.137"
-cranelift-module = "0.137"
-cranelift-native = "0.137"
+cranelift-codegen = "0.138"
+cranelift-frontend = "0.138"
+cranelift-jit = "0.138"
+cranelift-module = "0.138"
+cranelift-native = "0.138"
 rustyline = { version = "19", default-features = false, features = ["with-file-history"] }
 regex-cursor = { version = "0.1.5", default-features = false, features = ["perf-inline"] }
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }
