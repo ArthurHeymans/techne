@@ -1,5 +1,6 @@
 ;;; Run in fresh, attached sessions by techne-editor/tests/terminal.rs.
-(require "../../../test.scm")
+(import (techne test))
+(test-file #:ignore #t)
 (require "../../main.scm")
 (require "../../dispatch.scm")
 (require "../../keymaps.scm")

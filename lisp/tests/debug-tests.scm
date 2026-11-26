@@ -1,4 +1,4 @@
-(require "../test.scm")
+(import (techne test))
 (import (techne debug))
 
 (define (failure thunk)

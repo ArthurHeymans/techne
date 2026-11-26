@@ -21,7 +21,16 @@ pub fn main(args: Vec<String>) -> ExitCode {
 /// [`main`], in a world SETUP has added to: the other crates' natives,
 /// for a command that has them.
 pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>) -> ExitCode {
-    let mut vm = Vm::new();
+    main_with_grants(args, crate::vm::Grants::ALL, setup)
+}
+
+/// [`main_with`], with explicit capability GRANTS on the world.
+pub fn main_with_grants(
+    args: Vec<String>,
+    grants: crate::vm::Grants,
+    setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>,
+) -> ExitCode {
+    let mut vm = Vm::with_grants(grants);
     if let Err(e) = setup(&mut vm) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
@@ -62,6 +71,120 @@ pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), cr
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.exit_code().is_some() => ExitCode::from(e.exit_code().unwrap_or(1) as u8),
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run a Scheme test file directly at top level (preserving full async
+/// suspension and package resolution), passing runner protocol state as VM
+/// values rather than relying on Scheme's `Environment` or `Loading` grants,
+/// then invoke `(%test-worker-finish!)` from `(techne test)`.
+pub fn main_test_worker(
+    args: Vec<String>,
+    world: &str,
+    without: &[String],
+    grants: crate::vm::Grants,
+    setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>,
+) -> ExitCode {
+    let mut vm = Vm::with_grants(grants);
+    if let Err(e) = setup(&mut vm) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    let Some(path) = args.first().cloned() else {
+        eprintln!("techne run --test-worker: expected a test file path");
+        return ExitCode::from(2);
+    };
+    let stopped = signals(vm.interrupt_handle(), true);
+    crate::stdlib::set_command_line(args);
+
+    let had_loading = !without.iter().any(|c| c == "loading");
+    let nonce = std::env::var("TECHNE_TEST_RUNNER").unwrap_or_default();
+    let filters: Vec<String> =
+        std::env::var("TECHNE_TEST_FILTERS").unwrap_or_default().lines().filter(|s| !s.is_empty()).map(str::to_owned).collect();
+    let timeout: Option<i64> = std::env::var("TECHNE_TEST_TIMEOUT").ok().and_then(|s| s.parse::<i64>().ok()).filter(|&n| n > 0);
+    let capture = std::env::var("TECHNE_TEST_NOCAPTURE").map(|v| v != "1").unwrap_or(true);
+    let list_only = std::env::var("TECHNE_TEST_LIST").map(|v| v == "1").unwrap_or(false);
+    let executable = std::env::var("TECHNE_BIN").ok();
+
+    let test_scm = crate::library::lisp_dir().join("test.scm").to_string_lossy().into_owned();
+    if !had_loading {
+        vm.set_grant(crate::vm::Capability::Loading, true);
+    }
+    let init_res = vm.find_module(&test_scm).and_then(|_| {
+        let begin_fn = vm.eval_source("(eval '%test-worker-begin! (environment '(techne test)))")?;
+        let filter_vals: Vec<_> = filters.iter().map(|s| vm.make_string(s)).collect::<Result<_, _>>()?;
+        let without_vals: Vec<_> = without.iter().map(|s| vm.make_string(s)).collect::<Result<_, _>>()?;
+        let vals = [
+            vm.make_string(&nonce)?,
+            vm.make_string(&path)?,
+            vm.make_list(&filter_vals)?,
+            match timeout {
+                Some(t) => vm.make_int(t)?,
+                None => crate::api::Value::FALSE,
+            },
+            crate::api::Value::bool(capture),
+            crate::api::Value::bool(list_only),
+            vm.make_string(world)?,
+            vm.make_list(&without_vals)?,
+            match &executable {
+                Some(e) => vm.make_string(e)?,
+                None => crate::api::Value::FALSE,
+            },
+        ];
+        vm.call(&begin_fn, &vals).map(|_| ())
+    });
+    if let Err(e) = init_res {
+        eprintln!("techne run --test-worker: init failed: {e}");
+        std::mem::forget(vm);
+        return ExitCode::FAILURE;
+    }
+    let pkg_res = use_package_of(&mut vm, Path::new(&path));
+    if !had_loading {
+        vm.set_grant(crate::vm::Capability::Loading, false);
+    }
+
+    let load_res = pkg_res.and_then(|()| vm.eval_file(Path::new(&path)).map(|_| ()));
+    let load_err = match &load_res {
+        Ok(()) => None,
+        Err(e) if e.exit_code() == Some(0) => None,
+        Err(e) => Some(e.to_string()),
+    };
+
+    if !had_loading {
+        vm.set_grant(crate::vm::Capability::Loading, true);
+    }
+    let set_err_res = vm.eval_source("(eval '%test-worker-set-load-error! (environment '(techne test)))").and_then(|f| {
+        let v_err = match &load_err {
+            Some(s) => vm.make_string(s)?,
+            None => crate::api::Value::FALSE,
+        };
+        vm.call(&f, &[v_err]).map(|_| ())
+    });
+    if !had_loading {
+        vm.set_grant(crate::vm::Capability::Loading, false);
+    }
+
+    let finish_res = set_err_res.and_then(|()| vm.eval_source("((eval '%test-worker-finish! (environment '(techne test))))").map(|_| ()));
+    vm.flush();
+    vm.report_jit_stats();
+    if std::env::var_os("TECHNE_GC_STATS").is_some() {
+        eprintln!("{:?}", vm.heap().stats);
+    }
+    std::mem::forget(vm);
+    let signal = stopped.load(Ordering::SeqCst);
+    if signal != 0
+        && let Err(e) = &finish_res
+        && e.exit_code().is_none()
+        && e.msg == crate::vm::INTERRUPTED
+    {
+        return ExitCode::from((128 + signal) as u8);
+    }
+    match finish_res {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE

@@ -35,9 +35,8 @@ Keep that Rust a small mechanism with its policy exposed to Lisp, and say
 in the commit why it could not be Scheme.
 
 Write tests in Scheme by default; use Rust only when the test needs a host-level check that Scheme cannot make.
-Use `lisp/test.scm`;
-for headless editor suites, `crates/techne-editor/tests/lisp.rs` already
-loads `lisp/editor/tests/*.scm` with the editor primitives installed.
+Import `(techne test)` (`define-test`, `define-suite`, `assert-equal`, `assert-raises`, `assert-match`, `assert-eventually`, `assert-golden`, `call-with-temporary-directory`, or soft `check`/`check-true`) and run them with `techne test` (from a package directory or the repo root; `techne test --help` lists options).
+Declare non-default worlds at the top of a test file with `(test-file #:environment 'host)` or `(test-file #:environment 'editor)` (plus optional `#:without`, `#:timeout`, `#:serial`, `#:requires`).
 Keep Rust tests for the host contracts they actually observe (for example,
 frontend snapshots or process reaping). A test that needs host setup can
 still keep its scenario and assertions in a `.scm` file.

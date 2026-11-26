@@ -1,5 +1,6 @@
 ;;; Shared fixtures for the Scheme tool suites, not a second test framework.
-(require "../../test.scm")
+(import (techne test))
+(test-file #:ignore #t)
 (import (techne tools) (techne crypto))
 (provide expect fails tool-test-case with-tool-project call-with-tool-directory
          fixture-write test-summary)

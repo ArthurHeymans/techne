@@ -1,4 +1,4 @@
-(require "../test.scm")
+(import (techne test))
 (require "../org/date.scm")
 (require "../org/org.scm")
 (require "../org/agenda.scm")

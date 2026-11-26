@@ -1,5 +1,6 @@
 ;;; Start with a fresh history, independent of other search scenarios.
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote editor))
 (require "../main.scm")
 (require "../session.scm")
 (require "../dispatch.scm")

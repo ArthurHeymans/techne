@@ -1,4 +1,4 @@
-(require "../test.scm")
+(import (techne test))
 (require "../schema.scm")
 (require "../http/http.scm")
 

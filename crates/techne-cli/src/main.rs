@@ -20,7 +20,8 @@ usage: techne [SUBCOMMAND] [ARGS...]
   eval [ARGS] FORM         evaluate FORM in the editor running
   daemon                   the editor with no frontend, for frontends to attach
   attach --stdio [--start] relay to the editor running here (what ssh runs)
-  run FILE [ARGS]          run a Scheme file
+  run [OPTS] FILE [ARGS]   run a Scheme file (--world vm|host|editor, --without CAPS)
+  test [ARGS]              run Scheme tests; test --help for options
   repl                     a Lisp REPL in this terminal
   tool ROOT [FORM [SESSION]] bounded tools for callers; tool --help to begin
   node [ARGS]              serve the node protocol, or nREPL with --nrepl PORT
@@ -65,10 +66,8 @@ fn main() -> ExitCode {
         "eval" => eval(rest()),
         "daemon" => daemon(rest()),
         "attach" => attach(rest()),
-        "run" => match rest() {
-            file if file.is_empty() => usage(),
-            file => techne_vm::cli::main_with(file, install),
-        },
+        "run" => run(args.split_off(1)),
+        "test" => test(args.split_off(1)),
         "repl" => match rest() {
             none if none.is_empty() => techne_vm::cli::main_with(none, install),
             _ => usage(),
@@ -94,6 +93,131 @@ fn main() -> ExitCode {
 fn install(vm: &mut techne_vm::vm::Vm) -> Result<(), techne_vm::vm::Error> {
     techne_net::install(vm)?;
     techne_node::install(vm)
+}
+
+fn parse_capability(name: &str) -> Option<techne_vm::vm::Capability> {
+    use techne_vm::vm::Capability;
+    match name {
+        "files" => Some(Capability::Files),
+        "environment" => Some(Capability::Environment),
+        "processes" => Some(Capability::Processes),
+        "network" => Some(Capability::Network),
+        "loading" => Some(Capability::Loading),
+        "host-control" | "host_control" => Some(Capability::HostControl),
+        "console" => Some(Capability::Console),
+        "clock" => Some(Capability::Clock),
+        "entropy" => Some(Capability::Entropy),
+        _ => None,
+    }
+}
+
+fn apply_without(val: &str, grants: &mut techne_vm::vm::Grants, removed: &mut Vec<String>) -> Result<(), ExitCode> {
+    for cap in val.split(',').filter(|s| !s.is_empty()) {
+        let Some(c) = parse_capability(cap) else {
+            eprintln!("techne run: unknown capability `{cap}`");
+            return Err(ExitCode::from(2));
+        };
+        *grants = grants.without(c);
+        let canonical = if cap == "host_control" { "host-control" } else { cap };
+        if !removed.iter().any(|r| r == canonical) {
+            removed.push(canonical.to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Run a Scheme file in a chosen world (`vm`, `host`, or `editor`) with optional capability removals.
+fn run(args: Vec<String>) -> ExitCode {
+    let mut world = "host".to_string();
+    let mut grants = techne_vm::vm::Grants::ALL;
+    let mut without_names: Vec<String> = Vec::new();
+    let mut test_worker = false;
+    let mut it = args.into_iter();
+    let mut rest = Vec::new();
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            rest.extend(it);
+            break;
+        }
+        if arg == "--test-worker" {
+            test_worker = true;
+        } else if let Some(val) = arg.strip_prefix("--world=") {
+            world = val.to_string();
+        } else if arg == "--world" {
+            let Some(val) = it.next() else {
+                eprintln!("techne run: --world expects vm, host, or editor");
+                return ExitCode::from(2);
+            };
+            world = val;
+        } else if let Some(val) = arg.strip_prefix("--without=") {
+            if let Err(code) = apply_without(val, &mut grants, &mut without_names) {
+                return code;
+            }
+        } else if arg == "--without" {
+            let Some(val) = it.next() else {
+                eprintln!("techne run: --without expects a capability name");
+                return ExitCode::from(2);
+            };
+            if let Err(code) = apply_without(&val, &mut grants, &mut without_names) {
+                return code;
+            }
+        } else if arg.starts_with("--") {
+            eprintln!("techne run: unknown option `{arg}`");
+            return ExitCode::from(2);
+        } else {
+            rest.push(arg);
+            rest.extend(it);
+            break;
+        }
+    }
+    if rest.is_empty() {
+        return usage();
+    }
+    let dispatch = |setup: fn(&mut techne_vm::vm::Vm) -> Result<(), techne_vm::vm::Error>| {
+        if test_worker {
+            techne_vm::cli::main_test_worker(rest, &world, &without_names, grants, setup)
+        } else {
+            techne_vm::cli::main_with_grants(rest, grants, setup)
+        }
+    };
+    match world.as_str() {
+        "vm" => dispatch(|_| Ok(())),
+        "host" => dispatch(install),
+        "editor" => {
+            #[cfg(any(feature = "window", feature = "term"))]
+            {
+                dispatch(|vm| {
+                    techne_editor::install(vm);
+                    techne_node::install(vm)
+                })
+            }
+            #[cfg(not(any(feature = "window", feature = "term")))]
+            {
+                let _ = dispatch;
+                eprintln!("techne run: --world editor requires a build with editor support");
+                ExitCode::from(2)
+            }
+        }
+        other => {
+            eprintln!("techne run: unknown world `{other}` (expected vm, host, or editor)");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Scheme owns the test runner; this only selects its entry point.
+fn test(args: Vec<String>) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("techne test: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut call =
+        vec![techne_vm::library::lisp_dir().join("test-runner.scm").to_string_lossy().into_owned(), exe.to_string_lossy().into_owned()];
+    call.extend(args);
+    techne_vm::cli::main_with(call, install)
 }
 
 /// Scheme owns the tool interface and help; this only selects its entry point.

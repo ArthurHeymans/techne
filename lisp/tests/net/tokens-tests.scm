@@ -1,4 +1,5 @@
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote host))
 (require "../../cloud/tokens.scm")
 (import (techne crypto))
 

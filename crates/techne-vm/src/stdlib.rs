@@ -965,6 +965,16 @@ pub fn install(vm: &mut Vm) {
         /// Return CONDITION as a message for people: its message and irritants.
         "(condition/report-string condition)" => |vm: &mut Vm, a, _| {
             let s = crate::builtins::condition_message(vm, arg(vm, a, 0)); Ok(vm.make_string_raw(&s)) };
+        /// Return the innermost-first backtrace frames of the exception currently being handled, or the empty list elsewhere.
+        "(current-backtrace)" => |vm: &mut Vm, _, _| {
+            let frames: Vec<String> = vm.raise_backtrace().to_vec();
+            vm.convert_raw(frames)
+        };
+        /// Return the number of available parallel hardware threads (at least 1).
+        "(available-parallelism)" => |_, _, _| {
+            let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+            Ok(Value::int_unchecked(n as i64))
+        };
         "(%push-handler handler)" => |vm: &mut Vm, a, _| { let h = vm.root(arg(vm, a, 0)); vm.push_proc_handler(h); Ok(Value::VOID) };
         "(%push-wind after)" => |vm: &mut Vm, a, _| { let after = vm.root(arg(vm, a, 0)); vm.push_wind(after); Ok(Value::VOID) };
         "(%resume-unwind)" => |vm: &mut Vm, _, _| Err(vm.resume_unwind());

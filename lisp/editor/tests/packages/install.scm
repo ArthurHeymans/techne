@@ -1,4 +1,5 @@
-(require "../../../test.scm")
+(import (techne test))
+(test-file #:ignore #t)
 (require "../../dispatch.scm")
 (import (techne editor) (techne packages) (techne path))
 (provide install-and-use restore-offline)

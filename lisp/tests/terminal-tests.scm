@@ -1,5 +1,5 @@
 (import (techne) (techne terminal))
-(require "../test.scm")
+(import (techne test))
 
 (define esc (string #\x1b))
 (define (csi tail) (string-append esc "[" tail))

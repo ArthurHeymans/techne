@@ -1,7 +1,7 @@
 ;;; Package directories: manifests read as data, the libraries a package
 ;;; provides and those of the packages it depends on, without the editor.
 (import (techne) (techne package) (techne path) (techne uuid))
-(require "../test.scm")
+(import (techne test))
 
 (define root (string-append (or (get-environment-variable "TMPDIR") "/tmp") "/techne-package-" (uuid-v4)))
 (define (at . parts) (apply path-join root parts))

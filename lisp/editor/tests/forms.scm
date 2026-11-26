@@ -1,4 +1,5 @@
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote editor))
 (require "../api.scm")
 (require "../main.scm")
 (require "../dispatch.scm")

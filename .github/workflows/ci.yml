@@ -121,6 +121,9 @@ jobs:
       - run: cargo test --release --no-fail-fast -p techne-vm --features counting-allocator --test suites
         env:
           TECHNE_TEST_MODES: ${{ matrix.mode }}
+      - run: cargo test --release --no-fail-fast -p techne-cli --test scheme
+        env:
+          TECHNE_TEST_MODES: ${{ matrix.mode }}
 
   # The flake's package: the binary finds its Lisp where it is installed.
   package:
@@ -140,6 +143,11 @@ jobs:
       - run: |
           echo '(import (scheme base) (scheme write) (srfi 1)) (write (iota 3))' > /tmp/t.scm
           test "$(result/bin/techne run /tmp/t.scm)" = "(0 1 2)"
+      - run: |
+          mkdir -p /tmp/smoke-pkg/tests
+          echo '(package smoke-pkg)' > /tmp/smoke-pkg/techne-package.scm
+          echo '(import (techne test)) (define-test "adds" (assert-equal 4 (+ 2 2)))' > /tmp/smoke-pkg/tests/smoke-test.scm
+          result/bin/techne test /tmp/smoke-pkg
 
   # Random keys for the editor (crates/techne-editor/examples/keyfuzz.rs),
   # from fixed seeds: an error no command raised, a violation in the

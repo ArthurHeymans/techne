@@ -1,5 +1,6 @@
 ;;; Exercise indentation through both key profiles, not through a renderer.
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote editor))
 (require "../main.scm")
 (require "../session.scm")
 (require "../dispatch.scm")

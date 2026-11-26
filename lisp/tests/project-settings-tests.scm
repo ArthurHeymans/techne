@@ -1,7 +1,7 @@
 ;;; Headless tests for `(techne editorconfig)` and `(techne project-settings)`.
 
 (import (techne) (techne path) (techne uuid) (techne editorconfig) (techne project-settings))
-(require "../test.scm")
+(import (techne test))
 
 (define (assert-true label v)
   (check label #t (and v #t)))

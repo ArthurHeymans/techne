@@ -1,4 +1,5 @@
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote host))
 (require "../../cloud/manifest.scm")
 
 (define root (string-append "/tmp/techne-manifest-tests-" (number->string (exact (floor (* 1000 (current-second)))))))

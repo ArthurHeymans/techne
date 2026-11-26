@@ -1,5 +1,7 @@
 ;;; Mutable replies, shared parser declarations and explicit snapshot origin.
+(import (techne test))
 (require "support.scm")
+(test-file #:environment (quote host))
 (import (techne tools) (techne source) (techne languages))
 
 (with-tool-project "replies do not expose mutable cache or project state" '(("source" "abc\n"))

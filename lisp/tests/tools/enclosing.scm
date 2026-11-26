@@ -1,5 +1,7 @@
 ;;; Ownership shares parser results and immutable snapshots with definitions.
+(import (techne test))
 (require "support.scm")
+(test-file #:environment (quote host))
 (import (techne tools))
 
 (with-tool-project "Rust hit owners and immutable definition handles"

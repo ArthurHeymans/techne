@@ -1,5 +1,7 @@
 ;;; Bounded contexts, matching-line counts and literal query diagnostics.
+(import (techne test))
 (require "support.scm")
+(test-file #:environment (quote host))
 (import (techne tools))
 
 (with-tool-project "grouped counts page files, not matching lines"

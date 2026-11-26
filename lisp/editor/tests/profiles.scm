@@ -4,7 +4,8 @@
 ;;;
 ;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
 
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote editor))
 (require "../session.scm")
 (require "../dispatch.scm")
 (require "../commands.scm")

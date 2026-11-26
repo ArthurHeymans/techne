@@ -1,4 +1,5 @@
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote host))
 (require "../../cloud/kv.scm")
 
 ;; A directory of this run's own, under the system's.

@@ -1,5 +1,6 @@
 (import (techne) (mail smtp))
 (import (techne test))
+(test-file #:environment 'host)
 
 ;; A local peer accepts TCP and reads ClientHello, but never speaks TLS.
 (let* ((server (tcp-listen 0))

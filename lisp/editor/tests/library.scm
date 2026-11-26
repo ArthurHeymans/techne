@@ -3,7 +3,8 @@
 ;;;
 ;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
 
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote editor))
 (require "../api.scm")
 
 (check "the Emacs profile's own keys" 'forward-char (lookup-key emacs-map (kbd "C-f")))

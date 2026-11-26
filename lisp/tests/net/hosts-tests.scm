@@ -1,4 +1,5 @@
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote host))
 (require "../../cloud/hosts.scm")
 
 (check "a project of a tenant" "acme/shop" (host-target "shop.acme.techne.example" "techne.example"))

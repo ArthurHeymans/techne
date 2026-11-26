@@ -9,7 +9,8 @@
 ;;; 5. Mixed ibuffer-do-save batch with a sync changed-on-disk refusal, a second sync file,
 ;;;    an async success, and an async cancellation settles every selected file with exact totals.
 (import (techne))
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote editor))
 (require "../main.scm")
 (require "../files.scm")
 (require "../buffers.scm")

@@ -1,5 +1,7 @@
 ;;; Budgets and original coordinates, including incomplete syntax.
+(import (techne test))
 (require "support.scm")
+(test-file #:environment (quote host))
 (import (techne tools))
 
 (with-tool-project "definition character budget and item ceiling" '()

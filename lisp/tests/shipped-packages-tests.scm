@@ -1,7 +1,7 @@
 ;;; The packages Techne ships, in packages/ beside its Lisp, and a package
 ;;; of this repository that depends on one of them without the editor.
 (import (techne) (techne package) (techne path))
-(require "../test.scm")
+(import (techne test))
 
 ;; Each manifest is one, named as its directory, and depends on nothing:
 ;; the editor relies on that to advertise them at start without

@@ -101,10 +101,6 @@ name = "language"
 required-features = ["counting-allocator"]
 
 [[test]]
-name = "lisp"
-required-features = ["counting-allocator"]
-
-[[test]]
 name = "scheme"
 required-features = ["counting-allocator"]
 

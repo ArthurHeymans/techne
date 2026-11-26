@@ -1,4 +1,5 @@
-(require "../../test.scm")
+(import (techne test))
+(test-file #:environment (quote host))
 (require "../../http/http.scm")
 (require "../../http/debug-route.scm")
 

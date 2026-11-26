@@ -1,6 +1,7 @@
 ;;; Mail application tests. The host opens a fresh attached session with a
 ;;; private directory for its journal and SQLite database for each case.
-(require "../../../test.scm")
+(import (techne test))
+(test-file #:ignore #t)
 (require "../../main.scm")
 (require "../../dispatch.scm")
 (import (techne editor) (mail store))
