@@ -3,7 +3,10 @@
 (test-file #:environment 'host)
 
 (define (run-techne-test dir . args)
-  (call-with-process (test-executable) (cons "test" args)
+  (apply run-techne dir "test" args))
+
+(define (run-techne dir . args)
+  (call-with-process (test-executable) args
     (lambda (p)
       (let* ((err-task (spawn (lambda () (process-read-all p 'stderr))))
              (out (process-read-all p 'stdout))
@@ -31,7 +34,7 @@
               "(import (techne test) (demo math))\n"
               "(define-test \"doubles integers\"\n"
               "  (assert-equal 8 (double 4)))\n"
-              "(define-test (\"skipped case\" #:skip \"not yet\")\n"
+              "(define-test \"skipped case\" #:skip \"not yet\"\n"
               "  (assert-true #f))\n"))
           ;; --list discovers the package test with package-prefixed id
           (let ((listed (run-techne-test pkg "--list")))
@@ -170,7 +173,7 @@
             "(import (techne test))\n(display \"no-newline\")\n(define-test \"still passes\" (assert-equal 2 (+ 1 1)))\n")
           ;; Nested `techne run` must NOT inherit runner mode
           (write-file (path-join pkg "child.scm")
-            "(import (techne test))\n(define-test \"child fails\" (assert-equal 1 2))\n(test-summary)\n")
+            "(import (techne test))\n(define-test \"child fails\" (assert-equal 1 2))\n")
           (write-file (path-join pkg "tests/nested-run-test.scm")
             (string-append
               "(import (techne) (techne test))\n"
@@ -203,7 +206,7 @@
           (write-file (path-join pkg "tests/sub/timeout-test.scm")
             (string-append
               "(import (techne test))\n"
-              "(define-test (\"times out with cleanup\" #:timeout 1)\n"
+              "(define-test \"times out with cleanup\" #:timeout 1\n"
               "  (dynamic-wind\n"
               "    (lambda () #f)\n"
               "    (lambda () (sleep 10000))\n"
@@ -278,3 +281,25 @@
       (let ((result (run-techne-test root "--list-tests" "broken.scm")))
         (assert-equal 1 (car result))
         (assert-match "wrap the check in a test or declare (test-file #:script #t)" (caddr result))))))
+
+(define-test "computed names, keyword options and procedural registration"
+  (call-with-temporary-directory
+    (lambda (root)
+      (write-file (path-join root "cases.scm")
+        (string-append
+          "(import (techne) (techne test))\n"
+          "(for-each (lambda (n)\n"
+          "  (define-test (string-append \"case \" (number->string n))\n"
+          "    #:timeout 5 #:skip (and (= n 2) \"second row skipped\")\n"
+          "    (assert-equal 1 n))) '(1 2))\n"
+          "(register-test! \"procedural\" (lambda () (assert-true #t)) #:timeout 3)\n"))
+      (let ((listed (run-techne-test root "--list-tests" "cases.scm")))
+        (assert-equal 0 (car listed))
+        (assert-equal '("cases.scm::case 1" "cases.scm::case 2" "cases.scm::procedural")
+          (filter (lambda (line) (not (string=? line ""))) (string-split (cadr listed) "\n"))))
+      (let ((run (run-techne-test root "cases.scm")))
+        (assert-equal 0 (car run))
+        (assert-match "2 passed, 0 failed, 1 skipped" (cadr run)))
+      (let ((standalone (run-techne root "run" "cases.scm")))
+        (assert-equal 1 (car standalone))
+        (assert-match "techne test FILE" (caddr standalone))))))

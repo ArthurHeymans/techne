@@ -8,7 +8,7 @@
 
 (provide
   test-file
-  define-test define-suite
+  define-test define-suite register-test!
   assert-equal assert-true assert-false assert-raises assert-match
   assert-eventually assert-golden
   skip
@@ -50,7 +50,7 @@
 (define %worker-nonce #f)
 (define %worker-file #f)
 (define %worker-file-id #f)
-(define %worker-script? #f)
+(define %script-file? #f)
 (define %worker-requires-skip #f)
 (define %worker-filters '())
 (define %worker-timeout #f)
@@ -74,7 +74,7 @@
       (set! %worker-nonce (if (and (string? nonce) (not (string=? nonce ""))) nonce #f))
       (set! %worker-file (%cfg-ref cfg 'file #f))
       (set! %worker-file-id (%cfg-ref cfg 'file-id #f))
-      (set! %worker-script? (%cfg-ref cfg 'script #f))
+      (set! %script-file? (%cfg-ref cfg 'script #f))
       (set! %worker-requires-skip (%cfg-ref cfg 'requires-skip #f))
       (set! %worker-filters (let ((f (%cfg-ref cfg 'filters '()))) (if (list? f) f '())))
       (set! %worker-timeout (and (exact-integer? timeout) (> timeout 0) timeout))
@@ -176,7 +176,7 @@ discovery for helper files."
   (when (and timeout (not (and (exact-integer? timeout) (> timeout 0))))
     (error "test-file: #:timeout must be a positive integer (seconds)" timeout))
   (when (and (%test-runner-active?) (not ignore))
-    (unless (eq? script %worker-script?)
+    (unless (eq? script %script-file?)
       (error "test-file: #:script declaration must be at the top of the file after imports"))
     (let ((want-env (symbol->string environment))
           (want-without (map %canonical-cap-name without)))
@@ -186,6 +186,7 @@ discovery for helper files."
       (unless (%same-string-set? want-without %worker-without)
         (error "test-file: #:without declaration was not active when worker started (move test-file to the top of the file after import/require)"
                (list 'declared want-without 'actual %worker-without)))))
+  (unless (%test-runner-active?) (set! %script-file? script))
   (if #f #f))
 
 ;;; ---------------------------------------------------------------------------
@@ -427,7 +428,7 @@ When TECHNE_BLESS=1 is set, writes ACTUAL to PATH and passes."
 (define (check name expected actual)
   "Count a soft check called NAME: ACTUAL must be `equal?` to EXPECTED.
 A failure is recorded and printed with both without aborting the test."
-  (when (and (%test-runner-active?) (not %worker-script?) (not (%active-soft-failures)))
+  (when (and (%test-runner-active?) (not %script-file?) (not (%active-soft-failures)))
     (error "check: outside a running test; wrap the check in a test or declare (test-file #:script #t)"))
   (set! %count (+ %count 1))
   (unless (equal? expected actual)
@@ -449,7 +450,8 @@ A failure is recorded and printed with both without aborting the test."
 
 (define (test-summary)
   "Print how many checks passed, then exit with failure if any failed.
-Under `techne test`, this is a no-op so the runner collects results."
+Script files only. Under `techne test` the runner collects results."
+  (unless %script-file? (error "test-summary: only script files can exit via test-summary"))
   (unless (%test-runner-active?)
     (displayln (string-append (number->string (- %count %failures)) "/" (number->string %count) " passed"))
     (exit (if (= %failures 0) 0 1))))
@@ -468,14 +470,6 @@ Under `techne test`, this is a no-op so the runner collects results."
     (if (null? prefix)
         name
         (string-join (append prefix (list name)) " / "))))
-
-(define (%parse-test-options opts)
-  (let loop ((xs opts) (acc '()))
-    (cond
-      ((null? xs) acc)
-      ((and (keyword? (car xs)) (pair? (cdr xs)))
-       (loop (cddr xs) (cons (cons (car xs) (cadr xs)) acc)))
-      (else (error "define-test: expected keyword-value option pairs" opts)))))
 
 (define (%opt-ref alist key default)
   (let ((p (assq key alist)))
@@ -552,39 +546,23 @@ Under `techne test`, this is a no-op so the runner collects results."
           (if out-port (get-output-string out-port) "")
           (if err-port (get-output-string err-port) ""))))
 
-(define (%register-test! name thunk raw-opts)
-  (when %worker-script?
-    (error "define-test: script files cannot register tests"))
-  (let* ((full-name (%join-suite-name name))
-         (loc (procedure-location thunk))
-         (opts (%parse-test-options raw-opts)))
-    (if (%test-runner-active?)
-        (set! %registered (cons (list full-name thunk loc opts) %registered))
-        ;; Standalone `techne run`: run immediately and report.
-        (let* ((skip-reason (%opt-ref opts #:skip #f))
-               (timeout (%opt-ref opts #:timeout #f))
-               (start (%safe-jiffy)))
-          (set! %count (+ %count 1))
-          (if skip-reason
-              (begin (display "SKIP ") (display full-name)
-                     (display " (") (display skip-reason) (displayln ")"))
-              (let* ((res (%capture-and-run thunk timeout #f))
-                     (st (car res))
-                     (floc (cadr res))
-                     (det (caddr res)))
-                (cond
-                  ((eq? st 'pass)
-                   (display "PASS ") (displayln full-name))
-                  ((eq? st 'skip)
-                   (display "SKIP ") (display full-name)
-                   (display " (") (display det) (displayln ")"))
-                  (else
-                   (set! %failures (+ %failures 1))
-                   (display "FAIL ") (display full-name)
-                   (when (or floc (%format-location loc))
-                     (display " [") (display (or floc (%format-location loc))) (display "]"))
-                   (newline)
-                   (unless (string=? det "") (displayln det))))))))))
+(define (register-test! name thunk #:timeout [timeout #f] #:skip [skip-reason #f])
+  "Register THUNK as NAME for the active test run.
+TIMEOUT is an optional limit in seconds. SKIP-REASON, if given, skips the test."
+  (unless (%test-runner-active?)
+    (error "register-test!: run this file with techne test FILE"))
+  (when %script-file?
+    (error "register-test!: script files cannot register tests"))
+  (unless (string? name) (error "register-test!: expected a string name" name))
+  (unless (procedure? thunk) (error "register-test!: expected a thunk" thunk))
+  (when (and timeout (not (and (exact-integer? timeout) (> timeout 0))))
+    (error "register-test!: #:timeout must be a positive integer in seconds" timeout))
+  (when (and skip-reason (not (string? skip-reason)))
+    (error "register-test!: #:skip must be a reason string" skip-reason))
+  (let ((opts (append (if timeout (list (cons #:timeout timeout)) '())
+                      (if skip-reason (list (cons #:skip skip-reason)) '()))))
+    (set! %registered (cons (list (%join-suite-name name) thunk (procedure-location thunk) opts)
+                            %registered))))
 
 (define-syntax define-suite
   (syntax-rules ()
@@ -593,13 +571,21 @@ Under `techne test`, this is a no-op so the runner collects results."
      (parameterize ((%suite-prefix (append (%suite-prefix) (list name))))
        body ...))))
 
+;; Split off leading options without looking inside the name expression.
+(define-syntax %define-test-options
+  (syntax-rules ()
+    ((_ name (opts ...) #:timeout value body ...)
+     (%define-test-options name (opts ... #:timeout value) body ...))
+    ((_ name (opts ...) #:skip value body ...)
+     (%define-test-options name (opts ... #:skip value) body ...))
+    ((_ name (opts ...) body first-or-rest ...)
+     (register-test! name (lambda () body first-or-rest ...) opts ...))))
+
 (define-syntax define-test
   (syntax-rules ()
-    "Define a named unit test, optionally with keyword options."
-    ((_ (name opts ...) body ...)
-     (%register-test! name (lambda () body ...) (list opts ...)))
+    "Register NAME (any string-valued expression) and an unevaluated body."
     ((_ name body ...)
-     (%register-test! name (lambda () body ...) '()))))
+     (%define-test-options name () body ...))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Worker protocol (used by lisp/test-worker.scm)
@@ -663,7 +649,7 @@ Under `techne test`, this is a no-op so the runner collects results."
       (%worker-load-error
        (%test-emit `(test-result "<load>" fail 0 ,%worker-file ,%worker-load-error "" ""))
        (%test-emit '(test-done 0 1 0)))
-      (%worker-script?
+      (%script-file?
        (let* ((ok? (= %failures 0))
               (detail (if ok? "" (string-append (number->string %failures) " of "
                                                 (number->string %count) " checks failed"))))
