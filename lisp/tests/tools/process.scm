@@ -90,6 +90,19 @@
     (expect #t (and (string-contains (tool-show kept) "the first 100 kept: ") #t))
     (expect #t (and (string-contains (tool-show kept) "tool-expand reads it from #:offset 0") #t))))
 
+(with-tool-project "default retention fills the widest window of each stream" (quote ())
+  (lambda (root p)
+    ;; #:chars is per stream, and what tool-run retains unasked is its
+    ;; most: neither one long stream nor two together come back short.
+    (define (lengths result)
+      (map (lambda (key) (string-length (tool-ref (tool-ref result key) 'text))) '(stdout stderr)))
+    (define one (tool-run p "seq" '("1" "4000")))
+    (expect '(8000 0) (lengths (tool-process-result one #:chars 8000)))
+    (expect '(8000 0) (lengths (tool-process-result one #:chars 8000 #:head #t)))
+    (define both (tool-run p "sh" '("-c" "seq 1 4000; seq 1 4000 >&2")))
+    (expect '(8000 8000) (lengths (tool-process-result both #:chars 8000)))
+    (expect '(8000 8000) (lengths (tool-process-result both #:chars 8000 #:head #t)))))
+
 (with-tool-project "passing test summaries do not crowd out failures" (quote ())
   (lambda (root p)
     (define log "i=0; while [ $i -lt 40 ]; do echo 'test result: ok. 3 passed; 0 failed'; i=$((i+1)); done; echo 'thread main panicked at src/a.rs:1:1'; echo 'test a::b ... FAILED'; echo 'test result: FAILED. 0 passed; 1 failed'; exit 101")
