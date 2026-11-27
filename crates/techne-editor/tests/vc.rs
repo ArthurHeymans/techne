@@ -860,7 +860,7 @@ fn the_picker_discards_only_the_unstaged_side() {
     let rows = s.minibuffer.unwrap().rows;
     assert_eq!(rows[0].text(0), "a.txt");
     assert_eq!(rows[1].text(0), "a.txt");
-    keys(&mut rt, "C-;");
+    keys(&mut rt, "C-; ?");
     type_text(&mut rt, "revert");
     keys(&mut rt, "RET RET");
     until(&mut rt, "discard from the picker", |s| s.echo == "Reverted a.txt");
@@ -1429,7 +1429,7 @@ fn acting_on_changes_from_anywhere() {
     assert!(rt.snapshot().pane().status.contains("a.txt"));
     keys(&mut rt, "C-x v f");
     until(&mut rt, "the changes", |s| s.minibuffer.as_ref().is_some_and(|m| !m.rows.is_empty()));
-    keys(&mut rt, "C-;");
+    keys(&mut rt, "C-; ?");
     let s = rt.snapshot();
     let actions: Vec<String> = s.minibuffer.unwrap().rows.iter().map(|r| r.text(0)).collect();
     assert_eq!(actions, ["vc-visit", "vc-diff", "vc-revert", "vc-copy-path"]);
@@ -1441,7 +1441,7 @@ fn acting_on_changes_from_anywhere() {
     // Revert, after asking: the file is back and the view no longer lists it.
     keys(&mut rt, "C-x 1 C-x v f");
     until(&mut rt, "the changes", |s| s.minibuffer.is_some());
-    keys(&mut rt, "C-;");
+    keys(&mut rt, "C-; ?");
     type_text(&mut rt, "revert");
     keys(&mut rt, "RET");
     assert_eq!(rt.snapshot().minibuffer.unwrap().prompt, "1/2 Discard unstaged edits to a.txt? ");

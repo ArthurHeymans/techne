@@ -130,22 +130,11 @@ kept a journal where it was, a list of texts."
                      problem))
                  moved plans))))
 
-(define (delete-path-and-buffers! s path)
-  "Delete the file or directory PATH, with all it holds, in session S.
-The buffers of the open files deleted are killed. It is an error, and
-nothing is deleted, when one of them has unsaved edits: they would be
-left with no file to be recovered against."
-  (let* ((deleted (documents-under (entry-truename path)))
-         (dirty (filter document-dirty? deleted)))
-    (unless (null? dirty)
-      (error "Unsaved edits: save or undo them first" (string-join (map document-path dirty) ", ")))
-    (delete-path path #t)
-    (for-each (lambda (d)
-                ;; Its text is the file's now: none.
-                (reload-document! d)
-                (let ((b (document-buffer d)))
-                  (when (and b (> (length (buffer-list)) 1)) (drop-buffer! s b))))
-              deleted)))
+(define (delete-path-and-buffers! s path #:recursive [recursive? #t])
+  "Delete the file or directory PATH in session S.
+With RECURSIVE? (default #t), deletes directories recursively;
+with #f, refuses real directories. Buffers of deleted files are killed."
+  (extra-action 'delete-path s path recursive? entry-truename documents-under))
 
 (define (make-generated-buffer! name d mode #:state [state #f])
   "Return a new buffer NAME of the document D in MODE, with STATE.
@@ -738,7 +727,9 @@ directory's path, with its slash."
   (completing-read s prompt
                    (lambda (input)
                      (let ((dir (directory-of input)))
-                       (map (lambda (name) (candidate name #:target (target 'file (string-append dir name))))
+                       (map (lambda (name)
+                              (candidate name #:target (target (if (directory-name? name) 'directory 'file)
+                                                               (string-append dir name))))
                             (guard (e (#t '()))
                               (directory-entries (if (string=? dir "") (working-directory) (absolute-path dir)))))))
                    #:initial initial
@@ -746,6 +737,12 @@ directory's path, with its slash."
                    #:keymap file-name-map
                    #:require-match #f
                    #:select-input existing-directory?
+                   #:input-target (lambda (input)
+                                    (let* ((full (absolute-path input))
+                                           (attrs (guard (e (#t #f)) (file-attributes full)))
+                                           (dir? (or (directory-name? full)
+                                                     (and attrs (eq? (car attrs) 'directory)))))
+                                      (target (if dir? 'directory 'file) full)))
                    #:history 'file-name
                    #:remember (lambda (entry c)
                                 (let* ((t (candidate-target c))
@@ -930,25 +927,24 @@ its target the line's location."
                      #:remember 'input)))
 
 ;;; Actions on files, buffers and locations; the first is the default.
+;;; Rich extra actions load lazily on first `actions-for` lookup.
 
-(define-action file (visit-file s path) "Open the file." (file-visit! s path))
-(define-action file (visit-file-other-pane s path) "Open the file in a new pane below." (file-visit! s path #:other-pane #t))
-(define-action file (copy-file-name s path) "Save the file's name as a kill." (kill-save! s path #f #f))
+(define-action file (visit-file s path) #:key "f" #:default #t "Open the file." (file-visit! s path))
+(define-action buffer (show-buffer s b) #:key "b" "Show the buffer." (show-buffer! s b))
 
-(define-action buffer (show-buffer s b) "Show the buffer." (show-buffer! s b))
-(define-action buffer (show-buffer-other-pane s b) "Show the buffer in a new pane below." (show-in-other-pane! s (buffer-document b)))
-(define-action buffer (save-buffer-document s b)
-  "Write the buffer to its file."
-  (save-document-in-session! s (buffer-document b) 'save-buffer-document))
-(define-action buffer (kill-buffer-target s b) "Take the buffer off the buffer list." (drop-buffer! s b))
+(define %extra-actions-path
+  (string-append (directory-of (current-module)) "extra-actions.scm"))
+
+(register-lazy-actions! '(file directory buffer url region)
+  (lambda () (eval (list 'require %extra-actions-path))))
 
 ;; The focused pane shows the location's document with the caret there.
 (define (goto-location! s l show)
   (let* ((p (location-position l)) (v (show s (location-document l))))
     (view-set-ranges! v (list (list p p)) 0)))
 
-(define-action location (goto-location s l) "Go to the location." (goto-location! s l show-document!))
-(define-action location (goto-location-other-pane s l) "Go to the location in a new pane below." (goto-location! s l show-in-other-pane!))
+(define-action location (goto-location s l) #:key "f" "Go to the location." (goto-location! s l show-document!))
+(define-action location (goto-location-other-pane s l) #:key "o" "Go to the location in a new pane below." (goto-location! s l show-in-other-pane!))
 (define-action location (copy-location-line s l)
   "Save the location's line as a kill."
   (let ((d (location-document l)))

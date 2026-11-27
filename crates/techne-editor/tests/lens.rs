@@ -134,7 +134,7 @@ fn a_structured_view_with_targets_and_actions() {
     let s = rt.snapshot();
     assert_eq!((text(&s).as_str(), s.pane().head()), ("TODO three\n", 0));
     // Back, and the actions on locations, with no code of the view's.
-    keys(&mut rt, "C-x b RET M-< C-;");
+    keys(&mut rt, "C-x b RET M-< C-; ?");
     let s = rt.snapshot();
     let actions: Vec<String> = s.minibuffer.as_ref().unwrap().rows.iter().map(|r| r.text(0)).collect();
     assert_eq!(actions, ["goto-location", "goto-location-other-pane", "copy-location-line"]);

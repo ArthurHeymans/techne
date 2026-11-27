@@ -24,12 +24,12 @@ share navigation, commands, selection, search, and project context. Native
 applications can compose their objects and operations, not merely their windows.
 Existing graphical applications remain usable even without semantic integration.
 
-### Embark is foundational
+### Typed targets and actions
 
-Selection and search return typed, actionable targets rather than display
-strings. Applicable actions are discoverable on individual targets and sets of
-targets. Results remain actionable: a search result can become an input to a
-subsequent operation.
+Inspired by Emacs Embark, selection and search return typed, actionable targets
+rather than display strings. Applicable actions are discoverable on individual
+targets and sets of targets. Results remain actionable: a search result can
+become an input to a subsequent operation.
 
 Commands describe their arguments, availability, effects, and documentation.
 Humans, live programs, and authorized agents use the same underlying operations.

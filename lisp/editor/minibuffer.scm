@@ -42,7 +42,8 @@
          minibuffer-map minibuffer-keymaps minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          minibuffer-history add-history! history-length history-save-interval keep-histories! save-histories!
-         take-target pattern-parts matches? match-spans candidate-row)
+         take-target pattern-parts matches? match-spans candidate-row
+         set-extra-actions! extra-action collect-candidates-buffer!)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
 ;;; an annotation in a column of its own, as Marginalia aligns them, and a
@@ -162,6 +163,10 @@ filtered by Orderless against the input pattern."
   (keymap mb-keymap set-mb-keymap!)
   ;; (input) -> whether the input is selected first, or #f.
   (select-input mb-select-input set-mb-select-input!)
+  ;; (input) -> target for the input itself when no candidate is selected, or #f.
+  (input-target mb-input-target set-mb-input-target!)
+  ;; Marked candidates in this minibuffer session for batch act-all.
+  (marked mb-marked set-mb-marked!)
   ;; The name of its history, or #f; what it remembers (`choice`,
   ;; `input` or a procedure); how far back in it the input is (0: what
   ;; was typed, kept in `unfinished` while going through the entries as
@@ -210,6 +215,7 @@ The prompt's own keymap first, then `minibuffer-map`."
                          #:abort [abort #f]
                          #:keymap [keymap #f]
                          #:select-input [select-input #f]
+                         #:input-target [input-target #f]
                          #:history [history #f]
                          #:remember [remember 'choice])
   "Read a choice in the minibuffer of session S with PROMPT and INITIAL.
@@ -229,7 +235,9 @@ directory). KEYMAP, if given, holds the keys of what is being read
 (a file name's, say): it is looked up before `minibuffer-map`.
 SELECT-INPUT, if given, is a procedure (input) saying when the input
 itself is selected first rather than the first candidate, as vertico
-selects an existing directory's name. HISTORY, if given, is the name
+selects an existing directory's name. INPUT-TARGET, if given, is a
+procedure (input) returning a target when the input itself is acted on.
+HISTORY, if given, is the name
 of the history \\[minibuffer-previous-history] and
 \\[minibuffer-next-history] go through, a symbol; what is taken is
 remembered there: the input completed with the candidate taken, or,
@@ -277,6 +285,8 @@ minibuffer is open, and aborting cancels it."
     (set-mb-session! mb s)
     (set-mb-keymap! mb keymap)
     (set-mb-select-input! mb (owned select-input))
+    (set-mb-input-target! mb (owned input-target))
+    (set-mb-marked! mb '())
     (set-mb-private?! mb (session-document-private? s))
     (let ((op (current-operation)) (owned (list 'minibuffer)))
       (set-mb-operation! mb op)
@@ -429,6 +439,11 @@ Unescaped spaces split components; `\\ ` keeps a space inside one."
   (table-ref (mb-table mb) (matcher-match (table-matcher (mb-table mb)) k)))
 
 (define (mb-selected mb) (matches mb) (mb-selected* mb))
+
+(define (minibuffer-candidates-bounded mb limit)
+  (let* ((total (matches mb))
+         (n (min total limit)))
+    (cons total (map (lambda (k) (match-ref mb k)) (iota n)))))
 
 (define (minibuffer-candidates s)
   "Return the candidates matching the input of S's minibuffer."
@@ -752,31 +767,63 @@ This is how `completing-read` accepts by default."
       (act-default! s (candidate-target c))
       (error "No target for" (candidate-text c))))
 
-(define (act-on! s t name)
-  "Choose an action on the target T, described by NAME, and do it.
-The actions are offered in the minibuffer of session S."
-  (completing-read s (string-append "Act on " name ": ")
-                   (map (lambda (a)
-                          (candidate (symbol->string (action-name a)) #:annotation (action-doc a) #:target a))
-                        (actions-for (target-kind t)))
-                   #:accept (lambda (s c) (run-action! s (candidate-target c) t))))
+(define %extra-actions #f)
+(define (set-extra-actions! proc)
+  "Register PROC as the lazy dispatcher for extra target action operations."
+  (set! %extra-actions proc))
+
+(define (extra-action op . args)
+  "Invoke lazy extra-actions dispatcher with OP and ARGS."
+  (unless %extra-actions (actions-for 'file))
+  (apply %extra-actions op args))
+
+(define %collect-limit 200)
+
+(define (collect-candidates-buffer! s title cands #:total [total #f])
+  "Open a `*Targets*` buffer named TITLE for CANDS in session S.
+Optional TOTAL is the full match count before bounding."
+  (extra-action 'collect s title cands (or total (length cands))))
+
+(define (act-on! s t name #:minibuffer-context [mb-ctx #f])
+  "Choose an action on the target T, described by NAME, in session S.
+Shows single-key shortcuts immediately; press a shortcut key, RET for
+the default action, ? to search by name, or \\[keyboard-quit] to cancel.
+Optional MB-CTX enables batch/meta keys (E, S, A)."
+  (let ((actions (actions-for (target-kind t))))
+    (if (null? actions)
+        (message! s (string-append "No actions for " name))
+        (extra-action 'prompt s (list t) name actions mb-ctx
+                      (string-append "Act on " name " (press key, ? to search, C-g to cancel)")))))
+
+(define-command (minibuffer-toggle-mark s n)
+  "Mark or unmark the selected candidate for batch actions, then move next."
+  (let ((mb (open-minibuffer s)))
+    (extra-action 'toggle-mark s mb (mb-marked mb) set-mb-marked! minibuffer-next)))
+
+(define-command (minibuffer-collect s n)
+  "Collect matching minibuffer candidates into a `*Targets*` buffer."
+  (let ((mb (open-minibuffer s)))
+    (extra-action 'collect-cmd s (mb-prompt mb) (minibuffer-candidates-bounded mb %collect-limit))))
+
+(define-command (minibuffer-act-all s n)
+  "Act on all marked candidates, or all matches if none are marked."
+  (let ((mb (open-minibuffer s)))
+    (extra-action 'act-all s (or (and (pair? (mb-marked mb)) (mb-marked mb))
+                                 (cdr (minibuffer-candidates-bounded mb %collect-limit))))))
 
 (define-command (minibuffer-act s n)
   "Act on the selected candidate's target: choose an action for its kind.
-The minibuffer closes first, its previews undone."
-  (open-minibuffer s)
-  (let* ((c (minibuffer-selected s)) (t (and c (candidate-target c))))
-    (if (target? t)
-        (begin
-          (abort-minibuffer! s)
-          ;; A minibuffer key runs in no operation, as it only reads; this
-          ;; one acts, so the action chosen runs in an operation of its own.
-          (call-in-operation (start-operation! 'minibuffer-act s) (lambda () (act-on! s t (candidate-text c)))))
-        (message! s "No target to act on"))))
+Falls back to the input's own target (e.g. the current directory in
+`find-file`) when the input itself is selected. The minibuffer closes
+first, its previews undone."
+  (let ((mb (open-minibuffer s)))
+    (extra-action 'act s mb (mb-prompt mb) (mb-input-target mb) (mb-marked mb)
+                  (lambda (limit) (minibuffer-candidates-bounded mb limit)))))
 
 (define (target-at-point s)
-  (let ((d (doc s)))
-    (or (target-at d (point s)) (error "No target at point"))))
+  (or (extra-action 'region-target s)
+      (target-at (doc s) (point s))
+      (error "No target at point")))
 
 (define-command (act-at-point s n)
   "Act on the target at point: choose an action for its kind."
@@ -796,7 +843,9 @@ The minibuffer closes first, its previews undone."
             ("M-p" minibuffer-previous-history) ("M-n" minibuffer-next-history)
             ("RET" minibuffer-accept) ("M-RET" minibuffer-accept-input) ("TAB" minibuffer-complete)
             ("M-SPC" minibuffer-insert-separator)
-            ("C-g" minibuffer-abort) ("ESC" minibuffer-abort) ("C-;" minibuffer-act)
+            ("C-g" minibuffer-abort) ("ESC" minibuffer-abort)
+            ("C-;" minibuffer-act) ("C-." minibuffer-act) ("C-c a" minibuffer-act)
+            ("C-SPC" minibuffer-toggle-mark) ("C-c S" minibuffer-collect) ("C-c A" minibuffer-act-all)
             ;; Editing the input.
             ("C-f" forward-char) ("C-b" backward-char) ("M-f" forward-word) ("M-b" backward-word)
             ("C-a" beginning-of-line) ("C-e" end-of-line) ("<left>" backward-char) ("<right>" forward-char)

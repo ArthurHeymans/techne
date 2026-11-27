@@ -18,9 +18,9 @@
 (require "files.scm")
 
 (provide target target? target-kind target-value
-         define-action register-action! actions-for all-actions action-kind action-name action-doc run-action! act-default!
+         define-action register-action! register-lazy-actions! actions-for all-actions action-kind action-name action-doc action-key action-interactive? run-action! act-default!
          location file-location location? location-document location-position location-revision location-offset
-         line-candidate-text target-at)
+         line-candidate-text target-at set-fallback-target-at!)
 
 (define-record-type target
   (target kind value)
@@ -31,28 +31,48 @@
 ;;; Actions
 
 (define-record-type action
-  (make-action kind name doc proc order)
+  (make-action kind name doc proc order key interactive?)
   action?
   (kind action-kind)
   (name action-name)
   (doc action-doc)
   ;; (session value) -> anything
   (proc action-proc)
-  (order action-order))
+  (order action-order)
+  ;; Optional single-key binding string (e.g. "d", "r", "o") for quick dispatch.
+  (key action-key)
+  ;; Whether the action prompts interactively (excluded from batch act-all).
+  (interactive? action-interactive?))
 
 (define %actions (make-registry 'actions))
 (define %action-count 0)
 
-(define (register-action! kind name doc proc)
+(define (register-action! kind name doc proc #:key [key #f] #:default [default? #f] #:interactive [interactive? #f])
   "Define the action NAME on targets of KIND, documented by DOC.
-PROC is called as (PROC session value). The first action defined for
-a kind is its default; a redefinition keeps its place."
+PROC is called as (PROC session value). Optional KEY names a single-key
+shortcut; DEFAULT? pins it first regardless of load order; INTERACTIVE?
+marks prompting actions excluded from batch dispatch."
   (let ((old (registry-ref %actions (list kind name))))
     (set! %action-count (+ %action-count 1))
-    ;; A redefinition keeps its place.
+    ;; A redefinition keeps its place; an explicit default always sorts first.
     (registry-add! %actions (list kind name)
-                   (make-action kind name doc (scope-procedure proc) (if old (action-order old) %action-count)))
+                   (make-action kind name doc (scope-procedure proc)
+                                (cond (default? 0)
+                                      (old (action-order old))
+                                      (else %action-count))
+                                (or key (and old (action-key old)))
+                                (or interactive? (and old (action-interactive? old)))))
     name))
+
+(define-syntax %define-action
+  (syntax-rules ()
+    ((_ kind sig (opt ...) #:key k rest ...) (%define-action kind sig (opt ... #:key k) rest ...))
+    ((_ kind sig (opt ...) #:default d rest ...) (%define-action kind sig (opt ... #:default d) rest ...))
+    ((_ kind sig (opt ...) #:interactive i rest ...) (%define-action kind sig (opt ... #:interactive i) rest ...))
+    ((_ kind (name s v) (opt ...) doc body ...)
+     (begin
+       (define (name s v) doc body ...)
+       (register-action! 'kind 'name doc (lambda (s2 v2) (name s2 v2)) opt ...)))))
 
 ;; The procedure is called through its global binding, so redefining it
 ;; takes effect at once.
@@ -60,14 +80,29 @@ a kind is its default; a redefinition keeps its place."
   (syntax-rules ()
     "Define the action NAME on targets of KIND.
 It is a procedure of the session S and the target's value V; DOC
-documents both the procedure and the action."
-    ((_ kind (name s v) doc body ...)
-     (begin
-       (define (name s v) doc body ...)
-       (register-action! 'kind 'name doc (lambda (s2 v2) (name s2 v2)))))))
+documents both the procedure and the action. Supports optional `#:key`,
+`#:default`, and `#:interactive` flags before DOC."
+    ((_ kind sig rest ...) (%define-action kind sig () rest ...))))
+
+(define %lazy-action-loaders '())
+
+(define (register-lazy-actions! kinds loader)
+  "Register LOADER to run once before `actions-for` returns KINDS."
+  (set! %lazy-action-loaders (cons (cons kinds (scope-procedure loader)) %lazy-action-loaders)))
+
+(define (ensure-lazy-actions! kind)
+  (let ((run (filter (lambda (e) (memq kind (car e))) %lazy-action-loaders)))
+    (when (pair? run)
+      (set! %lazy-action-loaders (filter (lambda (e) (not (memq kind (car e)))) %lazy-action-loaders))
+      (for-each (lambda (entry)
+                  (guard (e (#t (set! %lazy-action-loaders (cons entry %lazy-action-loaders))
+                                (unless (string-contains (error-text e) "capability") (raise e))))
+                    ((cdr entry))))
+                (reverse run)))))
 
 (define (actions-for kind)
   "Return the actions on targets of KIND, the default first."
+  (ensure-lazy-actions! kind)
   (sort (filter-map (lambda (k) (and (eq? (car k) kind) (registry-ref %actions k))) (registry-keys %actions))
         (lambda (a b) (< (action-order a) (action-order b)))))
 
@@ -131,8 +166,18 @@ For a file's location, its line."
   "Return the line at POS in D, as candidate text."
   (document-substring d (line-start d pos) (line-end d pos)))
 
+(define %fallback-target-at #f)
+
+(define (set-fallback-target-at! proc)
+  "Register PROC as the fallback target detector for `target-at`."
+  (set! %fallback-target-at proc))
+
 (define (target-at d pos)
   "Return the target at POS in document D, or #f.
-It is found by D's buffer's mode, if that finds any."
+It is found by D's buffer's mode, or falls back to a URL or existing
+file path at POS."
   (let ((b (document-buffer d)))
-    (and b (buffer-target-at b pos))))
+    (or (and b (buffer-target-at b pos))
+        (begin
+          (unless %fallback-target-at (ensure-lazy-actions! 'file))
+          (and %fallback-target-at (%fallback-target-at d pos))))))

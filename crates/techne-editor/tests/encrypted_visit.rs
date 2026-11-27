@@ -847,6 +847,7 @@ fn private_clipboard_provenance_and_joined_kills() {
         secret.display().to_string()
     ))
     .unwrap();
+    rt.handle(Input::Key { key: "?".into(), at: Instant::now() });
     for ch in "copy-location-line".chars() {
         rt.handle(Input::Key { key: ch.to_string(), at: Instant::now() });
     }
