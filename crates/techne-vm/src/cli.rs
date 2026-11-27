@@ -106,38 +106,28 @@ pub fn main_test_worker(
     if !had_loading {
         vm.set_grant(crate::vm::Capability::Loading, true);
     }
-    let init_res = vm.find_module(&test_scm).and_then(|_| {
-        let begin_fn = vm.eval_source("(eval '%test-worker-begin! (environment '(techne test)))")?;
-        let v_cfg = vm.make_string(&config)?;
-        vm.call(&begin_fn, &[v_cfg]).map(|_| ())
-    });
-    let pkg_res = init_res.and_then(|()| use_package_of(&mut vm, Path::new(&path)));
-    if !had_loading {
-        vm.set_grant(crate::vm::Capability::Loading, false);
-    }
+    let finish_res = (|| {
+        // Resolve these once in the trusted framework's module, and keep the
+        // rooted values across evaluation of the test file.
+        let module = vm.find_module(&test_scm)?;
+        let begin = vm.eval_in(module, "<test worker>", "%test-worker-begin!")?;
+        let set_load_error = vm.eval_in(module, "<test worker>", "%test-worker-set-load-error!")?;
+        let finish = vm.eval_in(module, "<test worker>", "%test-worker-finish!")?;
+        let config = vm.make_string(&config)?;
+        vm.call(&begin, &[config])?;
+        let pkg_res = use_package_of(&mut vm, Path::new(&path));
+        if !had_loading {
+            vm.set_grant(crate::vm::Capability::Loading, false);
+        }
 
-    let load_res = pkg_res.and_then(|()| vm.eval_file(Path::new(&path)).map(|_| ()));
-    let load_err = match &load_res {
-        Ok(()) => None,
-        Err(e) if e.exit_code() == Some(0) => None,
-        Err(e) => Some(e.to_string()),
-    };
-
-    if !had_loading {
-        vm.set_grant(crate::vm::Capability::Loading, true);
-    }
-    let set_err_res = vm.eval_source("(eval '%test-worker-set-load-error! (environment '(techne test)))").and_then(|f| {
-        let v_err = match &load_err {
-            Some(s) => vm.make_string(s)?,
-            None => crate::api::Value::FALSE,
+        let load_res = pkg_res.and_then(|()| vm.eval_file(Path::new(&path)));
+        let load_error = match load_res {
+            Err(e) if e.exit_code() != Some(0) => vm.make_string(&e.to_string())?,
+            _ => crate::api::Value::FALSE,
         };
-        vm.call(&f, &[v_err]).map(|_| ())
-    });
-    if !had_loading {
-        vm.set_grant(crate::vm::Capability::Loading, false);
-    }
-
-    let finish_res = set_err_res.and_then(|()| vm.eval_source("((eval '%test-worker-finish! (environment '(techne test))))").map(|_| ()));
+        vm.call(&set_load_error, &[load_error])?;
+        vm.call(&finish, &[]).map(|_| ())
+    })();
     vm.flush();
     vm.report_jit_stats();
     if std::env::var_os("TECHNE_GC_STATS").is_some() {

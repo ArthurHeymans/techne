@@ -101,7 +101,12 @@
               "  (assert-equal 4 (+ 2 2)))\n"))
           (let ((res (run-techne-test pkg)))
             (assert-equal 0 (car res))
-            (assert-match "2 passed, 0 failed" (cadr res)))))))
+            (assert-match "2 passed, 0 failed" (cadr res)))
+           (write-file (path-join pkg "tests/no-load-test.scm")
+             "(import (techne test))\n(test-file #:without '(loading))\n(error \"load error with Loading revoked\")\n")
+           (let ((res (run-techne-test pkg "tests/no-load-test.scm")))
+             (assert-equal 1 (car res))
+             (assert-match "load error with Loading revoked" (cadr res)))))))
 
   (define-test "fails closed on misplaced or invalid test-file declarations"
     (call-with-temporary-directory
