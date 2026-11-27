@@ -863,6 +863,17 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, last_recovery: Las
         /// Each word of PATTERN must occur, without case unless it has an
         /// upper-case letter.
         "(matcher-filter! matcher pattern)" => |m: Mat, pattern: String| m.0.borrow_mut().filter(&pattern);
+        /// Match parsed Orderless PARTS against MATCHER's entries; return
+        /// how many match. Each part is `(kind text fold?)` with KIND
+        /// `"literal"`, `"flex"`, `"literal-or-regexp"`, or `"regexp"`.
+        #[vm]
+        "(matcher-filter-parts! matcher parts)" => |vm: &mut Vm, m: Mat, parts: techne_vm::api::Value| -> Result<usize, Error> {
+            let techne_vm::data::Data::List(items) = vm.to_data(&parts, 64 << 20)? else {
+                return Err(Error::new("matcher-filter-parts!: parts must be a list"));
+            };
+            let parsed = matcher::parse_filter_parts(&items, true).map_err(Error::new)?;
+            Ok(m.0.borrow_mut().filter_parts(&parsed))
+        };
         /// Return a matcher of MATCHER's entries that filters on its own.
         "(matcher-copy matcher)" => |m: Mat| Foreign::new(RefCell::new(m.0.borrow().copy()));
         /// Return the number of entries of MATCHER.

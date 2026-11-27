@@ -146,3 +146,27 @@ fn a_search_belongs_to_the_scope_reading() {
     rt.run_tasks(Duration::from_millis(20)).unwrap();
     assert!(rt.eval("(%live-task-count)").unwrap().parse::<i64>().unwrap() < tasks.parse::<i64>().unwrap());
 }
+
+/// `search-project` supports Orderless `~flex`, `M-SPC`, and regexp queries.
+#[test]
+fn searching_a_project_with_orderless_queries() {
+    let dir = project();
+    let (mut rt, _) = Runtime::open(&dir.path().join("a.txt"), &dir.path().join("journal"), "emacs").unwrap();
+    keys(&mut rt, "C-c s p ~ d f n M-SPC 2");
+    let rows = candidates(&mut rt);
+    let found: Vec<(String, String)> = rows.iter().map(|r| (r.text(0), r.text(1))).collect();
+    assert_eq!(found, [("(define Beta 2)".to_string(), "sub/b.scm:2".to_string())]);
+
+    // Regexp alternation across project files.
+    keys(&mut rt, "C-g C-c s p ^ a l p h a | B e t a");
+    let rows = candidates(&mut rt);
+    let found: Vec<(String, String)> = rows.iter().map(|r| (r.text(0), r.text(1))).collect();
+    assert_eq!(
+        found,
+        [
+            ("alpha".to_string(), "a.txt:1".to_string()),
+            ("alpha beta".to_string(), "a.txt:2".to_string()),
+            ("(define Beta 2)".to_string(), "sub/b.scm:2".to_string()),
+        ]
+    );
+}
