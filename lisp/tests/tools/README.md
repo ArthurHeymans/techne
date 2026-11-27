@@ -11,11 +11,7 @@ for node/CLI suites, and `#:environment 'host #:without '(files processes)`
 for `help.scm`. `support.scm` (marked `#:ignore #t`) supplies shared fixture
 helpers on top of `(techne test)`.
 
-Cargo runs these same Scheme files through the unified `techne-cli` bridge:
-
-```
-cargo test -p techne-cli --test scheme -- tools
-```
+CI runs these same Scheme files directly through `techne test --all`.
 
 ## Migration coverage
 

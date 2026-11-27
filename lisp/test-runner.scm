@@ -17,6 +17,7 @@
     "      --all, --workspace  Run all workspace packages and test directories\n"
     "  -k, --filter PATTERN    Filter by file path or test name substring (repeatable)\n"
     "      --mode MODES        Comma-separated VM modes: default,interp,jit,gc,no-ir-interp,no-ir-jit\n"
+    "      --vm-only           Run only `vm`-world test files\n"
     "  -j, --jobs N            Max parallel test workers (default: CPU count)\n"
     "      --timeout SECONDS   Per-file timeout in seconds (default: 120)\n"
     "  -x, --fail-fast         Stop launching new files after the first failure\n"
@@ -424,7 +425,8 @@
       (else
         (let* ((env-kind (meta-ref meta 'environment))
                (without (meta-ref meta 'without))
-               (file-timeout (or (meta-ref meta 'timeout) timeout))
+               (base-timeout (or (meta-ref meta 'timeout) timeout))
+               (file-timeout (if (string=? mode "gc") (max base-timeout 300) base-timeout))
                (nonce (string-append ";;T" (hex-encode (random-bytes 6))))
                (id-matches? (and (pair? filters)
                                  (any (lambda (f) (and (string-contains (spec-id spec) f) #t)) filters)))
@@ -447,7 +449,18 @@
                 (create-directory xdg-data #o700)
                 (create-directory xdg-state #o700)
                 (create-directory node-dir #o700)
-                (let* ((extra-env
+                (let* ((cfg-datum
+                         (list (cons 'nonce nonce)
+                               (cons 'file (spec-path spec))
+                               (cons 'filters worker-filters)
+                               (cons 'timeout file-timeout)
+                               (cons 'capture capture?)
+                               (cons 'list-only list-only?)
+                               (cons 'world (symbol->string env-kind))
+                               (cons 'without (map symbol->string without))
+                               (cons 'executable executable)))
+                       (cfg-str (call-with-output-string (lambda (p) (write cfg-datum p))))
+                       (extra-env
                          (append
                            (list (cons "HOME" tmp)
                                  (cons "TMPDIR" tmp)
@@ -456,12 +469,7 @@
                                  (cons "XDG_STATE_HOME" xdg-state)
                                  (cons "TECHNE_NODE_DIR" node-dir)
                                  (cons "TECHNE_BIN" executable)
-                                 (cons "TECHNE_TEST_RUNNER" nonce)
-                                 (cons "TECHNE_TEST_FILE" (spec-path spec))
-                                 (cons "TECHNE_TEST_FILTERS" (string-join worker-filters "\n"))
-                                 (cons "TECHNE_TEST_TIMEOUT" (number->string file-timeout))
-                                 (cons "TECHNE_TEST_NOCAPTURE" (if capture? "0" "1"))
-                                 (cons "TECHNE_TEST_LIST" (if list-only? "1" "0")))
+                                 (cons "TECHNE_TEST_CONFIG" cfg-str))
                            (cdr (assoc mode mode-envs))))
                        (timed-out #f))
                   (call-with-process executable world-args
@@ -542,6 +550,7 @@
         (jobs (available-parallelism))
         (timeout 120)
         (all? #f)
+        (vm-only? #f)
         (fail-fast? #f)
         (verbose? #f)
         (capture? #t)
@@ -560,6 +569,8 @@
              (set! help? #t) (loop (cdr xs)))
             ((or (string=? a "--all") (string=? a "--workspace"))
              (set! all? #t) (loop (cdr xs)))
+            ((string=? a "--vm-only")
+             (set! vm-only? #t) (loop (cdr xs)))
             ((or (string=? a "-x") (string=? a "--fail-fast"))
              (set! fail-fast? #t) (loop (cdr xs)))
             ((or (string=? a "-v") (string=? a "--verbose"))
@@ -598,10 +609,9 @@
                (set! timeout n))
              (loop (cddr xs)))
             ((string=? a "--format")
-             (when (null? (cdr xs)) (bad "--format expects human, sexp, or tsv"))
+             (when (null? (cdr xs)) (bad "--format expects human or sexp"))
              (cond ((string=? (cadr xs) "human") (set! format-kind 'human))
                    ((string=? (cadr xs) "sexp") (set! format-kind 'sexp))
-                   ((string=? (cadr xs) "tsv") (set! format-kind 'tsv))
                    (else (bad (string-append "unknown format: " (cadr xs)))))
              (loop (cddr xs)))
             ((string=? a "--")
@@ -624,6 +634,7 @@
           (cons 'jobs jobs)
           (cons 'timeout timeout)
           (cons 'all all?)
+          (cons 'vm-only vm-only?)
           (cons 'fail-fast fail-fast?)
           (cons 'verbose verbose?)
           (cons 'capture capture?)
@@ -784,6 +795,9 @@
                   (cond ((null? xs) (reverse acc))
                         ((member (spec-path (car xs)) seen) (loop (cdr xs) seen acc))
                         (else (loop (cdr xs) (cons (spec-path (car xs)) seen) (cons (car xs) acc))))))
+         (specs (if (opt 'vm-only)
+                    (filter (lambda (s) (eq? (meta-ref (spec-meta s) 'environment) 'vm)) specs)
+                    specs))
          (filters (opt 'filters))
          (modes (opt 'modes))
          (multi-mode? (> (length modes) 1)))
@@ -815,15 +829,6 @@
                                (cons 'serial (and (meta-ref (spec-meta s) 'serial) #t))))
                        shown))
            (newline))
-          ((eq? (opt 'format) 'tsv)
-           (for-each
-             (lambda (s)
-               (display (spec-id s)) (display "\t")
-               (display (spec-path s)) (display "\t")
-               (display (symbol->string (meta-ref (spec-meta s) 'environment))) (display "\t")
-               (display (if (gc-applies? s) "true" "false")) (display "\t")
-               (displayln (if (meta-ref (spec-meta s) 'serial) "true" "false")))
-             shown))
           (else
            (for-each (lambda (s) (displayln (spec-id s))) shown)))
         (exit 0)))
@@ -854,10 +859,10 @@
                          (print-file-line res multi-mode? (opt 'verbose) (not (opt 'capture))))))
              (par-results (run-tasks-pool (map make-job par-items) (opt 'jobs) (opt 'fail-fast) on-res))
              (par-failed? (any (lambda (r) (and (eq? (car r) 'file-result) (eq? (list-ref r 3) 'fail))) par-results))
-             (ser-results (if (and (opt 'fail-fast) par-failed?)
-                              '()
-                              (run-tasks-pool (map make-job serial-items) 1 (opt 'fail-fast) on-res)))
-             (all-results (append par-results ser-results))
+             (serial-results (if (and (opt 'fail-fast) par-failed?)
+                                 '()
+                                 (run-tasks-pool (map make-job serial-items) 1 (opt 'fail-fast) on-res)))
+             (all-results (append par-results serial-results))
              (total-ms (elapsed-ms start)))
       (when (opt 'list-tests)
         (let ((list-errors 0))

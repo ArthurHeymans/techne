@@ -111,17 +111,13 @@ fn parse_capability(name: &str) -> Option<techne_vm::vm::Capability> {
     }
 }
 
-fn apply_without(val: &str, grants: &mut techne_vm::vm::Grants, removed: &mut Vec<String>) -> Result<(), ExitCode> {
+fn apply_without(val: &str, grants: &mut techne_vm::vm::Grants) -> Result<(), ExitCode> {
     for cap in val.split(',').filter(|s| !s.is_empty()) {
         let Some(c) = parse_capability(cap) else {
             eprintln!("techne run: unknown capability `{cap}`");
             return Err(ExitCode::from(2));
         };
         *grants = grants.without(c);
-        let canonical = if cap == "host_control" { "host-control" } else { cap };
-        if !removed.iter().any(|r| r == canonical) {
-            removed.push(canonical.to_owned());
-        }
     }
     Ok(())
 }
@@ -130,7 +126,6 @@ fn apply_without(val: &str, grants: &mut techne_vm::vm::Grants, removed: &mut Ve
 fn run(args: Vec<String>) -> ExitCode {
     let mut world = "host".to_string();
     let mut grants = techne_vm::vm::Grants::ALL;
-    let mut without_names: Vec<String> = Vec::new();
     let mut test_worker = false;
     let mut it = args.into_iter();
     let mut rest = Vec::new();
@@ -150,7 +145,7 @@ fn run(args: Vec<String>) -> ExitCode {
             };
             world = val;
         } else if let Some(val) = arg.strip_prefix("--without=") {
-            if let Err(code) = apply_without(val, &mut grants, &mut without_names) {
+            if let Err(code) = apply_without(val, &mut grants) {
                 return code;
             }
         } else if arg == "--without" {
@@ -158,7 +153,7 @@ fn run(args: Vec<String>) -> ExitCode {
                 eprintln!("techne run: --without expects a capability name");
                 return ExitCode::from(2);
             };
-            if let Err(code) = apply_without(&val, &mut grants, &mut without_names) {
+            if let Err(code) = apply_without(&val, &mut grants) {
                 return code;
             }
         } else if arg.starts_with("--") {
@@ -175,7 +170,7 @@ fn run(args: Vec<String>) -> ExitCode {
     }
     let dispatch = |setup: fn(&mut techne_vm::vm::Vm) -> Result<(), techne_vm::vm::Error>| {
         if test_worker {
-            techne_vm::cli::main_test_worker(rest, &world, &without_names, grants, setup)
+            techne_vm::cli::main_test_worker(rest, grants, setup)
         } else {
             techne_vm::cli::main_with_grants(rest, grants, setup)
         }

@@ -78,14 +78,12 @@ pub fn main_with_grants(
     }
 }
 
-/// Run a Scheme test file directly at top level (preserving full async
-/// suspension and package resolution), passing runner protocol state as VM
-/// values rather than relying on Scheme's `Environment` or `Loading` grants,
-/// then invoke `(%test-worker-finish!)` from `(techne test)`.
+/// Run a Scheme test file directly at top level (preserving async suspension
+/// and package resolution), passing the opaque `TECHNE_TEST_CONFIG` string
+/// and any load error into `(techne test)` without requiring Scheme's
+/// `Environment` or `Loading` grants.
 pub fn main_test_worker(
     args: Vec<String>,
-    world: &str,
-    without: &[String],
     grants: crate::vm::Grants,
     setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>,
 ) -> ExitCode {
@@ -101,48 +99,19 @@ pub fn main_test_worker(
     let stopped = signals(vm.interrupt_handle(), true);
     crate::stdlib::set_command_line(args);
 
-    let had_loading = !without.iter().any(|c| c == "loading");
-    let nonce = std::env::var("TECHNE_TEST_RUNNER").unwrap_or_default();
-    let filters: Vec<String> =
-        std::env::var("TECHNE_TEST_FILTERS").unwrap_or_default().lines().filter(|s| !s.is_empty()).map(str::to_owned).collect();
-    let timeout: Option<i64> = std::env::var("TECHNE_TEST_TIMEOUT").ok().and_then(|s| s.parse::<i64>().ok()).filter(|&n| n > 0);
-    let capture = std::env::var("TECHNE_TEST_NOCAPTURE").map(|v| v != "1").unwrap_or(true);
-    let list_only = std::env::var("TECHNE_TEST_LIST").map(|v| v == "1").unwrap_or(false);
-    let executable = std::env::var("TECHNE_BIN").ok();
-
+    let had_loading = grants.has(crate::vm::Capability::Loading);
+    let config = std::env::var("TECHNE_TEST_CONFIG").unwrap_or_default();
     let test_scm = crate::library::lisp_dir().join("test.scm").to_string_lossy().into_owned();
+
     if !had_loading {
         vm.set_grant(crate::vm::Capability::Loading, true);
     }
     let init_res = vm.find_module(&test_scm).and_then(|_| {
         let begin_fn = vm.eval_source("(eval '%test-worker-begin! (environment '(techne test)))")?;
-        let filter_vals: Vec<_> = filters.iter().map(|s| vm.make_string(s)).collect::<Result<_, _>>()?;
-        let without_vals: Vec<_> = without.iter().map(|s| vm.make_string(s)).collect::<Result<_, _>>()?;
-        let vals = [
-            vm.make_string(&nonce)?,
-            vm.make_string(&path)?,
-            vm.make_list(&filter_vals)?,
-            match timeout {
-                Some(t) => vm.make_int(t)?,
-                None => crate::api::Value::FALSE,
-            },
-            crate::api::Value::bool(capture),
-            crate::api::Value::bool(list_only),
-            vm.make_string(world)?,
-            vm.make_list(&without_vals)?,
-            match &executable {
-                Some(e) => vm.make_string(e)?,
-                None => crate::api::Value::FALSE,
-            },
-        ];
-        vm.call(&begin_fn, &vals).map(|_| ())
+        let v_cfg = vm.make_string(&config)?;
+        vm.call(&begin_fn, &[v_cfg]).map(|_| ())
     });
-    if let Err(e) = init_res {
-        eprintln!("techne run --test-worker: init failed: {e}");
-        std::mem::forget(vm);
-        return ExitCode::FAILURE;
-    }
-    let pkg_res = use_package_of(&mut vm, Path::new(&path));
+    let pkg_res = init_res.and_then(|()| use_package_of(&mut vm, Path::new(&path)));
     if !had_loading {
         vm.set_grant(crate::vm::Capability::Loading, false);
     }

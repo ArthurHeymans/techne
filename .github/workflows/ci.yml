@@ -75,6 +75,8 @@ jobs:
       - run: cargo nextest run --release --no-fail-fast
         env:
           TECHNE_TEST_MODES: default
+      # All workspace Scheme suites (packages + core + editor), plus GC stress on vm suites.
+      - run: target/release/techne test --all --mode default,gc
       # The Emacs client against the server the tests above built.
       - run: TECHNE_NODE=$PWD/target/release/techne-node emacs -Q --batch -L editors/emacs -l editors/emacs/techne-test.el -f ert-run-tests-batch-and-exit
       - run: cargo test --release --doc
@@ -121,9 +123,8 @@ jobs:
       - run: cargo test --release --no-fail-fast -p techne-vm --features counting-allocator --test suites
         env:
           TECHNE_TEST_MODES: ${{ matrix.mode }}
-      - run: cargo test --release --no-fail-fast -p techne-cli --test scheme
-        env:
-          TECHNE_TEST_MODES: ${{ matrix.mode }}
+      - run: cargo build --release -p techne-cli
+      - run: target/release/techne test --all --vm-only --mode ${{ matrix.mode }}
 
   # The flake's package: the binary finds its Lisp where it is installed.
   package:

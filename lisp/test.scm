@@ -58,17 +58,26 @@
 (define %worker-executable #f)
 (define %worker-load-error #f)
 
-(define (%test-worker-begin! nonce path filters timeout capture? list-only? world without executable)
-  (set! %worker-nonce (if (and (string? nonce) (not (string=? nonce ""))) nonce #f))
-  (set! %worker-file path)
-  (set! %worker-filters (if (list? filters) filters '()))
-  (set! %worker-timeout (and (exact-integer? timeout) (> timeout 0) timeout))
-  (set! %worker-capture? (and capture? #t))
-  (set! %worker-list-only? (and list-only? #t))
-  (set! %worker-world world)
-  (set! %worker-without (if (list? without) without '()))
-  (set! %worker-executable (and (string? executable) executable))
-  (set! %worker-load-error #f))
+(define (%cfg-ref cfg key default)
+  (let ((p (assq key cfg))) (if p (cdr p) default)))
+
+(define (%test-worker-begin! config-str)
+  (let ((cfg (if (and (string? config-str) (not (string=? config-str "")))
+                 (read (open-input-string config-str))
+                 '())))
+    (let ((nonce (%cfg-ref cfg 'nonce #f))
+          (timeout (%cfg-ref cfg 'timeout #f))
+          (without (%cfg-ref cfg 'without '())))
+      (set! %worker-nonce (if (and (string? nonce) (not (string=? nonce ""))) nonce #f))
+      (set! %worker-file (%cfg-ref cfg 'file #f))
+      (set! %worker-filters (let ((f (%cfg-ref cfg 'filters '()))) (if (list? f) f '())))
+      (set! %worker-timeout (and (exact-integer? timeout) (> timeout 0) timeout))
+      (set! %worker-capture? (and (%cfg-ref cfg 'capture #t) #t))
+      (set! %worker-list-only? (and (%cfg-ref cfg 'list-only #f) #t))
+      (set! %worker-world (%cfg-ref cfg 'world #f))
+      (set! %worker-without (if (list? without) (map %canonical-cap-name without) '()))
+      (set! %worker-executable (let ((e (%cfg-ref cfg 'executable #f))) (and (string? e) e)))
+      (set! %worker-load-error #f))))
 
 (define (%test-worker-set-load-error! err)
   (set! %worker-load-error (and (string? err) err)))
@@ -101,8 +110,8 @@
 (define %temp-counter 0)
 
 (define (call-with-temporary-directory proc)
-  "Create a short-lived temporary directory, call (PROC dir), and delete it
-when PROC returns, fails, or unwinds."
+  "Call PROC with a fresh temporary directory, deleting it on exit.
+The directory is removed when PROC returns, raises, or unwinds."
   (let* ((env-tmp (%safe-env "TMPDIR"))
          (base (if (and env-tmp (< (string-length env-tmp) 48)) env-tmp "/tmp")))
     (let make ((tries 32))
@@ -145,9 +154,12 @@ when PROC returns, fails, or unwinds."
                    #:requires [requires '()]
                    #:cwd [cwd #f]
                    #:ignore [ignore #f])
-  "Declare file-level test metadata. Must appear near the top of the file
-(before executable forms, after any import/require/provide). Under `techne test`,
-verifies that the runner started the worker with matching world and grants."
+  "Declare file-level metadata for `techne test`.
+ENVIRONMENT selects `vm`, `host`, or `editor`; WITHOUT revokes
+capabilities; TIMEOUT sets the per-file timeout in seconds; SERIAL
+runs the file alone; GC-STRESS toggles GC stress mode; REQUIRES gates
+on programs or env vars; CWD sets the working directory; IGNORE skips
+discovery for helper files."
   (unless (memq environment '(vm host editor))
     (error "test-file: #:environment must be vm, host, or editor" environment))
   (unless (list? without)
@@ -319,6 +331,7 @@ verifies that the runner started the worker with matching world and grants."
 
 (define-syntax assert-equal
   (syntax-rules ()
+    "Assert that ACTUAL is `equal?` to EXPECTED, failing with a diff."
     ((_ expected actual)
      (%assert-equal (procedure-location (lambda () #f)) expected actual #f))
     ((_ expected actual msg)
@@ -326,6 +339,7 @@ verifies that the runner started the worker with matching world and grants."
 
 (define-syntax assert-true
   (syntax-rules ()
+    "Assert that EXPR evaluates to a truthy value."
     ((_ expr)
      (%assert-true (procedure-location (lambda () #f)) expr #f))
     ((_ expr msg)
@@ -333,6 +347,7 @@ verifies that the runner started the worker with matching world and grants."
 
 (define-syntax assert-false
   (syntax-rules ()
+    "Assert that EXPR evaluates to `#f`."
     ((_ expr)
      (%assert-false (procedure-location (lambda () #f)) expr #f))
     ((_ expr msg)
@@ -340,6 +355,7 @@ verifies that the runner started the worker with matching world and grants."
 
 (define-syntax assert-match
   (syntax-rules ()
+    "Assert that string ACTUAL contains substring PATTERN."
     ((_ pattern actual)
      (%assert-match (procedure-location (lambda () #f)) pattern actual #f))
     ((_ pattern actual msg)
@@ -347,13 +363,15 @@ verifies that the runner started the worker with matching world and grants."
 
 (define-syntax assert-raises
   (syntax-rules ()
+    "Assert that EXPR raises an error, optionally matching PRED."
     ((_ expr)
      (%assert-raises (procedure-location (lambda () #f)) #f (lambda () expr)))
     ((_ pred expr)
      (%assert-raises (procedure-location (lambda () #f)) pred (lambda () expr)))))
 
 (define (assert-eventually thunk #:timeout [timeout 5000] #:interval [interval 25] #:message [msg #f])
-  "Poll THUNK every INTERVAL ms until it returns truthy or TIMEOUT ms elapses."
+  "Poll THUNK until it returns truthy or TIMEOUT ms elapses.
+Polls every INTERVAL ms and reports MSG on timeout."
   (set! %count (+ %count 1))
   (let ((start (%safe-jiffy)))
     (let loop ()
@@ -416,7 +434,7 @@ A failure is recorded and printed with both without aborting the test."
 
 (define (test-summary)
   "Print how many checks passed, then exit with failure if any failed.
-When running under `techne test`, this is a no-op so the runner collects results."
+Under `techne test`, this is a no-op so the runner collects results."
   (unless (%test-runner-active?)
     (displayln (string-append (number->string (- %count %failures)) "/" (number->string %count) " passed"))
     (exit (if (= %failures 0) 0 1))))
@@ -553,12 +571,14 @@ When running under `techne test`, this is a no-op so the runner collects results
 
 (define-syntax define-suite
   (syntax-rules ()
+    "Group nested `define-test` declarations under suite prefix NAME."
     ((_ name body ...)
      (parameterize ((%suite-prefix (append (%suite-prefix) (list name))))
        body ...))))
 
 (define-syntax define-test
   (syntax-rules ()
+    "Define a named unit test, optionally with keyword options."
     ((_ (name opts ...) body ...)
      (%register-test! name (lambda () body ...) (list opts ...)))
     ((_ name body ...)

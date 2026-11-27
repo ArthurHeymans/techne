@@ -36,10 +36,5 @@ techne-term = { path = "../techne-term", optional = true }
 techne-editor = { path = "../techne-editor", optional = true }
 
 [dev-dependencies]
-libtest-mimic = "0.8"
 tempfile = "3"
 techne-editor = { path = "../techne-editor" }
-
-[[test]]
-name = "scheme"
-harness = false
