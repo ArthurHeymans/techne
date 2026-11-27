@@ -1,7 +1,7 @@
 ;;; The library (techne editor) is not the application: loading it loads
 ;;; the interfaces, none of the editor's own features or keys.
 ;;;
-;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
+;;; Run by `techne test` in the editor environment, which provides the natives.
 
 (import (techne test))
 (test-file #:script #t #:environment (quote editor))

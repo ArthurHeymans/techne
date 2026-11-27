@@ -1,10 +1,21 @@
 ;;; Techne's Scheme test framework: `(techne test)`.
 ;;;
-;;; Write unit tests with `define-test` and `define-suite`, assert with
-;;; `assert-equal`, `assert-true`, `assert-false`, `assert-raises`,
-;;; `assert-contains`, `assert-eventually`, and `assert-golden`, or use the
-;;; soft checks `check` and `check-true`. Run with `techne test` (or
-;;; standalone with `techne run`).
+;;; Run tests with `techne test FILE`. By default a test file registers
+;;; tests at load time; use `(define-test NAME #:timeout 5 #:skip "why"
+;;; BODY ...)`, with either or both options omitted. NAME can be any
+;;; string-valued expression. `register-test!` takes NAME and a thunk with
+;;; the same options, and `define-suite` groups registrations under a prefix.
+;;; Tests in a file share one heap and run in registration order. Each must
+;;; pass on its own: keep scenario setup and mutation in the test body.
+;;;
+;;; A legacy `(test-file #:script #t)` file runs its top-level checks as one
+;;; test named by the file id. Selection and listing never execute a test
+;;; body or a script; they may load registered files to find their tests.
+;;; In a registered file, call `check` and `check-true` only inside tests.
+;;; Script files may also use `techne run FILE` and exit via `test-summary`.
+;;;
+;;; `#:environment 'vm` (the default) selects the VM natives. It does not
+;;; sandbox the filesystem. `host` and `editor` install additional natives.
 
 (provide
   test-file
@@ -45,8 +56,8 @@
 (define (%written v)
   (call-with-output-string (lambda (p) (write v p))))
 
-;; Worker state initialized by the Rust host (`main_test_worker`), never
-;; inherited through environment variables.
+;; The Rust host (`main_test_worker`) passes the runner's TECHNE_TEST_CONFIG
+;; into the worker, even when Scheme has no Environment grant.
 (define %worker-nonce #f)
 (define %worker-file #f)
 (define %worker-file-id #f)
@@ -162,10 +173,10 @@ The directory is removed when PROC returns, raises, or unwinds."
                    #:ignore [ignore #f])
   "Declare file-level metadata for `techne test`.
 ENVIRONMENT selects `vm`, `host`, or `editor`; WITHOUT revokes
-capabilities; TIMEOUT sets the per-file timeout in seconds; SERIAL
-runs the file alone; REQUIRES gates
-on programs or env vars; CWD sets the working directory; IGNORE skips
-discovery for helper files."
+capabilities; TIMEOUT sets the per-file timeout in seconds; SERIAL runs
+the file alone; SCRIPT treats top-level code as one test; REQUIRES gates
+on programs or env vars; CWD selects file, package, or workspace; IGNORE
+skips discovery for helper files."
   (unless (boolean? script)
     (error "test-file: #:script must be a boolean" script))
   (unless (memq cwd '(#f file package workspace))
@@ -589,7 +600,7 @@ TIMEOUT is an optional limit in seconds. SKIP-REASON, if given, skips the test."
      (%define-test-options name () body ...))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Worker protocol (used by lisp/test-worker.scm)
+;;; Worker protocol (used by the Rust host's main_test_worker)
 ;;; ---------------------------------------------------------------------------
 
 (define (%test-emit event)

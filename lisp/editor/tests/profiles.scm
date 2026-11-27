@@ -2,7 +2,7 @@
 ;;; scenario in each gives the same document, selections and undo grouping,
 ;;; also when cancelled midway. Then each profile's own behavior.
 ;;;
-;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
+;;; Run by `techne test` in the editor environment, which provides the natives.
 
 (import (techne test))
 (test-file #:script #t #:environment (quote editor))

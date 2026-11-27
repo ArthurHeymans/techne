@@ -2,7 +2,7 @@
 ;;; the changes since a revision and positions, as LSP counts them, and
 ;;; waiting for the next change without asking every so often.
 ;;;
-;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
+;;; Run by `techne test` in the editor environment, which provides the natives.
 
 (import (techne test))
 (test-file #:script #t #:environment (quote editor))

@@ -1,5 +1,5 @@
 ;;; M-SPC separates completion parts, matched in any order, as Corfu's.
-;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
+;;; Run by `techne test` in the editor environment, which provides the natives.
 
 (import (techne test))
 (test-file #:script #t #:environment (quote editor))

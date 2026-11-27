@@ -3,7 +3,7 @@
 ;;; The output of one in the background: its last bytes, cut at a line's
 ;;; start, else a character's, so each cut drops some.
 ;;;
-;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
+;;; Run by `techne test` in the editor environment, which provides the natives.
 
 (import (techne test))
 (test-file #:script #t #:environment (quote editor))
