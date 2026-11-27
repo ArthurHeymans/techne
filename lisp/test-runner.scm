@@ -407,6 +407,33 @@
       ((spec-ws-root spec) (spec-ws-root spec))
       (else (parent-dir (spec-path spec))))))
 
+;; Keep the wire format at the worker boundary. Everything downstream uses keys.
+(define (result-ref result key) (cadr (assq key result)))
+
+(define (make-test-event name status ms location detail stdout stderr)
+  `((kind test-result) (name ,name) (status ,status) (elapsed-ms ,ms)
+    (location ,location) (detail ,detail) (stdout ,stdout) (stderr ,stderr)))
+
+(define (make-list-event name location)
+  `((kind test-list) (name ,name) (location ,location)))
+
+(define (decode-worker-event datum)
+  (match datum
+    [(list 'test-result name status ms loc detail out err)
+     (make-test-event name status ms loc detail out err)]
+    [(list 'test-list name loc) (make-list-event name loc)]
+    [(list 'test-done passed failed skipped)
+     `((kind test-done) (passed ,passed) (failed ,failed) (skipped ,skipped))]
+    [_ (error "unknown test worker event" datum)]))
+
+(define (make-file-result id mode status ms events passed failed skipped stdout stderr)
+  `((kind file-result) (file ,id) (mode ,mode) (status ,status) (elapsed-ms ,ms)
+    (events ,events) (passed ,passed) (failed ,failed) (skipped ,skipped)
+    (stdout ,stdout) (stderr ,stderr)))
+
+(define (make-file-list id events error)
+  `((kind file-list) (file ,id) (events ,events) (error ,error)))
+
 (define (parse-worker-events stdout nonce)
   (let ((prefix (string-append nonce " "))
         (events '())
@@ -416,7 +443,7 @@
         (if (string-prefix? prefix line)
             (let ((body (substring line (string-length prefix) (string-length line))))
               (guard (e (#t (set! stray (cons line stray))))
-                (set! events (cons (read (open-input-string body)) events))))
+                (set! events (cons (decode-worker-event (read (open-input-string body))) events))))
             (unless (string=? line "")
               (set! stray (cons line stray)))))
       (string-split stdout "\n"))
@@ -436,17 +463,17 @@
     (cond
       (meta-err
        (if list-only?
-           (list 'file-list (spec-id spec) mode '() 1 meta-err)
-           (list 'file-result (spec-id spec) mode 'fail 0
-                 (list (list 'test-result "<metadata>" 'fail 0 (spec-path spec)
+           (make-file-list (spec-id spec) '() meta-err)
+           (make-file-result (spec-id spec) mode 'fail 0
+                 (list (make-test-event "<metadata>" 'fail 0 (spec-path spec)
                              (string-append "invalid test-file declaration: " meta-err) "" ""))
                  0 1 0 "" "")))
       ((and script? list-only?)
-        (list 'file-list (spec-id spec) mode
-              (list (list 'test-list (spec-id spec) (spec-path spec))) 0 ""))
+        (make-file-list (spec-id spec)
+                        (list (make-list-event (spec-id spec) (spec-path spec))) #f))
        ((and req-skip file-match?)
-       (list 'file-result (spec-id spec) mode 'skip 0
-             (list (list 'test-result "<file>" 'skip 0 (spec-path spec) req-skip "" ""))
+       (make-file-result (spec-id spec) mode 'skip 0
+             (list (make-test-event "<file>" 'skip 0 (spec-path spec) req-skip "" ""))
              0 0 1 "" ""))
       (else
         (let* ((env-kind (meta-ref meta 'environment))
@@ -515,47 +542,47 @@
                                (parsed (parse-worker-events stdout nonce))
                                (events (car parsed))
                                (stray (cdr parsed))
-                               (results (filter (lambda (ev) (and (pair? ev) (eq? (car ev) 'test-result))) events))
-                               (listed (filter (lambda (ev) (and (pair? ev) (eq? (car ev) 'test-list))) events))
-                               (done-ev (find (lambda (ev) (and (pair? ev) (eq? (car ev) 'test-done))) events)))
+                               (results (filter (lambda (ev) (and (pair? ev) (eq? (result-ref ev 'kind) 'test-result))) events))
+                               (listed (filter (lambda (ev) (and (pair? ev) (eq? (result-ref ev 'kind) 'test-list))) events))
+                               (done-ev (find (lambda (ev) (and (pair? ev) (eq? (result-ref ev 'kind) 'test-done))) events)))
                           (cond
                             (list-only?
                              (let ((err-msg
                                      (cond
                                        (timed-out (string-append "timed out after " (number->string file-timeout) "s"))
                                        ((not done-ev) (string-append "worker exited without finishing (status " (number->string (or code -1)) ")\n" stderr))
-                                       ((> (caddr done-ev) 0)
-                                        (let ((fev (find (lambda (ev) (eq? (list-ref ev 2) 'fail)) results)))
-                                          (if fev (list-ref fev 5) "failed while loading tests")))
+                                       ((> (result-ref done-ev 'failed) 0)
+                                        (let ((fev (find (lambda (ev) (eq? (result-ref ev 'status) 'fail)) results)))
+                                          (if fev (result-ref fev 'detail) "failed while loading tests")))
                                        (else #f))))
-                               (list 'file-list (spec-id spec) mode listed (if err-msg 1 0) (or err-msg ""))))
+                               (make-file-list (spec-id spec) listed err-msg)))
                             (timed-out
-                             (list 'file-result (spec-id spec) mode 'fail ms
+                             (make-file-result (spec-id spec) mode 'fail ms
                                    (append results
-                                     (list (list 'test-result "<timeout>" 'fail ms (spec-path spec)
+                                     (list (make-test-event "<timeout>" 'fail ms (spec-path spec)
                                                  (string-append "file timed out after " (number->string file-timeout) "s")
                                                  stray stderr)))
                                    0 1 0 stray stderr))
                             ((not done-ev)
-                             (list 'file-result (spec-id spec) mode 'fail ms
+                             (make-file-result (spec-id spec) mode 'fail ms
                                    (append results
-                                     (list (list 'test-result "<crash>" 'fail ms (spec-path spec)
+                                     (list (make-test-event "<crash>" 'fail ms (spec-path spec)
                                                  (string-append "worker exited without finishing (status "
                                                                 (number->string (or code -1)) ")")
                                                  stray stderr)))
                                    0 1 0 stray stderr))
                             (else
-                             (let ((p-cnt (cadr done-ev))
-                                   (f-cnt (caddr done-ev))
-                                   (s-cnt (cadddr done-ev)))
+                             (let ((p-cnt (result-ref done-ev 'passed))
+                                   (f-cnt (result-ref done-ev 'failed))
+                                   (s-cnt (result-ref done-ev 'skipped)))
                                (if (and (not (eqv? code 0)) (= f-cnt 0))
-                                   (list 'file-result (spec-id spec) mode 'fail ms
+                                   (make-file-result (spec-id spec) mode 'fail ms
                                          (append results
-                                           (list (list 'test-result "<exit>" 'fail ms (spec-path spec)
+                                           (list (make-test-event "<exit>" 'fail ms (spec-path spec)
                                                        (string-append "worker exited with status " (number->string code))
                                                        stray stderr)))
                                          p-cnt 1 s-cnt stray stderr)
-                                   (list 'file-result (spec-id spec) mode
+                                   (make-file-result (spec-id spec) mode
                                          (cond ((> f-cnt 0) 'fail)
                                                ((and (= p-cnt 0) (> s-cnt 0)) 'skip)
                                                (else 'pass))
@@ -676,14 +703,14 @@
 ;;; ---------------------------------------------------------------------------
 
 (define (print-file-line res multi-mode? verbose? show-output?)
-  (let* ((id (list-ref res 1))
-         (mode (list-ref res 2))
-         (status (list-ref res 3))
-         (ms (list-ref res 4))
-         (events (list-ref res 5))
-         (p (list-ref res 6))
-         (f (list-ref res 7))
-         (s (list-ref res 8))
+  (let* ((id (result-ref res 'file))
+         (mode (result-ref res 'mode))
+         (status (result-ref res 'status))
+         (ms (result-ref res 'elapsed-ms))
+         (events (result-ref res 'events))
+         (p (result-ref res 'passed))
+         (f (result-ref res 'failed))
+         (s (result-ref res 'skipped))
          (tag (cond ((eq? status 'pass) "PASS")
                     ((eq? status 'skip) "SKIP")
                     (else "FAIL")))
@@ -693,7 +720,7 @@
       (display label)
       (cond
         ((eq? status 'skip)
-         (let ((reason (and (pair? events) (list-ref (car events) 5))))
+         (let ((reason (and (pair? events) (result-ref (car events) 'detail))))
            (when (and (string? reason) (not (string=? reason "")))
              (display " (") (display reason) (display ")"))))
         ((> f 0)
@@ -709,11 +736,11 @@
       (when (or verbose? show-output?)
         (for-each
           (lambda (ev)
-            (let ((tname (list-ref ev 1))
-                  (tst (list-ref ev 2))
-                  (tms (list-ref ev 3))
-                  (out (list-ref ev 6))
-                  (err (list-ref ev 7)))
+            (let ((tname (result-ref ev 'name))
+                  (tst (result-ref ev 'status))
+                  (tms (result-ref ev 'elapsed-ms))
+                  (out (result-ref ev 'stdout))
+                  (err (result-ref ev 'stderr)))
               (when verbose?
                 (display "    ")
                 (display (cond ((eq? tst 'pass) "ok  ") ((eq? tst 'skip) "skip") (else "FAIL")))
@@ -724,30 +751,30 @@
                 (unless (string=? err "") (displayln err)))))
           events)
         (when (and show-output? (not (eq? status 'fail)))
-          (let ((stray (list-ref res 9)) (stderr (list-ref res 10)))
+          (let ((stray (result-ref res 'stdout)) (stderr (result-ref res 'stderr)))
             (unless (string=? stray "") (displayln stray))
             (unless (string=? stderr "") (displayln stderr))))))))
 
 (define (print-failures all-results multi-mode?)
-  (let ((failed-files (filter (lambda (r) (eq? (list-ref r 3) 'fail)) all-results)))
+  (let ((failed-files (filter (lambda (r) (eq? (result-ref r 'status) 'fail)) all-results)))
     (when (pair? failed-files)
       (display "\nFailures:\n")
       (for-each
         (lambda (r)
-          (let* ((id (list-ref r 1))
-                 (mode (list-ref r 2))
-                 (events (list-ref r 5))
-                 (stray (list-ref r 9))
-                 (stderr (list-ref r 10))
+          (let* ((id (result-ref r 'file))
+                 (mode (result-ref r 'mode))
+                 (events (result-ref r 'events))
+                 (stray (result-ref r 'stdout))
+                 (stderr (result-ref r 'stderr))
                  (label (if multi-mode? (string-append id " [" mode "]") id)))
             (for-each
               (lambda (ev)
-                (when (eq? (list-ref ev 2) 'fail)
-                  (let ((tname (list-ref ev 1))
-                        (loc (list-ref ev 4))
-                        (detail (list-ref ev 5))
-                        (out (list-ref ev 6))
-                        (err (list-ref ev 7)))
+                (when (eq? (result-ref ev 'status) 'fail)
+                  (let ((tname (result-ref ev 'name))
+                        (loc (result-ref ev 'location))
+                        (detail (result-ref ev 'detail))
+                        (out (result-ref ev 'stdout))
+                        (err (result-ref ev 'stderr)))
                     (display "\n---- ") (display label)
                     (unless (string=? tname id)
                       (display "::") (display tname))
@@ -770,8 +797,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (define (run-tasks-pool tasks jobs fail-fast? on-result)
-  (let ((total (length tasks))
-        (queue tasks)
+  (let ((queue tasks)
         (results '())
         (failed? #f)
         (done-ch (make-channel))
@@ -784,10 +810,7 @@
           (let ((task (car queue)))
             (set! queue (cdr queue))
             (set! in-flight (+ in-flight 1))
-            (spawn (lambda ()
-                     (let ((res (guard (e (#t (list 'worker-error (condition/report-string e))))
-                                  (task))))
-                       (channel-send done-ch res))))
+            (spawn (lambda () (channel-send done-ch (task))))
             (loop)))))
     (launch-more!)
     (let loop ()
@@ -795,7 +818,7 @@
         (let ((res (channel-recv done-ch)))
           (set! in-flight (- in-flight 1))
           (set! results (cons res results))
-          (when (and (eq? (car res) 'file-result) (eq? (list-ref res 3) 'fail))
+          (when (and (eq? (result-ref res 'kind) 'file-result) (eq? (result-ref res 'status) 'fail))
             (set! failed? #t))
           (when on-result (on-result res))
           (launch-more!)
@@ -878,21 +901,22 @@
              (make-job (lambda (it)
                          (lambda ()
                            (guard (e (#t
-                                      (let ((s (car it)) (m (cdr it)))
-                                        (list 'file-result (spec-id s) m 'fail 0
-                                              (list (list 'test-result "<runner>" 'fail 0 (spec-path s)
-                                                          (string-append "runner error: " (condition/report-string e))
-                                                          "" ""))
-                                              0 1 0 "" ""))))
-                             (run-worker executable (car it) (cdr it)
+                                      (let* ((s (car it))
+                                              (msg (string-append "runner error: " (condition/report-string e))))
+                                         (if (opt 'list-tests)
+                                             (make-file-list (spec-id s) '() msg)
+                                             (make-file-result (spec-id s) (cdr it) 'fail 0
+                                               (list (make-test-event "<runner>" 'fail 0 (spec-path s) msg "" ""))
+                                               0 1 0 "" "")))))
+                              (run-worker executable (car it) (cdr it)
                                          filters (opt 'timeout) (opt 'capture) (opt 'list-tests))))))
              (on-res (lambda (res)
                        (when (and (eq? (opt 'format) 'human)
                                   (not (opt 'list-tests))
-                                  (eq? (car res) 'file-result))
+                                  (eq? (result-ref res 'kind) 'file-result))
                          (print-file-line res multi-mode? (opt 'verbose) (not (opt 'capture))))))
              (par-results (run-tasks-pool (map make-job par-items) (opt 'jobs) (opt 'fail-fast) on-res))
-             (par-failed? (any (lambda (r) (and (eq? (car r) 'file-result) (eq? (list-ref r 3) 'fail))) par-results))
+             (par-failed? (any (lambda (r) (and (eq? (result-ref r 'kind) 'file-result) (eq? (result-ref r 'status) 'fail))) par-results))
              (serial-results (if (and (opt 'fail-fast) par-failed?)
                                  '()
                                  (run-tasks-pool (map make-job serial-items) 1 (opt 'fail-fast) on-res)))
@@ -902,27 +926,26 @@
         (let ((list-errors 0) (listed-count 0))
           (for-each
             (lambda (r)
-              (let ((id (list-ref r 1))
-                    (listed (list-ref r 3))
-                    (code (list-ref r 4))
-                    (err (list-ref r 5)))
-                (if (not (eqv? code 0))
-                    (begin
-                      (set! list-errors (+ list-errors 1))
+              (let ((id (result-ref r 'file))
+                     (listed (result-ref r 'events))
+                     (err (result-ref r 'error)))
+                 (if err
+                     (begin
+                       (set! list-errors (+ list-errors 1))
                       (display (string-append "error listing " id ": " err "\n") (current-error-port)))
                     (for-each
                       (lambda (ev)
                         (set! listed-count (+ listed-count 1))
-                         (unless (string=? id (cadr ev)) (display id) (display "::"))
-                         (displayln (cadr ev)))
+                         (unless (string=? id (result-ref ev 'name)) (display id) (display "::"))
+                         (displayln (result-ref ev 'name)))
                       listed))))
             all-results)
           (exit (if (and (= list-errors 0) (or (null? filters) (> listed-count 0))) 0 1))))
-      (let* ((all-results (filter (lambda (r) (> (+ (list-ref r 6) (list-ref r 7) (list-ref r 8)) 0))
+      (let* ((all-results (filter (lambda (r) (> (+ (result-ref r 'passed) (result-ref r 'failed) (result-ref r 'skipped)) 0))
                                    all-results))
-              (total-passed (apply + (map (lambda (r) (list-ref r 6)) all-results)))
-             (total-failed (apply + (map (lambda (r) (list-ref r 7)) all-results)))
-             (total-skipped (apply + (map (lambda (r) (list-ref r 8)) all-results)))
+              (total-passed (apply + (map (lambda (r) (result-ref r 'passed)) all-results)))
+             (total-failed (apply + (map (lambda (r) (result-ref r 'failed)) all-results)))
+             (total-skipped (apply + (map (lambda (r) (result-ref r 'skipped)) all-results)))
              (files-ran (length all-results))
              (matched-nothing? (and (pair? filters) (= (+ total-passed total-failed total-skipped) 0)))
              (ok? (and (= total-failed 0) (> files-ran 0) (not matched-nothing?))))
@@ -937,12 +960,12 @@
                        (failures
                          ,(filter-map
                             (lambda (r)
-                              (and (eq? (list-ref r 3) 'fail)
-                                   (list (list-ref r 1)
-                                         (list-ref r 2)
-                                         (filter (lambda (ev) (eq? (list-ref ev 2) 'fail))
-                                                 (list-ref r 5)))))
-                            all-results))))
+                              (and (eq? (result-ref r 'status) 'fail)
+                                   `((file ,(result-ref r 'file))
+                                      (mode ,(result-ref r 'mode))
+                                      (tests ,(filter (lambda (ev) (eq? (result-ref ev 'status) 'fail))
+                                                       (result-ref r 'events))))))
+                             all-results))))
               (newline))
             (begin
               (print-failures all-results multi-mode?)
