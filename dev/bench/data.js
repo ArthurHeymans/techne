@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795771382089,
+  "lastUpdate": 1795771384233,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -65780,6 +65780,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 627475369,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 102445,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee986b069ce249a99d0240ada81d7dba462297d7",
+          "message": "Merge pull request #423 from ArthurHeymans/tool-run-retain\n\ntechne tool: show a full window of process output by default",
+          "timestamp": "2026-11-27T10:15:20+01:00",
+          "tree_id": "0ad7a7e55a58ab883e83ba8b87fc0566d4122564",
+          "url": "https://github.com/ArthurHeymans/techne/commit/ee986b069ce249a99d0240ada81d7dba462297d7"
+        },
+        "date": 1795771384177,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 692347320,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 627474720,
             "unit": "instructions"
           },
           {
