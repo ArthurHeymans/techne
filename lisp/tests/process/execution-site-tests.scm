@@ -3,7 +3,8 @@
 ;;; poisoned project PATH isolation, concurrency dedup, and real direnv E2E.
 (import (techne) (techne location) (techne endpoint) (techne execution-site)
         (techne trusted-process) (techne uuid) (techne crypto))
-(require "../../test.scm")
+(import (techne test))
+(test-file #:script #t #:environment (quote host))
 
 (define (techne-bin)
   (or (get-environment-variable "TECHNE_BIN")

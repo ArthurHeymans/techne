@@ -1,4 +1,5 @@
-(require "../test.scm")
+(import (techne test))
+(test-file #:script #t)
 (import (techne debug))
 
 (define (failure thunk)

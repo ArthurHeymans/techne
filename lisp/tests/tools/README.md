@@ -1,39 +1,17 @@
 # Repository-tool regression suites
 
-Run the normal suite directly in Scheme:
+Run all repository-tool suites with `techne test`:
 
 ```
-target/debug/techne run lisp/tests/tools/run.scm
+target/debug/techne test lisp/tests/tools
 ```
 
-Run the CLI suite with the real binary as its argument (use its absolute path):
+Each file declares its world via `(test-file ...)` — `#:environment 'host`
+for node/CLI suites, and `#:environment 'host #:without '(files processes)`
+for `help.scm`. `support.scm` (marked `#:ignore #t`) supplies shared fixture
+helpers on top of `(techne test)`.
 
-```
-target/debug/techne run lisp/tests/tools/cli.scm /absolute/path/to/techne
-```
-
-These suites live in their own directory because the VM-only harness discovers
-all top-level `lisp/tests/*.scm`; tool suites need node bindings or the real CLI.
-
-The suites use `lisp/test.scm`. `support.scm` supplies named cases,
-short-lived temporary directories and text/binary fixtures. Case exceptions count
-as failures, directories are cleaned on either path, and `test-summary` exits
-nonzero if any check fails. The CLI suite creates isolated node directories and
-explicitly shuts its nodes down; it tests the actual CLI, not a replacement
-renderer.
-
-Cargo runs these same Scheme files:
-
-```
-cargo test -p techne-node --test tools_scheme
-cargo test -p techne-cli --test tools
-```
-
-The node bridge only installs the VM's native mechanisms and chooses grants.
-`help.scm` must run in its host-created world without file/process
-grants, so use Cargo for that case. Scheme cannot grant itself those privileges.
-The CLI bridge only supplies the binary path and checks the suite's exit status.
-There are no tool assertions or fixture programs embedded in either bridge.
+CI runs these same Scheme files directly through `techne test --all`.
 
 ## Migration coverage
 

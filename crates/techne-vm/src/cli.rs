@@ -21,7 +21,16 @@ pub fn main(args: Vec<String>) -> ExitCode {
 /// [`main`], in a world SETUP has added to: the other crates' natives,
 /// for a command that has them.
 pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>) -> ExitCode {
-    let mut vm = Vm::new();
+    main_with_grants(args, crate::vm::Grants::ALL, setup)
+}
+
+/// [`main_with`], with explicit capability GRANTS on the world.
+pub fn main_with_grants(
+    args: Vec<String>,
+    grants: crate::vm::Grants,
+    setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>,
+) -> ExitCode {
+    let mut vm = Vm::with_grants(grants);
     if let Err(e) = setup(&mut vm) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
@@ -62,6 +71,79 @@ pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), cr
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.exit_code().is_some() => ExitCode::from(e.exit_code().unwrap_or(1) as u8),
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run a Scheme test file directly at top level (preserving async suspension
+/// and package resolution), passing the opaque `TECHNE_TEST_CONFIG` string
+/// and any load error into `(techne test)` without requiring Scheme's
+/// `Environment` or `Loading` grants.
+pub fn main_test_worker(
+    args: Vec<String>,
+    grants: crate::vm::Grants,
+    setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>,
+) -> ExitCode {
+    let mut vm = Vm::with_grants(grants);
+    if let Err(e) = setup(&mut vm) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    let Some(path) = args.first().cloned() else {
+        eprintln!("techne run --test-worker: expected a test file path");
+        return ExitCode::from(2);
+    };
+    let stopped = signals(vm.interrupt_handle(), true);
+    crate::stdlib::set_command_line(args);
+
+    let had_loading = grants.has(crate::vm::Capability::Loading);
+    let config = std::env::var("TECHNE_TEST_CONFIG").unwrap_or_default();
+    let test_scm = crate::library::lisp_dir().join("test.scm").to_string_lossy().into_owned();
+
+    if !had_loading {
+        vm.set_grant(crate::vm::Capability::Loading, true);
+    }
+    let finish_res = (|| {
+        // Resolve these once in the trusted framework's module, and keep the
+        // rooted values across evaluation of the test file.
+        let module = vm.find_module(&test_scm)?;
+        let begin = vm.eval_in(module, "<test worker>", "%test-worker-begin!")?;
+        let set_load_error = vm.eval_in(module, "<test worker>", "%test-worker-set-load-error!")?;
+        let finish = vm.eval_in(module, "<test worker>", "%test-worker-finish!")?;
+        let config = vm.make_string(&config)?;
+        vm.call(&begin, &[config])?;
+        let pkg_res = use_package_of(&mut vm, Path::new(&path));
+        if !had_loading {
+            vm.set_grant(crate::vm::Capability::Loading, false);
+        }
+
+        let load_res = pkg_res.and_then(|()| vm.eval_file(Path::new(&path)));
+        let load_error = match load_res {
+            Err(e) if e.exit_code() != Some(0) => vm.make_string(&e.to_string())?,
+            _ => crate::api::Value::FALSE,
+        };
+        vm.call(&set_load_error, &[load_error])?;
+        vm.call(&finish, &[]).map(|_| ())
+    })();
+    vm.flush();
+    vm.report_jit_stats();
+    if std::env::var_os("TECHNE_GC_STATS").is_some() {
+        eprintln!("{:?}", vm.heap().stats);
+    }
+    std::mem::forget(vm);
+    let signal = stopped.load(Ordering::SeqCst);
+    if signal != 0
+        && let Err(e) = &finish_res
+        && e.exit_code().is_none()
+        && e.msg == crate::vm::INTERRUPTED
+    {
+        return ExitCode::from((128 + signal) as u8);
+    }
+    match finish_res {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE

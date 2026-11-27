@@ -1,5 +1,6 @@
 (import (techne) (mail smtp) (mail address) (mail mime))
 (import (techne test))
+(test-file #:script #t)
 
 (check "addresses" '("ada@example.org" "ben@example.org") (mail-addresses "Ada <ada@example.org>, ben@example.org"))
 (check "quoted commas and escaped names" '("jane@example.org" "ben@example.org")

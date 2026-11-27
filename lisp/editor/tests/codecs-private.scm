@@ -1,7 +1,8 @@
 ;;; Negative tests for cold library-registered private codecs, shadowing,
 ;;; 0o600 enforcement on private replacement, and mid-decode symlink retargeting.
 (import (techne))
-(require "../../test.scm")
+(import (techne test))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../files.scm")
 (require "../session.scm")

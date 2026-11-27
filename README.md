@@ -105,7 +105,7 @@ that set fails the run. Useful variables:
 Everything the editor loads is documented: every name a module provides,
 every built-in, command, mode, option and hook has a docstring following
 the convention in [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md)
-("Docstrings"). `crates/techne-editor/tests/documentation.rs` fails on
+("Docstrings"). `techne check --all` fails on
 anything missing or wrong, as M-x checkdoc shows it and the language
 server warns while a file is edited; `tests/help.rs` checks that every
 key and name the manual refers to exists. CI also builds the Rust

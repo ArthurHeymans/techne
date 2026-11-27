@@ -95,13 +95,6 @@ fn text_prints_strings_as_they_are_and_stdin_needs_no_escaping() {
     assert_eq!(session.query(dir.path(), "(tool-ref (tool-read project \"made\") 'path)"), r#""made""#);
 }
 
-#[test]
-fn scheme_source_rendering_tests() {
-    let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/tests/tools/cli.scm");
-    let out = Command::new(env!("CARGO_BIN_EXE_techne")).arg("run").arg(suite).arg(env!("CARGO_BIN_EXE_techne")).output().unwrap();
-    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-}
-
 /// Copy the directory FROM to TO, recursively.
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();

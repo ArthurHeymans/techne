@@ -9,7 +9,8 @@
 ;;; 4. Trust ledger entries and cached snapshots return defensive copies, and
 ;;;    memory-only ('none) trust stays isolated from file-backed editor ledgers.
 (import (techne) (techne editorconfig))
-(require "../../test.scm")
+(import (techne test))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../api.scm")
 (require "../modes.scm")

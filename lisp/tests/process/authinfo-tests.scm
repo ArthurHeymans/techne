@@ -1,5 +1,6 @@
 (import (techne) (techne authinfo) (techne uuid))
-(require "../../test.scm")
+(import (techne test))
+(test-file #:script #t #:environment (quote host))
 
 (define tmp (string-append (or (get-environment-variable "TMPDIR") "/tmp") "/techne-authinfo-" (uuid-v4)))
 (create-directory tmp #o700)

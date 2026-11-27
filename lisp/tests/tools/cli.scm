@@ -1,11 +1,12 @@
 ;;; Exercise the REAL CLI in child processes, not a substitute renderer.
 ;;; Usage: techne run lisp/tests/tools/cli.scm /absolute/path/to/techne
+(import (techne test))
 (require "support.scm")
+(test-file #:script #t #:environment (quote host))
 (import (techne tools))
 
 (define binary
-  (if (= 2 (length (command-line))) (cadr (command-line))
-      (error "pass the techne binary to tools/cli.scm")))
+  (if (= 2 (length (command-line))) (cadr (command-line)) (test-executable)))
 
 (define (written datum)
   (call-with-output-string (lambda (port) (write datum port))))

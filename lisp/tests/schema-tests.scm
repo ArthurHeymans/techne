@@ -1,4 +1,5 @@
-(require "../test.scm")
+(import (techne test))
+(test-file #:script #t)
 (require "../schema.scm")
 
 (define port '(natural #:min 1 #:max 65535))

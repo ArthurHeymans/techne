@@ -1,7 +1,8 @@
 ;;; Drive incremental search from keys; the frontend click/coordinate check
 ;;; stays in the host suite. Use the pane, not the minibuffer's input view,
 ;;; when asking where the match is.
-(require "../../test.scm")
+(import (techne test))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../api.scm")
 (require "../session.scm")

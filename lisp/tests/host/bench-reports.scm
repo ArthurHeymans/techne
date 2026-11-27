@@ -1,7 +1,8 @@
 ;;; Run from the repository root, with the absolute techne binary as argument.
 ;;; These are golden-output tests on recorded data, not timing benchmarks.
-(require "../../test.scm")
-(define binary (cadr (command-line)))
+(import (techne test))
+(test-file #:script #t #:environment (quote host) #:cwd (quote workspace))
+(define binary (if (pair? (cdr (command-line))) (cadr (command-line)) (test-executable)))
 (define (fixture name) (string-append "crates/techne-cli/tests/bench/" name))
 (define (report expected script args stdin)
   (call-with-process binary (append (list "run" (string-append "runtime/bench/" script)) args)

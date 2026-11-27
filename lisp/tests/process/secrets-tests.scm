@@ -1,7 +1,8 @@
 ;;; Tests for `(techne secrets)`: opaque secret non-leakage, scope-owned
 ;;; backend registry, `secret-ref`, `authinfo`, `sops`, `pass`, and `env`.
 (import (techne) (techne secrets) (techne trusted-process) (techne task) (techne uuid))
-(require "../../test.scm")
+(import (techne test))
+(test-file #:script #t #:environment (quote host))
 
 (define tmp (string-append (or (get-environment-variable "TMPDIR") "/tmp") "/techne-secrets-" (uuid-v4)))
 (create-directory tmp #o700)

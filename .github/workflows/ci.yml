@@ -75,6 +75,13 @@ jobs:
       - run: cargo nextest run --release --no-fail-fast
         env:
           TECHNE_TEST_MODES: default
+      # All workspace Scheme suites (packages + core + editor), plus GC stress on vm suites.
+      - run: target/release/techne test --all
+      - run: target/release/techne test --all --environment vm --timeout 300
+        env:
+          TECHNE_GC_STRESS: "1"
+      # Package manifests, library docstrings, and editor documentation checks.
+      - run: target/release/techne check --all
       # The Emacs client against the server the tests above built.
       - run: TECHNE_NODE=$PWD/target/release/techne-node emacs -Q --batch -L editors/emacs -l editors/emacs/techne-test.el -f ert-run-tests-batch-and-exit
       - run: cargo test --release --doc
@@ -121,6 +128,19 @@ jobs:
       - run: cargo test --release --no-fail-fast -p techne-vm --features counting-allocator --test suites
         env:
           TECHNE_TEST_MODES: ${{ matrix.mode }}
+      - run: cargo build --release -p techne-cli
+      - run: |
+          timeout=120
+          case "$MODE" in
+            interp) export TECHNE_JIT=0 ;;
+            jit) export TECHNE_JIT=1 ;;
+            gc) export TECHNE_GC_STRESS=1; timeout=300 ;;
+            no-ir-interp) export TECHNE_IR=0 TECHNE_JIT=0 ;;
+            no-ir-jit) export TECHNE_IR=0 TECHNE_JIT=1 ;;
+          esac
+          target/release/techne test --all --environment vm --timeout "$timeout"
+        env:
+          MODE: ${{ matrix.mode }}
 
   # The flake's package: the binary finds its Lisp where it is installed.
   package:
@@ -140,6 +160,11 @@ jobs:
       - run: |
           echo '(import (scheme base) (scheme write) (srfi 1)) (write (iota 3))' > /tmp/t.scm
           test "$(result/bin/techne run /tmp/t.scm)" = "(0 1 2)"
+      - run: |
+          mkdir -p /tmp/smoke-pkg/tests
+          echo '(package smoke-pkg)' > /tmp/smoke-pkg/techne-package.scm
+          echo '(import (techne test)) (define-test "adds" (assert-equal 4 (+ 2 2)))' > /tmp/smoke-pkg/tests/smoke-test.scm
+          result/bin/techne test /tmp/smoke-pkg
 
   # Random keys for the editor (crates/techne-editor/examples/keyfuzz.rs),
   # from fixed seeds: an error no command raised, a violation in the

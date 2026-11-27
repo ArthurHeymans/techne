@@ -34,10 +34,16 @@ Use Rust only where Scheme cannot do the job:
 Keep that Rust a small mechanism with its policy exposed to Lisp, and say
 in the commit why it could not be Scheme.
 
-Write tests in Scheme by default; use Rust only when the test needs a host-level check that Scheme cannot make.
-Use `lisp/test.scm`;
-for headless editor suites, `crates/techne-editor/tests/lisp.rs` already
-loads `lisp/editor/tests/*.scm` with the editor primitives installed.
+Write tests in Scheme by default with `(techne test)` (`lisp/test.scm`).
+Use `(define-test NAME #:timeout 5 #:skip "why" BODY ...)`, omitting options
+as needed, and run `techne test FILE`. Registered files may be loaded for
+listing and name selection, but neither operation runs test bodies or
+scripts. Tests in a file share one heap and run in registration order; each
+must pass alone with `-k`. Mark legacy top-level checks with
+`(test-file #:script #t)`; the file id is its single test name.
+`#:environment 'editor` installs editor natives for headless tests; the
+default `vm` selects VM natives and is not a filesystem sandbox.
+Check package manifests and docstrings with `techne check` (`(techne checkdoc)`).
 Keep Rust tests for the host contracts they actually observe (for example,
 frontend snapshots or process reaping). A test that needs host setup can
 still keep its scenario and assertions in a `.scm` file.

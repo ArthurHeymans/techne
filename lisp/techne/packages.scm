@@ -22,7 +22,7 @@
     (error "Expected (branch name), (tag name) or (commit full-object-id)" ref))
   (%ref (car ref) (cadr ref)))
 (define (parse-package-source datum)
-  "Validate DATUM and return a package source, without accessing a repository."
+  "Validate DATUM and return a package source without network access."
   (unless (and (list? datum) (memv (length datum) '(2 3 4)) (string? (cadr datum)))
     (error "Expected (github owner/repo [ref] [(package name)]), (git https-url ...) or (local absolute-repo ...)" datum))
   (let* ((kind (car datum)) (s (cadr datum))
@@ -45,7 +45,7 @@
                 packages)
       (%source kind url (and (pair? refs) (parse-ref (car refs))) (and (pair? packages) (cadr (car packages)))))))
 (define (register-package-recipe! datum)
-  "Register a catalog entry DATUM, (recipe name source), without fetching it."
+  "Register catalog entry DATUM, (recipe name source), without fetching."
   (unless (and (list? datum) (= 3 (length datum)) (eq? 'recipe (car datum)) (symbol? (cadr datum)))
     (error "Invalid recipe" datum))
   (let ((wanted (package-source-package (parse-package-source (caddr datum)))))
@@ -224,8 +224,9 @@
            (advertise-package! name (car (manifest-editor d)) (commands d) (options d))
            (hash-table-set! indexed name i))) name))
 (define (package-install! spec #:directory [directory (store)])
-  "Install SPEC (a source datum or catalog name) and advertise its commands.
-DIRECTORY is the package store. First install pins a commit; repeats are offline.
+  "Install SPEC (a source datum or catalog name) and advertise commands.
+DIRECTORY is the package store. First install pins a commit; repeats
+work offline.
 Of a repository holding several packages, the one installed is the one
 the source names with (package NAME), else the one of the catalog name.
 The packages installed from one source share its checkout, and so the
@@ -249,7 +250,7 @@ packages beside them that they depend on."
         (guard (e ((or published added) (remove-installation! dir dest sub) (raise e)))
           (announce! (cons dest sub) wanted))))))
 (define (package-restore! #:directory [directory (store)])
-  "Advertise all packages installed in DIRECTORY without fetching or loading."
+  "Advertise packages installed in DIRECTORY without fetching or loading."
   (let ((dir directory))
     (if (file-exists? dir)
         (let* ((all (all-installations dir)) (manifests (map stored-manifest all)))

@@ -2,6 +2,7 @@
 ;;; and no other package's, which its manifest depends on none of.
 ;;; Run: techne run packages/mail/tests/mail-package-tests.scm
 (import (techne) (techne path) (techne uuid) (techne test))
+(test-file #:script #t)
 (import (mail date))
 
 (define dir (path-join (or (get-environment-variable "TMPDIR") "/tmp") (string-append "techne-mail-package-" (uuid-v4))))

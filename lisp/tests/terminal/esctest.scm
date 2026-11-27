@@ -1,13 +1,20 @@
 ;;; Run Ebb's focused VT compatibility suite through the actual Techne
 ;;; terminal frontend, its Scheme emulator, and the child's real PTY.
-;;; Usage: techne run lisp/tests/terminal/esctest.scm ESCTEST2 TECHNE
+;;; Usage: ESCTEST2=/path/to/esctest2 techne test lisp/tests/terminal/esctest.scm
+;;;    or: techne run lisp/tests/terminal/esctest.scm ESCTEST2 TECHNE
 ;;; ESCTEST2 revision: 664be3cf2c1e3f06bc93a8bafb48a0db83c607db.
-(import (techne) (techne uuid))
+(import (techne) (techne uuid) (techne test))
+(test-file #:script #t #:environment 'host #:serial #t #:requires '((env "ESCTEST2") (program "tmux")))
 
 (define args (cdr (command-line)))
-(unless (= (length args) 2) (error "Expected the esctest2 directory and Techne executable"))
-(define suite (string-append (file-truename (car args)) "/esctest"))
-(define binary (file-truename (cadr args)))
+(define esctest-dir
+  (cond ((= (length args) 2) (car args))
+        ((get-environment-variable "ESCTEST2"))
+        (else (error "Expected ESCTEST2 directory via env or arguments"))))
+(define techne-bin
+  (if (= (length args) 2) (cadr args) (test-executable)))
+(define suite (string-append (file-truename esctest-dir) "/esctest"))
+(define binary (file-truename techne-bin))
 (define dir (string-append (or (get-environment-variable "TMPDIR") "/tmp") "/techne-vt-" (uuid-v4)))
 (define logfile (string-append dir "/esctest.log"))
 (define notes (string-append dir "/notes"))
@@ -66,7 +73,8 @@
    (let* ((log (file->string logfile))
           (summary (find (lambda (line) (and (string-prefix? "*** " line) (string-contains line "known bug")))
                          (reverse (string-split log "\n")))))
-     (unless (equal? summary expected) (display log) (error "VT compatibility failed" summary))
+     (unless (equal? summary expected) (display log))
+     (check "esctest2 VT compatibility summary" expected summary)
      (display summary) (newline)))
  (lambda ()
    (guard (e (#t #f)) (tmux "kill-server"))
