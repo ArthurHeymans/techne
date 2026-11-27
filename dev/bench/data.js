@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795802399823,
+  "lastUpdate": 1795802401915,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -66824,6 +66824,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 632745327,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104365,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aad5b018289efb0bc61b8720a09fb976ea2cc775",
+          "message": "Merge pull request #431 from ArthurHeymans/ci/workflow-build-speedups\n\nCache Nix store, use mold linker, and eliminate redundant CI builds",
+          "timestamp": "2026-11-27T18:54:32+01:00",
+          "tree_id": "2c856f88f77b9ad2a0f84135b2c3aa5b0d852b66",
+          "url": "https://github.com/ArthurHeymans/techne/commit/aad5b018289efb0bc61b8720a09fb976ea2cc775"
+        },
+        "date": 1795802401862,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697637409,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 632767735,
             "unit": "instructions"
           },
           {
