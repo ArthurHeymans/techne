@@ -93,7 +93,9 @@
 ;; Decode encoded words only when the complete word is well formed. Adjacent
 ;; encoded words suppress the folding whitespace between them (RFC 2047).
 (define (m-word s at)
-  (and (<= (+ at 2) (string-length s)) (string=? "=?" (substring s at (+ at 2)))
+  (and (<= (+ at 2) (string-length s))
+       (char=? (string-ref s at) #\=)
+       (char=? (string-ref s (+ at 1)) #\?)
        ;; RFC 2047 allows a word 75 characters, and senders write longer
        ;; ones, which other readers decode: a header line's 998 is the
        ;; bound here. Each search is bounded, including on malformed
@@ -109,18 +111,22 @@
                                     ((string=? encoding "q") (m-qp payload #t)) (else #f))))
                   (and bytes (cons (+ end 2) (m-decode bytes (substring s (+ at 2) a))))))))))
 (define (m-decode-words s)
-  (let ((out (open-output-string)) (n (string-length s)))
-    (let loop ((i 0) (plain 0) (previous? #f))
-      (if (= i n)
-          (begin (display (m-decode (m-octets->bytes (substring s plain n)) "utf-8") out)
-                 (get-output-string out))
-          (let ((word (m-word s i)))
-            (if word
-                (let ((gap (substring s plain i)))
-                  (unless (and previous? (string=? (m-trim gap) ""))
-                    (display (m-decode (m-octets->bytes gap) "utf-8") out))
-                  (display (cdr word) out) (loop (car word) (car word) #t))
-                (loop (+ i 1) plain previous?)))))))
+  (let ((n (string-length s)))
+    (if (not (m-find s "=?" 0))
+        (m-decode (m-octets->bytes s) "utf-8")
+        (let ((out (open-output-string)))
+          (let loop ((i 0) (plain 0) (previous? #f))
+            (let ((next (m-find s "=?" i)))
+              (if (not next)
+                  (begin (display (m-decode (m-octets->bytes (substring s plain n)) "utf-8") out)
+                         (get-output-string out))
+                  (let ((word (m-word s next)))
+                    (if word
+                        (let ((gap (substring s plain next)))
+                          (unless (and previous? (string=? (m-trim gap) ""))
+                            (display (m-decode (m-octets->bytes gap) "utf-8") out))
+                          (display (cdr word) out) (loop (car word) (car word) #t))
+                        (loop (+ next 2) plain previous?))))))))))
 
 ;; Line callbacks use the original offsets: binary bodies are never normalized.
 (define (m-line s at)

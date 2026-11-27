@@ -242,6 +242,11 @@
 (check "HTML nesting flattened" #t
        (list? (mail-html->rich (string-append (apply string-append (make-list 100 "<div>")) "deep" (apply string-append (make-list 100 "</div>"))))))
 (check "HTML size bounded" #t (raises? (lambda () (mail-html->rich (make-string 2097153 #\x)))))
-(check "HTML node budget" #t (raises? (lambda () (mail-html->rich (apply string-append (make-list 50001 "<br>"))))))
+(if (equal? (get-environment-variable "TECHNE_GC_STRESS") "1")
+    ;; Under GC stress every allocation traces the full live heap (O(N^2));
+    ;; test the same budget path with a smaller cap here and the default
+    ;; 50000-node cap in the normal run.
+    (check "HTML node budget" #t (raises? (lambda () (mail-html->rich (apply string-append (make-list 501 "<br>")) #:max-nodes 500))))
+    (check "HTML node budget" #t (raises? (lambda () (mail-html->rich (apply string-append (make-list 50001 "<br>")))))))
 (check "HTML type checked" #t (raises? (lambda () (mail-html->rich #f))))
 (test-summary)
