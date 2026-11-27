@@ -12,13 +12,13 @@
     (assert-true 42)
     (assert-false #f))
 
-  (define-test "assert-match finds substring"
-    (assert-match "world" "hello world")
-    (assert-match "42" "answer is 42"))
+  (define-test "assert-contains finds substring"
+    (assert-contains "world" "hello world")
+    (assert-contains "42" "answer is 42"))
 
   (define-test "assert-raises catches errors and returns condition"
     (let ((c (assert-raises (error "boom" 1 2))))
-      (assert-match "boom" (condition/report-string c)))
+      (assert-contains "boom" (condition/report-string c)))
     (assert-raises "specific failure" (error "a specific failure happened"))
     (assert-raises error-object? (error "is an error object")))
 
@@ -34,18 +34,18 @@
 (define-suite "diffs"
   (define-test "scalar diff shows expected and actual"
     (let ((d (format-diff 10 20)))
-      (assert-match "expected: 10" d)
-      (assert-match "actual:   20" d)))
+      (assert-contains "expected: 10" d)
+      (assert-contains "actual:   20" d)))
 
   (define-test "multiline string diff shows line numbers"
     (let ((d (format-diff "line1\nexpected-line\nline3" "line1\nactual-line\nline3")))
-      (assert-match "- 2: \"expected-line\"" d)
-      (assert-match "+ 2: \"actual-line\"" d)))
+      (assert-contains "- 2: \"expected-line\"" d)
+      (assert-contains "+ 2: \"actual-line\"" d)))
 
   (define-test "structural diff reports first differing index"
     (let ((d (format-diff '(1 (2 3) 4) '(1 (2 99) 4))))
-      (assert-match "first diff at (1 1)" d)
-      (assert-match "expected 3, actual 99" d))))
+      (assert-contains "first diff at (1 1)" d)
+      (assert-contains "expected 3, actual 99" d))))
 
 (define-suite "fixtures"
   (define-test "call-with-temporary-directory creates and cleans up on return"
@@ -77,7 +77,7 @@
           (assert-golden path "golden text\n")))))
 
   (define-test "test-file-directory points to lisp/tests"
-    (assert-match "lisp/tests" (test-file-directory)))
+    (assert-contains "lisp/tests" (test-file-directory)))
 
   (define-test "current-backtrace captures frames inside with-exception-handler"
     (define (inner-boom) (error "trace me"))
@@ -90,4 +90,4 @@
             (raise e))
           outer-boom))
       (assert-true (pair? bt))
-      (assert-match "inner-boom" (string-join bt "\n")))))
+      (assert-contains "inner-boom" (string-join bt "\n")))))

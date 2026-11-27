@@ -4,7 +4,7 @@
 (require "../org/org.scm")
 (require "../org/agenda.scm")
 
-(define fixture "tests/fixtures/agenda.org")
+(define fixture (string-append (test-file-directory) "/fixtures/agenda.org"))
 (define text (file->string fixture))
 (define org (read-org-file fixture))
 (define today (days-from-civil 2026 10 5))

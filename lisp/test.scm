@@ -2,14 +2,14 @@
 ;;;
 ;;; Write unit tests with `define-test` and `define-suite`, assert with
 ;;; `assert-equal`, `assert-true`, `assert-false`, `assert-raises`,
-;;; `assert-match`, `assert-eventually`, and `assert-golden`, or use the
+;;; `assert-contains`, `assert-eventually`, and `assert-golden`, or use the
 ;;; soft checks `check` and `check-true`. Run with `techne test` (or
 ;;; standalone with `techne run`).
 
 (provide
   test-file
   define-test define-suite register-test!
-  assert-equal assert-true assert-false assert-raises assert-match
+  assert-equal assert-true assert-false assert-raises assert-contains
   assert-eventually assert-golden
   skip
   call-with-temporary-directory test-file-directory test-executable
@@ -157,18 +157,19 @@ The directory is removed when PROC returns, raises, or unwinds."
                    #:timeout [timeout #f]
                    #:serial [serial #f]
                     #:script [script #f]
-                   #:gc-stress [gc-stress 'default]
                    #:requires [requires '()]
                    #:cwd [cwd #f]
                    #:ignore [ignore #f])
   "Declare file-level metadata for `techne test`.
 ENVIRONMENT selects `vm`, `host`, or `editor`; WITHOUT revokes
 capabilities; TIMEOUT sets the per-file timeout in seconds; SERIAL
-runs the file alone; GC-STRESS toggles GC stress mode; REQUIRES gates
+runs the file alone; REQUIRES gates
 on programs or env vars; CWD sets the working directory; IGNORE skips
 discovery for helper files."
   (unless (boolean? script)
     (error "test-file: #:script must be a boolean" script))
+  (unless (memq cwd '(#f file package workspace))
+    (error "test-file: #:cwd must be file, package, or workspace" cwd))
   (unless (memq environment '(vm host editor))
     (error "test-file: #:environment must be vm, host, or editor" environment))
   (unless (list? without)
@@ -307,10 +308,10 @@ discovery for helper files."
     (raise (%make-test-failure loc (or msg "expected #f")
                                (string-append "  actual: " (%written val))))))
 
-(define (%assert-match loc pattern actual msg)
+(define (%assert-contains loc pattern actual msg)
   (set! %count (+ %count 1))
   (unless (string? actual)
-    (raise (%make-test-failure loc (or msg "assert-match expected a string")
+    (raise (%make-test-failure loc (or msg "assert-contains expected a string")
                                (string-append "  pattern: " (%written pattern)
                                               "\n  actual:  " (%written actual)))))
   (unless (string-contains actual pattern)
@@ -367,13 +368,13 @@ discovery for helper files."
     ((_ expr msg)
      (%assert-false (procedure-location (lambda () #f)) expr msg))))
 
-(define-syntax assert-match
+(define-syntax assert-contains
   (syntax-rules ()
     "Assert that string ACTUAL contains substring PATTERN."
     ((_ pattern actual)
-     (%assert-match (procedure-location (lambda () #f)) pattern actual #f))
+     (%assert-contains (procedure-location (lambda () #f)) pattern actual #f))
     ((_ pattern actual msg)
-     (%assert-match (procedure-location (lambda () #f)) pattern actual msg))))
+     (%assert-contains (procedure-location (lambda () #f)) pattern actual msg))))
 
 (define-syntax assert-raises
   (syntax-rules ()

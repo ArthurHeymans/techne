@@ -76,7 +76,10 @@ jobs:
         env:
           TECHNE_TEST_MODES: default
       # All workspace Scheme suites (packages + core + editor), plus GC stress on vm suites.
-      - run: target/release/techne test --all --mode default,gc
+      - run: target/release/techne test --all
+      - run: target/release/techne test --all --environment vm --timeout 300
+        env:
+          TECHNE_GC_STRESS: "1"
       # The Emacs client against the server the tests above built.
       - run: TECHNE_NODE=$PWD/target/release/techne-node emacs -Q --batch -L editors/emacs -l editors/emacs/techne-test.el -f ert-run-tests-batch-and-exit
       - run: cargo test --release --doc
@@ -124,7 +127,18 @@ jobs:
         env:
           TECHNE_TEST_MODES: ${{ matrix.mode }}
       - run: cargo build --release -p techne-cli
-      - run: target/release/techne test --all --vm-only --mode ${{ matrix.mode }}
+      - run: |
+          timeout=120
+          case "$MODE" in
+            interp) export TECHNE_JIT=0 ;;
+            jit) export TECHNE_JIT=1 ;;
+            gc) export TECHNE_GC_STRESS=1; timeout=300 ;;
+            no-ir-interp) export TECHNE_IR=0 TECHNE_JIT=0 ;;
+            no-ir-jit) export TECHNE_IR=0 TECHNE_JIT=1 ;;
+          esac
+          target/release/techne test --all --environment vm --timeout "$timeout"
+        env:
+          MODE: ${{ matrix.mode }}
 
   # The flake's package: the binary finds its Lisp where it is installed.
   package:

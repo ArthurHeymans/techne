@@ -39,7 +39,7 @@
           ;; --list discovers the package test with package-prefixed id
           (let ((listed (run-techne-test pkg "--list")))
             (assert-equal 0 (car listed))
-            (assert-match "demo:tests/math-test.scm" (cadr listed)))
+            (assert-contains "demo:tests/math-test.scm" (cadr listed)))
           ;; --format sexp runs and reports counts
           (let* ((res (run-techne-test pkg "--format" "sexp"))
                  (data (read (open-input-string (cadr res)))))
@@ -68,18 +68,18 @@
           ;; Running all tests reports 1 passed, 2 failed, with diff + backtrace
           (let ((res (run-techne-test pkg)))
             (assert-equal 1 (car res))
-            (assert-match "1 passed, 2 failed" (cadr res))
-            (assert-match "first diff at (1)" (cadr res))
-            (assert-match "kaboom" (cadr res))
-            (assert-match "helper" (cadr res)))
+            (assert-contains "1 passed, 2 failed" (cadr res))
+            (assert-contains "first diff at (1)" (cadr res))
+            (assert-contains "kaboom" (cadr res))
+            (assert-contains "helper" (cadr res)))
           ;; Filtering by test name runs only the matching test and passes
-          (let ((res (run-techne-test pkg "alpha")))
+          (let ((res (run-techne-test pkg "-k" "alpha")))
             (assert-equal 0 (car res))
-            (assert-match "1 passed, 0 failed" (cadr res)))
+            (assert-contains "1 passed, 0 failed" (cadr res)))
           ;; Filtering with no match fails cleanly
-          (let ((res (run-techne-test pkg "does-not-exist")))
+          (let ((res (run-techne-test pkg "-k" "does-not-exist")))
             (assert-equal 1 (car res))
-            (assert-match "filter matched 0 tests" (cadr res)))))))
+            (assert-contains "filter matched 0 tests" (cadr res)))))))
 
   (define-test "works with #:without '(environment) and #:without '(loading)"
     (call-with-temporary-directory
@@ -101,12 +101,12 @@
               "  (assert-equal 4 (+ 2 2)))\n"))
           (let ((res (run-techne-test pkg)))
             (assert-equal 0 (car res))
-            (assert-match "2 passed, 0 failed" (cadr res)))
+            (assert-contains "2 passed, 0 failed" (cadr res)))
            (write-file (path-join pkg "tests/no-load-test.scm")
              "(import (techne test))\n(test-file #:without '(loading))\n(error \"load error with Loading revoked\")\n")
            (let ((res (run-techne-test pkg "tests/no-load-test.scm")))
              (assert-equal 1 (car res))
-             (assert-match "load error with Loading revoked" (cadr res)))))))
+             (assert-contains "load error with Loading revoked" (cadr res)))))))
 
   (define-test "fails closed on misplaced or invalid test-file declarations"
     (call-with-temporary-directory
@@ -133,8 +133,8 @@
               "(define-test \"should fail\" (assert-equal 2 y))\n"))
           (let ((res (run-techne-test pkg)))
             (assert-equal 1 (car res))
-            (assert-match "must appear at the top of the file" (cadr res))
-            (assert-match "invalid test-file declaration" (cadr res)))))))
+            (assert-contains "must appear at the top of the file" (cadr res))
+            (assert-contains "invalid test-file declaration" (cadr res)))))))
 
   (define-test "assert-raises propagates skip/failure, soft check beats later skip, and -p outside workspace works"
     (call-with-temporary-directory
@@ -155,7 +155,7 @@
           ;; -p with non-matching name outside a workspace must fail
           (let ((other (run-techne-test pkg "-p" "other")))
             (assert-equal 1 (car other))
-            (assert-match "no test files found" (caddr other)))
+            (assert-contains "no test files found" (caddr other)))
           ;; -p matching the standalone package runs its tests
           (let* ((res (run-techne-test pkg "-p" "solo" "--format" "sexp"))
                  (data (read (open-input-string (cadr res)))))
@@ -190,14 +190,14 @@
               "    (assert-equal 1 code)))\n"))
           (let ((r1 (run-techne-test pkg (path-join pkg "tests/esc-err-test.scm"))))
             (assert-equal 1 (car r1))
-            (assert-match "esc " (cadr r1))
+            (assert-contains "esc " (cadr r1))
             (assert-false (string-contains (cadr r1) "unknown escape")))
           (let ((r2 (run-techne-test pkg (path-join pkg "tests/partial-out-test.scm"))))
             (assert-equal 0 (car r2))
-            (assert-match "1 passed, 0 failed" (cadr r2)))
+            (assert-contains "1 passed, 0 failed" (cadr r2)))
           (let ((r3 (run-techne-test pkg (path-join pkg "tests/nested-run-test.scm"))))
             (assert-equal 0 (car r3))
-            (assert-match "1 passed, 0 failed" (cadr r3)))))))
+            (assert-contains "1 passed, 0 failed" (cadr r3)))))))
 
   (define-test "timeout runs dynamic-wind cleanup, directory targets scope discovery, and missing paths fail"
     (call-with-temporary-directory
@@ -221,16 +221,16 @@
           ;; Directory target scopes --list to tests/sub only
           (let ((listed (run-techne-test pkg "--list" (path-join pkg "tests/sub"))))
             (assert-equal 0 (car listed))
-            (assert-match "timeout-test.scm" (cadr listed))
+            (assert-contains "timeout-test.scm" (cadr listed))
             (assert-false (string-contains (cadr listed) "root-test.scm")))
           ;; Missing path fails with exit 2
-          (let ((missing (run-techne-test pkg "tests/does-not-exist.scm")))
+          (let ((missing (run-techne-test pkg "does-not-exist")))
             (assert-equal 2 (car missing))
-            (assert-match "path not found" (caddr missing)))
+            (assert-contains "path not found" (caddr missing)))
           ;; Per-test timeout fails AND runs dynamic-wind cleanup
           (let ((timed (run-techne-test pkg (path-join pkg "tests/sub/timeout-test.scm"))))
             (assert-equal 1 (car timed))
-            (assert-match "timed out after 1s" (cadr timed))
+            (assert-contains "timed out after 1s" (cadr timed))
             (assert-true (file-exists? marker))
             (assert-equal "cleaned" (file->string marker)))
           ;; Soft check failure inside define-test fails the test
@@ -238,13 +238,13 @@
             "(import (techne test))\n(define-test \"soft check\" (check \"mismatch\" 1 2))\n")
           (let ((soft (run-techne-test pkg (path-join pkg "tests/soft-test.scm"))))
             (assert-equal 1 (car soft))
-            (assert-match "check mismatch" (cadr soft)))
+            (assert-contains "check mismatch" (cadr soft)))
           ;; --list-tests surfaces load errors and exits non-zero
           (write-file (path-join pkg "tests/broken-test.scm")
             "(import (techne test))\n(error \"broken load\")\n")
           (let ((lt (run-techne-test pkg "--list-tests" (path-join pkg "tests/broken-test.scm"))))
             (assert-equal 1 (car lt))
-            (assert-match "broken load" (caddr lt))))))))
+            (assert-contains "broken load" (caddr lt))))))))
 
 (define-test "script selection is static and requirements do not select files"
   (call-with-temporary-directory
@@ -261,8 +261,8 @@
           "(import (techne test))\n(test-file #:requires '(program \"techne-test-program-that-does-not-exist\"))\n(define-test \"gated body\" (error \"must not run\"))\n")
         (let ((listed (run-techne-test root "--list-tests")))
           (assert-equal 0 (car listed))
-          (assert-match "selection:tests/script.scm" (cadr listed))
-          (assert-match "gated body" (cadr listed)))
+          (assert-contains "selection:tests/script.scm" (cadr listed))
+          (assert-contains "gated body" (cadr listed)))
         (assert-false (file-exists? marker))
         (let* ((no-match (run-techne-test root "-k" "zzz-nomatch" "--format" "sexp"))
                (data (read (open-input-string (cadr no-match)))))
@@ -272,10 +272,10 @@
         (assert-false (file-exists? marker))
         (let ((gated (run-techne-test root "-k" "gated body")))
           (assert-equal 0 (car gated))
-          (assert-match "1 skipped" (cadr gated)))
+          (assert-contains "1 skipped" (cadr gated)))
         (let ((selected (run-techne-test root "-k" "script.scm")))
           (assert-equal 0 (car selected))
-          (assert-match "1 file, 1 passed" (cadr selected)))
+          (assert-contains "1 file, 1 passed" (cadr selected)))
         (assert-equal "ran" (file->string marker))))))
 
 (define-test "checks called by helpers at registered-file load are errors"
@@ -285,7 +285,7 @@
         "(import (techne test))\n(define (helper) (check-true \"bad\" #t))\n(helper)\n")
       (let ((result (run-techne-test root "--list-tests" "broken.scm")))
         (assert-equal 1 (car result))
-        (assert-match "wrap the check in a test or declare (test-file #:script #t)" (caddr result))))))
+        (assert-contains "wrap the check in a test or declare (test-file #:script #t)" (caddr result))))))
 
 (define-test "computed names, keyword options and procedural registration"
   (call-with-temporary-directory
@@ -304,10 +304,10 @@
           (filter (lambda (line) (not (string=? line ""))) (string-split (cadr listed) "\n"))))
       (let ((run (run-techne-test root "cases.scm")))
         (assert-equal 0 (car run))
-        (assert-match "2 passed, 0 failed, 1 skipped" (cadr run)))
+        (assert-contains "2 passed, 0 failed, 1 skipped" (cadr run)))
       (let ((standalone (run-techne root "run" "cases.scm")))
         (assert-equal 1 (car standalone))
-        (assert-match "techne test FILE" (caddr standalone))))))
+        (assert-contains "techne test FILE" (caddr standalone))))))
 
 (define-test "sexp failures have keyed file and test fields"
   (call-with-temporary-directory
@@ -321,12 +321,25 @@
         (define (field key) (cadr (assq key test)))
         (assert-equal 1 (car run))
         (assert-equal "failed.scm" (cadr (assq 'file file)))
-        (assert-equal "default" (cadr (assq 'mode file)))
         (assert-equal 'test-result (field 'kind))
         (assert-equal "fails" (field 'name))
         (assert-equal 'fail (field 'status))
         (assert-true (exact-integer? (field 'elapsed-ms)))
-        (assert-match "failed.scm" (field 'location))
-        (assert-match "expected" (field 'detail))
+        (assert-contains "failed.scm" (field 'location))
+        (assert-contains "expected" (field 'detail))
         (assert-equal "out" (field 'stdout))
         (assert-equal "err" (field 'stderr))))))
+
+(define-test "an environment selects files and the package root is their default cwd"
+  (call-with-temporary-directory
+    (lambda (root)
+      (make-directory (path-join root "tests"))
+      (write-file (path-join root "techne-package.scm") "(package environments)")
+      (write-file (path-join root "root-marker") "root")
+      (write-file (path-join root "tests/vm.scm")
+        "(import (techne) (techne test))\n(define-test \"runs at package root\" (assert-equal \"root\" (file->string \"root-marker\")))\n")
+      (write-file (path-join root "tests/host.scm")
+        "(import (techne test))\n(test-file #:environment 'host)\n(error \"the host file must not load\")\n")
+      (let ((run (run-techne-test root "--environment" "vm")))
+        (assert-equal 0 (car run))
+        (assert-contains "1 file, 1 passed" (cadr run))))))

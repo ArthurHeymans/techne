@@ -7,17 +7,15 @@
 
 (define usage-text
   (string-append
-    "usage: techne test [OPTIONS] [PATH-OR-FILTER...]\n"
+    "usage: techne test [OPTIONS] [PATH...]\n"
     "\n"
     "Discover and run Scheme tests in the current package, workspace, or given paths.\n"
-    "Positional arguments that are not existing files or directories act as name filters.\n"
     "\n"
     "Options:\n"
     "  -p, --package NAME      Run tests only for package NAME (repeatable)\n"
     "      --all, --workspace  Run all workspace packages and test directories\n"
     "  -k, --filter PATTERN    Filter by file path or test name substring (repeatable)\n"
-    "      --mode MODES        Comma-separated VM modes: default,interp,jit,gc,no-ir-interp,no-ir-jit\n"
-    "      --vm-only           Run only `vm`-world test files\n"
+    "      --environment ENV   Run only test files in ENV (vm, host, editor)\n"
     "  -j, --jobs N            Max parallel test workers (default: CPU count)\n"
     "      --timeout SECONDS   Per-file timeout in seconds (default: 120)\n"
     "  -x, --fail-fast         Stop launching new files after the first failure\n"
@@ -94,20 +92,6 @@
              (string-split path-env ":")))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Modes
-;;; ---------------------------------------------------------------------------
-
-(define mode-envs
-  '(("default"      . ())
-    ("interp"       . (("TECHNE_JIT" . "0")))
-    ("jit"          . (("TECHNE_JIT" . "1")))
-    ("gc"           . (("TECHNE_GC_STRESS" . "1")))
-    ("no-ir-interp" . (("TECHNE_IR" . "0") ("TECHNE_JIT" . "0")))
-    ("no-ir-jit"    . (("TECHNE_IR" . "0") ("TECHNE_JIT" . "1")))))
-
-(define (valid-mode? m) (and (assoc m mode-envs) #t))
-
-;;; ---------------------------------------------------------------------------
 ;;; Reading `(test-file ...)` metadata without evaluating
 ;;; ---------------------------------------------------------------------------
 
@@ -117,7 +101,6 @@
         (cons 'timeout #f)
         (cons 'serial #f)
         (cons 'script #f)
-        (cons 'gc-stress 'default)
         (cons 'requires '())
         (cons 'cwd #f)
         (cons 'ignore #f)))
@@ -190,17 +173,13 @@
                       (unless (boolean? v)
                         (error "test-file: #:serial must be a boolean" v))
                       (loop (cddr xs) (cons (cons 'serial v) acc)))
-                     ((eq? k #:gc-stress)
-                      (unless (or (boolean? v) (eq? v 'default))
-                        (error "test-file: #:gc-stress must be #t, #f, or default" v))
-                      (loop (cddr xs) (cons (cons 'gc-stress v) acc)))
                      ((eq? k #:requires)
                       (unless (valid-requires? v)
                         (error "test-file: #:requires must be (program NAME) / (env NAME) or a list of them" v))
                       (loop (cddr xs) (cons (cons 'requires v) acc)))
                      ((eq? k #:cwd)
-                      (unless (memq v '(#f file package workspace lisp))
-                        (error "test-file: #:cwd must be file, package, workspace, or lisp" v))
+                      (unless (memq v '(#f file package workspace))
+                        (error "test-file: #:cwd must be file, package, or workspace" v))
                       (loop (cddr xs) (cons (cons 'cwd v) acc)))
                      ((eq? k #:ignore)
                       (unless (boolean? v)
@@ -399,11 +378,7 @@
       ((eq? cwd 'file) (parent-dir (spec-path spec)))
       ((eq? cwd 'package) (or (spec-pkg-root spec) (spec-ws-root spec) (parent-dir (spec-path spec))))
       ((eq? cwd 'workspace) (or (spec-ws-root spec) (spec-pkg-root spec) (parent-dir (spec-path spec))))
-      ((eq? cwd 'lisp) (if (spec-ws-root spec) (path-join (spec-ws-root spec) "lisp") (%lisp-directory)))
       ((spec-pkg-root spec) (spec-pkg-root spec))
-      ((and (spec-ws-root spec)
-            (string-prefix? (string-append (spec-ws-root spec) "/lisp/tests/") (spec-path spec)))
-       (path-join (spec-ws-root spec) "lisp"))
       ((spec-ws-root spec) (spec-ws-root spec))
       (else (parent-dir (spec-path spec))))))
 
@@ -426,8 +401,8 @@
      `((kind test-done) (passed ,passed) (failed ,failed) (skipped ,skipped))]
     [_ (error "unknown test worker event" datum)]))
 
-(define (make-file-result id mode status ms events passed failed skipped stdout stderr)
-  `((kind file-result) (file ,id) (mode ,mode) (status ,status) (elapsed-ms ,ms)
+(define (make-file-result id status ms events passed failed skipped stdout stderr)
+  `((kind file-result) (file ,id) (status ,status) (elapsed-ms ,ms)
     (events ,events) (passed ,passed) (failed ,failed) (skipped ,skipped)
     (stdout ,stdout) (stderr ,stderr)))
 
@@ -453,7 +428,7 @@
   (or (null? filters)
       (any (lambda (f) (string-contains (spec-id spec) f)) filters)))
 
-(define (run-worker executable spec mode filters timeout capture? list-only?)
+(define (run-worker executable spec filters timeout capture? list-only?)
   (let* ((meta (spec-meta spec))
          (meta-err (meta-ref meta 'meta-error))
          (script? (meta-ref meta 'script))
@@ -464,7 +439,7 @@
       (meta-err
        (if list-only?
            (make-file-list (spec-id spec) '() meta-err)
-           (make-file-result (spec-id spec) mode 'fail 0
+           (make-file-result (spec-id spec) 'fail 0
                  (list (make-test-event "<metadata>" 'fail 0 (spec-path spec)
                              (string-append "invalid test-file declaration: " meta-err) "" ""))
                  0 1 0 "" "")))
@@ -472,14 +447,13 @@
         (make-file-list (spec-id spec)
                         (list (make-list-event (spec-id spec) (spec-path spec))) #f))
        ((and req-skip file-match?)
-       (make-file-result (spec-id spec) mode 'skip 0
+       (make-file-result (spec-id spec) 'skip 0
              (list (make-test-event "<file>" 'skip 0 (spec-path spec) req-skip "" ""))
              0 0 1 "" ""))
       (else
         (let* ((env-kind (meta-ref meta 'environment))
                (without (meta-ref meta 'without))
-               (base-timeout (or (meta-ref meta 'timeout) timeout))
-               (file-timeout (if (string=? mode "gc") (max base-timeout 300) base-timeout))
+               (file-timeout (or (meta-ref meta 'timeout) timeout))
                (nonce (string-append ";;T" (hex-encode (random-bytes 6))))
                (worker-filters (if file-match? '() filters))
                (world-args (append
@@ -516,16 +490,14 @@
                                (cons 'executable executable)))
                        (cfg-str (call-with-output-string (lambda (p) (write cfg-datum p))))
                        (extra-env
-                         (append
-                           (list (cons "HOME" tmp)
-                                 (cons "TMPDIR" tmp)
-                                 (cons "XDG_CONFIG_HOME" xdg-cfg)
-                                 (cons "XDG_DATA_HOME" xdg-data)
-                                 (cons "XDG_STATE_HOME" xdg-state)
-                                 (cons "TECHNE_NODE_DIR" node-dir)
-                                 (cons "TECHNE_BIN" executable)
-                                 (cons "TECHNE_TEST_CONFIG" cfg-str))
-                           (cdr (assoc mode mode-envs))))
+                         (list (cons "HOME" tmp)
+                               (cons "TMPDIR" tmp)
+                               (cons "XDG_CONFIG_HOME" xdg-cfg)
+                               (cons "XDG_DATA_HOME" xdg-data)
+                               (cons "XDG_STATE_HOME" xdg-state)
+                               (cons "TECHNE_NODE_DIR" node-dir)
+                               (cons "TECHNE_BIN" executable)
+                               (cons "TECHNE_TEST_CONFIG" cfg-str)))
                        (timed-out #f))
                   (call-with-process executable world-args
                     (lambda (p)
@@ -557,14 +529,14 @@
                                        (else #f))))
                                (make-file-list (spec-id spec) listed err-msg)))
                             (timed-out
-                             (make-file-result (spec-id spec) mode 'fail ms
+                             (make-file-result (spec-id spec) 'fail ms
                                    (append results
                                      (list (make-test-event "<timeout>" 'fail ms (spec-path spec)
                                                  (string-append "file timed out after " (number->string file-timeout) "s")
                                                  stray stderr)))
                                    0 1 0 stray stderr))
                             ((not done-ev)
-                             (make-file-result (spec-id spec) mode 'fail ms
+                             (make-file-result (spec-id spec) 'fail ms
                                    (append results
                                      (list (make-test-event "<crash>" 'fail ms (spec-path spec)
                                                  (string-append "worker exited without finishing (status "
@@ -576,13 +548,13 @@
                                    (f-cnt (result-ref done-ev 'failed))
                                    (s-cnt (result-ref done-ev 'skipped)))
                                (if (and (not (eqv? code 0)) (= f-cnt 0))
-                                   (make-file-result (spec-id spec) mode 'fail ms
+                                   (make-file-result (spec-id spec) 'fail ms
                                          (append results
                                            (list (make-test-event "<exit>" 'fail ms (spec-path spec)
                                                        (string-append "worker exited with status " (number->string code))
                                                        stray stderr)))
                                          p-cnt 1 s-cnt stray stderr)
-                                   (make-file-result (spec-id spec) mode
+                                   (make-file-result (spec-id spec)
                                          (cond ((> f-cnt 0) 'fail)
                                                ((and (= p-cnt 0) (> s-cnt 0)) 'skip)
                                                (else 'pass))
@@ -601,11 +573,10 @@
   (let ((packages '())
         (filters '())
         (paths '())
-        (modes '("default"))
         (jobs (available-parallelism))
         (timeout 120)
         (all? #f)
-        (vm-only? #f)
+        (environment #f)
         (fail-fast? #f)
         (verbose? #f)
         (capture? #t)
@@ -624,8 +595,12 @@
              (set! help? #t) (loop (cdr xs)))
             ((or (string=? a "--all") (string=? a "--workspace"))
              (set! all? #t) (loop (cdr xs)))
-            ((string=? a "--vm-only")
-             (set! vm-only? #t) (loop (cdr xs)))
+            ((string=? a "--environment")
+             (when (null? (cdr xs)) (bad "--environment expects vm, host, or editor"))
+             (let ((env (string->symbol (cadr xs))))
+               (unless (memq env '(vm host editor)) (bad "--environment expects vm, host, or editor"))
+               (set! environment env))
+             (loop (cddr xs)))
             ((or (string=? a "-x") (string=? a "--fail-fast"))
              (set! fail-fast? #t) (loop (cdr xs)))
             ((or (string=? a "-v") (string=? a "--verbose"))
@@ -643,13 +618,6 @@
             ((or (string=? a "-k") (string=? a "--filter"))
              (when (null? (cdr xs)) (bad "--filter expects a pattern"))
              (set! filters (append filters (list (cadr xs))))
-             (loop (cddr xs)))
-            ((string=? a "--mode")
-             (when (null? (cdr xs)) (bad "--mode expects a mode name"))
-             (let ((ms (filter (lambda (s) (not (string=? s ""))) (string-split (cadr xs) ","))))
-               (for-each (lambda (m) (unless (valid-mode? m) (bad (string-append "unknown mode: " m)))) ms)
-               (when (null? ms) (bad "--mode expects at least one mode"))
-               (set! modes ms))
              (loop (cddr xs)))
             ((or (string=? a "-j") (string=? a "--jobs"))
              (when (null? (cdr xs)) (bad "--jobs expects a positive integer"))
@@ -674,22 +642,19 @@
             ((string-prefix? "-" a)
              (bad (string-append "unknown option: " a)))
             (else
-             (cond
-               ((guard (e (#t #f)) (file-attributes a))
-                (set! paths (append paths (list a))))
-               ((or (string-contains a "/") (string-suffix? ".scm" a))
-                (bad (string-append "path not found: " a)))
-               (else
-                (set! filters (append filters (list a)))))
+             (set! paths (append paths (list a)))
              (loop (cdr xs)))))))
+    (for-each (lambda (path)
+                (unless (or (regular-file? path) (dir-exists? path) (file-exists? path))
+                  (bad (string-append "path not found: " path))))
+              paths)
     (list (cons 'packages packages)
           (cons 'filters filters)
           (cons 'paths paths)
-          (cons 'modes modes)
           (cons 'jobs jobs)
           (cons 'timeout timeout)
           (cons 'all all?)
-          (cons 'vm-only vm-only?)
+          (cons 'environment environment)
           (cons 'fail-fast fail-fast?)
           (cons 'verbose verbose?)
           (cons 'capture capture?)
@@ -702,9 +667,8 @@
 ;;; Reporting
 ;;; ---------------------------------------------------------------------------
 
-(define (print-file-line res multi-mode? verbose? show-output?)
+(define (print-file-line res verbose? show-output?)
   (let* ((id (result-ref res 'file))
-         (mode (result-ref res 'mode))
          (status (result-ref res 'status))
          (ms (result-ref res 'elapsed-ms))
          (events (result-ref res 'events))
@@ -713,11 +677,10 @@
          (s (result-ref res 'skipped))
          (tag (cond ((eq? status 'pass) "PASS")
                     ((eq? status 'skip) "SKIP")
-                    (else "FAIL")))
-         (label (if multi-mode? (string-append id " [" mode "]") id)))
-    (when (or verbose? (> (+ p f s) 0))
+                    (else "FAIL"))))
+    (when (> (+ p f s) 0)
       (display "  ") (display tag) (display " [") (display (format-seconds ms)) (display "] ")
-      (display label)
+      (display id)
       (cond
         ((eq? status 'skip)
          (let ((reason (and (pair? events) (result-ref (car events) 'detail))))
@@ -755,18 +718,16 @@
             (unless (string=? stray "") (displayln stray))
             (unless (string=? stderr "") (displayln stderr))))))))
 
-(define (print-failures all-results multi-mode?)
+(define (print-failures all-results)
   (let ((failed-files (filter (lambda (r) (eq? (result-ref r 'status) 'fail)) all-results)))
     (when (pair? failed-files)
       (display "\nFailures:\n")
       (for-each
         (lambda (r)
           (let* ((id (result-ref r 'file))
-                 (mode (result-ref r 'mode))
                  (events (result-ref r 'events))
                  (stray (result-ref r 'stdout))
-                 (stderr (result-ref r 'stderr))
-                 (label (if multi-mode? (string-append id " [" mode "]") id)))
+                 (stderr (result-ref r 'stderr)))
             (for-each
               (lambda (ev)
                 (when (eq? (result-ref ev 'status) 'fail)
@@ -775,7 +736,7 @@
                         (detail (result-ref ev 'detail))
                         (out (result-ref ev 'stdout))
                         (err (result-ref ev 'stderr)))
-                    (display "\n---- ") (display label)
+                    (display "\n---- ") (display id)
                     (unless (string=? tname id)
                       (display "::") (display tname))
                     (when (string? loc) (display " [") (display loc) (display "]"))
@@ -846,24 +807,13 @@
                   (cond ((null? xs) (reverse acc))
                         ((member (spec-path (car xs)) seen) (loop (cdr xs) seen acc))
                         (else (loop (cdr xs) (cons (spec-path (car xs)) seen) (cons (car xs) acc))))))
-         (specs (if (opt 'vm-only)
-                    (filter (lambda (s) (eq? (meta-ref (spec-meta s) 'environment) 'vm)) specs)
+         (specs (if (opt 'environment)
+                    (filter (lambda (s) (eq? (meta-ref (spec-meta s) 'environment) (opt 'environment))) specs)
                     specs))
-         (filters (opt 'filters))
-         (modes (opt 'modes))
-         (multi-mode? (> (length modes) 1)))
+         (filters (opt 'filters)))
     (when (null? specs)
       (display "techne test: no test files found\n" (current-error-port))
       (exit 1))
-    ;; Build (spec . mode) helper
-    (define (gc-applies? spec)
-      (let ((gs (meta-ref (spec-meta spec) 'gc-stress))
-            (env (meta-ref (spec-meta spec) 'environment)))
-        (cond ((eq? gs #t) #t)
-              ((eq? gs #f) #f)
-              (else (eq? env 'vm)))))
-    (define (mode-applies? spec mode)
-      (if (string=? mode "gc") (gc-applies? spec) #t))
     ;; --list: fast file listing without spawning workers
     (when (opt 'list-files)
       (let ((shown (filter (lambda (s)
@@ -876,79 +826,70 @@
                          (list (spec-id s)
                                (cons 'path (spec-path s))
                                (cons 'environment (meta-ref (spec-meta s) 'environment))
-                               (cons 'gc-stress (gc-applies? s))
                                (cons 'serial (and (meta-ref (spec-meta s) 'serial) #t))))
                        shown))
            (newline))
           (else
            (for-each (lambda (s) (displayln (spec-id s))) shown)))
         (exit (if (null? shown) 1 0))))
-    (let* ((specs (filter (lambda (s)
-                             (or (not (meta-ref (spec-meta s) 'script))
-                                 (file-selected? s filters)))
-                           specs))
-            (items (apply append
-                    (map (lambda (s)
-                           (filter-map (lambda (m) (and (mode-applies? s m) (cons s m))) modes))
-                         specs))))
-      (when (null? items)
-        (display (if (pair? filters) "techne test: filter matched 0 tests\n"
-                      "techne test: no applicable test files for the selected mode(s)\n")
-                  (current-error-port))
-        (exit 1))
-      (let* ((serial-items (filter (lambda (it) (meta-ref (spec-meta (car it)) 'serial)) items))
-             (par-items (filter (lambda (it) (not (meta-ref (spec-meta (car it)) 'serial))) items))
-             (make-job (lambda (it)
-                         (lambda ()
-                           (guard (e (#t
-                                      (let* ((s (car it))
-                                              (msg (string-append "runner error: " (condition/report-string e))))
-                                         (if (opt 'list-tests)
-                                             (make-file-list (spec-id s) '() msg)
-                                             (make-file-result (spec-id s) (cdr it) 'fail 0
-                                               (list (make-test-event "<runner>" 'fail 0 (spec-path s) msg "" ""))
-                                               0 1 0 "" "")))))
-                              (run-worker executable (car it) (cdr it)
-                                         filters (opt 'timeout) (opt 'capture) (opt 'list-tests))))))
-             (on-res (lambda (res)
-                       (when (and (eq? (opt 'format) 'human)
-                                  (not (opt 'list-tests))
-                                  (eq? (result-ref res 'kind) 'file-result))
-                         (print-file-line res multi-mode? (opt 'verbose) (not (opt 'capture))))))
-             (par-results (run-tasks-pool (map make-job par-items) (opt 'jobs) (opt 'fail-fast) on-res))
-             (par-failed? (any (lambda (r) (and (eq? (result-ref r 'kind) 'file-result) (eq? (result-ref r 'status) 'fail))) par-results))
-             (serial-results (if (and (opt 'fail-fast) par-failed?)
-                                 '()
-                                 (run-tasks-pool (map make-job serial-items) 1 (opt 'fail-fast) on-res)))
-             (all-results (append par-results serial-results))
-             (total-ms (elapsed-ms start)))
+    (let* ((specs (filter (lambda (s) (or (not (meta-ref (spec-meta s) 'script))
+                                        (file-selected? s filters)))
+                          specs))
+           (serial? (lambda (s) (meta-ref (spec-meta s) 'serial)))
+           (serial-specs (filter serial? specs))
+           (parallel-specs (remove serial? specs))
+           (make-job (lambda (s)
+                       (lambda ()
+                         (guard (e (#t
+                                    (let ((msg (string-append "runner error: " (condition/report-string e))))
+                                      (if (opt 'list-tests)
+                                          (make-file-list (spec-id s) '() msg)
+                                          (make-file-result (spec-id s) 'fail 0
+                                            (list (make-test-event "<runner>" 'fail 0 (spec-path s) msg "" ""))
+                                            0 1 0 "" "")))))
+                           (run-worker executable s filters (opt 'timeout) (opt 'capture) (opt 'list-tests))))))
+           (on-res (lambda (res)
+                     (when (and (eq? (opt 'format) 'human) (not (opt 'list-tests)))
+                       (print-file-line res (opt 'verbose) (not (opt 'capture))))))
+           (par-results (run-tasks-pool (map make-job parallel-specs) (opt 'jobs) (opt 'fail-fast) on-res))
+           (par-failed? (any (lambda (r) (and (eq? (result-ref r 'kind) 'file-result)
+                                             (eq? (result-ref r 'status) 'fail)))
+                             par-results))
+           (serial-results (if (and (opt 'fail-fast) par-failed?)
+                               '()
+                               (run-tasks-pool (map make-job serial-specs) 1 (opt 'fail-fast) on-res)))
+           (all-results (append par-results serial-results))
+           (total-ms (elapsed-ms start)))
       (when (opt 'list-tests)
         (let ((list-errors 0) (listed-count 0))
           (for-each
             (lambda (r)
               (let ((id (result-ref r 'file))
-                     (listed (result-ref r 'events))
-                     (err (result-ref r 'error)))
-                 (if err
-                     (begin
-                       (set! list-errors (+ list-errors 1))
+                    (listed (result-ref r 'events))
+                    (err (result-ref r 'error)))
+                (if err
+                    (begin
+                      (set! list-errors (+ list-errors 1))
                       (display (string-append "error listing " id ": " err "\n") (current-error-port)))
                     (for-each
                       (lambda (ev)
                         (set! listed-count (+ listed-count 1))
-                         (unless (string=? id (result-ref ev 'name)) (display id) (display "::"))
-                         (displayln (result-ref ev 'name)))
+                        (let ((name (result-ref ev 'name)))
+                          (unless (string=? id name) (display id) (display "::"))
+                          (displayln name)))
                       listed))))
             all-results)
           (exit (if (and (= list-errors 0) (or (null? filters) (> listed-count 0))) 0 1))))
-      (let* ((all-results (filter (lambda (r) (> (+ (result-ref r 'passed) (result-ref r 'failed) (result-ref r 'skipped)) 0))
-                                   all-results))
-              (total-passed (apply + (map (lambda (r) (result-ref r 'passed)) all-results)))
+      (let* ((all-results (filter (lambda (r) (> (+ (result-ref r 'passed)
+                                                   (result-ref r 'failed)
+                                                   (result-ref r 'skipped)) 0))
+                                  all-results))
+             (total-passed (apply + (map (lambda (r) (result-ref r 'passed)) all-results)))
              (total-failed (apply + (map (lambda (r) (result-ref r 'failed)) all-results)))
              (total-skipped (apply + (map (lambda (r) (result-ref r 'skipped)) all-results)))
              (files-ran (length all-results))
-             (matched-nothing? (and (pair? filters) (= (+ total-passed total-failed total-skipped) 0)))
-             (ok? (and (= total-failed 0) (> files-ran 0) (not matched-nothing?))))
+             (matched-nothing? (and (pair? filters) (= files-ran 0)))
+             (ok? (and (= total-failed 0) (> files-ran 0))))
         (if (eq? (opt 'format) 'sexp)
             (begin
               (write `((status ,(if ok? 'ok 'failed))
@@ -962,13 +903,12 @@
                             (lambda (r)
                               (and (eq? (result-ref r 'status) 'fail)
                                    `((file ,(result-ref r 'file))
-                                      (mode ,(result-ref r 'mode))
-                                      (tests ,(filter (lambda (ev) (eq? (result-ref ev 'status) 'fail))
-                                                       (result-ref r 'events))))))
-                             all-results))))
+                                     (tests ,(filter (lambda (ev) (eq? (result-ref ev 'status) 'fail))
+                                                     (result-ref r 'events))))))
+                            all-results))))
               (newline))
             (begin
-              (print-failures all-results multi-mode?)
+              (print-failures all-results)
               (newline)
               (when matched-nothing?
                 (displayln "error: filter matched 0 tests"))
@@ -978,4 +918,4 @@
               (display total-failed) (display " failed, ")
               (display total-skipped) (display " skipped (")
               (display (format-seconds total-ms)) (displayln ")")))
-        (exit (if ok? 0 1)))))))
+        (exit (if ok? 0 1))))))
