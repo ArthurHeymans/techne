@@ -1,7 +1,7 @@
 ;;; Run from the repository root, with the absolute techne binary as argument.
 ;;; These are golden-output tests on recorded data, not timing benchmarks.
 (import (techne test))
-(test-file #:environment (quote host) #:cwd (quote workspace))
+(test-file #:script #t #:environment (quote host) #:cwd (quote workspace))
 (define binary (if (pair? (cdr (command-line))) (cadr (command-line)) (test-executable)))
 (define (fixture name) (string-append "crates/techne-cli/tests/bench/" name))
 (define (report expected script args stdin)

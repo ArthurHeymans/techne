@@ -1,5 +1,5 @@
 (import (techne test))
-(test-file #:environment (quote host))
+(test-file #:script #t #:environment (quote host))
 (require "../../http/http.scm")
 (require "../../http/server.scm")
 

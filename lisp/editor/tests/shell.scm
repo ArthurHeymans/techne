@@ -6,7 +6,7 @@
 ;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
 
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 (require "../shell.scm")
 
 (define (collect limit . pieces)

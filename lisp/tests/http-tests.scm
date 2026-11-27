@@ -1,4 +1,5 @@
 (import (techne test))
+(test-file #:script #t)
 (require "../schema.scm")
 (require "../http/http.scm")
 

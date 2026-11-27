@@ -1,5 +1,6 @@
 ;;; Run: techne run packages/mail/tests/mail-backend-tests.scm
 (import (techne test))
+(test-file #:script #t)
 (import (mail imap) (mail maildir) (mail mime) (techne uuid))
 
 (define (field row key) (cdr (assq key row)))

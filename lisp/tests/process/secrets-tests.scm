@@ -2,7 +2,7 @@
 ;;; backend registry, `secret-ref`, `authinfo`, `sops`, `pass`, and `env`.
 (import (techne) (techne secrets) (techne trusted-process) (techne task) (techne uuid))
 (import (techne test))
-(test-file #:environment (quote host))
+(test-file #:script #t #:environment (quote host))
 
 (define tmp (string-append (or (get-environment-variable "TMPDIR") "/tmp") "/techne-secrets-" (uuid-v4)))
 (create-directory tmp #o700)

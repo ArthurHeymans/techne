@@ -231,15 +231,50 @@
           (let ((soft (run-techne-test pkg (path-join pkg "tests/soft-test.scm"))))
             (assert-equal 1 (car soft))
             (assert-match "check mismatch" (cadr soft)))
-          ;; Check-only file with non-matching filter reports 0 matched and fails
-          (write-file (path-join pkg "tests/legacy-test.scm")
-            "(import (techne test))\n(check \"legacy\" 1 1)\n")
-          (let ((legacy (run-techne-test pkg (path-join pkg "tests/legacy-test.scm") "no-such-filter")))
-            (assert-equal 1 (car legacy))
-            (assert-match "filter matched 0 tests" (cadr legacy)))
           ;; --list-tests surfaces load errors and exits non-zero
           (write-file (path-join pkg "tests/broken-test.scm")
             "(import (techne test))\n(error \"broken load\")\n")
           (let ((lt (run-techne-test pkg "--list-tests" (path-join pkg "tests/broken-test.scm"))))
             (assert-equal 1 (car lt))
             (assert-match "broken load" (caddr lt))))))))
+
+(define-test "script selection is static and requirements do not select files"
+  (call-with-temporary-directory
+    (lambda (root)
+      (let ((script (path-join root "tests/script.scm"))
+            (marker (path-join root "script-ran")))
+        (make-directory (path-join root "tests"))
+        (write-file (path-join root "techne-package.scm") "(package selection)")
+        (write-file script
+          (string-append "(import (techne) (techne test))\n(test-file #:script #t)\n"
+                         "(call-with-output-file \""
+                         marker "\" (lambda (p) (display \"ran\" p)))\n(check \"legacy\" 1 1)\n"))
+        (write-file (path-join root "tests/requires.scm")
+          "(import (techne test))\n(test-file #:requires '(program \"techne-test-program-that-does-not-exist\"))\n(define-test \"gated body\" (error \"must not run\"))\n")
+        (let ((listed (run-techne-test root "--list-tests")))
+          (assert-equal 0 (car listed))
+          (assert-match "selection:tests/script.scm" (cadr listed))
+          (assert-match "gated body" (cadr listed)))
+        (assert-false (file-exists? marker))
+        (let* ((no-match (run-techne-test root "-k" "zzz-nomatch" "--format" "sexp"))
+               (data (read (open-input-string (cadr no-match)))))
+          (assert-equal 1 (car no-match))
+          (assert-equal 0 (cadr (assq 'files data)))
+          (assert-equal 0 (cadr (assq 'skipped data))))
+        (assert-false (file-exists? marker))
+        (let ((gated (run-techne-test root "-k" "gated body")))
+          (assert-equal 0 (car gated))
+          (assert-match "1 skipped" (cadr gated)))
+        (let ((selected (run-techne-test root "-k" "script.scm")))
+          (assert-equal 0 (car selected))
+          (assert-match "1 file, 1 passed" (cadr selected)))
+        (assert-equal "ran" (file->string marker))))))
+
+(define-test "checks called by helpers at registered-file load are errors"
+  (call-with-temporary-directory
+    (lambda (root)
+      (write-file (path-join root "broken.scm")
+        "(import (techne test))\n(define (helper) (check-true \"bad\" #t))\n(helper)\n")
+      (let ((result (run-techne-test root "--list-tests" "broken.scm")))
+        (assert-equal 1 (car result))
+        (assert-match "wrap the check in a test or declare (test-file #:script #t)" (caddr result))))))

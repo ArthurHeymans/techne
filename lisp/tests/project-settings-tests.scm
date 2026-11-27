@@ -2,6 +2,7 @@
 
 (import (techne) (techne path) (techne uuid) (techne editorconfig) (techne project-settings))
 (import (techne test))
+(test-file #:script #t)
 
 (define (assert-true label v)
   (check label #t (and v #t)))

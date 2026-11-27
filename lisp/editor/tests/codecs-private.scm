@@ -2,7 +2,7 @@
 ;;; 0o600 enforcement on private replacement, and mid-decode symlink retargeting.
 (import (techne))
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../files.scm")
 (require "../session.scm")

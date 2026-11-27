@@ -49,6 +49,9 @@
 ;; inherited through environment variables.
 (define %worker-nonce #f)
 (define %worker-file #f)
+(define %worker-file-id #f)
+(define %worker-script? #f)
+(define %worker-requires-skip #f)
 (define %worker-filters '())
 (define %worker-timeout #f)
 (define %worker-capture? #t)
@@ -70,6 +73,9 @@
           (without (%cfg-ref cfg 'without '())))
       (set! %worker-nonce (if (and (string? nonce) (not (string=? nonce ""))) nonce #f))
       (set! %worker-file (%cfg-ref cfg 'file #f))
+      (set! %worker-file-id (%cfg-ref cfg 'file-id #f))
+      (set! %worker-script? (%cfg-ref cfg 'script #f))
+      (set! %worker-requires-skip (%cfg-ref cfg 'requires-skip #f))
       (set! %worker-filters (let ((f (%cfg-ref cfg 'filters '()))) (if (list? f) f '())))
       (set! %worker-timeout (and (exact-integer? timeout) (> timeout 0) timeout))
       (set! %worker-capture? (and (%cfg-ref cfg 'capture #t) #t))
@@ -150,6 +156,7 @@ The directory is removed when PROC returns, raises, or unwinds."
                    #:without [without '()]
                    #:timeout [timeout #f]
                    #:serial [serial #f]
+                    #:script [script #f]
                    #:gc-stress [gc-stress 'default]
                    #:requires [requires '()]
                    #:cwd [cwd #f]
@@ -160,6 +167,8 @@ capabilities; TIMEOUT sets the per-file timeout in seconds; SERIAL
 runs the file alone; GC-STRESS toggles GC stress mode; REQUIRES gates
 on programs or env vars; CWD sets the working directory; IGNORE skips
 discovery for helper files."
+  (unless (boolean? script)
+    (error "test-file: #:script must be a boolean" script))
   (unless (memq environment '(vm host editor))
     (error "test-file: #:environment must be vm, host, or editor" environment))
   (unless (list? without)
@@ -167,6 +176,8 @@ discovery for helper files."
   (when (and timeout (not (and (exact-integer? timeout) (> timeout 0))))
     (error "test-file: #:timeout must be a positive integer (seconds)" timeout))
   (when (and (%test-runner-active?) (not ignore))
+    (unless (eq? script %worker-script?)
+      (error "test-file: #:script declaration must be at the top of the file after imports"))
     (let ((want-env (symbol->string environment))
           (want-without (map %canonical-cap-name without)))
       (unless (and (string? %worker-world) (string=? want-env %worker-world))
@@ -416,6 +427,8 @@ When TECHNE_BLESS=1 is set, writes ACTUAL to PATH and passes."
 (define (check name expected actual)
   "Count a soft check called NAME: ACTUAL must be `equal?` to EXPECTED.
 A failure is recorded and printed with both without aborting the test."
+  (when (and (%test-runner-active?) (not %worker-script?) (not (%active-soft-failures)))
+    (error "check: outside a running test; wrap the check in a test or declare (test-file #:script #t)"))
   (set! %count (+ %count 1))
   (unless (equal? expected actual)
     (set! %failures (+ %failures 1))
@@ -540,6 +553,8 @@ Under `techne test`, this is a no-op so the runner collects results."
           (if err-port (get-output-string err-port) ""))))
 
 (define (%register-test! name thunk raw-opts)
+  (when %worker-script?
+    (error "define-test: script files cannot register tests"))
   (let* ((full-name (%join-suite-name name))
          (loc (procedure-location thunk))
          (opts (%parse-test-options raw-opts)))
@@ -642,50 +657,26 @@ Under `techne test`, this is a no-op so the runner collects results."
     (list passed failed skipped)))
 
 (define (%test-worker-finish!)
-  "Finalize a `--test-worker` run: run registered `define-test`s or report
-top-level checks/load errors as structured S-expression events."
-  (let* ((test-file %worker-file)
-         (load-err %worker-load-error)
-         (filters %worker-filters)
-         (timeout %worker-timeout)
-         (capture? %worker-capture?)
-         (list-only? %worker-list-only?)
-         (raw-port (current-output-port))
-         (top-checks %count)
-         (top-fails %failures)
-         (reg (%test-registered)))
+  "Report load errors and script checks, or run the selected registered tests."
+  (let ((raw-port (current-output-port)))
     (cond
-      (load-err
-       (%test-emit `(test-result "<load>" fail 0 ,test-file ,load-err "" ""))
+      (%worker-load-error
+       (%test-emit `(test-result "<load>" fail 0 ,%worker-file ,%worker-load-error "" ""))
        (%test-emit '(test-done 0 1 0)))
-      ((pair? reg)
-       (let* ((counts (%test-run-worker! filters timeout capture? list-only? raw-port))
-              (p (car counts))
-              (f (cadr counts))
-              (s (caddr counts)))
-         (when (and (not list-only?) (> top-checks 0) (null? filters))
-           (let ((st (if (= top-fails 0) 'pass 'fail))
-                 (det (if (= top-fails 0) ""
-                          (string-append (number->string top-fails) " of "
-                                         (number->string top-checks) " top-level checks failed"))))
-             (if (eq? st 'pass) (set! p (+ p 1)) (set! f (+ f 1)))
-             (%test-emit `(test-result "<top-level>" ,st 0 ,test-file ,det "" ""))))
-         (%test-emit `(test-done ,p ,f ,s))))
-      (list-only?
-       (when (null? filters)
-         (%test-emit `(test-list "<top-level>" ,test-file)))
-       (%test-emit '(test-done 0 0 0)))
-      ((> top-checks 0)
-       (if (pair? filters)
-           ;; Check-only files have no individual test names to match a filter.
-           (%test-emit '(test-done 0 0 0))
-           (let ((st (if (= top-fails 0) 'pass 'fail))
-                 (det (if (= top-fails 0) ""
-                          (string-append (number->string top-fails) " of "
-                                         (number->string top-checks) " checks failed"))))
-             (%test-emit `(test-result "<top-level>" ,st 0 ,test-file ,det "" ""))
-             (%test-emit `(test-done ,(if (= top-fails 0) 1 0) ,(if (= top-fails 0) 0 1) 0)))))
+      (%worker-script?
+       (let* ((ok? (= %failures 0))
+              (detail (if ok? "" (string-append (number->string %failures) " of "
+                                                (number->string %count) " checks failed"))))
+         (%test-emit `(test-result ,%worker-file-id ,(if ok? 'pass 'fail) 0 ,%worker-file ,detail "" ""))
+         (%test-emit `(test-done ,(if ok? 1 0) ,(if ok? 0 1) 0))))
+      ((and %worker-requires-skip
+            (any (lambda (entry) (%matches-filter? (car entry) %worker-filters)) %registered))
+       (%test-emit `(test-result "<file>" skip 0 ,%worker-file ,%worker-requires-skip "" ""))
+       (%test-emit '(test-done 0 0 1)))
+      ((and (null? %registered) (null? %worker-filters) (not %worker-list-only?))
+       (%test-emit `(test-result "<file>" fail 0 ,%worker-file "file registered no tests" "" ""))
+       (%test-emit '(test-done 0 1 0)))
       (else
-       (%test-emit `(test-result "<top-level>" fail 0 ,test-file
-                                 "file defined no tests and ran no checks" "" ""))
-       (%test-emit '(test-done 0 1 0))))))
+       (let ((counts (%test-run-worker! %worker-filters %worker-timeout %worker-capture?
+                                        %worker-list-only? raw-port)))
+         (%test-emit (cons 'test-done counts)))))))

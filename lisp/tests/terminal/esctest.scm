@@ -4,7 +4,7 @@
 ;;;    or: techne run lisp/tests/terminal/esctest.scm ESCTEST2 TECHNE
 ;;; ESCTEST2 revision: 664be3cf2c1e3f06bc93a8bafb48a0db83c607db.
 (import (techne) (techne uuid) (techne test))
-(test-file #:environment 'host #:serial #t #:requires '((env "ESCTEST2") (program "tmux")))
+(test-file #:script #t #:environment 'host #:serial #t #:requires '((env "ESCTEST2") (program "tmux")))
 
 (define args (cdr (command-line)))
 (define esctest-dir

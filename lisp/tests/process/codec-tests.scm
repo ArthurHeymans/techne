@@ -1,7 +1,7 @@
 ;;; Tests for `(techne codec)` and binary `run-trusted-tool-bytes`.
 (import (techne) (techne codec) (techne trusted-process) (techne task) (techne uuid))
 (import (techne test))
-(test-file #:environment (quote host))
+(test-file #:script #t #:environment (quote host))
 
 (define tmp-raw (string-append (or (get-environment-variable "TMPDIR") "/tmp") "/techne-codec-" (uuid-v4)))
 (create-directory tmp-raw #o700)

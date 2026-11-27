@@ -1,7 +1,7 @@
 ;;; Citation bounds are not semantic support; revisions belong to the read.
 (import (techne test))
 (require "support.scm")
-(test-file #:environment (quote host))
+(test-file #:script #t #:environment (quote host))
 (import (techne tools))
 
 (with-tool-project "citation bounds and invalid arguments"

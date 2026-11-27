@@ -1,7 +1,7 @@
 ;;; Multi-process concurrency and locking tests for `(techne project-settings)` trust ledger.
 (import (techne) (techne project-settings) (techne uuid))
 (import (techne test))
-(test-file #:environment (quote host))
+(test-file #:script #t #:environment (quote host))
 
 (define techne-bin (or (get-environment-variable "TECHNE_BIN") "techne"))
 (define tmp-raw (string-append (or (get-environment-variable "TMPDIR") "/tmp")

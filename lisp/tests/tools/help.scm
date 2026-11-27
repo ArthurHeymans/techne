@@ -1,7 +1,7 @@
 ;;; Runs in a host world without file or process grants.
 (import (techne test))
 (require "support.scm")
-(test-file #:environment (quote host) #:without (quote (files processes)))
+(test-file #:script #t #:environment (quote host) #:without (quote (files processes)))
 (import (techne tools))
 (define (help-fixture x) "A live help fixture." x)
 

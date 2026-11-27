@@ -2,7 +2,7 @@
 ;;; Usage: techne run lisp/tests/tools/cli.scm /absolute/path/to/techne
 (import (techne test))
 (require "support.scm")
-(test-file #:environment (quote host))
+(test-file #:script #t #:environment (quote host))
 (import (techne tools))
 
 (define binary

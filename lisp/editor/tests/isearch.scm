@@ -2,7 +2,7 @@
 ;;; stays in the host suite. Use the pane, not the minibuffer's input view,
 ;;; when asking where the match is.
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../api.scm")
 (require "../session.scm")

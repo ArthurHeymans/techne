@@ -10,7 +10,7 @@
 ;;;    an async success, and an async cancellation settles every selected file with exact totals.
 (import (techne))
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../files.scm")
 (require "../buffers.scm")

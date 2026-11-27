@@ -4,7 +4,7 @@
 (import (techne) (techne location) (techne endpoint) (techne execution-site)
         (techne trusted-process) (techne uuid) (techne crypto))
 (import (techne test))
-(test-file #:environment (quote host))
+(test-file #:script #t #:environment (quote host))
 
 (define (techne-bin)
   (or (get-environment-variable "TECHNE_BIN")

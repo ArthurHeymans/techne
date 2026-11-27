@@ -1,4 +1,5 @@
 (import (techne test))
+(test-file #:script #t)
 (require "../org/date.scm")
 (require "../org/org.scm")
 (require "../org/agenda.scm")

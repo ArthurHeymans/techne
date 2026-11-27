@@ -1,6 +1,6 @@
 ;;; A buffer's next snapshot must reflect changes made without editing text.
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../modes.scm")
 (require "../session.scm")

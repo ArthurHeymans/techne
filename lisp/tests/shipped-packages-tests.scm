@@ -2,6 +2,7 @@
 ;;; of this repository that depends on one of them without the editor.
 (import (techne) (techne package) (techne path))
 (import (techne test))
+(test-file #:script #t)
 
 ;; Each manifest is one, named as its directory, and depends on nothing:
 ;; the editor relies on that to advertise them at start without

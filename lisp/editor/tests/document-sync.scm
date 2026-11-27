@@ -5,7 +5,7 @@
 ;;; Run by crates/techne-editor/tests/lisp.rs, which provides the natives.
 
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 
 (define d (make-document "ab\ncdéf\n"))
 (define v (make-view d "user"))

@@ -1,5 +1,5 @@
 (import (techne test))
-(test-file #:environment (quote host))
+(test-file #:script #t #:environment (quote host))
 (require "../../cloud/tokens.scm")
 (import (techne crypto))
 

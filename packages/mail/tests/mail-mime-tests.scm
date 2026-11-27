@@ -1,5 +1,6 @@
 ;;; Fixtures are relative to this suite, independent of the working directory.
 (import (techne test))
+(test-file #:script #t)
 (import (mail mime) (mail html) (techne path))
 
 (define (field msg key) (cdr (assq key msg)))

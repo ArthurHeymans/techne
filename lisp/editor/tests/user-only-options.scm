@@ -1,6 +1,6 @@
 ;;; Tests for #:user-only option metadata and principal/cell guards.
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../modes.scm")
 (require "../operations.scm")

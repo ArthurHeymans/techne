@@ -10,7 +10,7 @@
 ;;;    memory-only ('none) trust stays isolated from file-backed editor ledgers.
 (import (techne) (techne editorconfig))
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../api.scm")
 (require "../modes.scm")

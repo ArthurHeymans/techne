@@ -1,6 +1,6 @@
 ;;; Start with a fresh history, independent of other search scenarios.
 (import (techne test))
-(test-file #:environment (quote editor))
+(test-file #:script #t #:environment (quote editor))
 (require "../main.scm")
 (require "../session.scm")
 (require "../dispatch.scm")

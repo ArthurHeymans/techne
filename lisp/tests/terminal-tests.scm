@@ -1,5 +1,6 @@
 (import (techne) (techne terminal))
 (import (techne test))
+(test-file #:script #t)
 
 (define esc (string #\x1b))
 (define (csi tail) (string-append esc "[" tail))
