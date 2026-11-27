@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795794422911,
+  "lastUpdate": 1795794424710,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -66481,6 +66481,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 102681,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d13280997589a36a5406d1fbf88017a6966d3186",
+          "message": "Merge pull request #427 from ArthurHeymans/editor/orderless-completion\n\nAdd unified Orderless completion across minibuffer, popup, and project search",
+          "timestamp": "2026-11-27T16:39:18+01:00",
+          "tree_id": "d9529f25fe2ba364085b97f1038ecbc68dc31d21",
+          "url": "https://github.com/ArthurHeymans/techne/commit/d13280997589a36a5406d1fbf88017a6966d3186"
+        },
+        "date": 1795794424635,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 697622623,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 632745327,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104365,
             "unit": "data"
           }
         ]
