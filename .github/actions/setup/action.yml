@@ -13,6 +13,12 @@ runs:
   using: composite
   steps:
     - uses: cachix/install-nix-action@v31
+    # Cache the dev shell's Nix store paths across runs so jobs do not
+    # re-download the toolchain and tools from cache.nixos.org every time.
+    - uses: nix-community/cache-nix-action@v7
+      with:
+        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ inputs.shell }}-${{ hashFiles('flake.nix', 'flake.lock', 'rust-toolchain.toml') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-${{ inputs.shell }}-
     # The cache action calls cargo and rustc itself, and keys the cache by the
     # rustc version: give it the dev shell's, not the runner's.
     - name: Put the dev shell's toolchain on PATH
