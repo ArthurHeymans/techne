@@ -22,6 +22,7 @@ usage: techne [SUBCOMMAND] [ARGS...]
   attach --stdio [--start] relay to the editor running here (what ssh runs)
   run [OPTS] FILE [ARGS]   run a Scheme file (--world vm|host|editor, --without CAPS)
   test [ARGS]              run Scheme tests; test --help for options
+  check [ARGS]             check Scheme packages and docstrings; check --help for options
   repl                     a Lisp REPL in this terminal
   tool ROOT [FORM [SESSION]] bounded tools for callers; tool --help to begin
   node [ARGS]              serve the node protocol, or nREPL with --nrepl PORT
@@ -68,6 +69,7 @@ fn main() -> ExitCode {
         "attach" => attach(rest()),
         "run" => run(args.split_off(1)),
         "test" => test(args.split_off(1)),
+        "check" => check(args.split_off(1)),
         "repl" => match rest() {
             none if none.is_empty() => techne_vm::cli::main_with(none, install),
             _ => usage(),
@@ -183,6 +185,7 @@ fn run(args: Vec<String>) -> ExitCode {
             {
                 dispatch(|vm| {
                     techne_editor::install(vm);
+                    techne_net::install(vm)?;
                     techne_node::install(vm)
                 })
             }
@@ -202,15 +205,23 @@ fn run(args: Vec<String>) -> ExitCode {
 
 /// Scheme owns the test runner; this only selects its entry point.
 fn test(args: Vec<String>) -> ExitCode {
+    scheme_command("test", "test-runner.scm", args)
+}
+
+/// Scheme owns the package/docstring checker; this only selects its entry point.
+fn check(args: Vec<String>) -> ExitCode {
+    scheme_command("check", "check-runner.scm", args)
+}
+
+fn scheme_command(name: &str, script: &str, args: Vec<String>) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            eprintln!("techne test: {e}");
+            eprintln!("techne {name}: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let mut call =
-        vec![techne_vm::library::lisp_dir().join("test-runner.scm").to_string_lossy().into_owned(), exe.to_string_lossy().into_owned()];
+    let mut call = vec![techne_vm::library::lisp_dir().join(script).to_string_lossy().into_owned(), exe.to_string_lossy().into_owned()];
     call.extend(args);
     techne_vm::cli::main_with(call, install)
 }

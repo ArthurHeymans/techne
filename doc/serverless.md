@@ -847,7 +847,7 @@ people need, made explicit:
   and, at best effort, a hint (an unbound name close to a bound one, a
   wrong number of arguments with the procedure's signature). Today nREPL
   sends rendered text (runtime work 8). The docstrings
-  checked by `crates/techne-editor/tests/documentation.rs` are served by
+  checked by `techne check --all` are served by
   `info`, so an agent can look up what it is calling.
 - **Idempotent and checkable**: deploying the same bundle twice is one
   deployment (bundles are content-addressed); `deploy` with `dry-run`

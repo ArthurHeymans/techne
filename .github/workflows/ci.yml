@@ -80,6 +80,8 @@ jobs:
       - run: target/release/techne test --all --environment vm --timeout 300
         env:
           TECHNE_GC_STRESS: "1"
+      # Package manifests, library docstrings, and editor documentation checks.
+      - run: target/release/techne check --all
       # The Emacs client against the server the tests above built.
       - run: TECHNE_NODE=$PWD/target/release/techne-node emacs -Q --batch -L editors/emacs -l editors/emacs/techne-test.el -f ert-run-tests-batch-and-exit
       - run: cargo test --release --doc

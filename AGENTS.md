@@ -43,6 +43,7 @@ must pass alone with `-k`. Mark legacy top-level checks with
 `(test-file #:script #t)`; the file id is its single test name.
 `#:environment 'editor` installs editor natives for headless tests; the
 default `vm` selects VM natives and is not a filesystem sandbox.
+Check package manifests and docstrings with `techne check` (`(techne checkdoc)`).
 Keep Rust tests for the host contracts they actually observe (for example,
 frontend snapshots or process reaping). A test that needs host setup can
 still keep its scenario and assertions in a `.scm` file.
