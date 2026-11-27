@@ -446,12 +446,13 @@ must take no arguments; successful values should themselves be bounded."
                     (vector-set! state 3 (+ kept (string-length part)))))))
             (loop)))))
 
-    (define (tool-run project program args #:retain [retain 4000] #:environment [environment '()] #:keep [keep #f]
+    (define (tool-run project program args #:retain [retain 8000] #:environment [environment '()] #:keep [keep #f]
                       #:timeout [timeout #f])
       "Start a command, PROGRAM with ARGS, in PROJECT; keep bounded output.
 RETAIN is 1 to 16000 characters per stream, kept from its end and from
-its start (`tool-process-result` #:head #t reports that). Both streams drain
-concurrently, even after their retained text is full. The current scope
+its start (`tool-process-result` #:head #t reports that); left out, it
+is 8000, the most `tool-process-result` shows of a stream. Both streams
+drain concurrently, even after their retained text is full. The current scope
 owns the process. Wait with `tool-process-result`, or cancel explicitly;
 this does not run a shell unless PROGRAM is a shell. ENVIRONMENT is a
 list of (name . value) strings added to the inherited environment.
@@ -495,7 +496,8 @@ exited by then; its result says timed-out."
     (define (tool-process-result job #:chars [chars 2000] #:wait [wait #f] #:head [head #f])
       "Wait for JOB and return its status and bounded stdout and stderr.
 CHARS is 1 to 8000 characters per stream; more shows 8000, the reply
-saying what it left out. Characters counts all text
+saying what it left out. No stream shows more than `tool-run` retained
+of it (its #:retain). Characters counts all text
 seen; retained counts the saved tail. Dropped reports retention loss,
 clipped a smaller report window, and truncated either kind of omission.
 This is a tail, not parsed diagnostics. Repeated reads are safe.
