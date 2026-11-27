@@ -202,6 +202,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    # Keep the default linker so dynamic-linker startup instruction counts
+    # stay comparable with main's benchmark history.
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
