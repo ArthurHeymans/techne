@@ -36,6 +36,7 @@
 (require "requests.scm")
 (require "operations.scm")
 (require "files.scm")
+(require "orderless.scm")
 
 (provide completing-read async-source candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
          minibuffer-map minibuffer-keymaps minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
@@ -104,19 +105,21 @@ or asked for."
 ;;; A source whose candidates come later.
 
 (define-record-type async-source
-  (%async-source produce min-input)
+  (%async-source produce min-input filter?)
   async-source?
   (produce async-produce)
-  (min-input async-min-input))
+  (min-input async-min-input)
+  (filter? async-filter?))
 
-(define (async-source produce #:min-input [min-input 3])
+(define (async-source produce #:min-input [min-input 3] #:filter [filter #f])
   "Return a source of candidates for `completing-read` that come later.
 (PRODUCE input) returns the candidates for the input, as a list; it
 runs in a task, so it can wait, for a service's answer say. The input
 changing cancels it, for the new input. An input shorter than
 MIN-INPUT has no candidates. Until they come, those for the input
-before are shown."
-  (%async-source produce min-input))
+before are shown. When FILTER is true, returned candidates are also
+filtered by Orderless against the input pattern."
+  (%async-source produce min-input filter))
 
 ;;; The open minibuffer.
 
@@ -240,7 +243,7 @@ minibuffer is open, and aborting cancels it."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
          (source (cond ((procedure? source) (owned source))
-                       ((async-source? source) (%async-source (owned (async-produce source)) (async-min-input source)))
+                       ((async-source? source) (%async-source (owned (async-produce source)) (async-min-input source) (async-filter? source)))
                        ;; Its own matcher: filtering is the minibuffer's.
                        ((candidate-table? source)
                         (%candidate-table (matcher-copy (table-matcher source)) (owned (table-make source)) (table-made source)))
@@ -320,39 +323,21 @@ While the minibuffer is open they act on its input otherwise."
         (sset! s 'input-view v)
         r))))
 
-;;; Matching
+;;; Matching (delegated to `orderless.scm`, shared with the popup and
+;;; project search).
 
 (define (pattern-parts pattern)
-  "Return the parts of PATTERN, the words it has.
-Each matches without case unless it has an upper-case letter."
-  (filter (lambda (p) (not (string=? p ""))) (string-split pattern " ")))
-
-(define (fold-case? part) (not (any char-upper-case? (string->list part))))
-
-;; Where PART starts in candidate C's text, or #f. Without case, both
-;; are folded (a title-case letter is not upper case, but folds).
-(define (part-index c part)
-  (if (fold-case? part)
-      (string-contains (candidate-folded c) (string-downcase part))
-      (string-contains (candidate-text c) part)))
+  "Return the Orderless component strings of PATTERN.
+Unescaped spaces split components; `\\ ` keeps a space inside one."
+  (orderless-split pattern))
 
 (define (matches? c parts)
-  "Return #t if every one of PARTS occurs in the text of candidate C."
-  (every (lambda (p) (part-index c p)) parts))
-
-;; Where PART occurs in candidate C's text: (from to), or #f.
-(define (find-part c part)
-  (let ((i (part-index c part)))
-    (and i (list i (+ i (string-length part))))))
+  "Return #t if every one of PARTS matches the text of candidate C."
+  (orderless-matches? (candidate-text c) parts #:folded (candidate-folded c)))
 
 (define (match-spans c parts)
-  "Return the spans each of PARTS matches in candidate C's text.
-Return #f if one does not occur."
-  (let loop ((parts parts) (spans '()))
-    (if (null? parts)
-        (sort spans (lambda (a b) (< (car a) (car b))))
-        (let ((m (find-part c (car parts))))
-          (and m (loop (cdr parts) (cons m spans)))))))
+  "Return the merged spans PARTS match in candidate C's text, or #f."
+  (orderless-match-spans (candidate-text c) parts #:folded (candidate-folded c)))
 
 ;; How many candidates match the current input. Which parts of them
 ;; match is found again for the few shown.
@@ -364,8 +349,13 @@ Return #f if one does not occur."
           (set-mb-table! mb (list-table (history-first mb input ((mb-source mb) input)))))
         (when (async-source? (mb-source mb))
           (ask! mb input))
-        (let ((n (matcher-filter! (table-matcher (mb-table mb))
-                                  (if (async-source? (mb-source mb)) "" ((mb-pattern mb) input)))))
+        (let* ((source (mb-source mb))
+               (filter? (or (not (async-source? source)) (async-filter? source)))
+               (pat (if filter? ((mb-pattern mb) input) ""))
+               (m (table-matcher (mb-table mb)))
+               (n (if (or (not filter?) (> (string-length pat) 1024) (orderless-simple-pattern? pat))
+                      (matcher-filter! m pat)
+                      (matcher-filter-parts! m (orderless-filter-specs (orderless-parse pat))))))
           (set-mb-matches! mb n)
           (set-mb-revision! mb rev)
           (set-mb-selected! mb (cond ((recalled-match mb input n))
@@ -399,14 +389,16 @@ Return #f if one does not occur."
 ;; command or file it took before, not another with that in its name.
 ;; An async source's are those for the input once they come.
 (define (recalled-match mb input n)
-  (and (equal? input (mb-recalled mb))
-       (not (eq? (mb-remember mb) 'input))
-       (let ((m (table-matcher (mb-table mb))) (text ((mb-pattern mb) input)))
-         ;; A directory: no candidate is named "".
-         (let loop ((k (if (string=? text "") n 0)))
-           (cond ((>= k n) #f)
-                 ((string=? (matcher-text m (matcher-match m k)) text) k)
-                 (else (loop (+ k 1))))))))
+  (let* ((rec (mb-recalled mb))
+         (completed? (and (pair? rec) (eq? (car rec) 'complete) (equal? input (cdr rec))))
+         (history? (and (string? rec) (equal? input rec) (not (eq? (mb-remember mb) 'input)))))
+    (and (or completed? history?)
+         (let ((m (table-matcher (mb-table mb))) (text ((mb-pattern mb) input)))
+           ;; A directory: no candidate is named "".
+           (let loop ((k (if (string=? text "") n 0)))
+             (cond ((>= k n) #f)
+                   ((string=? (matcher-text m (matcher-match m k)) text) k)
+                   (else (loop (+ k 1)))))))))
 
 ;; Ask an async source for the candidates for INPUT, unless asked
 ;; already. When they come they replace those shown, the first selected
@@ -505,7 +497,15 @@ It is #f also when the input itself is selected."
 It goes after the part the pattern leaves out."
   (open-minibuffer s)
   (let ((c (minibuffer-selected s)) (mb (minibuffer s)))
-    (when c (set-input! mb (completed mb c)))))
+    (when c
+      (let ((text (completed mb c)))
+        (set-mb-recalled! mb (cons 'complete text))
+        (set-input! mb text)))))
+
+(define-command (minibuffer-insert-separator s n)
+  "Insert a space separating Orderless completion parts."
+  (open-minibuffer s)
+  (insert-text! s (make-string (max n 0) #\space) "new"))
 
 ;; The input of MB completed with candidate C: its text after the part
 ;; the pattern leaves out (a file name after its directory).
@@ -795,6 +795,7 @@ The minibuffer closes first, its previews undone."
             ("M-<" minibuffer-first) ("M->" minibuffer-last)
             ("M-p" minibuffer-previous-history) ("M-n" minibuffer-next-history)
             ("RET" minibuffer-accept) ("M-RET" minibuffer-accept-input) ("TAB" minibuffer-complete)
+            ("M-SPC" minibuffer-insert-separator)
             ("C-g" minibuffer-abort) ("ESC" minibuffer-abort) ("C-;" minibuffer-act)
             ;; Editing the input.
             ("C-f" forward-char) ("C-b" backward-char) ("M-f" forward-word) ("M-b" backward-word)
@@ -862,7 +863,10 @@ the selected one."
                      (string-append (if (and (mb-slot mb) (request-pending? (mb-slot mb))) "… " "")
                                     (if (and i (>= i 0)) (number->string (+ i 1)) "*") "/" (number->string n) " " (mb-prompt mb)))
                  (mb-view mb)
-                 (map (lambda (c) (candidate-row c (or (match-spans c (pattern-parts ((mb-pattern mb) (minibuffer-input* mb)))) '())))
-                      shown)
+                 (let* ((pat ((mb-pattern mb) (minibuffer-input* mb)))
+                        (parts (if (> (string-length pat) 1024)
+                                   '()
+                                   (orderless-parse pat))))
+                   (map (lambda (c) (candidate-row c (or (match-spans c parts) '()))) shown))
                  (and i (>= i 0) (- i offset))
                  (eqv? i -1))))))

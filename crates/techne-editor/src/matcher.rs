@@ -10,9 +10,141 @@
 //! the part has an upper-case letter. Copies share the texts and filter
 //! on their own, one per minibuffer.
 
-use std::{borrow::Cow, cell::OnceCell, rc::Rc};
+use std::{cell::OnceCell, rc::Rc};
 
 use memchr::memmem::Finder;
+use regex_cursor::{Cursor, Input, engines::meta::Regex};
+use techne_vm::data::Data;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PartKind {
+    Literal,
+    Flex,
+    LiteralOrRegexp,
+    Regexp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterPart {
+    pub kind: PartKind,
+    pub text: String,
+    pub fold: bool,
+}
+
+impl FilterPart {
+    pub fn literal(text: impl Into<String>, fold: bool) -> Self {
+        Self { kind: PartKind::Literal, text: text.into(), fold }
+    }
+
+    pub fn from_legacy(raw: &str) -> Self {
+        let fold = !raw.chars().any(char::is_uppercase);
+        Self { kind: PartKind::Literal, text: raw.to_string(), fold }
+    }
+
+    pub fn normalized(&self) -> Self {
+        match self.kind {
+            PartKind::Literal | PartKind::Flex if self.fold => Self { kind: self.kind, text: self.text.to_lowercase(), fold: true },
+            _ => self.clone(),
+        }
+    }
+}
+
+pub(crate) fn parse_filter_parts(items: &[Data], allow_strings: bool) -> Result<Vec<FilterPart>, String> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Data::String(s) if allow_strings => {
+                if !s.is_empty() {
+                    out.push(FilterPart::from_legacy(s));
+                }
+            }
+            Data::List(elems) if elems.len() == 3 => {
+                let (Data::String(kind), Data::String(text), Data::Bool(fold)) = (&elems[0], &elems[1], &elems[2]) else {
+                    return Err("filter part must be (kind text fold?)".into());
+                };
+                let kind = match kind.as_str() {
+                    "literal" => PartKind::Literal,
+                    "flex" => PartKind::Flex,
+                    "literal-or-regexp" => PartKind::LiteralOrRegexp,
+                    "regexp" => PartKind::Regexp,
+                    other => return Err(format!("unknown filter part kind: {other}")),
+                };
+                if !text.is_empty() {
+                    out.push(FilterPart { kind, text: text.clone(), fold: *fold });
+                }
+            }
+            _ => return Err("filter part must be (kind text fold?)".into()),
+        }
+    }
+    Ok(out)
+}
+
+struct SliceCursor<'a>(&'a [u8]);
+
+impl Cursor for SliceCursor<'_> {
+    fn chunk(&self) -> &[u8] {
+        self.0
+    }
+    fn utf8_aware(&self) -> bool {
+        true
+    }
+    fn advance(&mut self) -> bool {
+        false
+    }
+    fn backtrack(&mut self) -> bool {
+        false
+    }
+    fn total_bytes(&self) -> Option<usize> {
+        Some(self.0.len())
+    }
+    fn offset(&self) -> usize {
+        0
+    }
+}
+
+pub(crate) fn compile_regexp(pattern: &str, fold: bool) -> Option<Regex> {
+    if fold { Regex::new(&format!("(?i){pattern}")).ok() } else { Regex::new(pattern).ok() }
+}
+
+pub(crate) fn regexp_is_match(re: &Regex, haystack: &[u8]) -> bool {
+    re.is_match(Input::new(SliceCursor(haystack)))
+}
+
+pub(crate) fn flex_match(haystack: &str, needle: &str) -> bool {
+    let mut chars = needle.chars();
+    let Some(mut want) = chars.next() else { return true };
+    for c in haystack.chars() {
+        if c == want {
+            match chars.next() {
+                Some(next) => want = next,
+                None => return true,
+            }
+        }
+    }
+    false
+}
+
+/// Whether `next` is guaranteed to match a subset of what `prev` matched.
+/// Regexp parts only refine when unchanged, since editing a regexp (e.g.
+/// adding `|alt` or `?`) can broaden its matches. Switching from folded to
+/// case-sensitive is only provably monotonic for ASCII (Unicode context-
+/// sensitive folding like Greek final sigma `ΟΣ` vs `ΟΣΑ` is not).
+fn refines(prev: &[FilterPart], next: &[FilterPart]) -> bool {
+    prev.iter().all(|p| {
+        next.iter().any(|q| match (p.kind, q.kind) {
+            (PartKind::Literal, PartKind::Literal) => {
+                (p.fold == q.fold && q.text.contains(&p.text))
+                    || (p.fold && !q.fold && p.text.is_ascii() && q.text.is_ascii() && q.text.to_ascii_lowercase().contains(&p.text))
+            }
+            (PartKind::Flex, PartKind::Flex) => {
+                (p.fold == q.fold && q.text.starts_with(&p.text))
+                    || (p.fold && !q.fold && p.text.is_ascii() && q.text.is_ascii() && q.text.to_ascii_lowercase().starts_with(&p.text))
+            }
+            (PartKind::LiteralOrRegexp, PartKind::LiteralOrRegexp) | (PartKind::Regexp, PartKind::Regexp) => p == q,
+            _ => false,
+        })
+    })
+}
 
 /// A part of a pattern to find. On x86_64 with AVX2, memchr's search for
 /// a pair of the needle's bytes is called directly: memmem's dispatch to it
@@ -68,9 +200,9 @@ struct Entries {
 
 pub struct Matcher {
     entries: Rc<Entries>,
-    /// Patterns, each extending the one before, with their matches; the
-    /// first is the empty pattern, which every entry matches.
-    stack: Vec<(String, Vec<u32>)>,
+    /// Part lists, each refining the one before, with their matches; the
+    /// first is the empty list, which every entry matches.
+    stack: Vec<(Vec<FilterPart>, Vec<u32>)>,
 }
 
 impl Matcher {
@@ -135,7 +267,7 @@ impl Matcher {
 
     fn sharing(entries: Rc<Entries>) -> Matcher {
         let all = (0..entries.spans.len() as u32).collect();
-        Matcher { entries, stack: vec![(String::new(), all)] }
+        Matcher { entries, stack: vec![(Vec::new(), all)] }
     }
 
     /// A matcher of the same entries, filtering on its own.
@@ -166,61 +298,123 @@ impl Matcher {
         self.entries.lines.get(entry).copied()
     }
 
-    /// Match `pattern`; return how many entries match.
+    /// Match `pattern` (legacy space-separated smart-case literals); return
+    /// how many entries match.
     pub fn filter(&mut self, pattern: &str) -> usize {
-        while !pattern.starts_with(self.stack.last().expect("the empty pattern").0.as_str()) {
+        let parts: Vec<FilterPart> = pattern.split(' ').filter(|p| !p.is_empty()).map(FilterPart::from_legacy).collect();
+        self.filter_parts(&parts)
+    }
+
+    /// Match parsed Orderless `parts`; return how many entries match.
+    pub fn filter_parts(&mut self, parts: &[FilterPart]) -> usize {
+        let mut normalized: Vec<FilterPart> = parts.iter().filter(|p| !p.text.is_empty()).map(FilterPart::normalized).collect();
+        // Run literal parts first (longest first, as likely the rarest), then
+        // flex and regexp parts on the already-narrowed entries; deduplicate.
+        normalized
+            .sort_by(|a, b| a.kind.cmp(&b.kind).then(b.text.len().cmp(&a.text.len())).then(a.fold.cmp(&b.fold)).then(a.text.cmp(&b.text)));
+        normalized.dedup();
+
+        while !refines(&self.stack.last().expect("the empty pattern").0, &normalized) {
             self.stack.pop();
         }
         let (last, within) = self.stack.last().expect("the empty pattern");
-        if last != pattern {
-            let mut parts: Vec<(bool, Cow<'_, str>)> = pattern
-                .split(' ')
-                .filter(|p| !p.is_empty())
-                .map(|p| match p.chars().any(char::is_uppercase) {
-                    true => (false, Cow::Borrowed(p)),
-                    false => (true, Cow::Owned(p.to_lowercase())),
-                })
-                .collect();
-            // The longest part first, as likely the rarest; each part once,
-            // a line yanked into the input repeating its words. Sorted and
-            // made unique as text: a searcher is made only for a part
-            // searched, and none once no entry is left, which a long line
-            // yanked into the input reaches after a few of its thousands.
-            parts.sort_by(|(fa, a), (fb, b)| b.len().cmp(&a.len()).then((fa, a).cmp(&(fb, b))));
-            parts.dedup();
+        if *last != normalized {
             let e = &self.entries;
-            // Each part narrows the entries the parts before left. While
-            // they are more than one in 16, it is found in all the text at
-            // once, from one of them to the next past each occurrence,
-            // rather than in each on its own, some 100 instructions more an
-            // entry: several common words (a line yanked into the input)
-            // took 40 M in the lines of a 100k-line file. Among fewer, each
-            // is searched, not the text between them.
             let mut found: Option<Vec<u32>> = None;
-            for (fold, part) in &parts {
+            for part in &normalized {
                 if found.as_ref().is_some_and(Vec::is_empty) {
                     break;
                 }
                 let entries = found.as_deref().unwrap_or(within);
-                let f = &Needle::new(part.as_bytes());
-                let (text, spans) = if *fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
-                found = match entries.len() * 16 >= spans.len() {
-                    // Entries folding lengthened are after the text.
-                    true => Some(entries_with(text, spans, f, entries, e.text.len())),
-                    false => Some(
-                        entries
-                            .iter()
-                            .copied()
-                            .filter(|&i| {
-                                let (from, to) = spans[i as usize];
-                                f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
-                            })
-                            .collect(),
-                    ),
-                };
+                match part.kind {
+                    PartKind::Literal => {
+                        let f = &Needle::new(part.text.as_bytes());
+                        let (text, spans) = if part.fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
+                        found = match entries.len() * 16 >= spans.len() {
+                            // Entries folding lengthened are after the text.
+                            true => Some(entries_with(text, spans, f, entries, e.text.len())),
+                            false => Some(
+                                entries
+                                    .iter()
+                                    .copied()
+                                    .filter(|&i| {
+                                        let (from, to) = spans[i as usize];
+                                        f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
+                                    })
+                                    .collect(),
+                            ),
+                        };
+                    }
+                    PartKind::Flex => {
+                        let (text, spans) = if part.fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
+                        found = Some(
+                            entries
+                                .iter()
+                                .copied()
+                                .filter(|&i| {
+                                    let (from, to) = spans[i as usize];
+                                    flex_match(&text[from as usize..to as usize], &part.text)
+                                })
+                                .collect(),
+                        );
+                    }
+                    PartKind::LiteralOrRegexp => {
+                        let literal = if part.fold { part.text.to_lowercase() } else { part.text.clone() };
+                        let f = &Needle::new(literal.as_bytes());
+                        let re = compile_regexp(&part.text, part.fold);
+                        let (ltext, lspans) = if part.fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
+                        let (rtext, rspans) = (e.text.as_str(), e.spans.as_slice());
+                        found = Some(
+                            entries
+                                .iter()
+                                .copied()
+                                .filter(|&i| {
+                                    let (lf, lt) = lspans[i as usize];
+                                    if f.find(&ltext.as_bytes()[lf as usize..lt as usize]).is_some() {
+                                        return true;
+                                    }
+                                    if let Some(re) = &re {
+                                        let (rf, rt) = rspans[i as usize];
+                                        return regexp_is_match(re, &rtext.as_bytes()[rf as usize..rt as usize]);
+                                    }
+                                    false
+                                })
+                                .collect(),
+                        );
+                    }
+                    PartKind::Regexp => {
+                        if let Some(re) = compile_regexp(&part.text, part.fold) {
+                            let (text, spans) = (e.text.as_str(), e.spans.as_slice());
+                            found = Some(
+                                entries
+                                    .iter()
+                                    .copied()
+                                    .filter(|&i| {
+                                        let (from, to) = spans[i as usize];
+                                        regexp_is_match(&re, &text.as_bytes()[from as usize..to as usize])
+                                    })
+                                    .collect(),
+                            );
+                        } else {
+                            let literal = if part.fold { part.text.to_lowercase() } else { part.text.clone() };
+                            let f = &Needle::new(literal.as_bytes());
+                            let (text, spans) = if part.fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
+                            found = Some(
+                                entries
+                                    .iter()
+                                    .copied()
+                                    .filter(|&i| {
+                                        let (from, to) = spans[i as usize];
+                                        f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
             }
             let found = found.unwrap_or_else(|| within.clone());
-            self.stack.push((pattern.to_string(), found));
+            self.stack.push((normalized, found));
         }
         self.matches().len()
     }
@@ -437,5 +631,51 @@ mod tests {
                 assert_eq!(matching(&mut Matcher::new(entries.clone()), pattern), expected(pattern), "{pattern:?} first");
             }
         }
+    }
+
+    #[test]
+    fn orderless_parts_and_regexp_broadening() {
+        let mut m = Matcher::new(
+            ["alpha-one", "beta-two", "describe-named-command", "hello world", "foo.bar", "fooxbar"].map(String::from).to_vec(),
+        );
+        // Narrow to literal "alpha", then broaden with regexp "alpha|beta".
+        m.filter_parts(&[FilterPart::literal("alpha", true)]);
+        assert_eq!(m.matches(), &[0]);
+        m.filter_parts(&[FilterPart { kind: PartKind::Regexp, text: "alpha|beta".into(), fold: true }]);
+        assert_eq!(m.matches(), &[0, 1]);
+
+        // Flex subsequence matching.
+        m.filter_parts(&[FilterPart { kind: PartKind::Flex, text: "dscrb".into(), fold: true }]);
+        assert_eq!(m.matches(), &[2]);
+
+        // Literal with embedded space (escaped space in Orderless).
+        m.filter_parts(&[FilterPart::literal("hello world", true)]);
+        assert_eq!(m.matches(), &[3]);
+
+        // Literal dot vs regexp dot.
+        m.filter_parts(&[FilterPart::literal("foo.bar", true)]);
+        assert_eq!(m.matches(), &[4]);
+        m.filter_parts(&[FilterPart { kind: PartKind::Regexp, text: "foo.bar".into(), fold: true }]);
+        assert_eq!(m.matches(), &[4, 5]);
+
+        // LiteralOrRegexp matches both literal punctuation and regexp.
+        let mut m2 = Matcher::new(["foo+bar", "foooobar", "baz"].map(String::from).to_vec());
+        m2.filter_parts(&[FilterPart { kind: PartKind::LiteralOrRegexp, text: "foo+bar".into(), fold: true }]);
+        assert_eq!(m2.matches(), &[0, 1]);
+
+        // Unicode context-sensitive case folding (Greek final sigma):
+        // filtering with folded `ος` then case-sensitive `ΟΣ` must not
+        // falsely reuse the empty cached result.
+        let mut greek = Matcher::new(vec!["ΟΣΑ".into()]);
+        greek.filter_parts(&[FilterPart::literal("ος", true)]);
+        assert_eq!(greek.matches(), &[] as &[u32]);
+        greek.filter_parts(&[FilterPart::literal("ΟΣ", false)]);
+        assert_eq!(greek.matches(), &[0]);
+
+        let mut greek_flex = Matcher::new(vec!["ΟΣΑ".into()]);
+        greek_flex.filter_parts(&[FilterPart { kind: PartKind::Flex, text: "ος".into(), fold: true }]);
+        assert_eq!(greek_flex.matches(), &[] as &[u32]);
+        greek_flex.filter_parts(&[FilterPart { kind: PartKind::Flex, text: "ΟΣ".into(), fold: false }]);
+        assert_eq!(greek_flex.matches(), &[0]);
     }
 }

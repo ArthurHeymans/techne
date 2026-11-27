@@ -13,29 +13,57 @@ use techne_vm::{
     vm::{Capability, Error, INTERRUPTED, Vm},
 };
 
-use crate::service::Snapshot;
+use regex_cursor::engines::meta::Regex;
+
+use crate::{
+    matcher::{FilterPart, PartKind, compile_regexp, flex_match, parse_filter_parts, regexp_is_match},
+    service::Snapshot,
+};
 
 /// Files larger than this are not searched.
 const FILE_BYTES: u64 = 8 << 20;
 /// Of a line found, the bytes returned, at most.
 const LINE_BYTES: usize = 300;
 
-/// A part of a pattern, as the minibuffer matches it (`matcher.rs`):
-/// without case, lowered as `str::to_lowercase` lowers, unless it has
-/// an upper-case letter.
-struct Part {
-    bytes: Vec<u8>,
-    fold: bool,
+/// A compiled Orderless part for line searching.
+enum Part {
+    Literal { bytes: Vec<u8>, fold: bool },
+    Flex { needle: String, fold: bool },
+    LiteralOrRegexp { bytes: Vec<u8>, fold: bool, re: Regex },
+    Regexp(Regex),
 }
 
 impl Part {
-    fn new(part: &str) -> Part {
-        let fold = !part.chars().any(char::is_uppercase);
-        Part { bytes: if fold { part.to_lowercase().into_bytes() } else { part.as_bytes().to_vec() }, fold }
+    fn from_filter(part: &FilterPart) -> Part {
+        let lit_bytes = |p: &FilterPart| {
+            if p.fold { p.text.to_lowercase().into_bytes() } else { p.text.as_bytes().to_vec() }
+        };
+        match part.kind {
+            PartKind::Literal => Part::Literal { bytes: lit_bytes(part), fold: part.fold },
+            PartKind::Flex => Part::Flex { needle: if part.fold { part.text.to_lowercase() } else { part.text.clone() }, fold: part.fold },
+            PartKind::LiteralOrRegexp => match compile_regexp(&part.text, part.fold) {
+                Some(re) => Part::LiteralOrRegexp { bytes: lit_bytes(part), fold: part.fold, re },
+                None => Part::Literal { bytes: lit_bytes(part), fold: part.fold },
+            },
+            PartKind::Regexp => match compile_regexp(&part.text, part.fold) {
+                Some(re) => Part::Regexp(re),
+                None => Part::Literal { bytes: lit_bytes(part), fold: part.fold },
+            },
+        }
     }
 
     fn in_line(&self, line: &[u8], folded: &[u8]) -> bool {
-        memmem::find(if self.fold { folded } else { line }, &self.bytes).is_some()
+        match self {
+            Part::Literal { bytes, fold } => memmem::find(if *fold { folded } else { line }, bytes).is_some(),
+            Part::Flex { needle, fold } => {
+                let hay = String::from_utf8_lossy(if *fold { folded } else { line });
+                flex_match(&hay, needle)
+            }
+            Part::LiteralOrRegexp { bytes, fold, re } => {
+                memmem::find(if *fold { folded } else { line }, bytes).is_some() || regexp_is_match(re, line)
+            }
+            Part::Regexp(re) => regexp_is_match(re, line),
+        }
     }
 }
 
@@ -43,18 +71,33 @@ impl Part {
 /// `parts`, `limit` at most: its number from 1, the byte position of its
 /// start, and its first `LINE_BYTES` bytes.
 fn matching_lines(text: &[u8], parts: &[Part], limit: usize) -> Vec<(usize, usize, String)> {
-    if parts.is_empty() {
+    if parts.is_empty() || text.is_empty() {
         return Vec::new();
     }
-    if text.is_ascii() {
-        return ascii_lines(text, parts, limit);
+    // When ASCII and at least one pure literal part exists (without embedded
+    // line breaks), prefilter the whole text with memmem on the longest one.
+    if text.is_ascii()
+        && let Some((idx, _)) = parts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| match p {
+                Part::Literal { bytes, .. } if !bytes.contains(&b'\n') && !bytes.contains(&b'\r') => Some((i, bytes.len())),
+                _ => None,
+            })
+            .max_by_key(|&(_, len)| len)
+    {
+        return ascii_lines(text, parts, idx, limit);
     }
+    // Strip a single trailing LF so `^$` does not match a synthetic empty
+    // segment past the last line.
+    let body = text.strip_suffix(b"\n").unwrap_or(text);
     // A line at a time, lowered as the minibuffer lowers it.
-    let starts = std::iter::once(0).chain(memchr::memchr_iter(b'\n', text).map(|i| i + 1));
-    text.split(|&b| b == b'\n')
+    let starts = std::iter::once(0).chain(memchr::memchr_iter(b'\n', body).map(|i| i + 1));
+    body.split(|&b| b == b'\n')
         .zip(starts)
         .enumerate()
         .filter(|(_, (line, _))| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
             let folded = techne_text::motion::lowered(&String::from_utf8_lossy(line)).0;
             parts.iter().all(|p| p.in_line(line, folded.as_bytes()))
         })
@@ -63,13 +106,13 @@ fn matching_lines(text: &[u8], parts: &[Part], limit: usize) -> Vec<(usize, usiz
         .collect()
 }
 
-/// `matching_lines` of ASCII text, the most: the first part found in the
-/// whole text at once, the others then in its lines.
-fn ascii_lines(text: &[u8], parts: &[Part], limit: usize) -> Vec<(usize, usize, String)> {
-    let Some((first, rest)) = parts.split_first() else { return Vec::new() };
+/// `matching_lines` of ASCII text with a literal prefilter at `lead`:
+/// found in the whole text at once, the others then in its lines.
+fn ascii_lines(text: &[u8], parts: &[Part], lead: usize, limit: usize) -> Vec<(usize, usize, String)> {
+    let Part::Literal { bytes, fold } = &parts[lead] else { unreachable!() };
     let folded = text.to_ascii_lowercase();
-    let haystack = if first.fold { &folded } else { text };
-    let finder = memmem::Finder::new(&first.bytes);
+    let haystack = if *fold { &folded } else { text };
+    let finder = memmem::Finder::new(bytes);
     let (mut found, mut from) = (Vec::new(), 0);
     // Lines are counted up to `counted`, which is at line `line`.
     let (mut counted, mut line) = (0, 1);
@@ -79,10 +122,15 @@ fn ascii_lines(text: &[u8], parts: &[Part], limit: usize) -> Vec<(usize, usize, 
     {
         let start = memchr::memrchr(b'\n', &text[..at]).map_or(0, |i| i + 1);
         let end = memchr::memchr(b'\n', &text[at..]).map_or(text.len(), |i| at + i);
-        if rest.iter().all(|p| p.in_line(&text[start..end], &folded[start..end])) {
-            line += memchr::memchr_iter(b'\n', &text[counted..start]).count();
-            counted = start;
-            found.push((line, start, shown(&text[start..end])));
+        let raw_end = if text[start..end].ends_with(b"\r") { end - 1 } else { end };
+        if at + bytes.len() <= raw_end {
+            let raw_line = &text[start..raw_end];
+            let folded_line = &folded[start..raw_end];
+            if parts.iter().enumerate().all(|(i, p)| i == lead || p.in_line(raw_line, folded_line)) {
+                line += memchr::memchr_iter(b'\n', &text[counted..start]).count();
+                counted = start;
+                found.push((line, start, shown(&text[start..end])));
+            }
         }
         from = end + 1;
     }
@@ -157,8 +205,8 @@ fn as_data(lines: Vec<(usize, usize, String)>) -> Vec<Data> {
     lines.into_iter().map(|(line, at, text)| Data::List(vec![Data::Int(line as i64), Data::Int(at as i64), Data::String(text)])).collect()
 }
 
-fn parts(parts: &[String]) -> Vec<Part> {
-    parts.iter().filter(|p| !p.is_empty()).map(|p| Part::new(p)).collect()
+fn compile_parts(items: &[Data]) -> Result<Vec<Part>, String> {
+    Ok(parse_filter_parts(items, true)?.iter().map(Part::from_filter).collect())
 }
 
 /// The natives of a search service's world, which has the files
@@ -175,21 +223,31 @@ pub(crate) fn install(vm: &mut Vm) {
                 project_files(vm, Path::new(&root)).map_err(Error::new)
             };
             /// Return (line position text) of each line of the file at PATH
-            /// that has all of PARTS, strings, LIMIT at most. A part matches
-            /// without case unless it has an upper-case letter. A binary file,
-            /// one over 8 MiB, or one that cannot be read has none.
+            /// that has all of PARTS, LIMIT at most. Each part is either a
+            /// string (smart-case literal) or `(kind text fold?)` as
+            /// `orderless-filter-specs` produces. A binary file, one over
+            /// 8 MiB, or one that cannot be read has none.
             #[vm]
-            "(search-file path parts limit)" => |vm: &mut Vm, path: String, ps: Vec<String>, limit: usize| -> Result<Vec<Data>, Error> {
+            "(search-file path parts limit)" => |vm: &mut Vm, path: String, ps: techne_vm::api::Value, limit: usize| -> Result<Vec<Data>, Error> {
                 let p = Path::new(&path);
                 if !vm.may_read(p) {
                     return Err(Error::new(format!("search-file: {path} may not be read here")));
                 }
-                Ok(read_text(p).map_or_else(Vec::new, |t| as_data(matching_lines(&t, &parts(&ps), limit))))
+                let Data::List(items) = vm.to_data(&ps, 64 << 20)? else {
+                    return Err(Error::new("search-file: parts must be a list"));
+                };
+                let compiled = compile_parts(&items).map_err(Error::new)?;
+                Ok(read_text(p).map_or_else(Vec::new, |t| as_data(matching_lines(&t, &compiled, limit))))
             };
             /// Return (line position text) of each line of SNAPSHOT's text
             /// that has all of PARTS, as `search-file` does.
-            "(search-snapshot snapshot parts limit)" => |s: Foreign<Snapshot>, ps: Vec<String>, limit: usize| {
-                as_data(matching_lines(s.0.text.to_string().as_bytes(), &parts(&ps), limit))
+            #[vm]
+            "(search-snapshot snapshot parts limit)" => |vm: &mut Vm, s: Foreign<Snapshot>, ps: techne_vm::api::Value, limit: usize| -> Result<Vec<Data>, Error> {
+                let Data::List(items) = vm.to_data(&ps, 64 << 20)? else {
+                    return Err(Error::new("search-snapshot: parts must be a list"));
+                };
+                let compiled = compile_parts(&items).map_err(Error::new)?;
+                Ok(as_data(matching_lines(s.0.text.to_string().as_bytes(), &compiled, limit)))
             };
         }
     });
@@ -200,7 +258,8 @@ mod tests {
     use super::*;
 
     fn lines(text: &str, ps: &[&str]) -> Vec<(usize, usize, String)> {
-        matching_lines(text.as_bytes(), &parts(&ps.iter().map(|p| p.to_string()).collect::<Vec<_>>()), 10)
+        let compiled: Vec<Part> = ps.iter().filter(|p| !p.is_empty()).map(|p| Part::from_filter(&FilterPart::from_legacy(p))).collect();
+        matching_lines(text.as_bytes(), &compiled, 10)
     }
 
     #[test]
@@ -210,6 +269,27 @@ mod tests {
         // An upper-case letter makes a part match case.
         assert_eq!(lines(text, &["Beta"]), [(3, 16, "Beta alpha alpha".into())]);
         assert_eq!(lines(text, &[]), []);
+    }
+
+    #[test]
+    fn lines_match_orderless_flex_and_regexp_parts() {
+        let text = "describe-named-command\nalpha-one\nbeta-two\nhello world\n";
+        let flex = vec![Part::from_filter(&FilterPart { kind: PartKind::Flex, text: "dscrb".into(), fold: true })];
+        assert_eq!(matching_lines(text.as_bytes(), &flex, 10), [(1, 0, "describe-named-command".into())]);
+        let alt = vec![Part::from_filter(&FilterPart { kind: PartKind::Regexp, text: "alpha|beta".into(), fold: true })];
+        assert_eq!(matching_lines(text.as_bytes(), &alt, 10), [(2, 23, "alpha-one".into()), (3, 33, "beta-two".into())]);
+        let spaced = vec![Part::from_filter(&FilterPart::literal("hello world", true))];
+        assert_eq!(matching_lines(text.as_bytes(), &spaced, 10), [(4, 42, "hello world".into())]);
+
+        // CRLF: literal CR must not match a stripped line; `^$` must not
+        // match a synthetic empty segment after a trailing newline.
+        let crlf = "one\r\ntwo\r\n";
+        let cr = vec![Part::from_filter(&FilterPart::literal("\r", false))];
+        assert_eq!(matching_lines(crlf.as_bytes(), &cr, 10), []);
+        let empty = vec![Part::from_filter(&FilterPart { kind: PartKind::Regexp, text: "^$".into(), fold: true })];
+        assert_eq!(matching_lines(crlf.as_bytes(), &empty, 10), []);
+        let with_blank = "one\n\ntwo\n";
+        assert_eq!(matching_lines(with_blank.as_bytes(), &empty, 10), [(2, 4, "".into())]);
     }
 
     /// Listing a project's files stops as Lisp does, between entries.

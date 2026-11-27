@@ -11,6 +11,7 @@
 (require "targets.scm")
 (require "files.scm")
 (require "remote.scm")
+(require "orderless.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 
@@ -64,7 +65,7 @@ are, unsaved edits and all."
                      (async-source
                       (lambda (input)
                         (let ((found (service-call (search-service) "search"
-                                                   (list root (pattern-parts input) search-limit (map document-path documents) fresh)
+                                                   (list root (orderless-filter-specs (orderless-parse input)) search-limit (map document-path documents) fresh)
                                                    documents)))
                           (set! fresh #f)
                           (map (lambda (m) (match-candidate documents m)) found))))

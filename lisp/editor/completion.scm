@@ -21,6 +21,7 @@
 (require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
+(require "orderless.scm")
 (require "minibuffer.scm")
 
 (provide completion-at-point identifier-span scheme-completion editor-completion completion-rows completion-map)
@@ -113,7 +114,7 @@ first, each annotated with its kind."
            (let* ((typed (document-substring d (car found) p))
                   (candidates (list->vector (cdr found)))
                   (matcher (make-matcher (map candidate-text (cdr found))))
-                  (matches (matcher-filter! matcher typed)))
+                  (matches (matcher-filter-parts! matcher (orderless-filter-specs (orderless-parse typed)))))
              (if (= matches 0)
                  (when manual (message! s "No match"))
                  (begin
@@ -180,7 +181,7 @@ separator and Orderless have it."
           (popup-saw! pop start typed)
           (set-popup-separated! pop #t)
           (set-popup-typed! pop typed)
-          (set-popup-matches! pop (matcher-filter! (popup-matcher pop) typed))
+          (set-popup-matches! pop (matcher-filter-parts! (popup-matcher pop) (orderless-filter-specs (orderless-parse typed))))
           (set-popup-selected! pop -1)
           (set-popup-offset! pop 0)))))
 
@@ -226,20 +227,23 @@ With none selected, close the popup and do what RET does without it."
              (if (or (not start) (< p start) (not (continues? d start p (popup-separated pop))))
                  (close-completion! s)
                  (let* ((typed (document-substring d start p))
-                        (matches (matcher-filter! (popup-matcher pop) typed)))
-                   (if (= matches 0)
+                        (still-separated (and (popup-separated pop) (and (string-contains typed " ") #t)))
+                        (matches (matcher-filter-parts! (popup-matcher pop) (orderless-filter-specs (orderless-parse typed)))))
+                   (if (and (= matches 0) (not still-separated))
                        (close-completion! s)
                        (begin (popup-saw! pop start typed)
+                              (set-popup-separated! pop still-separated)
                               (set-popup-typed! pop typed)
                               (set-popup-matches! pop matches)
                               (set-popup-selected! pop -1)
                               (set-popup-offset! pop 0))))))))))
 
 ;; Whether the text from START to P is still what the popup completes:
-;; one identifier, or, after a separator, identifiers and spaces.
+;; one identifier, or, after a separator, any single-line Orderless query
+;; (including regexp metacharacters such as `[`, `(`, `{`).
 (define (continues? d start p separated)
   (if separated
-      (every (lambda (c) (or (identifier-char? c) (char=? c #\space))) (string->list (document-substring d start p)))
+      (every (lambda (c) (not (memv c '(#\newline #\return)))) (string->list (document-substring d start p)))
       (= (car (identifier-span d p)) start)))
 
 (define (completion-after-key s key)
@@ -274,11 +278,13 @@ aligned with, rows around the selected one, and that one's index."
                               ((< i (popup-offset pop)) i)
                               ((>= i (+ (popup-offset pop) completion-rows)) (+ (- i completion-rows) 1))
                               (else (popup-offset pop))))
-                (parts (pattern-parts (popup-typed pop))))
+                (parts (orderless-parse (popup-typed pop))))
            (set-popup-offset! pop offset)
            (list (popup-view pop)
                  (or (document-map-position (view-document (popup-view pop)) (popup-start pop) (popup-revision pop))
                      (popup-start pop))
-                 (map (lambda (k) (let ((c (popup-match pop k))) (candidate-row c (match-spans c parts))))
-                      (iota (min completion-rows (- n offset)) offset))
+                 (if (= n 0)
+                     (list (list (list (list "No match" 'comment))))
+                     (map (lambda (k) (let ((c (popup-match pop k))) (candidate-row c (or (match-spans c parts) '()))))
+                          (iota (min completion-rows (- n offset)) offset)))
                  (and (>= i 0) (- i offset)))))))
