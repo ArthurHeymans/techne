@@ -278,6 +278,22 @@
           (assert-contains "1 file, 1 passed" (cadr selected)))
         (assert-equal "ran" (file->string marker))))))
 
+(define-test "a name filter does not fail a file its unmet requirement keeps from loading"
+  (call-with-temporary-directory
+    (lambda (root)
+      (make-directory (path-join root "tests"))
+      (write-file (path-join root "techne-package.scm") "(package gated)")
+      (write-file (path-join root "tests/needs-program.scm")
+        "(import (techne test))\n(test-file #:requires '(program \"techne-test-program-that-does-not-exist\"))\n(error \"cannot load without the program\")\n")
+      (write-file (path-join root "tests/plain.scm")
+        "(import (techne test))\n(define-test \"plain case\" (assert-true #t))\n")
+      (let ((named (run-techne-test root "-k" "plain case")))
+        (assert-equal 0 (car named))
+        (assert-contains "1 file, 1 passed, 0 failed, 0 skipped" (cadr named)))
+      (let ((whole (run-techne-test root)))
+        (assert-equal 0 (car whole))
+        (assert-contains "1 passed, 0 failed, 1 skipped" (cadr whole))))))
+
 (define-test "checks called by helpers at registered-file load are errors"
   (call-with-temporary-directory
     (lambda (root)

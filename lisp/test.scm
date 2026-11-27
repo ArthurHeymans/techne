@@ -658,6 +658,10 @@ TIMEOUT is an optional limit in seconds. SKIP-REASON, if given, skips the test."
   "Report load errors and script checks, or run the selected registered tests."
   (let ((raw-port (current-output-port)))
     (cond
+      ;; An unmet requirement can keep the file from loading at all. Its
+      ;; test names are then unknown: the name filter selected nothing here.
+      ((and %worker-requires-skip %worker-load-error)
+       (%test-emit '(test-done 0 0 0)))
       (%worker-load-error
        (%test-emit `(test-result "<load>" fail 0 ,%worker-file ,%worker-load-error "" ""))
        (%test-emit '(test-done 0 1 0)))
