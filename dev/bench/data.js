@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795772349387,
+  "lastUpdate": 1795772350879,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -66133,6 +66133,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 102445,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cde4d6f8c712133914f78db9d1abfa01b7d5692c",
+          "message": "Merge pull request #422 from ArthurHeymans/techne-check\n\nAdd `techne check` for package manifests and docstrings",
+          "timestamp": "2026-11-27T10:15:40+01:00",
+          "tree_id": "0261129f815a63acb723307a3d848ec23dd00f62",
+          "url": "https://github.com/ArthurHeymans/techne/commit/cde4d6f8c712133914f78db9d1abfa01b7d5692c"
+        },
+        "date": 1795772350822,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 694086741,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 629148111,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 102681,
             "unit": "data"
           }
         ]
