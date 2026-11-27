@@ -39,6 +39,10 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -586,10 +590,15 @@ struct Options {
     keys: usize,
     corpus: Vec<&'static Corpus>,
     shrink: bool,
+    jobs: usize,
+}
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism().map(usize::from).unwrap_or(1)
 }
 
 fn options(args: &[String]) -> Options {
-    let mut o = Options { seeds: 0..4, keys: 200, corpus: CORPUS.iter().collect(), shrink: false };
+    let mut o = Options { seeds: 0..4, keys: 200, corpus: CORPUS.iter().collect(), shrink: false, jobs: default_jobs() };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--shrink" {
@@ -604,36 +613,72 @@ fn options(args: &[String]) -> Options {
             }
             "--keys" => o.keys = value.parse().expect("a number of keys"),
             "--corpus" => o.corpus = value.split(',').map(corpus).collect(),
+            "--jobs" | "-j" => o.jobs = value.parse::<usize>().expect("a job count").max(1),
             _ => panic!("unknown option {a}"),
         }
     }
     o
 }
 
+/// Run `f` over `items` across up to `jobs` worker threads, preserving input
+/// order. Workers stop picking new items once `stop` is set.
+fn run_parallel<T, R, F>(items: &[T], jobs: usize, f: F) -> Vec<Option<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T, &AtomicBool) -> R + Sync,
+{
+    let workers = jobs.max(1).min(items.len().max(1));
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let results: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= items.len() {
+                        break;
+                    }
+                    let out = f(&items[idx], &stop);
+                    results.lock().unwrap()[idx] = Some(out);
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap()
+}
+
 /// Run traces; shrink and report the first failure.
 fn fuzz(o: &Options) -> bool {
-    let mut candidates = Vec::new();
-    for c in &o.corpus {
-        for seed in o.seeds.clone() {
-            let args = ["trace".to_string(), c.name.to_string(), seed.to_string(), o.keys.to_string()];
-            let trace = run(&args, None);
-            for (i, us) in trace.took.iter().enumerate() {
-                // But a key running the user's code, whose time is not the
-                // budget's and which `count` passes over: evaluating the
-                // buffer was most of the list (a crash's last key has no
-                // answer yet).
-                if Duration::from_micros(*us) > SLOW && !trace.user.get(i).copied().unwrap_or(false) {
-                    candidates.push(format!("{} seed {seed} key {} ({}): {} ms", c.name, i + 1, trace.keys[i], us / 1000));
-                }
-            }
-            let Some((sig, detail)) = trace.failure else { continue };
-            println!("FAIL {} seed {seed} after {} keys: {detail}", c.name, trace.keys.len());
-            let keys = shrink(trace.keys, PROBES, |keys| run(&replay_args(c.name, keys), None).failure.is_some_and(|(s, _)| s == sig));
-            let again = run(&replay_args(c.name, &keys), None);
-            println!("shrunk to {} keys: {}", keys.len(), again.failure.map(|f| f.1).unwrap_or_else(|| "(flaky)".into()));
-            println!("  {}", command_line(c.name, &keys));
-            return false;
+    let tasks: Vec<(&'static Corpus, u64)> = o.corpus.iter().flat_map(|&c| o.seeds.clone().map(move |seed| (c, seed))).collect();
+    let results = run_parallel(&tasks, o.jobs, |&(c, seed), stop| {
+        let args = ["trace".to_string(), c.name.to_string(), seed.to_string(), o.keys.to_string()];
+        let trace = run(&args, None);
+        if trace.failure.is_some() {
+            stop.store(true, Ordering::Relaxed);
         }
+        trace
+    });
+    let mut candidates = Vec::new();
+    for ((c, seed), trace) in tasks.into_iter().zip(results) {
+        let Some(trace) = trace else { continue };
+        for (i, us) in trace.took.iter().enumerate() {
+            // But a key running the user's code, whose time is not the
+            // budget's and which `count` passes over: evaluating the
+            // buffer was most of the list (a crash's last key has no
+            // answer yet).
+            if Duration::from_micros(*us) > SLOW && !trace.user.get(i).copied().unwrap_or(false) {
+                candidates.push(format!("{} seed {seed} key {} ({}): {} ms", c.name, i + 1, trace.keys[i], us / 1000));
+            }
+        }
+        let Some((sig, detail)) = trace.failure else { continue };
+        println!("FAIL {} seed {seed} after {} keys: {detail}", c.name, trace.keys.len());
+        let keys = shrink(trace.keys, PROBES, |keys| run(&replay_args(c.name, keys), None).failure.is_some_and(|(s, _)| s == sig));
+        let again = run(&replay_args(c.name, &keys), None);
+        println!("shrunk to {} keys: {}", keys.len(), again.failure.map(|f| f.1).unwrap_or_else(|| "(flaky)".into()));
+        println!("  {}", command_line(c.name, &keys));
+        return false;
     }
     if !candidates.is_empty() {
         println!("keys slower than {} ms in wall time, for `keyfuzz count`:", SLOW.as_millis());
@@ -673,50 +718,57 @@ fn last_count(corpus: &str, keys: &[String]) -> Option<u64> {
 /// Count every key of the traces and report those over budget; with
 /// `--shrink`, the first one's prefix is shrunk while it stays over.
 fn count(o: &Options) -> bool {
+    let tasks: Vec<(&'static Corpus, u64)> = o.corpus.iter().flat_map(|&c| o.seeds.clone().map(move |seed| (c, seed))).collect();
+    let results = run_parallel(&tasks, o.jobs, |&(c, seed), stop| {
+        let dumps = tempfile::tempdir().expect("a directory");
+        let args = ["trace".to_string(), c.name.to_string(), seed.to_string(), o.keys.to_string()];
+        let trace = run(&args, Some(dumps.path()));
+        if trace.failure.is_some() {
+            stop.store(true, Ordering::Relaxed);
+            return (trace, Vec::new());
+        }
+        let key_counts = counts(dumps.path());
+        (trace, key_counts)
+    });
     let mut over = Vec::new();
-    for c in &o.corpus {
-        for seed in o.seeds.clone() {
-            let dumps = tempfile::tempdir().expect("a directory");
-            let args = ["trace".to_string(), c.name.to_string(), seed.to_string(), o.keys.to_string()];
-            let trace = run(&args, Some(dumps.path()));
-            if let Some((_, detail)) = &trace.failure {
-                println!("FAIL {} seed {seed}, counted: {detail}", c.name);
-                return false;
-            }
-            let counts = counts(dumps.path());
-            assert_eq!(counts.len(), trace.keys.len(), "{} seed {seed}: a dump for each key", c.name);
-            let max = counts.iter().max().copied().unwrap_or(0);
-            println!("{:<18} seed {seed}: {} keys, at most {max} instructions per key", c.name, counts.len());
-            for (i, n) in counts.into_iter().enumerate().filter(|&(i, n)| n > KEYS_BUDGET && !trace.user[i]) {
-                // The input before the key, or after it.
-                let input = trace.inputs[i].max(if i > 0 { trace.inputs[i - 1] } else { 0 });
-                let large = input > LARGE_INPUT;
-                let repeat = trace.repeats[i];
-                let listed = KNOWN_SLOW
-                    .iter()
-                    .find(|&&(text, command, _, _)| (text == "*" || text == c.text.0) && command == trace.commands[i])
-                    .map(|&(_, _, ceiling, _)| ceiling);
-                let known = large || repeat >= LONG_REPEAT || listed.is_some_and(|ceiling| n <= ceiling);
-                println!(
-                    "  key {} ({}, {}): {n} instructions{}",
-                    i + 1,
-                    trace.keys[i],
-                    trace.commands[i],
-                    if large {
-                        format!(" (known: an input of {input} bytes)")
-                    } else if repeat >= LONG_REPEAT {
-                        format!(" (known: {repeat} keys typed again)")
-                    } else if known {
-                        " (known)".to_string()
-                    } else if let Some(ceiling) = listed {
-                        format!(" (known up to {ceiling}: past it)")
-                    } else {
-                        String::new()
-                    }
-                );
-                if !known {
-                    over.push((c.name, trace.keys[..=i].to_vec()));
+    for ((c, seed), entry) in tasks.into_iter().zip(results) {
+        let Some((trace, counts)) = entry else { continue };
+        if let Some((_, detail)) = &trace.failure {
+            println!("FAIL {} seed {seed}, counted: {detail}", c.name);
+            return false;
+        }
+        assert_eq!(counts.len(), trace.keys.len(), "{} seed {seed}: a dump for each key", c.name);
+        let max = counts.iter().max().copied().unwrap_or(0);
+        println!("{:<18} seed {seed}: {} keys, at most {max} instructions per key", c.name, counts.len());
+        for (i, n) in counts.into_iter().enumerate().filter(|&(i, n)| n > KEYS_BUDGET && !trace.user[i]) {
+            // The input before the key, or after it.
+            let input = trace.inputs[i].max(if i > 0 { trace.inputs[i - 1] } else { 0 });
+            let large = input > LARGE_INPUT;
+            let repeat = trace.repeats[i];
+            let listed = KNOWN_SLOW
+                .iter()
+                .find(|&&(text, command, _, _)| (text == "*" || text == c.text.0) && command == trace.commands[i])
+                .map(|&(_, _, ceiling, _)| ceiling);
+            let known = large || repeat >= LONG_REPEAT || listed.is_some_and(|ceiling| n <= ceiling);
+            println!(
+                "  key {} ({}, {}): {n} instructions{}",
+                i + 1,
+                trace.keys[i],
+                trace.commands[i],
+                if large {
+                    format!(" (known: an input of {input} bytes)")
+                } else if repeat >= LONG_REPEAT {
+                    format!(" (known: {repeat} keys typed again)")
+                } else if known {
+                    " (known)".to_string()
+                } else if let Some(ceiling) = listed {
+                    format!(" (known up to {ceiling}: past it)")
+                } else {
+                    String::new()
                 }
+            );
+            if !known {
+                over.push((c.name, trace.keys[..=i].to_vec()));
             }
         }
     }
@@ -758,7 +810,9 @@ fn main() {
         Some("fuzz") => fuzz(&options(&args[1..])),
         Some("count") => count(&options(&args[1..])),
         _ => {
-            eprintln!("usage: keyfuzz fuzz|count [--seeds A-B] [--keys N] [--corpus NAME,...] [--shrink] | replay CORPUS KEY... | --list");
+            eprintln!(
+                "usage: keyfuzz fuzz|count [--seeds A-B] [--keys N] [--corpus NAME,...] [--jobs N] [--shrink] | replay CORPUS KEY... | --list"
+            );
             false
         }
     };

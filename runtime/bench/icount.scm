@@ -37,6 +37,9 @@
 (define (at path) (string-append here "/" path))
 
 (define (env name) (let ((v (get-environment-variable name))) (and v (not (string=? v "")) v)))
+(define jobs
+  (let ((v (and (env "JOBS") (string->number (env "JOBS")))))
+    (if (and (exact-integer? v) (> v 0)) v (available-parallelism))))
 (define vm (or (env "TECHNE_VM") (file-truename (at "../../target/release/techne-vm"))))
 
 
@@ -126,6 +129,50 @@
         (call-with-output-file file (lambda (p) (display text p)))
         (display text))))
 
+;; Run THUNKS across at most JOBS concurrent tasks, returning results in
+;; submission order. Instruction counts are deterministic under valgrind
+;; and independent of CPU contention; reporting still happens in order.
+(define (run-parallel thunks)
+  (let* ((n (length thunks))
+         (results (make-vector n #f))
+         (first-err #f)
+         (done-ch (make-channel))
+         (queue (let loop ((xs thunks) (i 0) (acc '()))
+                  (if (null? xs) (reverse acc)
+                      (loop (cdr xs) (+ i 1) (cons (cons i (car xs)) acc)))))
+         (in-flight 0))
+    (define (launch-more!)
+      (let loop ()
+        (when (and (< in-flight jobs) (pair? queue) (not first-err))
+          (let ((pair (car queue)))
+            (set! queue (cdr queue))
+            (set! in-flight (+ in-flight 1))
+            (spawn
+             (lambda ()
+               (let ((res (guard (e (#t (cons 'err e)))
+                            (cons 'ok ((cdr pair))))))
+                 (channel-send done-ch (cons (car pair) res)))))
+            (loop)))))
+    (launch-more!)
+    (let loop ()
+      (when (> in-flight 0)
+        (let* ((msg (channel-recv done-ch))
+               (idx (car msg))
+               (res (cdr msg)))
+          (set! in-flight (- in-flight 1))
+          (if (eq? (car res) 'err)
+              (unless first-err (set! first-err (cdr res)))
+              (vector-set! results idx (cdr res)))
+          (launch-more!)
+          (loop))))
+    (when first-err (raise first-err))
+    (vector->list results)))
+
+;; Queue work items across all sections into one pool so no section barrier
+;; leaves cores idle, then apply each item's reporter in submission order.
+(define work '())
+(define (queue! thunk) (set! work (cons thunk work)))
+
 ;; ----- The programs
 
 (make-directory (at "build/techne"))
@@ -133,33 +180,31 @@
 (unless (file-exists? (at "org-sample.org"))
   (run "python3" '("gen-org.py")))
 
+(define program-files
+  (map (lambda (program)
+         (let ((file (at (string-append "build/techne/" program ".scm"))))
+           (call-with-output-file file
+             (lambda (p)
+               (display (file->string (at "prelude/techne.scm")) p)
+               (display (file->string (at (string-append "programs/" program ".scm"))) p)))
+           (cons program file)))
+       programs))
+
 (for-each
- (lambda (program)
-   (let ((file (at (string-append "build/techne/" program ".scm"))))
-     (call-with-output-file file
-       (lambda (p)
-         (display (file->string (at "prelude/techne.scm")) p)
-         (display (file->string (at (string-append "programs/" program ".scm"))) p)))
-     (let* ((jit (instructions vm (list file) '(("TECHNE_JIT_SYNC" . "1"))))
-            (interp (instructions vm (list file) '(("TECHNE_JIT" . "0"))))
-            ;; The JIT compiling synchronously, as for the counts: compiled
-            ;; in the background, code is installed at different points of
-            ;; a run, which moves the collections.
-            (stats (cadr (run vm (list file) #:stdout 'null
-                              #:environment '(("TECHNE_JIT_SYNC" . "1") ("TECHNE_GC_STATS" . "1")))))
-            (stats (or (find (lambda (l) (string-contains l "GcStats")) (lines stats)) ""))
-            (pause (+ (or (number-after "max_copied_words: " stats) 0)
-                      (or (number-after "max_slice_words: " stats) 0))))
-       (report (left program 10) " " (right (number->string jit) 16) " instr (jit) "
-               (right (number->string interp) 16) " instr (interp) "
-               (right (number->string pause) 10) " words/pause")
-       (entry! (string-append program " (jit)") "instructions" jit)
-       (entry! (string-append program " (interp)") "instructions" interp)
-       ;; Pauses of a few words (a program that barely collects) are
-       ;; noise, not a pause to compare; 0 would break ratios.
-       (when (>= pause 64)
-         (entry! (string-append program " GC pause") "words" pause)))))
- programs)
+ (lambda (pf)
+   (let ((file (cdr pf)))
+     (queue! (lambda () (instructions vm (list file) '(("TECHNE_JIT_SYNC" . "1")))))
+     (queue! (lambda () (instructions vm (list file) '(("TECHNE_JIT" . "0")))))
+     ;; The JIT compiling synchronously, as for the counts: compiled
+     ;; in the background, code is installed at different points of
+     ;; a run, which moves the collections.
+     (queue! (lambda ()
+               (let* ((stats (cadr (run vm (list file) #:stdout 'null
+                                        #:environment '(("TECHNE_JIT_SYNC" . "1") ("TECHNE_GC_STATS" . "1")))))
+                      (stats (or (find (lambda (l) (string-contains l "GcStats")) (lines stats)) "")))
+                 (+ (or (number-after "max_copied_words: " stats) 0)
+                    (or (number-after "max_slice_words: " stats) 0)))))))
+ program-files)
 
 ;; ----- The editor starting
 
@@ -172,20 +217,11 @@
 ;; the startup budget instead.
 (define startup-budget 700000000) ; instructions, some 100 ms (REQUIREMENTS.md), as keys-budget's 4 ms
 (define over-startup #f)
-(let ((startup (env "TECHNE_EDITOR_STARTUP")))
-  (when startup
-    (let ((jit (instructions startup '() '(("TECHNE_JIT_SYNC" . "1"))))
-          (interp (instructions startup '() '(("TECHNE_JIT" . "0"))))
-          (data (string->number (car (words (car (run startup '("--data"))))))))
-      (report (left "editor" 10) " " (right (number->string jit) 16) " instr (jit) "
-              (right (number->string interp) 16) " instr (interp) "
-              (right (number->string data) 10) " data")
-      (entry! "editor load (jit)" "instructions per datum" (quotient jit data))
-      (entry! "editor load (interp)" "instructions per datum" (quotient interp data))
-      (footprint! "editor startup (jit)" "instructions" jit)
-      (footprint! "editor startup (interp)" "instructions" interp)
-      (footprint! "editor Lisp loaded" "data" data)
-      (set! over-startup (or (> jit startup-budget) (> interp startup-budget))))))
+(define startup-bin (env "TECHNE_EDITOR_STARTUP"))
+(when startup-bin
+  (queue! (lambda () (instructions startup-bin '() '(("TECHNE_JIT_SYNC" . "1")))))
+  (queue! (lambda () (instructions startup-bin '() '(("TECHNE_JIT" . "0")))))
+  (queue! (lambda () (string->number (car (words (car (run startup-bin '("--data")))))))))
 
 ;; ----- Keys, requests and forms
 
@@ -201,48 +237,106 @@
 ;; slice 7, "Known violation").
 (define known-slow '("type-rust" "type-rust-big"))
 (define over-budget '())
-(let ((keys (env "TECHNE_EDITOR_KEYS")))
-  (when keys
-    (for-each
-     (lambda (w)
-       (let ((per-key (instructions-per keys w "*timed_keys*" '(("TECHNE_JIT_SYNC" . "1")))))
-         (report (left (string-append "keys " w) 18) " " (right (number->string per-key) 16) " instr per key")
-         (entry! (string-append "keys: " w " (jit)") "instructions per key" per-key)
-         (when (and (> per-key keys-budget) (not (member w known-slow)))
-           (set! over-budget (append over-budget (list w))))))
-     (words (car (run keys '("--list")))))))
+(define keys-bin (env "TECHNE_EDITOR_KEYS"))
+(define keys-workloads (if keys-bin (words (car (run keys-bin '("--list")))) '()))
+(for-each
+ (lambda (w)
+   (queue! (lambda () (instructions-per keys-bin w "*timed_keys*" '(("TECHNE_JIT_SYNC" . "1"))))))
+ keys-workloads)
 
 ;; Instructions per request of the HTTP benchmark's server on in-memory
 ;; connections, if TECHNE_SERVE names techne-vm's `serve` example:
 ;; callgrind counts only in the function serving the timed requests,
 ;; after a warm-up in which the JIT compiled everything on first call.
-(let ((serve (env "TECHNE_SERVE")))
-  (when serve
-    (for-each
-     (lambda (w)
-       (for-each
-        (lambda (mode)
-          (let ((per-request (instructions-per serve w "*timed_requests*"
-                                               (cons (cons "TECHNE_JIT" (cdr mode)) steady-malloc))))
-            (report (left (string-append "http " w) 18) " " (right (number->string per-request) 16)
-                    " instr per request (" (car mode) ")")
-            (entry! (string-append "http: " w " request (" (car mode) ")") "instructions per request" per-request)))
-        '(("jit" . "1") ("interp" . "0"))))
-     (words (car (run serve '("--list")))))))
+(define serve-bin (env "TECHNE_SERVE"))
+(define serve-workloads (if serve-bin (words (car (run serve-bin '("--list")))) '()))
+(for-each
+ (lambda (w)
+   (for-each
+    (lambda (mode)
+      (queue! (lambda ()
+                (instructions-per serve-bin w "*timed_requests*"
+                                  (cons (cons "TECHNE_JIT" (cdr mode)) steady-malloc)))))
+    '(("jit" . "1") ("interp" . "0"))))
+ serve-workloads)
 
 ;; Instructions per top-level form of the front end's phases, if
 ;; TECHNE_COMPILE names techne-vm's `compile` example: callgrind counts
 ;; only in the function passing over the prelude (reading it, or loading
 ;; it into bare worlds made beforehand), and the count is divided by the
 ;; forms it timed.
-(let ((compile (env "TECHNE_COMPILE")))
-  (when compile
-    (for-each
-     (lambda (w)
-       (let ((per-form (instructions-per compile w "*timed_forms*" steady-malloc)))
-         (report (left (string-append "compile " w) 18) " " (right (number->string per-form) 16) " instr per form")
-         (entry! (string-append "compile: " w) "instructions per form" per-form)))
-     (words (car (run compile '("--list")))))))
+(define compile-bin (env "TECHNE_COMPILE"))
+(define compile-workloads (if compile-bin (words (car (run compile-bin '("--list")))) '()))
+(for-each
+ (lambda (w)
+   (queue! (lambda () (instructions-per compile-bin w "*timed_forms*" steady-malloc))))
+ compile-workloads)
+
+;; ----- Execute in parallel and report in deterministic order
+
+(define results (run-parallel (reverse work)))
+(define (next-result!)
+  (let ((v (car results)))
+    (set! results (cdr results))
+    v))
+
+(for-each
+ (lambda (pf)
+   (let* ((program (car pf))
+          (jit (next-result!))
+          (interp (next-result!))
+          (pause (next-result!)))
+     (report (left program 10) " " (right (number->string jit) 16) " instr (jit) "
+             (right (number->string interp) 16) " instr (interp) "
+             (right (number->string pause) 10) " words/pause")
+     (entry! (string-append program " (jit)") "instructions" jit)
+     (entry! (string-append program " (interp)") "instructions" interp)
+     ;; Pauses of a few words (a program that barely collects) are
+     ;; noise, not a pause to compare; 0 would break ratios.
+     (when (>= pause 64)
+       (entry! (string-append program " GC pause") "words" pause))))
+ program-files)
+
+(when startup-bin
+  (let* ((jit (next-result!))
+         (interp (next-result!))
+         (data (next-result!)))
+    (report (left "editor" 10) " " (right (number->string jit) 16) " instr (jit) "
+            (right (number->string interp) 16) " instr (interp) "
+            (right (number->string data) 10) " data")
+    (entry! "editor load (jit)" "instructions per datum" (quotient jit data))
+    (entry! "editor load (interp)" "instructions per datum" (quotient interp data))
+    (footprint! "editor startup (jit)" "instructions" jit)
+    (footprint! "editor startup (interp)" "instructions" interp)
+    (footprint! "editor Lisp loaded" "data" data)
+    (set! over-startup (or (> jit startup-budget) (> interp startup-budget)))))
+
+(for-each
+ (lambda (w)
+   (let ((per-key (next-result!)))
+     (report (left (string-append "keys " w) 18) " " (right (number->string per-key) 16) " instr per key")
+     (entry! (string-append "keys: " w " (jit)") "instructions per key" per-key)
+     (when (and (> per-key keys-budget) (not (member w known-slow)))
+       (set! over-budget (append over-budget (list w))))))
+ keys-workloads)
+
+(for-each
+ (lambda (w)
+   (for-each
+    (lambda (mode)
+      (let ((per-request (next-result!)))
+        (report (left (string-append "http " w) 18) " " (right (number->string per-request) 16)
+                " instr per request (" (car mode) ")")
+        (entry! (string-append "http: " w " request (" (car mode) ")") "instructions per request" per-request)))
+    '(("jit" . "1") ("interp" . "0"))))
+ serve-workloads)
+
+(for-each
+ (lambda (w)
+   (let ((per-form (next-result!)))
+     (report (left (string-append "compile " w) 18) " " (right (number->string per-form) 16) " instr per form")
+     (entry! (string-append "compile: " w) "instructions per form" per-form)))
+ compile-workloads)
 
 (write-entries out-file entries)
 (when footprint-file (write-entries footprint-file footprint))

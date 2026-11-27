@@ -11,8 +11,12 @@
           (let end ((b n))
             (if (and (> b a) (h-space? (string-ref s (- b 1)))) (end (- b 1)) (substring s a b)))))))
 (define (h-at? s at text)
-  (and (<= (+ at (string-length text)) (string-length s))
-       (string=? text (substring s at (+ at (string-length text))))))
+  (let ((m (string-length text)))
+    (and (<= (+ at m) (string-length s))
+         (let loop ((i 0))
+           (or (= i m)
+               (and (char=? (string-ref s (+ at i)) (string-ref text i))
+                    (loop (+ i 1))))))))
 (define (h-find s text at)
   (and (<= at (string-length s)) (string-contains s text at)))
 (define (h-ref xs key fallback)
@@ -98,14 +102,15 @@
                   "h1" "h2" "h3" "h4" "h5" "h6" "pre" "blockquote" "ul" "ol" "li" "hr" "table" "tr" "td" "th" "dl" "dt" "dd"))
 ;; Frames are #(tag attrs reversed-children). Finish mismatched elements
 ;; conservatively; support omitted p/li/td/tr closing tags common in email.
-(define (h-dom html)
+(define (h-dom html max-nodes)
   (let* ((n (string-length html))
          ;; Only ASCII tag names are folded; Unicode expansion would shift offsets.
-         (lower (string-map (lambda (c) (if (char<=? #\A c #\Z) (char-downcase c) c)) html))
+         ;; Computed lazily so documents with no dropped raw-content tags skip the pass.
+         (lower #f)
          (root (vector "root" '() '())) (stack (list root)) (count 0))
     (define (add! node)
       (set! count (+ count 1))
-      (when (> count 50000) (error "mail html: node budget exceeds 50000"))
+      (when (> count max-nodes) (error "mail html: node budget exceeded" max-nodes))
       (vector-set! (car stack) 2 (cons node (vector-ref (car stack) 2))))
     (define (finish!)
       (let ((node (car stack)))
@@ -118,6 +123,8 @@
           (let ((same? (string=? (vector-ref (car stack) 0) name)))
             (finish!) (unless same? (loop))))))
     (define (skip-content name at)
+      (unless lower
+        (set! lower (string-map (lambda (c) (if (char<=? #\A c #\Z) (char-downcase c) c)) html)))
       (let loop ((at at))
         (let ((pos (h-find lower (string-append "</" name) at)))
           (if (not pos) n
@@ -284,7 +291,7 @@
           ((string=? name "table") (h-table node))
           (else (h-blocks children)))))
 
-(define (mail-html->rich html)
+(define (mail-html->rich html #:max-nodes [max-nodes 50000])
   "Convert untrusted HTML to a generated rich.scm block list, without I/O.
 Head/script/style and embedded active content are discarded. No CSS,
 images or remote resources are loaded. Every img becomes descriptive text
@@ -294,8 +301,9 @@ schemes are inert. A reader converts these strings to (target 'url URL)
 records before rich-present!, so this library needs no editor primitives.
 Text is entity-decoded, never interpreted as Markdown. Common headings,
 paragraphs, emphasis, links, quotes, lists, pre/code and tables survive.
-Reject inputs over 2 Mi characters or 50000 nodes; flatten nesting past 64.
-This is a bounded tolerant reader, not an HTML5 browser or HTML serializer."
+Reject inputs over 2 Mi characters or MAX-NODES (default 50000) nodes;
+flatten nesting past 64. This is a bounded tolerant reader, not an HTML5
+browser or HTML serializer."
   (unless (string? html) (error "mail html: expected text"))
   (when (> (string-length html) 2097152) (error "mail html: input exceeds 2 Mi characters"))
-  (h-blocks (h-dom html)))
+  (h-blocks (h-dom html max-nodes)))

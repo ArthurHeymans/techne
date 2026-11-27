@@ -67,7 +67,7 @@
         let
           toolchain = toolchainOf pkgs;
           llvm = "${toolchain}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
-          rust = [ toolchain pkgs.cargo-nextest pkgs.cargo-llvm-cov pkgs.cargo-deny ];
+          rust = [ toolchain pkgs.cargo-nextest pkgs.cargo-llvm-cov pkgs.cargo-deny pkgs.mold ];
           windowLibs = windowLibsOf pkgs;
         in {
           # The language, tools and tests.
