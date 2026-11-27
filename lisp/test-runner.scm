@@ -146,15 +146,20 @@
     (guard (e (#t (cons (cons 'meta-error (condition/report-string e)) meta)))
       (let ((decl (call-with-input-file path
                     (lambda (p)
-                      (let scan ((limit 16))
-                        (if (<= limit 0) #f
-                            (let ((d (read p)))
-                              (cond
-                                ((eof-object? d) #f)
-                                ((and (pair? d) (eq? (car d) 'test-file)) d)
-                                ((and (pair? d) (memq (car d) '(import require provide)))
-                                 (scan (- limit 1)))
-                                (else #f)))))))))
+                      (let scan ((in-header? #t) (found #f))
+                        (let ((d (read p)))
+                          (cond
+                            ((eof-object? d) found)
+                            ((and (pair? d) (eq? (car d) 'test-file))
+                             (when found
+                               (error "test-file: duplicate declaration"))
+                             (unless in-header?
+                               (error "test-file: declaration must appear at the top of the file before executable forms"))
+                             (scan #t d))
+                            ((and in-header? (pair? d) (memq (car d) '(import require provide)))
+                             (scan #t found))
+                            (else
+                             (scan #f found)))))))))
         (if (not decl)
             meta
             (let loop ((xs (cdr decl)) (acc meta))
@@ -338,22 +343,29 @@
                     (else target))))
          (list (make-test-spec id canon pkg-name pkg-dir ws-dir (read-test-file-meta canon)))))
       ((dir-exists? canon)
-       (let* ((pkg-dir (and (not all?) (null? selected-packages) (find-upward canon "techne-package.scm")))
-              (ws-dir (find-upward canon "techne-workspace.scm"))
+       (let* ((ws-dir (find-upward canon "techne-workspace.scm"))
+              (enclosing-pkg (and (not all?) (find-upward canon "techne-package.scm")))
+              (pkg-dir (if (and (pair? selected-packages) ws-dir) #f enclosing-pkg))
               (prefix (if (string-suffix? "/" canon) canon (string-append canon "/")))
               (under-canon? (lambda (s)
                               (or (string=? (spec-path s) canon)
                                   (string-prefix? prefix (spec-path s)))))
               (specs
                 (cond
-                  (pkg-dir (discover-package pkg-dir ws-dir))
+                  (pkg-dir
+                   (let ((pkg-specs (discover-package pkg-dir ws-dir)))
+                     (if (pair? selected-packages)
+                         (filter (lambda (s) (member (spec-pkg-name s) selected-packages)) pkg-specs)
+                         pkg-specs)))
                   (ws-dir (discover-workspace ws-dir selected-packages))
                   (else
-                   (let ((files (collect-scm-files canon)))
-                     (filter (lambda (s) (not (meta-ref (spec-meta s) 'ignore)))
-                       (map (lambda (f)
-                              (make-test-spec (relative-to canon f) f #f #f canon (read-test-file-meta f)))
-                            files)))))))
+                   (if (pair? selected-packages)
+                       '()
+                       (let ((files (collect-scm-files canon)))
+                         (filter (lambda (s) (not (meta-ref (spec-meta s) 'ignore)))
+                           (map (lambda (f)
+                                  (make-test-spec (relative-to canon f) f #f #f canon (read-test-file-meta f)))
+                                files))))))))
          (if (or all? (pair? selected-packages)
                  (and pkg-dir (string=? canon pkg-dir))
                  (and ws-dir (string=? canon ws-dir)))

@@ -117,10 +117,44 @@
               "(import (techne test))\n"
               "(test-file #:environment 'bogus)\n"
               "(define-test \"never\" (assert-true #t))\n"))
+          (write-file (path-join pkg "tests/misplaced-serial-test.scm")
+            (string-append
+              "(import (techne test))\n"
+              "(define y 2)\n"
+              "(test-file #:serial #t)\n"
+              "(define-test \"should fail\" (assert-equal 2 y))\n"))
           (let ((res (run-techne-test pkg)))
             (assert-equal 1 (car res))
-            (assert-match "declaration was not active" (cadr res))
+            (assert-match "must appear at the top of the file" (cadr res))
             (assert-match "invalid test-file declaration" (cadr res)))))))
+
+  (define-test "assert-raises propagates skip/failure, soft check beats later skip, and -p outside workspace works"
+    (call-with-temporary-directory
+      (lambda (root)
+        (let ((pkg (path-join root "solo")))
+          (make-directory (path-join pkg "tests"))
+          (write-file (path-join pkg "techne-package.scm") "(package solo)\n")
+          (write-file (path-join pkg "tests/edge-test.scm")
+            (string-append
+              "(import (techne test))\n"
+              "(define-test \"assert-raises propagates skip\"\n"
+              "  (assert-raises (skip \"unavailable\")))\n"
+              "(define-test \"assert-raises propagates inner assert-equal failure\"\n"
+              "  (assert-raises (assert-equal 1 2)))\n"
+              "(define-test \"soft check failure beats later skip\"\n"
+              "  (check \"mismatch\" 1 2)\n"
+              "  (skip \"later skip\"))\n"))
+          ;; -p with non-matching name outside a workspace must fail
+          (let ((other (run-techne-test pkg "-p" "other")))
+            (assert-equal 1 (car other))
+            (assert-match "no test files found" (caddr other)))
+          ;; -p matching the standalone package runs its tests
+          (let* ((res (run-techne-test pkg "-p" "solo" "--format" "sexp"))
+                 (data (read (open-input-string (cadr res)))))
+            (assert-equal 1 (car res))
+            (assert-equal 0 (cadr (assq 'passed data)))
+            (assert-equal 2 (cadr (assq 'failed data)))
+            (assert-equal 1 (cadr (assq 'skipped data))))))))
 
   (define-test "handles ESC in load errors, partial stdout before events, and nested techne run"
     (call-with-temporary-directory

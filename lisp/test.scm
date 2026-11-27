@@ -309,7 +309,9 @@ discovery for helper files."
 (define (%assert-raises loc pred thunk)
   (set! %count (+ %count 1))
   (let ((raised #f) (cond-val #f))
-    (guard (e (#t (set! raised #t) (set! cond-val e)))
+    (guard (e
+             ((or (%test-skip? e) (%test-failure? e)) (raise e))
+             (#t (set! raised #t) (set! cond-val e)))
       (thunk))
     (unless raised
       (raise (%make-test-failure loc "expected an error to be raised, but expression returned normally" "")))
@@ -525,8 +527,8 @@ Under `techne test`, this is a no-op so the runner collects results."
             (set! status 'fail)
             (set! detail (string-append "timed out after " (number->string timeout-sec) "s"))))
         (invoke))
-    ;; Attach any soft check failures if the test did not already abort.
-    (when (and (eq? status 'pass) (pair? (car soft-box)))
+    ;; Attach any soft check failures (takes precedence over pass or a later skip).
+    (when (and (not (eq? status 'fail)) (pair? (car soft-box)))
       (set! status 'fail)
       (set! detail
         (string-join
