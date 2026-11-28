@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795866680267,
+  "lastUpdate": 1795866681657,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -67520,6 +67520,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 632012383,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104459,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "distinct": true,
+          "id": "308b6a3d62f62e1c5d13b4e5f25b11a48e620b13",
+          "message": "vm: use HashMap::entry in defined_names for clippy",
+          "timestamp": "2026-11-28T12:47:25+01:00",
+          "tree_id": "b8c88ccefcf0e306e9e5c0ca835d3f79257b2899",
+          "url": "https://github.com/ArthurHeymans/techne/commit/308b6a3d62f62e1c5d13b4e5f25b11a48e620b13"
+        },
+        "date": 1795866681605,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 696735752,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 631890183,
             "unit": "instructions"
           },
           {
