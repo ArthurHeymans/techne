@@ -110,6 +110,13 @@ pub(crate) fn regexp_is_match(re: &Regex, haystack: &[u8]) -> bool {
     re.is_match(Input::new(SliceCursor(haystack)))
 }
 
+#[inline]
+fn regexp_is_match_with(re: &Regex, cache: &mut regex_cursor::engines::meta::Cache, haystack: &[u8]) -> bool {
+    let mut input = Input::new(SliceCursor(haystack));
+    input.earliest(true);
+    re.search_half_with(cache, &mut input).is_some()
+}
+
 pub(crate) fn flex_match(haystack: &str, needle: &str) -> bool {
     let mut chars = needle.chars();
     let Some(mut want) = chars.next() else { return true };
@@ -361,29 +368,43 @@ impl Matcher {
                     PartKind::LiteralOrRegexp => {
                         let literal = if part.fold { part.text.to_lowercase() } else { part.text.clone() };
                         let f = &Needle::new(literal.as_bytes());
-                        let re = compile_regexp(&part.text, part.fold);
                         let (ltext, lspans) = if part.fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
-                        let (rtext, rspans) = (e.text.as_str(), e.spans.as_slice());
-                        found = Some(
-                            entries
-                                .iter()
-                                .copied()
-                                .filter(|&i| {
-                                    let (lf, lt) = lspans[i as usize];
-                                    if f.find(&ltext.as_bytes()[lf as usize..lt as usize]).is_some() {
-                                        return true;
-                                    }
-                                    if let Some(re) = &re {
+                        if let Some(re) = compile_regexp(&part.text, part.fold) {
+                            let mut cache = re.create_cache();
+                            let (rtext, rspans) = (e.text.as_str(), e.spans.as_slice());
+                            found = Some(
+                                entries
+                                    .iter()
+                                    .copied()
+                                    .filter(|&i| {
+                                        let (lf, lt) = lspans[i as usize];
+                                        if f.find(&ltext.as_bytes()[lf as usize..lt as usize]).is_some() {
+                                            return true;
+                                        }
                                         let (rf, rt) = rspans[i as usize];
-                                        return regexp_is_match(re, &rtext.as_bytes()[rf as usize..rt as usize]);
-                                    }
-                                    false
-                                })
-                                .collect(),
-                        );
+                                        regexp_is_match_with(&re, &mut cache, &rtext.as_bytes()[rf as usize..rt as usize])
+                                    })
+                                    .collect(),
+                            );
+                        } else {
+                            found = match entries.len() * 16 >= lspans.len() {
+                                true => Some(entries_with(ltext, lspans, f, entries, e.text.len())),
+                                false => Some(
+                                    entries
+                                        .iter()
+                                        .copied()
+                                        .filter(|&i| {
+                                            let (from, to) = lspans[i as usize];
+                                            f.find(&ltext.as_bytes()[from as usize..to as usize]).is_some()
+                                        })
+                                        .collect(),
+                                ),
+                            };
+                        }
                     }
                     PartKind::Regexp => {
                         if let Some(re) = compile_regexp(&part.text, part.fold) {
+                            let mut cache = re.create_cache();
                             let (text, spans) = (e.text.as_str(), e.spans.as_slice());
                             found = Some(
                                 entries
@@ -391,7 +412,7 @@ impl Matcher {
                                     .copied()
                                     .filter(|&i| {
                                         let (from, to) = spans[i as usize];
-                                        regexp_is_match(&re, &text.as_bytes()[from as usize..to as usize])
+                                        regexp_is_match_with(&re, &mut cache, &text.as_bytes()[from as usize..to as usize])
                                     })
                                     .collect(),
                             );
@@ -399,16 +420,19 @@ impl Matcher {
                             let literal = if part.fold { part.text.to_lowercase() } else { part.text.clone() };
                             let f = &Needle::new(literal.as_bytes());
                             let (text, spans) = if part.fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
-                            found = Some(
-                                entries
-                                    .iter()
-                                    .copied()
-                                    .filter(|&i| {
-                                        let (from, to) = spans[i as usize];
-                                        f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
-                                    })
-                                    .collect(),
-                            );
+                            found = match entries.len() * 16 >= spans.len() {
+                                true => Some(entries_with(text, spans, f, entries, e.text.len())),
+                                false => Some(
+                                    entries
+                                        .iter()
+                                        .copied()
+                                        .filter(|&i| {
+                                            let (from, to) = spans[i as usize];
+                                            f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
+                                        })
+                                        .collect(),
+                                ),
+                            };
                         }
                     }
                 }

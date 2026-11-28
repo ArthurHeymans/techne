@@ -80,17 +80,29 @@ fn binding_module(vm: &mut Vm, args: usize, _: usize) -> R {
 }
 
 fn defined_names(vm: &mut Vm, args: usize, _: usize) -> R {
-    use reader::Sexp;
     let here = module_arg(vm, arg(vm, args, 0), "defined-names")?;
-    let entries: Vec<Sexp> = vm
-        .defined_names_raw(here)
-        .into_iter()
-        .map(|(s, m)| {
-            let module = Sexp::Str(vm.module_name(m));
-            Sexp::list_of(vec![Sexp::Sym(s), module, Sexp::Sym(reader::intern(vm.binding_kind_raw(m, s)))])
-        })
-        .collect();
-    Ok(vm.constant(&Sexp::list_of(entries)))
+    let raw = vm.defined_names_raw(here);
+    let mut mod_strs = rustc_hash::FxHashMap::default();
+    let mut kind_syms = rustc_hash::FxHashMap::default();
+    let mut rows: Vec<(u32, u32, Value)> = Vec::with_capacity(raw.len());
+    for (s, m, kind) in raw {
+        if !mod_strs.contains_key(&m) {
+            let name = vm.module_name(m);
+            let v = vm.make_string_raw(&name);
+            mod_strs.insert(m, vm.root(v));
+        }
+        let ksym = *kind_syms.entry(kind).or_insert_with(|| Value::symbol(reader::intern(kind)));
+        rows.push((s, m, ksym));
+    }
+    let mut b = Bulk::list(vm, rows.len() * 4)?;
+    let mut list = Value::NIL;
+    for &(s, m, ksym) in rows.iter().rev() {
+        let tail = b.pair(vm, ksym, Value::NIL);
+        let tail = b.pair(vm, mod_strs[&m].get(), tail);
+        let entry = b.pair(vm, Value::symbol(s), tail);
+        list = b.pair(vm, entry, list);
+    }
+    Ok(list)
 }
 
 fn binding_description(vm: &mut Vm, args: usize, n: usize) -> R {

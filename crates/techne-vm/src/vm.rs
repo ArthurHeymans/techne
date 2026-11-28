@@ -678,8 +678,7 @@ impl SourceFile {
     /// The line and column, from 1, of byte position `pos`, as
     /// `reader::line_col` gives them, found in an index of the lines.
     pub(crate) fn line_col(&self, pos: u32) -> (usize, usize) {
-        let starts =
-            self.lines.get_or_init(|| self.text.bytes().enumerate().filter(|&(_, b)| b == b'\n').map(|(i, _)| i as u32 + 1).collect());
+        let starts = self.lines.get_or_init(|| memchr::memchr_iter(b'\n', self.text.as_bytes()).map(|i| i as u32 + 1).collect());
         let pos = self.text.floor_char_boundary(pos as usize);
         let line = starts.partition_point(|&s| s as usize <= pos);
         let start = if line == 0 { 0 } else { starts[line - 1] as usize };
@@ -6379,7 +6378,7 @@ impl Vm {
     /// Every name a loaded module defines or `here` sees, with the module
     /// it denotes something in: `here` if it sees it, else the first module
     /// loaded that defines it; by name, without `%` names.
-    pub(crate) fn defined_names_raw(&self, here: u32) -> Vec<(u32, u32)> {
+    pub(crate) fn defined_names_raw(&self, here: u32) -> Vec<(u32, u32, &'static str)> {
         let mut found: FxHashMap<u32, u32> = FxHashMap::default();
         for m in self.loaded_module_names().iter().filter_map(|name| self.loaded_module(name)) {
             for &s in &self.modules[m as usize].defined {
@@ -6388,19 +6387,32 @@ impl Vm {
                 }
             }
         }
-        for name in self.global_names_raw(here) {
-            let s = reader::intern(&name);
+        for (&(m, s), b) in &self.bindings {
+            if (m == ROOT_MODULE || m == here) && !matches!(b, GlobalBinding::Var(g) if self.globals[*g as usize] == Value::UNDEFINED) {
+                found.insert(s, here);
+            }
+        }
+        for &s in self.modules[here as usize].imports.keys() {
             if self.binding_kind_raw(here, s) != "unbound" {
                 found.insert(s, here);
             }
         }
-        let mut names: Vec<(Rc<str>, u32, u32)> = found
+        for &name in crate::compiler::SPECIAL_FORMS {
+            found.insert(reader::intern(name), here);
+        }
+        let mut names: Vec<(Rc<str>, u32, u32, &'static str)> = found
             .into_iter()
-            .map(|(s, m)| (symbol_name(s), s, m))
-            .filter(|(name, s, m)| !name.starts_with('%') && !name.contains('\u{1f}') && self.binding_kind_raw(*m, *s) != "unbound")
+            .filter_map(|(s, m)| {
+                let name = symbol_name(s);
+                if name.starts_with('%') || name.contains('\u{1f}') {
+                    return None;
+                }
+                let kind = self.binding_kind_raw(m, s);
+                (kind != "unbound").then_some((name, s, m, kind))
+            })
             .collect();
         names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        names.into_iter().map(|(_, s, m)| (s, m)).collect()
+        names.into_iter().map(|(_, s, m, kind)| (s, m, kind)).collect()
     }
 
     pub(crate) fn describe_name_raw(&self, module: u32, sym: u32) -> Description {

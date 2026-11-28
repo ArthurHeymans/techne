@@ -84,6 +84,12 @@
     (check "invalid regexp matches literally" #t (orderless-matches? "call foo(x)" bad))
     (check "invalid regexp rejects non-literal" #f (orderless-matches? "call foo" bad)))
 
+  ;; unmatched closing delimiters are plain literals, not regexps
+  (for-each (lambda (pat)
+              (check (string-append "simple pattern: " pat) #t (orderless-simple-pattern? pat))
+              (check (string-append "literal kind: " pat) 'literal (orderless-part-kind (car (orderless-parse pat)))))
+            '("]a" "}a" ")a"))
+
   ;; UTF-8 regexp spans return character indices, not byte indices
   (let ((spans (orderless-match-spans "éa b" (orderless-parse "a.b"))))
     (check "utf-8 regexp char spans" '((1 4)) spans)

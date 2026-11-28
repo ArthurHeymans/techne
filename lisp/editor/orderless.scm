@@ -68,7 +68,7 @@ Backslashes not before a space stay as typed."
             (else (loop (+ i 1)))))))
 
 (define (regexp-metachar? c)
-  (and (memv c '(#\^ #\$ #\. #\* #\+ #\? #\( #\) #\[ #\] #\{ #\} #\| #\\)) #t))
+  (and (memv c '(#\^ #\$ #\. #\* #\+ #\? #\( #\[ #\{ #\| #\\)) #t))
 
 (define (has-regexp-syntax? s)
   (let ((n (string-length s)))

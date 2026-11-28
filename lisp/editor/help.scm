@@ -79,7 +79,9 @@ The key is the one of session S's profile and state, or the way to run
 the command by name when no key does. Text in backquotes is left as it
 is, so that a docstring can show `\\[command]` itself; `\\=` keeps the
 character after it as it is, and goes, as in Emacs."
-  (let loop ((cs (string->list text)) (quoted #f) (acc '()))
+  (if (not (string-contains text "\\"))
+      text
+      (let loop ((cs (string->list text)) (quoted #f) (acc '()))
     (cond ((null? cs) (list->string (reverse acc)))
           ((and (not quoted) (char=? (car cs) #\\) (pair? (cdr cs)) (char=? (cadr cs) #\=) (pair? (cddr cs)))
            (loop (cdddr cs) quoted (cons (caddr cs) acc)))
@@ -89,7 +91,7 @@ character after it as it is, and goes, as in Emacs."
                   (after (cdr (memv #\] rest)))
                   (name (list->string (take rest (- (length rest) (length after) 1)))))
              (loop after quoted (append (reverse (string->list (command-key s (string->symbol name)))) acc))))
-          (else (loop (cdr cs) quoted (cons (car cs) acc))))))
+          (else (loop (cdr cs) quoted (cons (car cs) acc)))))))
 
 ;;; Names
 
@@ -111,17 +113,24 @@ module loaded that defines it."
 ;; module kind kinds): the module it is bound in (`name-module`) and its
 ;; kind there (as `binding-description` says), both #f if only registries
 ;; know it, and the registries'.
-(define (known-names s)
+(define (known-names s #:filter [match-name? #f])
   (let ((registries (make-hash-table)))
     (for-each (lambda (r)
-                (for-each (lambda (n) (hash-table-update!/default registries n (lambda (ks) (append ks (list (car r)))) '()))
-                          (cdr r)))
-              (registered s))
-    (let* ((bound (map (lambda (e)
-                         (let ((ks (hash-table-ref/default registries (car e) #f)))
-                           (when ks (hash-table-set! registries (car e) 'bound))
-                           (list (car e) (cadr e) (caddr e) (or ks '()))))
-                       (defined-names (document-module (doc s)))))
+                (let ((kind (car r)))
+                  (for-each (lambda (n)
+                              (when (or (not match-name?) (match-name? (symbol->string n)))
+                                (hash-table-update!/default registries n (lambda (ks) (cons kind ks)) '())))
+                            (cdr r))))
+              (reverse (registered s)))
+    (let* ((bound (let loop ((es (defined-names (document-module (doc s)))) (acc '()))
+                    (if (null? es)
+                        (reverse acc)
+                        (let ((e (car es)))
+                          (if (or (not match-name?) (match-name? (symbol->string (car e))))
+                              (let ((ks (hash-table-ref/default registries (car e) #f)))
+                                (when ks (hash-table-set! registries (car e) 'bound))
+                                (loop (cdr es) (cons (list (car e) (cadr e) (caddr e) (or ks '())) acc)))
+                              (loop (cdr es) acc))))))
            (only (sort (filter-map (lambda (p)
                                      (and (pair? (cdr p)) (not (string-prefix? "%" (symbol->string (car p))))
                                           (list (car p) #f #f (cdr p))))
@@ -328,9 +337,14 @@ The first `apropos-rows-max` are shown, then how many more there are."
 ;; and a view is made all at once.
 (define apropos-rows-max 100)
 
+(define (name-matches-words? name words)
+  (let loop ((ws words))
+    (cond ((null? ws) #t)
+          ((string-contains name (car ws)) (loop (cdr ws)))
+          (else #f))))
+
 (define (apropos-rows s words)
-  (let* ((found (filter (lambda (e) (let ((name (symbol->string (car e)))) (every (lambda (w) (string-contains name w)) words)))
-                        (known-names s)))
+  (let* ((found (known-names s #:filter (lambda (name) (name-matches-words? name words))))
          (more (- (length found) apropos-rows-max)))
     (append (map (lambda (e) (row (symbol->string (car e)) (summary s e) #:target (target 'symbol (car e))))
                  (if (> more 0) (take found apropos-rows-max) found))

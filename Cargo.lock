@@ -4187,6 +4187,7 @@ dependencies = [
  "jiff",
  "libc",
  "libtest-mimic",
+ "memchr",
  "num-bigint",
  "num-complex",
  "num-integer",
