@@ -639,13 +639,15 @@ anywhere in the name; a directory's has no slash."
 
 ;;; Targets: a directory is listed; files have their actions already.
 
-(define-action directory (visit-directory s path) "List the directory." (dired! s path))
+(define-action directory (visit-directory s path) #:key "f" #:default #t "List the directory." (dired! s path))
 (define-action directory (visit-directory-other-pane s path)
+  #:key "o"
   "List the directory in a new pane below."
   (show-in-other-pane! s (doc s))
   (dired! s path))
-(define-action directory (copy-directory-name s path) "Save the directory's name as a kill." (kill-save! s path #f #f))
+(define-action directory (copy-directory-name s path) #:key "w" "Save the directory's name as a kill." (kill-save! s path #f #f))
 (define-action file (list-file-directory s path)
+  #:key "j"
   "List the file's directory, at the file."
   (dired! s (directory-part path) #:select (base-name path)))
 

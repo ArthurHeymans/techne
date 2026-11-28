@@ -159,6 +159,7 @@
       (define-action orderless-test-kind (alpha-inspect-item _s v) "Inspect item." (set! ran (list 'inspect v)))
       (define-action orderless-test-kind (beta-delete-item _s v) "Delete item." (set! ran (list 'delete v)))
       (act-on! s (target 'orderless-test-kind "payload") "item")
+      (press-keys s "?")
       (type-text s "item")
       (press-keys s "M-SPC")
       (type-text s "~dl")

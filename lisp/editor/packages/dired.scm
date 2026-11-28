@@ -41,15 +41,19 @@ first); \\[dired-cycle-sort] goes to the next in one listing."
     (run-action! s a (target kind path))))
 
 (define-action directory (visit-directory s path)
+  #:key "f" #:default #t
   "List the directory."
   (dired-activate-action! s 'directory 'visit-directory path))
 (define-action directory (visit-directory-other-pane s path)
+  #:key "o"
   "List the directory in a new pane below."
   (dired-activate-action! s 'directory 'visit-directory-other-pane path))
 (define-action directory (copy-directory-name s path)
+  #:key "w"
   "Save the directory's name as a kill."
   (kill-save! s path #f #f))
 (define-action file (list-file-directory s path)
+  #:key "j"
   "List the file's directory, at the file."
   (dired-activate-action! s 'file 'list-file-directory path))
 

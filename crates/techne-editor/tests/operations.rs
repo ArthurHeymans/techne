@@ -315,7 +315,7 @@ fn an_action_chosen_in_the_minibuffer_runs_in_an_operation() {
            (completing-read s \"Thing: \" (list (candidate \"x\" #:target (target 'test-kind \"!\")))))",
     );
     eval(&mut rt, "(run-command (current-session) 'choose 1)");
-    keys(&mut rt, "C-; p u t - i t RET");
+    keys(&mut rt, "C-; ? p u t - i t RET");
     assert_eq!(eval(&mut rt, "(document-string (session-document (current-session)))"), "\"!abc\"");
     let act = eval(&mut rt, "(car (car (ended-of 'minibuffer-act)))");
     assert!(eval(&mut rt, "(last-change-operation)").ends_with(&format!(" {act})")), "its change names it");
@@ -405,7 +405,7 @@ fn the_text_at_point_says_which_operation_wrote_it() {
     assert!(listed.contains("self-insert ×2") && listed.contains("2 changes"), "{listed}");
     assert!(!listed.contains("operations"), "not the operation listing them: {listed}");
     // On its row, the action showing them.
-    keys(&mut rt, "M-< C-; s h o w - o p e r a t i o n - c h a n g e s RET");
+    keys(&mut rt, "M-< C-; ? s h o w - o p e r a t i o n - c h a n g e s RET");
     let lens = eval(&mut rt, "(document-string (session-document (current-session)))");
     assert!(lens.contains("abcxy"), "{lens} echo {:?}", rt.snapshot().echo);
 }
@@ -506,7 +506,7 @@ fn a_lens_edit_records_each_change_once_and_blame_works_through_it() {
     eval(&mut rt, "(define-command (lines s n) \"Insert three lines.\" (insert-text! s \"ONE\\nTWO\\nTHREE\\n\" \"new\"))");
     eval(&mut rt, "(run-command (current-session) 'lines 1)");
     eval(&mut rt, "(run-command (current-session) 'operations 1)");
-    keys(&mut rt, "M-< C-; s h o w - o p e r a t i o n - c h a n g e s RET");
+    keys(&mut rt, "M-< C-; ? s h o w - o p e r a t i o n - c h a n g e s RET");
     let lens = eval(&mut rt, "(document-string (session-document (current-session)))");
     assert!(lens.contains("ONE") && lens.contains("TWO") && lens.contains("THREE"), "{lens}");
     keys(&mut rt, "M-< C-e M-x o p e r a t i o n - a t - p o i n t RET");

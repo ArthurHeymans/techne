@@ -13,11 +13,11 @@
       "is_macro": false
     },
     "act-on!": {
-      "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:755\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
+      "description": "(act-on! s t name #:minibuffer-context (mb-ctx #f))  procedure, @lisp@/editor/minibuffer.scm:787\n\nChoose an action on the target T, described by NAME, in session S.\nShows single-key shortcuts immediately; press a shortcut key, RET for\nthe default action, ? to search by name, or \\[keyboard-quit] to cancel.\nOptional MB-CTX enables batch/meta keys (E, S, A).",
       "is_macro": false
     },
     "actions-for": {
-      "description": "(actions-for kind)  procedure, @lisp@/editor/targets.scm:69\n\nReturn the actions on targets of KIND, the default first.",
+      "description": "(actions-for kind)  procedure, @lisp@/editor/targets.scm:103\n\nReturn the actions on targets of KIND, the default first.",
       "is_macro": false
     },
     "add-buffer!": {
@@ -49,7 +49,7 @@
       "is_macro": false
     },
     "async-source": {
-      "description": "(async-source produce #:min-input (min-input 3) #:filter (filter #f))  procedure, @lisp@/editor/minibuffer.scm:114\n\nReturn a source of candidates for `completing-read` that come later.\n(PRODUCE input) returns the candidates for the input, as a list; it\nruns in a task, so it can wait, for a service's answer say. The input\nchanging cancels it, for the new input. An input shorter than\nMIN-INPUT has no candidates. Until they come, those for the input\nbefore are shown. When FILTER is true, returned candidates are also\nfiltered by Orderless against the input pattern.",
+      "description": "(async-source produce #:min-input (min-input 3) #:filter (filter #f))  procedure, @lisp@/editor/minibuffer.scm:115\n\nReturn a source of candidates for `completing-read` that come later.\n(PRODUCE input) returns the candidates for the input, as a list; it\nruns in a task, so it can wait, for a service's answer say. The input\nchanging cancels it, for the new input. An input shorter than\nMIN-INPUT has no candidates. Until they come, those for the input\nbefore are shown. When FILTER is true, returned candidates are also\nfiltered by Orderless against the input pattern.",
       "is_macro": false
     },
     "buffer-document": {
@@ -129,7 +129,7 @@
       "is_macro": false
     },
     "cancel-file-visit!": {
-      "description": "(cancel-file-visit! s)  procedure, @lisp@/editor/buffers.scm:338\n\nCancel any pending interactive asynchronous file visit in session S.",
+      "description": "(cancel-file-visit! s)  procedure, @lisp@/editor/buffers.scm:327\n\nCancel any pending interactive asynchronous file visit in session S.",
       "is_macro": false
     },
     "cancel-request!": {
@@ -141,23 +141,23 @@
       "is_macro": false
     },
     "candidate": {
-      "description": "(candidate text #:suffix (suffix #f) #:annotation (annotation \"\") #:target (target #f))  procedure, @lisp@/editor/minibuffer.scm:62\n\nReturn a candidate of the minibuffer, showing TEXT.\nSUFFIX is shown right after it, not matched (a command's key);\nANNOTATION in a column of its own; TARGET is what it stands for.",
+      "description": "(candidate text #:suffix (suffix #f) #:annotation (annotation \"\") #:target (target #f))  procedure, @lisp@/editor/minibuffer.scm:63\n\nReturn a candidate of the minibuffer, showing TEXT.\nSUFFIX is shown right after it, not matched (a command's key);\nANNOTATION in a column of its own; TARGET is what it stands for.",
       "is_macro": false
     },
     "candidate-annotation": {
-      "description": "(candidate-annotation record)  procedure, @lisp@/editor/minibuffer.scm:57\n\nReturn the `annotation` field of RECORD, a `candidate` record.",
+      "description": "(candidate-annotation record)  procedure, @lisp@/editor/minibuffer.scm:58\n\nReturn the `annotation` field of RECORD, a `candidate` record.",
       "is_macro": false
     },
     "candidate-table": {
-      "description": "(candidate-table matcher make)  procedure, @lisp@/editor/minibuffer.scm:88\n\nReturn a source of candidates for `completing-read`: MATCHER's entries.\nMATCHER is made by `make-matcher` or `lines-matcher`; (MAKE entry)\nreturns an entry's candidate (or string), once it is shown, selected\nor asked for.",
+      "description": "(candidate-table matcher make)  procedure, @lisp@/editor/minibuffer.scm:89\n\nReturn a source of candidates for `completing-read`: MATCHER's entries.\nMATCHER is made by `make-matcher` or `lines-matcher`; (MAKE entry)\nreturns an entry's candidate (or string), once it is shown, selected\nor asked for.",
       "is_macro": false
     },
     "candidate-target": {
-      "description": "(candidate-target record)  procedure, @lisp@/editor/minibuffer.scm:58\n\nReturn the `target` field of RECORD, a `candidate` record.",
+      "description": "(candidate-target record)  procedure, @lisp@/editor/minibuffer.scm:59\n\nReturn the `target` field of RECORD, a `candidate` record.",
       "is_macro": false
     },
     "candidate-text": {
-      "description": "(candidate-text record)  procedure, @lisp@/editor/minibuffer.scm:54\n\nReturn the `text` field of RECORD, a `candidate` record.",
+      "description": "(candidate-text record)  procedure, @lisp@/editor/minibuffer.scm:55\n\nReturn the `text` field of RECORD, a `candidate` record.",
       "is_macro": false
     },
     "changed-on-disk?": {
@@ -297,7 +297,7 @@
       "is_macro": false
     },
     "completing-read": {
-      "description": "(completing-read s prompt source #:accept (accept take-target) #:preview (preview #f) #:initial (initial \"\") #:pattern (pattern (lambda (input) input)) #:require-match (require-match #t) #:abort (abort #f) #:keymap (keymap #f) #:select-input (select-input #f) #:history (history #f) #:remember (remember (quote choice)))  procedure, @lisp@/editor/minibuffer.scm:204\n\nRead a choice in the minibuffer of session S with PROMPT and INITIAL.\nSOURCE is a list of candidates (strings or `candidate`s), a\n`candidate-table` (for many), a procedure from the input to a list,\nor an `async-source`.\nOn \\[minibuffer-accept],\n(ACCEPT session candidate) is called with the selected candidate, or\none made of the input when nothing matches and REQUIRE-MATCH is false\n(\\[minibuffer-accept-input] takes the input as it is); by default,\nthe default action on the candidate's target is done. PREVIEW, if\ngiven, is called the same way for each candidate selected while\nreading; \\[minibuffer-abort] undoes what it did to the panes, and\ncalls ABORT, if given, for what else they did. PATTERN gives the part\nof the input candidates are matched against (the file name after its\ndirectory). KEYMAP, if given, holds the keys of what is being read\n(a file name's, say): it is looked up before `minibuffer-map`.\nSELECT-INPUT, if given, is a procedure (input) saying when the input\nitself is selected first rather than the first candidate, as vertico\nselects an existing directory's name. HISTORY, if given, is the name\nof the history \\[minibuffer-previous-history] and\n\\[minibuffer-next-history] go through, a symbol; what is taken is\nremembered there: the input completed with the candidate taken, or,\nwith REMEMBER `input`, the input as typed (a search's words, not the\nline found). REMEMBER can also be a procedure (entry candidate)\nreturning what to remember of the candidate taken instead of ENTRY,\nthe input completed with it, or #f for nothing (a directory gone\ninto). The procedures run in the scope this is called in, as the\ncommand calling it does, and in its operation: it is held while the\nminibuffer is open, and aborting cancels it.",
+      "description": "(completing-read s prompt source #:accept (accept take-target) #:preview (preview #f) #:initial (initial \"\") #:pattern (pattern (lambda (input) input)) #:require-match (require-match #t) #:abort (abort #f) #:keymap (keymap #f) #:select-input (select-input #f) #:input-target (input-target #f) #:history (history #f) #:remember (remember (quote choice)))  procedure, @lisp@/editor/minibuffer.scm:209\n\nRead a choice in the minibuffer of session S with PROMPT and INITIAL.\nSOURCE is a list of candidates (strings or `candidate`s), a\n`candidate-table` (for many), a procedure from the input to a list,\nor an `async-source`.\nOn \\[minibuffer-accept],\n(ACCEPT session candidate) is called with the selected candidate, or\none made of the input when nothing matches and REQUIRE-MATCH is false\n(\\[minibuffer-accept-input] takes the input as it is); by default,\nthe default action on the candidate's target is done. PREVIEW, if\ngiven, is called the same way for each candidate selected while\nreading; \\[minibuffer-abort] undoes what it did to the panes, and\ncalls ABORT, if given, for what else they did. PATTERN gives the part\nof the input candidates are matched against (the file name after its\ndirectory). KEYMAP, if given, holds the keys of what is being read\n(a file name's, say): it is looked up before `minibuffer-map`.\nSELECT-INPUT, if given, is a procedure (input) saying when the input\nitself is selected first rather than the first candidate, as vertico\nselects an existing directory's name. INPUT-TARGET, if given, is a\nprocedure (input) returning a target when the input itself is acted on.\nHISTORY, if given, is the name\nof the history \\[minibuffer-previous-history] and\n\\[minibuffer-next-history] go through, a symbol; what is taken is\nremembered there: the input completed with the candidate taken, or,\nwith REMEMBER `input`, the input as typed (a search's words, not the\nline found). REMEMBER can also be a procedure (entry candidate)\nreturning what to remember of the candidate taken instead of ENTRY,\nthe input completed with it, or #f for nothing (a directory gone\ninto). The procedures run in the scope this is called in, as the\ncommand calling it does, and in its operation: it is held while the\nminibuffer is open, and aborting cancels it.",
       "is_macro": false
     },
     "condition-choices": {
@@ -385,7 +385,7 @@
       "is_macro": false
     },
     "default-directory": {
-      "description": "(default-directory s)  procedure, @lisp@/editor/buffers.scm:765\n\nReturn the directory of the focused pane's file in S, with a slash.\nWithout a file, it is the directory its buffer's mode says (a\ndirectory's listing is in that directory), else the working directory.",
+      "description": "(default-directory s)  procedure, @lisp@/editor/buffers.scm:762\n\nReturn the directory of the focused pane's file in S, with a slash.\nWithout a file, it is the directory its buffer's mode says (a\ndirectory's listing is in that directory), else the working directory.",
       "is_macro": false
     },
     "default-gpg-armor": {
@@ -429,7 +429,7 @@
       "is_macro": false
     },
     "define-action": {
-      "description": "define-action: macro, @lisp@/editor/targets.scm:60\n\nDefine the action NAME on targets of KIND.\nIt is a procedure of the session S and the target's value V; DOC\ndocuments both the procedure and the action.",
+      "description": "define-action: macro, @lisp@/editor/targets.scm:80\n\nDefine the action NAME on targets of KIND.\nIt is a procedure of the session S and the target's value V; DOC\ndocuments both the procedure and the action. Supports optional `#:key`,\n`#:default`, and `#:interactive` flags before DOC.",
       "is_macro": true
     },
     "define-codec": {
@@ -485,7 +485,7 @@
       "is_macro": true
     },
     "delete-path-and-buffers!": {
-      "description": "(delete-path-and-buffers! s path)  procedure, @lisp@/editor/buffers.scm:133\n\nDelete the file or directory PATH, with all it holds, in session S.\nThe buffers of the open files deleted are killed. It is an error, and\nnothing is deleted, when one of them has unsaved edits: they would be\nleft with no file to be recovered against.",
+      "description": "(delete-path-and-buffers! s path #:recursive (recursive? #t))  procedure, @lisp@/editor/buffers.scm:133\n\nDelete the file or directory PATH in session S.\nWith RECURSIVE? (default #t), deletes directories recursively;\nwith #f, refuses real directories. Buffers of deleted files are killed.",
       "is_macro": false
     },
     "derived-mode?": {
@@ -501,7 +501,7 @@
       "is_macro": false
     },
     "display-buffer!": {
-      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:879\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
+      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:876\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
       "is_macro": false
     },
     "doc": {
@@ -669,7 +669,7 @@
       "is_macro": false
     },
     "drop-buffer!": {
-      "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:839\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
+      "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:836\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
       "is_macro": false
     },
     "edit!": {
@@ -789,7 +789,7 @@
       "is_macro": false
     },
     "file-location": {
-      "description": "(file-location path line #:column (column 1))  procedure, @lisp@/editor/targets.scm:107\n\nReturn the location of line LINE of the file at PATH, at COLUMN.\nBoth count from 1.",
+      "description": "(file-location path line #:column (column 1))  procedure, @lisp@/editor/targets.scm:142\n\nReturn the location of line LINE of the file at PATH, at COLUMN.\nBoth count from 1.",
       "is_macro": false
     },
     "file-name": {
@@ -805,11 +805,11 @@
       "is_macro": false
     },
     "file-visit!": {
-      "description": "(file-visit! s path #:other-pane (other-pane? #f) #:line (line #f) #:column (column #f) #:async (force-async? #f) #:reload-clean (reload-clean? #f) #:journal-path (journal-path #f) #:alias (alias #f) #:pinned (pinned? #f) #:interactive (interactive? #t) #:on-pending (on-pending #f) #:on-shown (on-shown #f) #:on-ready (on-ready #f) #:on-fail (on-fail #f) #:on-cancel (on-cancel #f))  procedure, @lisp@/editor/buffers.scm:365\n\nOpen PATH in session S, running slow or remote opens asynchronously.\nAlready-open documents and fast local non-codec files open immediately.\nRemote files and codec-backed files (or when FORCE-ASYNC? is true) share a\ndeduplicated background decode task per path. When INTERACTIVE? is true (the\ndefault), opens supersede a prior interactive open in S and avoid hijacking\nfocus if S moved panes or opened a minibuffer while waiting; non-interactive\nopens (such as server `--wait` requests) run with independent waiters that are\nnot cancelled by interactive navigation or `C-g`.\nOTHER-PANE? displays the buffer in another pane; LINE and COLUMN move point\nonce opened; RELOAD-CLEAN? reloads an unmodified open document; JOURNAL-PATH\noverrides the journal file for a non-private local file; ALIAS records the\noriginal symlink pathname when PATH is already canonical; PINNED? suppresses\nre-canonicalization for a previously pinned local path; ON-PENDING, when an\nopen goes asynchronous, is called with a zero-argument cancellation thunk;\nON-SHOWN is called with (session document view) when displayed in S; ON-READY,\nON-FAIL, and ON-CANCEL override completion, failure, and cancellation handling.",
+      "description": "(file-visit! s path #:other-pane (other-pane? #f) #:line (line #f) #:column (column #f) #:async (force-async? #f) #:reload-clean (reload-clean? #f) #:journal-path (journal-path #f) #:alias (alias #f) #:pinned (pinned? #f) #:interactive (interactive? #t) #:on-pending (on-pending #f) #:on-shown (on-shown #f) #:on-ready (on-ready #f) #:on-fail (on-fail #f) #:on-cancel (on-cancel #f))  procedure, @lisp@/editor/buffers.scm:354\n\nOpen PATH in session S, running slow or remote opens asynchronously.\nAlready-open documents and fast local non-codec files open immediately.\nRemote files and codec-backed files (or when FORCE-ASYNC? is true) share a\ndeduplicated background decode task per path. When INTERACTIVE? is true (the\ndefault), opens supersede a prior interactive open in S and avoid hijacking\nfocus if S moved panes or opened a minibuffer while waiting; non-interactive\nopens (such as server `--wait` requests) run with independent waiters that are\nnot cancelled by interactive navigation or `C-g`.\nOTHER-PANE? displays the buffer in another pane; LINE and COLUMN move point\nonce opened; RELOAD-CLEAN? reloads an unmodified open document; JOURNAL-PATH\noverrides the journal file for a non-private local file; ALIAS records the\noriginal symlink pathname when PATH is already canonical; PINNED? suppresses\nre-canonicalization for a previously pinned local path; ON-PENDING, when an\nopen goes asynchronous, is called with a zero-argument cancellation thunk;\nON-SHOWN is called with (session document view) when displayed in S; ON-READY,\nON-FAIL, and ON-CANCEL override completion, failure, and cancellation handling.",
       "is_macro": false
     },
     "file-visit-pending?": {
-      "description": "(file-visit-pending? s)  procedure, @lisp@/editor/buffers.scm:333\n\nReturn #t if session S has an interactive async file visit in flight.",
+      "description": "(file-visit-pending? s)  procedure, @lisp@/editor/buffers.scm:322\n\nReturn #t if session S has an interactive async file visit in flight.",
       "is_macro": false
     },
     "find-codec": {
@@ -989,7 +989,7 @@
       "is_macro": false
     },
     "line-candidate": {
-      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:889\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
+      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:886\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
       "is_macro": false
     },
     "line-diff": {
@@ -1085,7 +1085,7 @@
       "is_macro": false
     },
     "location": {
-      "description": "(location d pos #:revision (revision (document-revision d)))  procedure, @lisp@/editor/targets.scm:102\n\nReturn the location of POS in document D, as of REVISION.\nREVISION is the document's revision now unless given.",
+      "description": "(location d pos #:revision (revision (document-revision d)))  procedure, @lisp@/editor/targets.scm:137\n\nReturn the location of POS in document D, as of REVISION.\nREVISION is the document's revision now unless given.",
       "is_macro": false
     },
     "location-at": {
@@ -1093,7 +1093,7 @@
       "is_macro": false
     },
     "location-document": {
-      "description": "(location-document l)  procedure, @lisp@/editor/targets.scm:112\n\nReturn the document of the location L, opening its file if needed.",
+      "description": "(location-document l)  procedure, @lisp@/editor/targets.scm:147\n\nReturn the document of the location L, opening its file if needed.",
       "is_macro": false
     },
     "location-endpoint": {
@@ -1105,7 +1105,7 @@
       "is_macro": false
     },
     "location-position": {
-      "description": "(location-position l)  procedure, @lisp@/editor/targets.scm:122\n\nReturn where the location L is now, mapped past the edits since.",
+      "description": "(location-position l)  procedure, @lisp@/editor/targets.scm:157\n\nReturn where the location L is now, mapped past the edits since.",
       "is_macro": false
     },
     "location-prefix": {
@@ -1117,7 +1117,7 @@
       "is_macro": false
     },
     "location?": {
-      "description": "(location? obj)  procedure, @lisp@/editor/targets.scm:92\n\nReturn #t if OBJ is a `location` record.",
+      "description": "(location? obj)  procedure, @lisp@/editor/targets.scm:127\n\nReturn #t if OBJ is a `location` record.",
       "is_macro": false
     },
     "log-history": {
@@ -1177,7 +1177,7 @@
       "is_macro": false
     },
     "make-generated-buffer!": {
-      "description": "(make-generated-buffer! name d mode #:state (state #f))  procedure, @lisp@/editor/buffers.scm:150\n\nReturn a new buffer NAME of the document D in MODE, with STATE.\nLENS is the lens whose document D is, if any. A buffer of that name is\nreplaced.",
+      "description": "(make-generated-buffer! name d mode #:state (state #f))  procedure, @lisp@/editor/buffers.scm:139\n\nReturn a new buffer NAME of the document D in MODE, with STATE.\nLENS is the lens whose document D is, if any. A buffer of that name is\nreplaced.",
       "is_macro": false
     },
     "make-indent-specs": {
@@ -1277,7 +1277,7 @@
       "is_macro": false
     },
     "minibuffer-history": {
-      "description": "(minibuffer-history name)  procedure, @lisp@/editor/minibuffer.scm:574\n\nReturn the entries of the minibuffer history NAME, newest first.",
+      "description": "(minibuffer-history name)  procedure, @lisp@/editor/minibuffer.scm:589\n\nReturn the entries of the minibuffer history NAME, newest first.",
       "is_macro": false
     },
     "minibuffer-map": {
@@ -1829,11 +1829,11 @@
       "is_macro": false
     },
     "read-directory-name": {
-      "description": "(read-directory-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:775\n\nRead a directory's name in the minibuffer of S with PROMPT and INITIAL.\nIt is completed a directory at a time, as `read-file-name` completes:\nthe candidates are ./, the directory of the input itself, then ../ and\nthe subdirectories. Taking ./ calls (ACCEPT session directory) with its\nabsolute name, with a slash; taking another goes into it. The input\nnaming a directory that exists is selected first, so that RET takes\nit, whatever subdirectory was taken before and is listed first.\n\\[minibuffer-accept-input] takes the input as it is, also a directory\nthat does not exist yet.",
+      "description": "(read-directory-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:772\n\nRead a directory's name in the minibuffer of S with PROMPT and INITIAL.\nIt is completed a directory at a time, as `read-file-name` completes:\nthe candidates are ./, the directory of the input itself, then ../ and\nthe subdirectories. Taking ./ calls (ACCEPT session directory) with its\nabsolute name, with a slash; taking another goes into it. The input\nnaming a directory that exists is selected first, so that RET takes\nit, whatever subdirectory was taken before and is listed first.\n\\[minibuffer-accept-input] takes the input as it is, also a directory\nthat does not exist yet.",
       "is_macro": false
     },
     "read-file-name": {
-      "description": "(read-file-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:730\n\nRead a file name in the minibuffer of S with PROMPT and INITIAL.\nThe name is completed a directory at a time: the candidates are the\nentries of the input's directory. Taking a directory goes into it;\n(ACCEPT session path) gets a file's absolute path, also one that does\nnot exist yet. The input naming a directory that exists is selected\nfirst, as vertico selects it: taking it as it is gives ACCEPT the\ndirectory's path, with its slash.",
+      "description": "(read-file-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:719\n\nRead a file name in the minibuffer of S with PROMPT and INITIAL.\nThe name is completed a directory at a time: the candidates are the\nentries of the input's directory. Taking a directory goes into it;\n(ACCEPT session path) gets a file's absolute path, also one that does\nnot exist yet. The input naming a directory that exists is selected\nfirst, as vertico selects it: taking it as it is gives ACCEPT the\ndirectory's path, with its slash.",
       "is_macro": false
     },
     "record-arguments": {
@@ -2121,7 +2121,7 @@
       "is_macro": false
     },
     "save-document-in-session!": {
-      "description": "(save-document-in-session! s d who #:after (after #f) #:on-fail (on-fail #f) #:on-cancel (on-cancel #f) #:overwrite (overwrite #f) #:if-clean (if-clean (quote write)))  procedure, @lisp@/editor/buffers.scm:557\n\nSave document D for session S, running codec or remote writes async.\nWHO names the command for error reporting. AFTER, when given, runs once\nthe save succeeds; ON-FAIL runs with the error condition if the save\nfails; ON-CANCEL runs if an asynchronous save is cancelled. OVERWRITE\nbypasses the external-change check. When IF-CLEAN is `'skip`, an\nalready-saved unmodified document is not rewritten and AFTER runs\nimmediately.",
+      "description": "(save-document-in-session! s d who #:after (after #f) #:on-fail (on-fail #f) #:on-cancel (on-cancel #f) #:overwrite (overwrite #f) #:if-clean (if-clean (quote write)))  procedure, @lisp@/editor/buffers.scm:546\n\nSave document D for session S, running codec or remote writes async.\nWHO names the command for error reporting. AFTER, when given, runs once\nthe save succeeds; ON-FAIL runs with the error condition if the save\nfails; ON-CANCEL runs if an asynchronous save is cancelled. OVERWRITE\nbypasses the external-change check. When IF-CLEAN is `'skip`, an\nalready-saved unmodified document is not rewritten and AFTER runs\nimmediately.",
       "is_macro": false
     },
     "screenshot!": {
@@ -2261,15 +2261,15 @@
       "is_macro": false
     },
     "show-buffer!": {
-      "description": "(show-buffer! s b #:remember (remember #t))  procedure, @lisp@/editor/buffers.scm:169\n\nShow the buffer B in the focused pane of S.\nIt is shown in the view it was last shown in, unless another pane, of\nS or of another attached session, shows that one. With REMEMBER #f (a\npreview) the buffer list's order stays.",
+      "description": "(show-buffer! s b #:remember (remember #t))  procedure, @lisp@/editor/buffers.scm:158\n\nShow the buffer B in the focused pane of S.\nIt is shown in the view it was last shown in, unless another pane, of\nS or of another attached session, shows that one. With REMEMBER #f (a\npreview) the buffer list's order stays.",
       "is_macro": false
     },
     "show-document!": {
-      "description": "(show-document! s d #:remember (remember #t))  procedure, @lisp@/editor/buffers.scm:164\n\nShow the document D in the focused pane of S, as `show-buffer!` does.\nREMEMBER is as `show-buffer!` takes it.",
+      "description": "(show-document! s d #:remember (remember #t))  procedure, @lisp@/editor/buffers.scm:153\n\nShow the document D in the focused pane of S, as `show-buffer!` does.\nREMEMBER is as `show-buffer!` takes it.",
       "is_macro": false
     },
     "show-in-other-pane!": {
-      "description": "(show-in-other-pane! s d)  procedure, @lisp@/editor/buffers.scm:865\n\nShow the document D in a new pane of S below the focused one.\nThe new pane is focused.",
+      "description": "(show-in-other-pane! s d)  procedure, @lisp@/editor/buffers.scm:862\n\nShow the document D in a new pane of S below the focused one.\nThe new pane is focused.",
       "is_macro": false
     },
     "show-lens!": {
@@ -2389,7 +2389,7 @@
       "is_macro": false
     },
     "take-target": {
-      "description": "(take-target s c)  procedure, @lisp@/editor/minibuffer.scm:748\n\nDo the default action on the target of candidate C in session S.\nThis is how `completing-read` accepts by default.",
+      "description": "(take-target s c)  procedure, @lisp@/editor/minibuffer.scm:763\n\nDo the default action on the target of candidate C in session S.\nThis is how `completing-read` accepts by default.",
       "is_macro": false
     },
     "take-violations!": {
@@ -2401,7 +2401,7 @@
       "is_macro": false
     },
     "target-at": {
-      "description": "(target-at d pos)  procedure, @lisp@/editor/targets.scm:134\n\nReturn the target at POS in document D, or #f.\nIt is found by D's buffer's mode, if that finds any.",
+      "description": "(target-at d pos)  procedure, @lisp@/editor/targets.scm:175\n\nReturn the target at POS in document D, or #f.\nIt is found by D's buffer's mode, or falls back to a URL or existing\nfile path at POS.",
       "is_macro": false
     },
     "target-kind": {
@@ -2597,7 +2597,7 @@
       "is_macro": false
     },
     "visit!": {
-      "description": "(visit! s path line column)  procedure, @lisp@/editor/buffers.scm:531\n\nShow line LINE, column COLUMN, of the file PATH in S's focused pane.\nLines and columns count from 1. Where the pane was is remembered for\n\\[xref-go-back] once navigation succeeds.",
+      "description": "(visit! s path line column)  procedure, @lisp@/editor/buffers.scm:520\n\nShow line LINE, column COLUMN, of the file PATH in S's focused pane.\nLines and columns count from 1. Where the pane was is remembered for\n\\[xref-go-back] once navigation succeeds.",
       "is_macro": false
     },
     "with-choices": {

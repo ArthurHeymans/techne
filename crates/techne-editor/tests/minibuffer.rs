@@ -268,10 +268,11 @@ fn acting_on_candidates() {
     std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
     std::fs::write(dir.path().join("b.txt"), "bee\n").unwrap();
     let mut rt = open(dir.path(), "a.txt", "emacs");
-    // A command: the actions on commands are offered, the default first.
+    // A command: C-; opens the single-key action prompter; ? searches actions by name.
     keys(&mut rt, "M-x");
     type_text(&mut rt, "forward-char");
     keys(&mut rt, "C-;");
+    keys(&mut rt, "?");
     let s = rt.snapshot();
     assert!(s.minibuffer.as_ref().unwrap().prompt.ends_with("Act on forward-char: "));
     assert_eq!(shown(&s), ["run-named-command", "describe-named-command", "find-command-definition", "configure-command"]);
@@ -283,12 +284,11 @@ fn acting_on_candidates() {
     assert_eq!(rt.snapshot().panes.len(), 2);
     keys(&mut rt, "q");
     assert_eq!(rt.snapshot().panes.len(), 1);
-    // A file, opened in a new pane.
+    // A file, opened in a new pane via single-key shortcut 'o'.
     keys(&mut rt, "C-x C-f");
     type_text(&mut rt, "b.t");
     keys(&mut rt, "C-;");
-    type_text(&mut rt, "other");
-    keys(&mut rt, "RET");
+    keys(&mut rt, "o");
     let s = rt.snapshot();
     assert_eq!(s.panes.iter().map(|p| p.text.to_string()).collect::<Vec<_>>(), ["one\ntwo\n", "bee\n"]);
     assert_eq!(s.focus, 1);
@@ -300,6 +300,7 @@ fn acting_on_candidates() {
     keys(&mut rt, "M-x");
     type_text(&mut rt, "set-option");
     keys(&mut rt, "C-;");
+    keys(&mut rt, "?");
     type_text(&mut rt, "configure");
     keys(&mut rt, "RET");
     let s = rt.snapshot();
