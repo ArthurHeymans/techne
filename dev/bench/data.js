@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795861355038,
+  "lastUpdate": 1795861356896,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -67177,6 +67177,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 104365,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "distinct": true,
+          "id": "be49e38380469153185f5573ca07f857de4c13ad",
+          "message": "editor, vm: speed up orderless literal closing delimiters and apropos\n\nFixes two pre-existing keyfuzz instruction-budget overruns on main:\n\n1. Orderless/Matcher (`search C-a ' ]'`: 40.96M -> 1.53M instr):\n   - Remove standalone closing delimiters `)`, `]`, `}` from\n     `regexp-metachar?` in `lisp/editor/orderless.scm`; they only have\n     regexp meaning when paired with `(`, `[`, `{` (already in the set).\n   - Reuse a single `regex_cursor` `Cache` per pass in\n     `crates/techne-editor/src/matcher.rs` and use `entries_with` when\n     regexp compilation falls back to literal matching.\n\n2. Help/Apropos (`unicode-modal SPC h a p RET`: 35.81M -> 22.50M instr):\n   - In `crates/techne-vm`: use `memchr` in `SourceFile::line_col`,\n     avoid the `global_names_raw` string/re-intern round-trip and\n     duplicate `binding_kind_raw` calls in `defined_names_raw`, and\n     build `defined-names` directly with `Bulk::list` and cached module\n     strings instead of `Sexp` + `vm.constant`.\n   - In `lisp/editor/help.scm`: fast-path `substitute-command-keys`\n     when there is no backslash, avoid `append` per entry in\n     `known-names`, and pre-filter `known-names` by words in\n     `apropos-rows`.\n\nRust changes are limited to existing VM introspection (`defined-names`,\n`SourceFile::line_col`) and native candidate filtering (`Matcher`),\nwhere Scheme cannot meet the 28M keystroke instruction budget.",
+          "timestamp": "2026-11-28T11:15:52+01:00",
+          "tree_id": "2d1ac0c9cd74a86adfa957b06a69f9a43b289894",
+          "url": "https://github.com/ArthurHeymans/techne/commit/be49e38380469153185f5573ca07f857de4c13ad"
+        },
+        "date": 1795861356802,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 696857077,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 632012383,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 104459,
             "unit": "data"
           }
         ]
