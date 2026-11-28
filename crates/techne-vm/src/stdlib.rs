@@ -86,11 +86,11 @@ fn defined_names(vm: &mut Vm, args: usize, _: usize) -> R {
     let mut kind_syms = rustc_hash::FxHashMap::default();
     let mut rows: Vec<(u32, u32, Value)> = Vec::with_capacity(raw.len());
     for (s, m, kind) in raw {
-        if !mod_strs.contains_key(&m) {
+        mod_strs.entry(m).or_insert_with(|| {
             let name = vm.module_name(m);
             let v = vm.make_string_raw(&name);
-            mod_strs.insert(m, vm.root(v));
-        }
+            vm.root(v)
+        });
         let ksym = *kind_syms.entry(kind).or_insert_with(|| Value::symbol(reader::intern(kind)));
         rows.push((s, m, ksym));
     }
