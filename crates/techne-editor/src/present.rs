@@ -224,6 +224,12 @@ pub struct Pane {
     /// Images shown as blocks of their own above lines, by position, in
     /// order; near the scroll anchor, as `layers`.
     pub blocks: Vec<Block>,
+    /// Half-open byte ranges of whole hidden logical lines (folds), sorted
+    /// and non-overlapping. Policy lives in Lisp; frontends skip them.
+    #[serde(default)]
+    pub folds: Vec<Fold>,
+    #[serde(default)]
+    pub conceals: Vec<Conceal>,
     /// The pane's default style: what its text is drawn with where no
     /// highlight says otherwise.
     pub default: StyleId,
@@ -357,6 +363,24 @@ pub struct Inlay {
 pub struct Hang {
     pub line: usize,
     pub at: usize,
+}
+
+/// A half-open byte range `[from, to)` of hidden whole logical lines in a
+/// view. `from` is a line start; `to` is a line start or the end of text.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fold {
+    pub from: usize,
+    pub to: usize,
+}
+
+/// A half-open byte range `[from, to)` of source text hidden inline within a
+/// single logical line (never crossing a line break). Frontends omit these
+/// bytes from shaped/terminal text while mapping carets, selections, and clicks
+/// back to source offsets.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conceal {
+    pub from: usize,
+    pub to: usize,
 }
 
 /// An image shown as a block of its own above the line `at` is on, as

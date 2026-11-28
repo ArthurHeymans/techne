@@ -19,7 +19,7 @@
 (require "windows.scm")
 
 (provide editor-press editor-viewport! editor-pointer! editor-focus-event! editor-click editor-message! session-quit?
-         editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays pane-projections cursor-shape
+         editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays pane-projections pane-folds cursor-shape
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations!)
 
@@ -241,10 +241,25 @@ the layers, which the runtime composes attribute by attribute."
   (append (buffer-layers (view-document view) from to)
           (search-highlights s view from to)))
 
+(define (pane-folds s view)
+  "Return the folded line ranges (from to) of VIEW in session S."
+  (buffer-folds view))
+
 (define (pane-inlays s view from to)
   "Return the inlays of VIEW from FROM to TO in session S.
-Each is (position text face): text shown in the line, not in the text."
-  (buffer-inlays (view-document view) from to))
+Each is (position text face): text shown in the line, not in the text.
+Includes fold ellipses at the end of folded header lines."
+  (let* ((d (view-document view))
+         (base (buffer-inlays d from to))
+         (folds (buffer-folds view)))
+    (if (null? folds)
+        base
+        (append base
+                (filter-map (lambda (f)
+                              (and (> (car f) 0)
+                                   (let ((at (line-end d (- (car f) 1))))
+                                     (and (>= at from) (<= at to) (list at " …" 'fold.ellipsis)))))
+                            folds)))))
 
 (define (pane-projections s view from to)
   "Return how VIEW's text from FROM to TO is laid out in session S.

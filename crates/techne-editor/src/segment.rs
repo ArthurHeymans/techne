@@ -11,6 +11,8 @@
 
 use techne_text::{motion, ropey::Rope};
 
+use crate::present::Fold;
+
 pub const LONG_LINE: usize = 4096;
 
 /// A byte range of one line, without its line break.
@@ -61,6 +63,142 @@ pub fn prev_segment(text: &Rope, seg: Segment) -> Option<Segment> {
     }
     let line = text.byte_to_line(seg.start);
     (line > 0).then(|| segment_at(text, motion::line_end(text, text.line_to_byte(line - 1))))
+}
+
+/// Return the fold hiding `pos`, if any (`folds` sorted and non-overlapping).
+pub fn hidden_fold(folds: &[Fold], pos: usize) -> Option<Fold> {
+    let i = folds.partition_point(|f| f.to <= pos);
+    folds.get(i).copied().filter(|f| f.from <= pos && pos < f.to)
+}
+
+/// Normalize `pos` out of any fold by snapping to the start of the line
+/// immediately preceding the fold (its header line), or `0`.
+pub fn visible_pos(text: &Rope, folds: &[Fold], pos: usize) -> usize {
+    let mut p = snap(text, pos.min(text.len_bytes()));
+    while let Some(f) = hidden_fold(folds, p) {
+        if f.from == 0 {
+            return f.to.min(text.len_bytes());
+        }
+        p = motion::line_start(text, f.from - 1);
+    }
+    p
+}
+
+/// Next display segment after `seg`, skipping any folded ranges.
+pub fn next_visible_segment(text: &Rope, seg: Segment, folds: &[Fold]) -> Option<Segment> {
+    let mut next = next_segment(text, seg)?;
+    while let Some(f) = hidden_fold(folds, next.start) {
+        let len = text.len_bytes();
+        if f.to >= len {
+            return None;
+        }
+        next = segment_at(text, f.to);
+    }
+    Some(next)
+}
+
+/// Previous display segment before `seg`, skipping any folded ranges.
+pub fn prev_visible_segment(text: &Rope, seg: Segment, folds: &[Fold]) -> Option<Segment> {
+    let mut prev = prev_segment(text, seg)?;
+    while let Some(f) = hidden_fold(folds, prev.start) {
+        if f.from == 0 {
+            return None;
+        }
+        prev = segment_at(text, motion::line_end(text, f.from - 1));
+    }
+    Some(prev)
+}
+
+/// Fold-aware counterpart of `scroll_lines`.
+pub fn scroll_lines_folded(text: &Rope, anchor: usize, n: i64, folds: &[Fold], starts: &mut impl FnMut(Segment) -> Vec<usize>) -> usize {
+    let anchor = visible_pos(text, folds, anchor);
+    let mut seg = segment_at(text, anchor);
+    let mut lines = starts(seg);
+    let mut i = line_index(&lines, anchor) as i64 + n;
+    if n > 0 {
+        while (i as usize) < lines.len() && i > 0 && lines[i as usize] == lines[i as usize - 1] {
+            i += 1;
+        }
+    }
+    loop {
+        if i < 0 {
+            match prev_visible_segment(text, seg, folds) {
+                Some(p) => {
+                    seg = p;
+                    lines = starts(seg);
+                    i += lines.len() as i64;
+                }
+                None => return visible_pos(text, folds, 0),
+            }
+        } else if i >= lines.len() as i64 {
+            match next_visible_segment(text, seg, folds) {
+                Some(nx) => {
+                    i -= lines.len() as i64;
+                    seg = nx;
+                    lines = starts(seg);
+                }
+                None => return *lines.last().expect("a segment has a visual line"),
+            }
+        } else {
+            return lines[i as usize];
+        }
+    }
+}
+
+/// Fold-aware counterpart of `keep_visible`.
+pub fn keep_visible_folded(
+    text: &Rope,
+    anchor: usize,
+    head: usize,
+    rows: usize,
+    folds: &[Fold],
+    starts: &mut impl FnMut(Segment) -> Vec<usize>,
+) -> Option<usize> {
+    let anchor = visible_pos(text, folds, anchor);
+    let head = visible_pos(text, folds, head);
+    let fit = rows.max(1) as i64;
+    let lines = starts(segment_at(text, head));
+    let line_start = lines[line_index(&lines, head)];
+    let top = scroll_lines_folded(text, anchor, 0, folds, starts);
+    let centred = |starts: &mut _| scroll_lines_folded(text, line_start, -(fit / 2), folds, starts);
+    if line_start < top {
+        let near = scroll_lines_folded(text, line_start, SCROLL_CONSERVATIVELY, folds, starts) >= top;
+        return Some(if near { line_start } else { centred(starts) });
+    }
+    let below = rows_down_folded(text, top, head, fit + SCROLL_CONSERVATIVELY, folds, starts);
+    if below < fit {
+        return None;
+    }
+    let near = below < fit + SCROLL_CONSERVATIVELY;
+    Some(if near { scroll_lines_folded(text, line_start, -(fit - 1), folds, starts) } else { centred(starts) })
+}
+
+fn rows_down_folded(
+    text: &Rope,
+    top: usize,
+    head: usize,
+    limit: i64,
+    folds: &[Fold],
+    starts: &mut impl FnMut(Segment) -> Vec<usize>,
+) -> i64 {
+    let target = segment_at(text, head);
+    let target_index = line_index(&starts(target), head);
+    let mut seg = segment_at(text, top);
+    let mut i = line_index(&starts(seg), top);
+    let mut n = 0;
+    loop {
+        if seg == target {
+            return n + target_index as i64 - i as i64;
+        }
+        n += starts(seg).len() as i64 - i as i64;
+        if n > limit {
+            return n;
+        }
+        match next_visible_segment(text, seg, folds) {
+            Some(next) => (seg, i) = (next, 0),
+            None => return n,
+        }
+    }
 }
 
 /// The scroll anchor `n` visual lines further down (up when negative).
@@ -193,6 +331,19 @@ mod tests {
             assert_eq!(segment_at(&t, s.end - 1), *s);
         }
         assert_eq!(prev_segment(&t, segment_at(&t, le + 1)), pieces.last().copied());
+    }
+
+    #[test]
+    fn folds_skip_hidden_segments_and_normalize_positions() {
+        let t = Rope::from_str("* One\nbody 1\nbody 2\n* Two\nbody 3\n");
+        let folds = [Fold { from: t.line_to_byte(1), to: t.line_to_byte(3) }];
+        let s0 = segment_at(&t, 0);
+        assert_eq!(next_visible_segment(&t, s0, &folds), Some(segment_at(&t, t.line_to_byte(3))));
+        assert_eq!(prev_visible_segment(&t, segment_at(&t, t.line_to_byte(3)), &folds), Some(s0));
+        assert_eq!(visible_pos(&t, &folds, t.line_to_byte(2)), 0);
+        let mut starts = |s: Segment| vec![s.start];
+        assert_eq!(scroll_lines_folded(&t, 0, 1, &folds, &mut starts), t.line_to_byte(3));
+        assert_eq!(scroll_lines_folded(&t, t.line_to_byte(3), -1, &folds, &mut starts), 0);
     }
 
     #[test]

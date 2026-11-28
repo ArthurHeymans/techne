@@ -33,8 +33,12 @@ pub fn key_name(key: &Key, mods: ModifiersState) -> Option<String> {
     if mods.super_key() {
         name.push_str("s-");
     }
-    // Shift is already in the character; named keys keep it explicitly.
-    if mods.shift_key() && matches!(key, Key::Named(_)) && base.starts_with('<') {
+    // Shift is already in the character; bracketed named keys, Tab (S-TAB),
+    // and chorded Enter (M-S-RET / C-S-RET) keep it explicitly.
+    if mods.shift_key()
+        && matches!(key, Key::Named(_))
+        && (base.starts_with('<') || base == "TAB" || (base == "RET" && (mods.control_key() || mods.alt_key() || mods.super_key())))
+    {
         name.push_str("S-");
     }
     name.push_str(&base);
@@ -106,10 +110,10 @@ mod tests {
         // C-, then M-, then s- (super), whatever order winit reports.
         assert_eq!(name(ch("a"), all).as_deref(), Some("C-M-s-a"));
         assert_eq!(name(Key::Named(NamedKey::F5), ModifiersState::ALT).as_deref(), Some("M-<f5>"));
-        // Shift is explicit only on bracketed named keys; on RET and TAB
-        // it would name a key no keymap binds.
+        // Bare Shift+RET stays RET (typing), while S-TAB and M-S-RET keep S-.
         assert_eq!(name(Key::Named(NamedKey::Enter), ModifiersState::SHIFT).as_deref(), Some("RET"));
-        assert_eq!(name(Key::Named(NamedKey::Tab), ModifiersState::SHIFT).as_deref(), Some("TAB"));
+        assert_eq!(name(Key::Named(NamedKey::Enter), ModifiersState::ALT | ModifiersState::SHIFT).as_deref(), Some("M-S-RET"));
+        assert_eq!(name(Key::Named(NamedKey::Tab), ModifiersState::SHIFT).as_deref(), Some("S-TAB"));
         assert_eq!(name(Key::Named(NamedKey::PageDown), ModifiersState::CONTROL).as_deref(), Some("C-<next>"));
         // A composed string is text to insert, unless a modifier makes
         // it a chord, where it is nothing the editor can name.

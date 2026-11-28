@@ -18,70 +18,146 @@ use std::{collections::HashMap, sync::Arc};
 use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Style as FontStyle, Weight as FontWeight, Wrap};
 use techne_editor::{
     images::Image,
-    present::{Block, Hang, Inlay, Slant, StyleId, Weight},
-    segment::{self, Segment, next_segment, segment_at, snap},
+    present::{Block, Conceal, Fold, Hang, Inlay, Slant, StyleId, Weight},
+    segment::{self, Segment, next_visible_segment, segment_at, visible_pos},
 };
 use techne_text::{motion, ropey::Rope};
 
 /// The text shaped for a segment: a stray carriage return would start a new
-/// line for the shaper, so it is shown as a space (same byte length); the
-/// inlays in it are in it, where they are shown.
-fn display_text(text: &Rope, seg: Segment, inlays: &[Inlay]) -> (String, Inlays) {
+/// line for the shaper, so it is shown as a space (same byte length); inlays
+/// are inserted where they belong and concealed spans are omitted.
+fn display_text(text: &Rope, seg: Segment, inlays: &[Inlay], conceals: &[Conceal]) -> (String, Inlays) {
     let plain = text.byte_slice(seg.start..seg.end).to_string().replace('\r', " ");
     let ends_line = seg.end == motion::line_end(text, seg.start);
     let own: Vec<&Inlay> = inlays[inlays.partition_point(|i| i.at < seg.start)..]
         .iter()
         .take_while(|i| i.at < seg.end || (ends_line && i.at == seg.end))
         .collect();
-    if own.is_empty() {
+    let own_c: Vec<(usize, usize)> = conceals[conceals.partition_point(|c| c.to <= seg.start)..]
+        .iter()
+        .take_while(|c| c.from < seg.end)
+        .filter_map(|c| {
+            let a = c.from.max(seg.start) - seg.start;
+            let b = c.to.min(seg.end) - seg.start;
+            (a < b).then_some((a, b))
+        })
+        .collect();
+    if own.is_empty() && own_c.is_empty() {
         return (plain, Inlays::default());
     }
     let mut shown = String::with_capacity(plain.len() + own.iter().map(|i| i.text.len()).sum::<usize>());
-    let mut at = 0;
-    let mut map = Vec::new();
-    for i in own {
-        let rel = i.at - seg.start;
-        shown.push_str(&plain[at..rel]);
-        // One line: an inlay's own line breaks would be the shaper's.
-        let text = i.text.replace(['\n', '\r'], " ");
-        shown.push_str(&text);
-        map.push((rel, text.len(), i.style));
-        at = rel;
+    let mut map = Vec::with_capacity(own.len());
+    let mut src = 0usize;
+    let mut ii = 0usize;
+    let mut ci = 0usize;
+    let push_visible = |shown: &mut String, from: usize, to: usize, ci: &mut usize| {
+        let mut cur = from;
+        while *ci < own_c.len() && own_c[*ci].1 <= cur {
+            *ci += 1;
+        }
+        while cur < to {
+            if *ci < own_c.len() && own_c[*ci].0 < to {
+                let (cf, ct) = own_c[*ci];
+                if cur < cf {
+                    shown.push_str(&plain[cur..cf]);
+                }
+                if ct <= to {
+                    cur = ct;
+                    *ci += 1;
+                } else {
+                    cur = to;
+                }
+            } else {
+                shown.push_str(&plain[cur..to]);
+                cur = to;
+            }
+        }
+    };
+    while ii < own.len() {
+        let rel = own[ii].at - seg.start;
+        push_visible(&mut shown, src, rel, &mut ci);
+        src = rel;
+        while ii < own.len() && own[ii].at - seg.start == rel {
+            // One line: an inlay's own line breaks would be the shaper's.
+            let text = own[ii].text.replace(['\n', '\r'], " ");
+            shown.push_str(&text);
+            map.push((rel, text.len(), own[ii].style));
+            ii += 1;
+        }
     }
-    shown.push_str(&plain[at..]);
-    (shown, Inlays(map))
+    push_visible(&mut shown, src, plain.len(), &mut ci);
+    (shown, Inlays { inlays: map, conceals: own_c })
 }
 
-/// Where a segment's inlays are in its shaped text: each (position in
-/// the segment's text, length shown, style), in order. Shaped offsets
-/// and the text's differ by the inlays before them.
+/// Where a segment's inlays and concealed spans are in its shaped text.
+/// Shaped offsets and source offsets differ by preceding inlays (+) and
+/// concealed spans (-).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Inlays(Vec<(usize, usize, StyleId)>);
+pub struct Inlays {
+    inlays: Vec<(usize, usize, StyleId)>,
+    conceals: Vec<(usize, usize)>,
+}
 
 impl Inlays {
+    fn hidden_before(&self, t: usize) -> usize {
+        self.conceals.iter().take_while(|c| c.0 < t).map(|&(f, to)| to.min(t) - f).sum()
+    }
+
     /// The shaped offset of the character at `t`: after the inlays there.
     pub fn char_at(&self, t: usize) -> usize {
-        t + self.0.iter().filter(|i| i.0 <= t).map(|i| i.1).sum::<usize>()
+        t - self.hidden_before(t) + self.inlays.iter().filter(|i| i.0 <= t).map(|i| i.1).sum::<usize>()
     }
 
     /// The shaped offset of the caret at `t`: before the inlays there.
     pub fn caret_at(&self, t: usize) -> usize {
-        t + self.0.iter().filter(|i| i.0 < t).map(|i| i.1).sum::<usize>()
+        t - self.hidden_before(t) + self.inlays.iter().filter(|i| i.0 < t).map(|i| i.1).sum::<usize>()
     }
 
     /// The text position a shaped offset is on: in an inlay, where it is.
     pub fn text_at(&self, d: usize) -> usize {
-        let mut shift = 0;
-        for &(at, len, _) in &self.0 {
-            if d < at + shift {
-                break;
+        let (mut src, mut disp) = (0usize, 0usize);
+        let (mut ii, mut ci) = (0usize, 0usize);
+        loop {
+            let next_i = self.inlays.get(ii).map(|i| i.0);
+            let next_c = self.conceals.get(ci).map(|c| c.0);
+            let next = match (next_i, next_c) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let Some(ev) = next else {
+                return src + (d - disp);
+            };
+            if ev > src {
+                let vis = ev - src;
+                if d < disp + vis {
+                    return src + (d - disp);
+                }
+                disp += vis;
+                src = ev;
             }
-            if d < at + shift + len {
-                return at;
+            if next_i == Some(src) {
+                let len = self.inlays[ii].1;
+                if d < disp + len {
+                    return src;
+                }
+                disp += len;
+                ii += 1;
+            } else if next_c == Some(src) {
+                let end = self.conceals[ci].1;
+                ci += 1;
+                while let Some(&(at, len, _)) = self.inlays.get(ii) {
+                    if at >= end {
+                        break;
+                    }
+                    if d < disp + len {
+                        return at;
+                    }
+                    disp += len;
+                    ii += 1;
+                }
+                src = end;
             }
-            shift += len;
         }
-        d - shift
     }
 
     /// The shaped ranges of the text from `a` to `b` (in the segment),
@@ -90,15 +166,21 @@ impl Inlays {
         let mut out = Vec::new();
         let mut from = self.char_at(a);
         let mut last = None;
-        for &(at, _, _) in self.0.iter().filter(|i| a < i.0 && i.0 < b) {
+        for &(at, _, _) in self.inlays.iter().filter(|i| a < i.0 && i.0 < b) {
             if last == Some(at) {
                 continue;
             }
             last = Some(at);
-            out.push((from, self.caret_at(at)));
+            let end = self.caret_at(at);
+            if from < end {
+                out.push((from, end));
+            }
             from = self.char_at(at);
         }
-        out.push((from, self.caret_at(b).max(from)));
+        let end = self.caret_at(b).max(from);
+        if from < end {
+            out.push((from, end));
+        }
         out
     }
 
@@ -106,7 +188,7 @@ impl Inlays {
     /// another.
     fn shown(&self) -> impl Iterator<Item = (usize, usize, StyleId)> + '_ {
         let mut at_place = (usize::MAX, 0);
-        self.0.iter().map(move |&(at, len, style)| {
+        self.inlays.iter().map(move |&(at, len, style)| {
             if at_place.0 != at {
                 at_place = (at, self.caret_at(at));
             }
@@ -270,6 +352,8 @@ pub struct Layout {
     /// and how tall a block may be.
     hangs: Vec<Hang>,
     blocks: Vec<Block>,
+    folds: Vec<Fold>,
+    conceals: Vec<Conceal>,
     block_height: f32,
 }
 
@@ -290,6 +374,8 @@ impl Layout {
             runs: Vec::new(),
             hangs: Vec::new(),
             blocks: Vec::new(),
+            folds: Vec::new(),
+            conceals: Vec::new(),
             block_height: f32::MAX,
         };
         let sample = layout.label(&"0".repeat(20), f32::MAX);
@@ -345,6 +431,18 @@ impl Layout {
         self.blocks.clear();
         self.blocks.extend_from_slice(blocks);
         self.block_height = block_height;
+    }
+
+    /// Set the view's folded byte ranges (sorted, non-overlapping).
+    pub fn set_folds(&mut self, folds: &[Fold]) {
+        self.folds.clear();
+        self.folds.extend_from_slice(folds);
+    }
+
+    /// Set the pane's inline concealed byte ranges (sorted, non-overlapping).
+    pub fn set_conceals(&mut self, conceals: &[Conceal]) {
+        self.conceals.clear();
+        self.conceals.extend_from_slice(conceals);
     }
 
     /// Start a frame: segments not used since the previous one may go, and
@@ -480,7 +578,7 @@ impl Layout {
     /// are, and the runs over it (the text's, around the inlays, and
     /// each inlay in its own style's weight and slant).
     fn segment(&self, text: &Rope, s: Segment) -> (String, Inlays, Vec<RunSpan>) {
-        let (shown, map) = display_text(text, s, &self.inlays);
+        let (shown, map) = display_text(text, s, &self.inlays, &self.conceals);
         let first = self.inlays.partition_point(|i| i.at < s.start);
         let mut own: Vec<RunSpan> = self
             .runs
@@ -602,7 +700,7 @@ impl Layout {
 
     /// The segments to show from the scroll anchor down to `height`.
     pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32) -> Vec<Placed> {
-        let anchor = snap(text, anchor.min(text.len_bytes()));
+        let anchor = visible_pos(text, &self.folds, anchor);
         let first = segment_at(text, anchor);
         let (_, starts, lines, _, _) = self.shaped(text, first);
         // From the anchor's line: its segment's blocks are above the
@@ -639,7 +737,7 @@ impl Layout {
             let p = Placed { seg: s, key, top: y + pad, lines, inlays, indent, indent_first, blocks };
             y = p.top + p.height();
             placed.push(p);
-            seg = next_segment(text, s);
+            seg = next_visible_segment(text, s, &self.folds);
         }
         placed
     }
@@ -651,7 +749,8 @@ impl Layout {
 
     /// The scroll anchor `n` visual lines further down (up when negative).
     pub fn scroll_lines(&mut self, text: &Rope, anchor: usize, n: i64) -> usize {
-        segment::scroll_lines(text, anchor, n, &mut |seg| self.visual_starts(text, seg))
+        let folds = self.folds.clone();
+        segment::scroll_lines_folded(text, anchor, n, &folds, &mut |seg| self.visual_starts(text, seg))
     }
 
     /// The scroll anchor `dy` pixels further down (up when negative), at
@@ -702,7 +801,8 @@ impl Layout {
             return None;
         }
         let fit = (height / self.line_height()).floor() as usize;
-        let counted = segment::keep_visible(text, anchor, head, fit, &mut |seg| self.visual_starts(text, seg));
+        let folds = self.folds.clone();
+        let counted = segment::keep_visible_folded(text, anchor, head, fit, &folds, &mut |seg| self.visual_starts(text, seg));
         let mut at = counted.unwrap_or(anchor);
         for _ in 0..fit.max(1) {
             let placed = self.frame(text, at, height);
@@ -940,12 +1040,32 @@ mod tests {
 
     #[test]
     fn inlays_at_one_place_follow_one_another() {
-        let map = Inlays(vec![(5, 2, 1), (5, 3, 2)]);
+        let map = Inlays { inlays: vec![(5, 2, 1), (5, 3, 2)], conceals: vec![] };
         assert_eq!(map.shown().collect::<Vec<_>>(), [(5, 7, 1), (7, 10, 2)]);
         assert_eq!(map.text_ranges(0, 10), [(0, 5), (10, 15)]);
         assert_eq!(map.caret_at(5), 5);
         assert_eq!(map.char_at(5), 10);
         assert_eq!(map.text_at(8), 5);
+    }
+
+    #[test]
+    fn conceals_hide_link_syntax_and_map_offsets() {
+        let t = Rope::from_str("See [[https://x.y][link]] and *bold*");
+        let seg = segment_at(&t, 0);
+        let conceals = vec![
+            Conceal { from: 4, to: 19 },  // [[https://x.y][
+            Conceal { from: 23, to: 25 }, // ]]
+            Conceal { from: 30, to: 31 }, // *
+            Conceal { from: 35, to: 36 }, // *
+        ];
+        let (shown, map) = display_text(&t, seg, &[], &conceals);
+        assert_eq!(shown, "See link and bold");
+        assert_eq!(map.char_at(19), 4);
+        assert_eq!(map.caret_at(23), 8);
+        assert_eq!(map.text_at(4), 19);
+        assert_eq!(map.text_at(13), 31);
+        assert_eq!(map.text_ranges(19, 23), [(4, 8)]);
+        assert_eq!(map.text_ranges(31, 35), [(13, 17)]);
     }
 
     #[test]

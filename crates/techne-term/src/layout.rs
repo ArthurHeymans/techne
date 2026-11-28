@@ -7,8 +7,8 @@
 //! is `techne_editor::segment`'s.
 
 use techne_editor::{
-    present::{Hang, Inlay, Pane, StyleId},
-    segment::{self, Segment, next_segment, segment_at, snap},
+    present::{Conceal, Fold, Hang, Inlay, Pane, StyleId},
+    segment::{self, Segment, next_visible_segment, segment_at, visible_pos},
 };
 use techne_text::{motion, ropey::Rope};
 use unicode_segmentation::UnicodeSegmentation;
@@ -22,13 +22,22 @@ pub const TAB_STOP: usize = 8;
 pub struct Projected<'a> {
     pub inlays: &'a [Inlay],
     pub hangs: &'a [Hang],
+    pub folds: &'a [Fold],
+    pub conceals: &'a [Conceal],
     pub word_wrap: bool,
     pub truncate_lines: bool,
 }
 
 impl<'a> Projected<'a> {
     pub fn of(p: &'a Pane) -> Projected<'a> {
-        Projected { inlays: &p.inlays, hangs: &p.hangs, word_wrap: p.display.word_wrap, truncate_lines: p.display.truncate_lines }
+        Projected {
+            inlays: &p.inlays,
+            hangs: &p.hangs,
+            folds: &p.folds,
+            conceals: &p.conceals,
+            word_wrap: p.display.word_wrap,
+            truncate_lines: p.display.truncate_lines,
+        }
     }
 }
 
@@ -172,12 +181,20 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec
             }
         }
     };
+    let concealed = |pos: usize| {
+        let idx = shown.conceals.partition_point(|c| c.to <= pos);
+        shown.conceals.get(idx).is_some_and(|c| c.from <= pos && pos < c.to)
+    };
     for (i, g) in s.grapheme_indices(true) {
-        inlays_before(&mut lines, seg.start + i, indent);
-        if line == seg.start && hang == Some(seg.start + i) && lines.len() == 1 && lines[0].width < cols / 2 {
+        let pos = seg.start + i;
+        inlays_before(&mut lines, pos, indent);
+        if concealed(pos) {
+            continue;
+        }
+        if line == seg.start && hang == Some(pos) && lines.len() == 1 && lines[0].width < cols / 2 {
             indent = lines[0].width;
         }
-        place(&mut lines, g, seg.start + i, g.len(), wrap_at, None, (lead, indent, shown.word_wrap));
+        place(&mut lines, g, pos, g.len(), wrap_at, None, (lead, indent, shown.word_wrap));
     }
     inlays_before(&mut lines, seg.end, indent);
     let last = lines.last_mut().expect("a line");
@@ -199,6 +216,16 @@ fn a_wider_terminal_grid_clips_instead_of_wrapping() {
     assert!(!lines[0].continued);
 }
 
+#[test]
+fn conceals_omit_hidden_spans_in_terminal() {
+    let t = Rope::from_str("See [[https://x.y][link]]\n");
+    let conceals = [Conceal { from: 4, to: 19 }, Conceal { from: 23, to: 25 }];
+    let lines = frame(&t, 0, 2, 80, Projected { conceals: &conceals, ..Projected::default() });
+    let shown: String = lines[0].glyphs.iter().map(|g| g.shown.as_str()).collect();
+    assert_eq!(shown, "See link");
+    assert_eq!(lines[0].width, 8);
+}
+
 /// The cells a line of text takes.
 pub fn width(text: &str) -> usize {
     text.graphemes(true).fold(0, |col, g| col + cells(g, col, usize::MAX).1)
@@ -213,23 +240,27 @@ pub fn starts(text: &Rope, seg: Segment, cols: usize, inlays: Projected<'_>) -> 
 
 /// The visual lines shown from the scroll anchor, at most `rows`.
 pub fn frame(text: &Rope, anchor: usize, rows: usize, cols: usize, inlays: Projected<'_>) -> Vec<Line> {
-    let first = segment_at(text, snap(text, anchor.min(text.len_bytes())));
+    let anchor = visible_pos(text, inlays.folds, anchor);
+    let first = segment_at(text, anchor);
     let lines = wrap(text, first, cols, inlays);
     let skip = segment::line_index(&lines.iter().map(|l| l.start).collect::<Vec<_>>(), anchor);
     lines
         .into_iter()
         .skip(skip)
-        .chain(std::iter::successors(next_segment(text, first), |&s| next_segment(text, s)).flat_map(|s| wrap(text, s, cols, inlays)))
+        .chain(
+            std::iter::successors(next_visible_segment(text, first, inlays.folds), |&s| next_visible_segment(text, s, inlays.folds))
+                .flat_map(|s| wrap(text, s, cols, inlays)),
+        )
         .take(rows)
         .collect()
 }
 
 pub fn scroll_lines(text: &Rope, anchor: usize, n: i64, cols: usize, inlays: Projected<'_>) -> usize {
-    segment::scroll_lines(text, anchor, n, &mut |seg| starts(text, seg, cols, inlays))
+    segment::scroll_lines_folded(text, anchor, n, inlays.folds, &mut |seg| starts(text, seg, cols, inlays))
 }
 
 pub fn keep_visible(text: &Rope, anchor: usize, head: usize, rows: usize, cols: usize, inlays: Projected<'_>) -> Option<usize> {
-    segment::keep_visible(text, anchor, head, rows, &mut |seg| starts(text, seg, cols, inlays))
+    segment::keep_visible_folded(text, anchor, head, rows, inlays.folds, &mut |seg| starts(text, seg, cols, inlays))
 }
 
 /// The text position at a cell: the grapheme on it, or past the end of its
@@ -373,5 +404,14 @@ mod tests {
         assert_eq!(indent, 6, "under the first word, past the inlay");
         let later = wrap(&t, segment_at(&t, 6000), 20, shown);
         assert!(later.iter().all(|l| l.glyphs[0].col == indent), "{:?}", later[0]);
+    }
+
+    #[test]
+    fn folded_lines_are_omitted_from_terminal_frame() {
+        let t = Rope::from_str("* One\nhidden 1\nhidden 2\n* Two\n");
+        let folds = [Fold { from: t.line_to_byte(1), to: t.line_to_byte(3) }];
+        let lines = frame(&t, 0, 10, 40, Projected { folds: &folds, ..Projected::default() });
+        let shown: Vec<String> = lines.iter().map(|l| l.glyphs.iter().map(|g| g.shown.as_str()).collect()).collect();
+        assert_eq!(shown, ["* One", "* Two", ""]);
     }
 }

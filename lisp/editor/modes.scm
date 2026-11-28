@@ -43,7 +43,7 @@
          set-option! unset-option! option option-json-overlay explain-option
          add-option-changed-hook! remove-option-changed-hook! project-settings-refresh-display!
          set-document-logical-path-hook! set-remote-path-hook! set-execution-site-inspector-hook!
-         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-target-at buffer-completion buffer-indent
+         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-projections buffer-folds buffer-target-at buffer-completion buffer-indent
          buffer-directory buffer-input buffer-display-options)
 
 ;;; Buffers
@@ -188,7 +188,7 @@ STATE is `chord` (the default) or `normal`."
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
                         #:complete [complete #f] #:indent [indent #f] #:directory [directory #f] #:options [options '()]
-                        #:projections [projections #f] #:input [input #f])
+                        #:projections [projections #f] #:folds [folds #f] #:input [input #f])
   "Define the major mode NAME, documented by DOC, extending PARENT.
 It has PARENT's keys, layers and options, and its own: KEYS and NORMAL
 are (key-description command) bindings for chords and for modal normal
@@ -202,12 +202,15 @@ DIRECTORY a procedure (buffer) giving the directory the buffer is in,
 with its slash, for a buffer of no file (a directory's listing); OPTIONS
 an alist of (option . value) set in the mode, FILES the file name
 suffixes it is for, PROJECTIONS a procedure (document from to) giving
-how the text is laid out (`buffer-projections'). It defines the command
-NAME, which gives the focused buffer this mode. INPUT is a procedure
-(session key) returning true if it handled the key before the profile."
+how the text is laid out (`buffer-projections'), FOLDS a procedure
+(view) returning hidden line ranges (from to) (`buffer-folds'). It
+defines the command NAME, which gives the focused buffer this mode.
+INPUT is a procedure (session key) returning true if it handled the key
+before the profile."
   (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete indent directory
              options files)
   (projections! name projections)
+  (folds! name folds)
   ;; INPUT gets (session key) and returns true if it consumed the key.
   (registry-add! %mode-inputs name (and input (scope-procedure input)))
   (register-command! name doc (lambda (s n)
@@ -222,7 +225,7 @@ The other arguments are keywords, as `register-mode!` takes them."
     ((_ name doc arg ...) (register-mode! 'name doc arg ...))))
 
 (define (register-minor-mode! name doc #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:inlays [inlays #f]
-                              #:projections [projections #f])
+                              #:projections [projections #f] #:folds [folds #f])
   "Define the minor mode NAME, documented by DOC.
 It is on where the boolean option NAME is. KEYS and NORMAL are
 (key-description command) bindings for chords and for modal normal
@@ -230,11 +233,13 @@ state, LAYER a procedure (document from to) giving highlights (from to
 face), INLAYS one (document from to) giving text shown in the line and
 not in the document (position text face): a type after a name,
 PROJECTIONS one (document from to) giving how the text is laid out
-(`buffer-projections'). It defines the command NAME, which turns the
+(`buffer-projections'), FOLDS one (view) returning hidden line ranges
+(from to) (`buffer-folds'). It defines the command NAME, which turns the
 mode on and off in the focused buffer."
   (add-mode! name doc #f #t keys normal layer #f #f #f #f '() '())
   (when inlays (registry-add! %inlays name (scope-procedure inlays)))
   (projections! name projections)
+  (folds! name folds)
   (register-option! name #f doc #:type 'boolean)
   (register-command! name doc (lambda (s n) (toggle-mode! s name)))
   name)
@@ -943,6 +948,25 @@ ignores it: a terminal shows no images."
                             '())))
                     names))))
 
+(define %folds (make-registry 'folds))
+
+(define (folds! name folds)
+  (when folds (registry-add! %folds name (scope-procedure folds))))
+
+(define (buffer-folds view)
+  "Return the hidden line ranges (from to) folded in VIEW.
+Folds are per view so two panes showing one buffer fold independently."
+  (let* ((names (registry-keys %folds))
+         (b (document-buffer (view-document view))))
+    (if (or (null? names) (not b))
+        '()
+        (append-map (lambda (name)
+                      (let ((m (find-mode name)))
+                        (if (and m (if (mode-minor? m) (option b name) (extends? (buffer-mode b) name)))
+                            ((registry-ref %folds name) view)
+                            '())))
+                    names))))
+
 ;; Whether the major mode NAME is ANCESTOR or extends it, without a list.
 (define (extends? name ancestor)
   (let loop ((n name))
@@ -1078,7 +1102,7 @@ Mapped from EditorConfig `end_of_line` and safe in `.techne.scm`."
 (define-mode fundamental-mode "The mode every other extends.")
 (define-mode text-mode
   "Prose."
-  #:files '(".txt" ".md" ".org" ".yaml" ".yml")
+  #:files '(".txt" ".md" ".yaml" ".yml")
   #:options '((line-numbers . absolute) (eob-marker . "~")))
 (define-mode conf-mode "Configuration files." #:files '(".conf" ".cfg" ".ini" ".toml") #:options '((line-numbers . absolute)))
 (define-mode prog-mode

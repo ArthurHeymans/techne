@@ -18,7 +18,7 @@
 (require "terminal-options.scm")
 (require "secrets-options.scm")
 
-(define builtin-packages (quote (compile dired ibuffer vc markdown-preview mail terminal))
+(define builtin-packages (quote (compile dired ibuffer vc markdown-preview mail terminal org))
   "The editor's own packages, loaded at start in this order.")
 
 ;; This file, which packages/ is beside.
